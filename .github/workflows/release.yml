@@ -16,7 +16,14 @@ jobs:
         include:
           - os: macos-14
             platform: darwin
-            build_cmd: pnpm electron:dist:signed
+            # Use signed build only when Apple credentials are available (tagged releases).
+            # Falls back to adhoc signing for manual dispatch without secrets.
+            build_cmd: |
+              if [ -n "$CSC_LINK" ]; then
+                pnpm electron:dist:signed
+              else
+                pnpm electron:dist
+              fi
             artifact: release-macos
           - os: windows-latest
             platform: win32
@@ -39,7 +46,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
           cache: pnpm
 
       - name: Set up uv
@@ -56,16 +63,17 @@ jobs:
         run: uv sync --frozen
 
       # Linux: system libraries required by Playwright / Electron
+      # libasound2 was renamed to libasound2t64 in Ubuntu 24.04
       - name: Install Linux system deps
         if: matrix.platform == 'linux'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             libnss3 libatk-bridge2.0-0 libdrm2 libxkbcommon0 \
-            libgbm1 libasound2 libxrandr2 libxfixes3 libxdamage1
+            libgbm1 libasound2t64 libxrandr2 libxfixes3 libxdamage1
 
       - name: Verify release credentials
-        if: matrix.platform != 'linux'
+        if: matrix.platform != 'linux' && secrets.CSC_LINK != ''
         env:
           CSC_LINK: ${{ secrets.CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
@@ -82,6 +90,7 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: ${{ matrix.build_cmd }}
+        shell: bash
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
