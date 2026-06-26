@@ -60,7 +60,7 @@ jobs:
 
       - name: Install backend Python dependencies
         working-directory: backend
-        run: uv sync --frozen
+        run: uv sync --frozen --python 3.12
 
       # Linux: system libraries required by Playwright / Electron
       # libasound2 was renamed to libasound2t64 in Ubuntu 24.04
