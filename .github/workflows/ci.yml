@@ -89,6 +89,3 @@ jobs:
       - name: Pack Electron app
         run: pnpm electron:pack
 
-      - name: Measure macOS cold start
-        run: node tools/measure_electron_startup.cjs --runs 5 --max-average-ms 3000 --output output/bench/electron-startup.json
-
