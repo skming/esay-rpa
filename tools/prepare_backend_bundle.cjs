@@ -11,7 +11,7 @@ const ROOT = path.resolve(__dirname, '..');
 const BACKEND_DIR = path.join(ROOT, 'backend');
 const TARGET_DIR = path.join(BACKEND_DIR, '.bundle-python');
 const STAMP_FILE = path.join(TARGET_DIR, '.build-stamp.json');
-const PYTHON_VERSION = process.env.RPA_BUNDLE_PYTHON_VERSION || '3.12.10';
+const PYTHON_VERSION = process.env.RPA_BUNDLE_PYTHON_VERSION || '3.12';
 const IS_WIN = process.platform === 'win32';
 
 function run(command, args, options = {}) {
