@@ -97,8 +97,8 @@ function main() {
 
   try {
     // 安装 & 定位
-    run(uvCmd, ['python', 'install', PYTHON_VERSION, '--managed-python']);
-    const pythonPath = run(uvCmd, ['python', 'find', PYTHON_VERSION, '--managed-python']);
+    run(uvCmd, ['python', 'install', PYTHON_VERSION]);
+    const pythonPath = run(uvCmd, ['python', 'find', PYTHON_VERSION]);
 
     const pythonRoot = IS_WIN
       ? path.dirname(pythonPath)

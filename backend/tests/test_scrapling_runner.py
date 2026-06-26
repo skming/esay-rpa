@@ -32,7 +32,7 @@ async def test_scrapling_runner_reports_timeout_with_context(monkeypatch: pytest
             _noop_log,
         )
 
-    assert str(exc_info.value) == "超时：1000ms · static · https://quotes.toscrape.com/"
+    assert str(exc_info.value) == "Scrapling 采集超时：1000ms · static · https://quotes.toscrape.com/"
 
 
 async def test_scrapling_runner_reports_empty_exception_with_type(monkeypatch: pytest.MonkeyPatch) -> None:
