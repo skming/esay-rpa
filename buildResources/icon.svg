@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Easy RPA app icon">
+  <defs>
+    <linearGradient id="mark" x1="270" y1="360" x2="770" y2="660" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0ea5e9"/>
+      <stop offset="0.52" stop-color="#2563eb"/>
+      <stop offset="1" stop-color="#6366f1"/>
+    </linearGradient>
+    <filter id="softShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="26" stdDeviation="24" flood-color="#0f172a" flood-opacity="0.18"/>
+    </filter>
+  </defs>
+
+  <rect x="118" y="106" width="788" height="788" rx="178" fill="#ffffff" filter="url(#softShadow)"/>
+  <rect x="119" y="107" width="786" height="786" rx="177" fill="none" stroke="#e2e8f0" stroke-width="2" opacity="0.75"/>
+  <path d="M286 632C348 482 442 366 544 430C652 498 596 686 748 606" fill="none" stroke="#dbeafe" stroke-width="58" stroke-linecap="round"/>
+  <path d="M286 632C348 482 442 366 544 430C652 498 596 686 748 606" fill="none" stroke="url(#mark)" stroke-width="36" stroke-linecap="round"/>
+  <circle cx="286" cy="632" r="58" fill="#0ea5e9"/>
+  <circle cx="286" cy="632" r="19" fill="#ffffff"/>
+  <circle cx="544" cy="430" r="48" fill="#2563eb"/>
+  <circle cx="544" cy="430" r="15" fill="#ffffff"/>
+  <circle cx="748" cy="606" r="58" fill="#6366f1"/>
+  <circle cx="748" cy="606" r="19" fill="#ffffff"/>
+</svg>

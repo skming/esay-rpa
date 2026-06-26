@@ -1,0 +1,20 @@
+node_modules/
+dist/
+release/
+output/
+backend/.venv/
+backend/.bundle-python/
+backend/.pytest_cache/
+backend/storage/
+.playwright-cli/
+__pycache__/
+*.py[cod]
+*.log
+
+# Local AI tool configs
+.claude/
+.agents/
+.codex/
+.impeccable/
+.pnpm-store/
+.DS_Store

@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; worker-src blob: 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws://127.0.0.1:* ws://localhost:* http://127.0.0.1:* http://localhost:*"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <link rel="apple-touch-icon" href="/icon.png" />
+    <style>
+      html,
+      body,
+      #root {
+        min-width: 1024px;
+        min-height: 720px;
+        height: 100%;
+        margin: 0;
+        background: #f8fafc;
+      }
+
+      .boot-shell {
+        display: flex;
+        height: 100vh;
+        align-items: center;
+        justify-content: center;
+        color: #64748b;
+        font: 12px/1.5 Inter, "PingFang SC", system-ui, sans-serif;
+      }
+    </style>
+    <title>Easy RPA</title>
+  </head>
+  <body>
+    <div id="root">
+      <div class="boot-shell">正在启动 Easy RPA...</div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

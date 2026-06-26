@@ -1,0 +1,65 @@
+/* ── react-json-view-lite theme — premium dark console ────────────────────────
+   Stable, version-proof styling. We do NOT override the library's hashed CSS
+   module class names (those change between releases). Instead the JsonView is
+   given a custom `style` StyleProps object (see jsonViewStyles.ts) that appends
+   these `.rpa-jv-*` classes alongside the library's structural classes. Here we
+   only paint color + the console surface — keyed to the Electric Indigo accent. */
+
+.rpa-json-view {
+  background: oklch(0.175 0.018 264);            /* inky indigo console field */
+  color: oklch(0.74 0.035 264);
+}
+
+/* Neutralize the library's own dark container background (Solarized rgb(0,43,54))
+   so our indigo console field shows through. */
+.rpa-json-view .rpa-jv-container {
+  background: transparent;
+}
+
+/* Object / array keys */
+.rpa-json-view .rpa-jv-key {
+  color: oklch(0.78 0.04 264);
+  font-weight: 500;
+}
+
+/* string → calm green */
+.rpa-json-view .rpa-jv-str {
+  color: oklch(0.80 0.13 152);
+}
+
+/* number → the brand accent, bright on dark — numbers pop */
+.rpa-json-view .rpa-jv-num {
+  color: var(--color-accent-bright);
+  font-variant-numeric: tabular-nums;
+}
+
+/* boolean → amber/gold */
+.rpa-json-view .rpa-jv-bool {
+  color: oklch(0.80 0.14 78);
+}
+
+/* null / undefined → muted, italic */
+.rpa-json-view .rpa-jv-null {
+  color: oklch(0.56 0.02 264);
+  font-style: italic;
+}
+
+/* other primitives */
+.rpa-json-view .rpa-jv-other {
+  color: oklch(0.72 0.05 264);
+}
+
+/* punctuation : { } [ ] , */
+.rpa-json-view .rpa-jv-punc {
+  color: oklch(0.50 0.02 264);
+}
+
+/* expand / collapse chevrons */
+.rpa-json-view .rpa-jv-icon {
+  color: oklch(0.62 0.10 264);
+}
+
+/* collapsed "…" content */
+.rpa-json-view .rpa-jv-collapsed {
+  color: oklch(0.56 0.02 264);
+}

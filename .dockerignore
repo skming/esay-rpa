@@ -1,0 +1,12 @@
+node_modules/
+.pnpm-store/
+dist/
+release/
+backend/.venv/
+backend/.pytest_cache/
+backend/storage/
+.playwright-cli/
+output/
+__pycache__/
+*.py[cod]
+*.log
