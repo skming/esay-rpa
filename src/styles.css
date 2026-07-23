@@ -1,0 +1,494 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/jetbrains-mono";
+
+@theme {
+  --font-sans: "Inter Variable", "PingFang SC", "Helvetica Neue", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", "Fira Code", Menlo, Consolas, monospace;
+  /* Serif retired — Easy RPA is a precision tool, not an editorial surface.
+     The alias keeps any stray `font-serif` from breaking; it resolves to sans. */
+  --font-serif: var(--font-sans);
+
+  /* ── Neutral skeleton — slate ink on a cool paper field ──────────────────
+     Token names are kept stable across the codebase; the values now carry the
+     RPA register: clean slate scale, soft surfaces, hairline borders. */
+  --color-paper: #f8fafc;
+  /* page / canvas field — slate-50 */
+  --color-paper-sunk: #f1f5f9;
+  /* recessed wells, hover fill, table zebra — slate-100 */
+  --color-ink: #0f172a;
+  /* titles, headings, primary — slate-900 */
+  --color-ink-2: #334155;
+  /* body, values — slate-700, 8.9:1 on white */
+  --color-ink-3: #64748b;
+  /* secondary labels — slate-500, 4.6:1 (AA body) */
+  --color-ink-4: #94a3b8;
+  /* faint — placeholders, rest icons (non-text only) */
+  --color-rule: rgba(15, 23, 42, 0.08);
+  /* hairline ≈ slate-200 */
+  --color-rule-2: rgba(15, 23, 42, 0.14);
+  /* structural rule ≈ slate-300 */
+
+  /* ── Brand — Indigo → Blue ───────────────────────────────────────────────
+     `accent` (indigo-500 #6366f1) is the brand fill: primary buttons, selection
+     rings, brand mark. `accent-strong` (blue-600 #2563eb) is the AA-safe text /
+     active register: links, active tabs, on-paper accent text (~5.2:1). The
+     live/running signal is a DISTINCT blue (see --color-live) so "the system is
+     executing" never collides with "this is selected / branded". */
+  --color-accent: #6366f1;
+  /* indigo-500 — primary fill, selection, brand */
+  --color-accent-strong: #2563eb;
+  /* blue-600 — AA text, active, links */
+  --color-accent-press: #1d4ed8;
+  /* blue-700 — pressed / active */
+  --color-accent-bright: #818cf8;
+  /* indigo-400 — on dark surfaces */
+  --color-accent-soft: rgba(99, 102, 241, 0.10);
+  /* tinted wash */
+  --color-accent-wash: rgba(99, 102, 241, 0.05);
+  /* faintest hover field */
+  --color-accent-line: rgba(99, 102, 241, 0.38);
+  /* accent hairline */
+  --color-accent-fg: #ffffff;
+  /* text on a filled accent */
+
+  /* The live/running signal — a true blue (#3b82f6), held apart from the indigo
+     brand so running state reads as its own semantic, reinforced by motion. */
+  --color-live: #3b82f6;
+  /* blue-500 */
+  --color-live-soft: rgba(59, 130, 246, 0.12);
+  --color-live-line: rgba(59, 130, 246, 0.45);
+
+  /* Legacy brand-* utilities resolve to the indigo→blue brand (single source). */
+  --color-brand-primary: #6366f1;
+  --color-brand-hover: #4f46e5;
+  --color-brand-light: #e0e7ff;
+  --color-brand-subtle: #eef2ff;
+
+  /* Surface stack */
+  --color-canvas: #f8fafc;
+  /* app shell + flow canvas field */
+  --color-surface: #ffffff;
+
+  /* Shadows — soft, layered elevation (the RPA register restores card depth) */
+  --shadow-xs: 0 1px 2px rgba(15, 23, 42, 0.05);
+  --shadow-sm: 0 1px 3px rgba(15, 23, 42, 0.06), 0 1px 2px rgba(15, 23, 42, 0.04);
+  --shadow-node: 0 1px 3px rgba(15, 23, 42, 0.06), 0 1px 2px rgba(15, 23, 42, 0.04);
+  --shadow-md: 0 4px 6px rgba(15, 23, 42, 0.07), 0 2px 4px rgba(15, 23, 42, 0.05);
+  --shadow-card: 0 1px 3px rgba(15, 23, 42, 0.06), 0 1px 2px rgba(15, 23, 42, 0.04);
+  --shadow-lg: 0 10px 15px rgba(15, 23, 42, 0.08), 0 4px 6px rgba(15, 23, 42, 0.04);
+  --shadow-panel: 0 10px 30px rgba(15, 23, 42, 0.12), 0 4px 10px rgba(15, 23, 42, 0.06);
+  --shadow-running: 0 2px 16px rgba(59, 130, 246, 0.22);
+  --shadow-node-selected: 0 0 0 3px rgba(99, 102, 241, 0.22), 0 4px 20px rgba(15, 23, 42, 0.12);
+  --shadow-glass: 0 8px 32px rgba(15, 23, 42, 0.06), inset 0 1px 0 rgba(255, 255, 255, 0.85);
+
+  /* Brand gradient — primary CTAs, progress fills */
+  --gradient-brand: linear-gradient(90deg, #6366f1, #2563eb);
+}
+
+:root {
+  color-scheme: light;
+  font-family: var(--font-sans);
+  background: var(--color-canvas);
+
+  /* 语义化层级标度 —— 数值只在此处定义一次。
+     select 必须高于 modal：下拉在对话框内打开时要盖住对话框本身。
+     banner 是最高层：人工接管横幅必须压过任何弹层，否则用户看不到该处理什么。 */
+  --z-sticky: 10;
+  --z-raised: 20;
+  --z-dropdown: 50;
+  --z-drawer-backdrop: 80;
+  --z-drawer: 81;
+  --z-modal-backdrop: 90;
+  --z-modal: 91;
+  --z-select: 110;
+  --z-toast: 120;
+  --z-banner: 200;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 1024px;
+  min-height: 720px;
+  background: var(--color-canvas);
+}
+
+button,
+input,
+select {
+  font-family: inherit;
+}
+
+button {
+  -webkit-tap-highlight-color: transparent;
+}
+
+button:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--color-accent-line);
+  outline-offset: 2px;
+}
+
+/* ── Brand button ────────────────────────────────────────── */
+.bg-brand-gradient {
+  background-image: var(--gradient-brand);
+  background-color: var(--color-brand-primary);
+}
+
+/* ── Running shimmer — indigo→blue flowing strip ─────────── */
+.bg-running-strip {
+  background: linear-gradient(90deg, #6366f1, #3b82f6, #6366f1);
+  background-size: 200% auto;
+}
+
+/* ── Electron drag regions ───────────────────────────────── */
+.drag-region {
+  -webkit-app-region: drag;
+}
+
+.no-drag,
+button,
+input,
+select {
+  -webkit-app-region: no-drag;
+}
+
+/* ── Animations ──────────────────────────────────────────── */
+.animate-shimmer {
+  animation: shimmer 2s linear infinite;
+}
+
+.pulse-ring {
+  animation: pulse-ring 1.8s ease-out infinite;
+}
+
+/* ── Nav surface — light rail (white, hairline right edge) ─ */
+.nav-glass {
+  background: #ffffff;
+  border-right: 1px solid var(--color-rule);
+  box-shadow: 1px 0 2px rgba(15, 23, 42, 0.03);
+}
+
+/* ── React Flow canvas ───────────────────────────────────── */
+.react-flow {
+  /* Single dot grid is owned by the toggleable <Background> component so the
+     toolbar's grid switch actually clears it. Keep only the canvas fill here. */
+  background-color: var(--color-canvas);
+}
+
+.react-flow__renderer {
+  cursor: default;
+}
+
+.react-flow__minimap {
+  width: 156px;
+  height: 116px;
+  margin: 14px;
+  border: 1px solid var(--color-rule);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.90);
+  box-shadow: var(--shadow-card);
+}
+
+.react-flow__controls {
+  display: none;
+}
+
+.react-flow__edge-path {
+  stroke: #94a3b8;
+  stroke-width: 1.5;
+}
+
+.react-flow__edge.selected .react-flow__edge-path,
+.react-flow__edge:hover .react-flow__edge-path {
+  stroke: var(--color-accent);
+}
+
+.react-flow__edge-textbg {
+  fill: #fff;
+  rx: 4px;
+  ry: 4px;
+}
+
+.react-flow__edge-text {
+  fill: var(--color-accent-strong);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+/* ── Node handles ─────────────────────────────────────────────────────────────
+   Connection affordance per the flow spec: an 8px resting dot that grows to a
+   12px Electric Indigo target the moment the node is hovered or a connection is
+   in flight. Growing width/height (not transform) preserves React Flow's own
+   centering translate, so the handle never drifts off the edge midpoint. */
+.rpa-handle {
+  z-index: 2 !important;
+  width: 8px !important;
+  height: 8px !important;
+  border: 2px solid #fff !important;
+  background: var(--color-rule-2) !important;
+  border-radius: 50% !important;
+  transition: background-color 0.15s ease-out, box-shadow 0.15s ease-out,
+    outline 0.15s ease-out !important;
+}
+
+/* Hovering the node surfaces its ports as live indigo targets. */
+.react-flow__node:hover .rpa-handle {
+  background: var(--color-accent) !important;
+  outline: 3px solid color-mix(in srgb, var(--color-accent) 30%, transparent) !important;
+}
+
+/* Direct hover / an in-flight or valid connection is the strongest state. */
+.rpa-handle:hover,
+.react-flow__handle.connecting,
+.react-flow__handle.valid,
+.react-flow__handle-connecting,
+.react-flow__handle-valid {
+  width: 12px !important;
+  height: 12px !important;
+  background: var(--color-accent) !important;
+  box-shadow: 0 0 0 4px var(--color-accent-soft) !important;
+}
+
+/* ── Scrollbar (native overlay style) ───────────────────── */
+*::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+
+*::-webkit-scrollbar-thumb {
+  border-radius: 9999px;
+  background: transparent;
+  transition: background-color 0.25s;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*:hover::-webkit-scrollbar-thumb,
+*:focus-within::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.28);
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--color-accent-line) !important;
+}
+
+/* Utility: fully hide scrollbar (macOS auto-hide simulation) */
+.no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* ── Running glow border ─────────────────────────────────── */
+.running-glow {
+  position: relative;
+}
+
+.running-glow::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1.5px;
+  background: linear-gradient(135deg, #6366f1, #3b82f6, #2563eb, #6366f1);
+  background-size: 300% auto;
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  animation: shimmer-border 2s linear infinite;
+  pointer-events: none;
+  z-index: 10;
+}
+
+@keyframes shimmer-border {
+  to {
+    background-position: 300% center;
+  }
+}
+
+/* ── Edge flowing animation ──────────────────────────────── */
+.edge-running .react-flow__edge-path {
+  stroke-dasharray: 6, 6;
+  animation: edge-flow 0.9s linear infinite !important;
+  stroke: var(--color-live) !important;
+  stroke-width: 2 !important;
+}
+
+@keyframes edge-flow {
+  from {
+    stroke-dashoffset: 12;
+  }
+
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+/* ── Keyframes ───────────────────────────────────────────── */
+@keyframes shimmer {
+  0% {
+    background-position: -200% center;
+  }
+
+  100% {
+    background-position: 200% center;
+  }
+}
+
+@keyframes pulse-ring {
+  0% {
+    box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.42);
+  }
+
+  70% {
+    box-shadow: 0 0 0 6px rgba(59, 130, 246, 0);
+  }
+
+  100% {
+    box-shadow: 0 0 0 0 rgba(59, 130, 246, 0);
+  }
+}
+
+/* ── Fade-in utility ─────────────────────────────────────── */
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-in {
+  animation: fade-in 0.15s ease-out both;
+}
+
+
+/* ── Editorial "Ledger" layer ────────────────────────────────────────────────
+   Operational surfaces. Ink on paper, hairline rules, typographic figures. */
+
+/* Data figures — Inter, bold, tabular so changing numbers don't reflow. */
+.figure {
+  font-family: var(--font-sans);
+  font-variant-numeric: tabular-nums lining-nums;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+/* Live signal — a single calm dot that breathes only while a flow runs. */
+.live-dot {
+  position: relative;
+}
+
+.live-dot::after {
+  content: "";
+  position: absolute;
+  inset: -5px;
+  border-radius: 9999px;
+  border: 1.5px solid var(--color-live);
+  opacity: 0;
+  animation: live-ping 1.9s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+  pointer-events: none;
+}
+
+@keyframes live-ping {
+  0% {
+    transform: scale(0.55);
+    opacity: 0.7;
+  }
+
+  70% {
+    transform: scale(1.25);
+    opacity: 0;
+  }
+
+  100% {
+    opacity: 0;
+  }
+}
+
+@keyframes thinking-dot {
+
+  0%,
+  55%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.6;
+  }
+
+  25% {
+    transform: translateY(-4px);
+    opacity: 1;
+  }
+}
+
+.animate-thinking-dot {
+  animation: thinking-dot 1.0s cubic-bezier(0.25, 0.46, 0.45, 0.94) infinite;
+}
+
+/* ── AI input breathing glow ─────────────────────────────────────────────── */
+/* Applied to the ChatInput card while the AI is streaming a response.
+   Sonar-style: a steady inner ring + an outer ring that expands and fades.  */
+@keyframes breath-glow {
+  0% {
+    box-shadow:
+      0 0 0 1.5px var(--color-accent-line),
+      0 0 0 1.5px rgba(99, 102, 241, 0.35);
+  }
+
+  65% {
+    box-shadow:
+      0 0 0 1.5px var(--color-accent-line),
+      0 0 0 10px rgba(99, 102, 241, 0);
+  }
+
+  100% {
+    box-shadow:
+      0 0 0 1.5px var(--color-accent-line),
+      0 0 0 1.5px rgba(99, 102, 241, 0.35);
+  }
+}
+
+.animate-breath-glow {
+  animation: breath-glow 2s ease-out infinite;
+}
+
+/* Hairline that reads as an editorial column divider on the stat band. */
+.rule-v {
+  background-image: linear-gradient(var(--color-rule-2), var(--color-rule-2));
+  background-repeat: no-repeat;
+  background-position: left top;
+  background-size: 1px 100%;
+}
+
+/* ── Reduced motion ──────────────────────────────────────────────────────────
+   The design system promised this; honor it for every animated affordance. */
+@media (prefers-reduced-motion: reduce) {
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .live-dot::after {
+    display: none;
+  }
+}

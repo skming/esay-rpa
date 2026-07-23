@@ -1,0 +1,141 @@
+{
+  "model": "gpt-5.5",
+  "scenario": "gen_paginated_scrape",
+  "reply": "我按页面返回的表格结构直接构建抓取流程，未加入登录链路；分页按钮的 selector 只能先按 Element UI 常见结构推测，因为这次 `inspect_page` 没有暴露分页控件。",
+  "calls": [
+    {
+      "name": "inspect_page",
+      "args": {
+        "url": "https://example.com/list",
+        "wait_selector": "table, [role=grid], main"
+      }
+    },
+    {
+      "name": "inspect_page",
+      "args": {
+        "url": "https://example.com/list",
+        "wait_selector": ".el-pagination, button, table, [role=grid]"
+      }
+    },
+    {
+      "name": "create_flow",
+      "args": {
+        "name": "示例列表全量抓取",
+        "description": "打开列表页，翻页抓取全部表格数据并保存为 JSON",
+        "nodes": [
+          {
+            "id": "start",
+            "type": "start",
+            "title": "开始",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 100
+            },
+            "description": "开始"
+          },
+          {
+            "id": "n1",
+            "type": "browser.open",
+            "title": "打开列表页",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 220
+            },
+            "targetUrl": "https://example.com/list",
+            "description": "打开目标列表页"
+          },
+          {
+            "id": "n2",
+            "type": "browser.wait",
+            "title": "等待表格加载",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 340
+            },
+            "selector": "table, .data-table tbody tr",
+            "timeoutMs": 15000,
+            "description": "等待表格渲染完成"
+          },
+          {
+            "id": "n3",
+            "type": "browser.paginateNext",
+            "title": "翻页抓取全部",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 460
+            },
+            "selector": ".el-pagination .btn-next",
+            "targetSelector": ".data-table tbody tr",
+            "extractMode": "table",
+            "outputVariable": "table_data",
+            "countVariable": "table_row_count",
+            "pageCountVariable": "page_count",
+            "maxIterations": 50,
+            "description": "逐页抓取表格直到没有下一页"
+          },
+          {
+            "id": "n4",
+            "type": "file.write",
+            "title": "保存 JSON",
+            "kind": "file",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 580
+            },
+            "path": "${var.output_prefix}.json",
+            "content": "${var.table_data}",
+            "description": "保存为本次运行目录下的 JSON 文件"
+          },
+          {
+            "id": "end",
+            "type": "end",
+            "title": "结束",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 700
+            },
+            "description": "结束"
+          }
+        ],
+        "edges": [
+          {
+            "id": "e_start_n1",
+            "source": "start",
+            "target": "n1"
+          },
+          {
+            "id": "e_n1_n2",
+            "source": "n1",
+            "target": "n2"
+          },
+          {
+            "id": "e_n2_n3",
+            "source": "n2",
+            "target": "n3"
+          },
+          {
+            "id": "e_n3_n4",
+            "source": "n3",
+            "target": "n4"
+          },
+          {
+            "id": "e_n4_end",
+            "source": "n4",
+            "target": "end"
+          }
+        ]
+      }
+    }
+  ]
+}

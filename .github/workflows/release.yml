@@ -1,0 +1,141 @@
+name: Easy RPA Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0) — leave empty to skip publish'
+        required: false
+        type: string
+  push:
+    tags:
+      - "v*"
+
+# 同一 tag 的发布串行排队，但不取消进行中的构建/发布，避免半途杀掉正在上传产物的任务。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  desktop:
+    name: Desktop package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            platform: darwin
+            artifact: release-macos
+          - os: windows-latest
+            platform: win32
+            artifact: release-windows
+          - os: ubuntu-latest
+            platform: linux
+            artifact: release-linux
+
+    env:
+      CSC_LINK: ${{ secrets.CSC_LINK }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.24.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.5.31"
+          enable-cache: true
+
+      - name: Install Node dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install extension dependencies
+        working-directory: extension
+        run: pnpm install --frozen-lockfile
+
+      - name: Install backend Python dependencies
+        working-directory: backend
+        run: uv sync --frozen --python 3.12
+
+      - name: Install Linux system deps
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libnss3 libatk-bridge2.0-0 libdrm2 libxkbcommon0 \
+            libgbm1 libasound2t64 libxrandr2 libxfixes3 libxdamage1
+
+      # macOS — signed build (requires Apple Developer secrets)
+      - name: Build macOS (signed)
+        if: matrix.platform == 'darwin' && env.CSC_LINK != ''
+        env:
+          RPA_RELEASE_SIGN: "1"
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: pnpm electron:dist:signed
+
+      # macOS — adhoc build (no signing secrets configured)
+      - name: Build macOS (adhoc)
+        if: matrix.platform == 'darwin' && env.CSC_LINK == ''
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: pnpm electron:dist
+
+      # Windows
+      - name: Build Windows
+        if: matrix.platform == 'win32'
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+        run: pnpm electron:dist:win
+
+      # Linux
+      - name: Build Linux
+        if: matrix.platform == 'linux'
+        run: pnpm electron:dist:linux
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            release/*.dmg
+            release/*.exe
+            release/*.AppImage
+            release/*.blockmap
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish GitHub Release
+    needs: desktop
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-all
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: dist-all/**/*
+          generate_release_notes: true

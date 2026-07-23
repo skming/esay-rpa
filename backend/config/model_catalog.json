@@ -1,0 +1,21 @@
+[
+  {"id": "claude-opus-4-8", "label": "Claude Opus 4.8", "provider": "anthropic", "provider_label": "Anthropic", "env_key": "ANTHROPIC_API_KEY", "context_window": 1000000, "tier": "strong", "badge": "最强"},
+  {"id": "claude-fable-5", "label": "Claude Fable 5", "provider": "anthropic", "provider_label": "Anthropic", "env_key": "ANTHROPIC_API_KEY", "context_window": 1000000, "tier": "strong", "badge": "最新"},
+  {"id": "claude-sonnet-5", "label": "Claude Sonnet 5", "provider": "anthropic", "provider_label": "Anthropic", "env_key": "ANTHROPIC_API_KEY", "context_window": 1000000, "tier": "standard", "recommended": true},
+  {"id": "claude-haiku-4-5", "label": "Claude Haiku 4.5", "provider": "anthropic", "provider_label": "Anthropic", "env_key": "ANTHROPIC_API_KEY", "context_window": 200000, "tier": "weak", "badge": "快速"},
+
+  {"id": "gpt-5.5", "label": "GPT-5.5", "provider": "openai", "provider_label": "OpenAI", "env_key": "OPENAI_API_KEY", "context_window": 1047576, "tier": "strong", "recommended": true},
+  {"id": "gpt-5.4-mini", "label": "GPT-5.4 mini", "provider": "openai", "provider_label": "OpenAI", "env_key": "OPENAI_API_KEY", "context_window": 400000, "tier": "weak", "badge": "快速"},
+
+  {"id": "xai/grok-4.5", "label": "Grok 4.5", "provider": "xai", "provider_label": "xAI", "env_key": "XAI_API_KEY", "context_window": 500000, "tier": "strong", "recommended": true},
+
+  {"id": "gemini/gemini-3.5-flash", "label": "Gemini 3.5 Flash", "provider": "google", "provider_label": "Google", "env_key": "GEMINI_API_KEY", "context_window": 1048576, "tier": "weak", "recommended": true, "badge": "超快"},
+
+  {"id": "deepseek/deepseek-v4-pro", "label": "DeepSeek V4 Pro", "provider": "deepseek", "provider_label": "DeepSeek", "env_key": "DEEPSEEK_API_KEY", "context_window": 1000000, "tier": "strong", "recommended": true},
+  {"id": "deepseek/deepseek-v4-flash", "label": "DeepSeek V4 Flash", "provider": "deepseek", "provider_label": "DeepSeek", "env_key": "DEEPSEEK_API_KEY", "context_window": 1000000, "tier": "standard", "badge": "超快"},
+
+  {"id": "openai/qwen3.7-max", "label": "Qwen3.7 Max", "provider": "qwen", "provider_label": "阿里云 Qwen", "env_key": "DASHSCOPE_API_KEY", "context_window": 131072, "tier": "standard", "recommended": true},
+  {"id": "openai/qwen3.6-flash", "label": "Qwen3.6 Flash", "provider": "qwen", "provider_label": "阿里云 Qwen", "env_key": "DASHSCOPE_API_KEY", "context_window": 131072, "tier": "weak", "badge": "超快"},
+
+  {"id": "zai/glm-4.6", "label": "GLM-4.6", "provider": "zai", "provider_label": "智谱 GLM", "env_key": "ZAI_API_KEY", "context_window": 200000, "no_vision": true, "tier": "standard", "recommended": true}
+]

@@ -1,0 +1,100 @@
+name: Easy RPA CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+# 新 push 到来即取消同分支/PR 上仍在跑的旧 CI，省掉白跑的构建分钟。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.5.31"
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: uv sync --python 3.12
+
+      - name: Run backend tests
+        working-directory: backend
+        run: uv run pytest
+
+      - name: Run backend benchmark smoke checks
+        working-directory: backend
+        run: |
+          uv run python tools/selector_regression.py --json-output storage/bench/selector-regression.json
+          uv run python tools/load_test.py --tasks 20 --create-concurrency 20 --worker-concurrency 4 --cron-samples 1 --runner-sleep-ms 20 --timeout-seconds 15 --json-output storage/bench/load-test-ci.json
+
+  frontend:
+    name: Frontend and Electron build
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.24.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.5.31"
+          enable-cache: true
+
+      - name: Install Node dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install extension dependencies
+        working-directory: extension
+        run: pnpm install --frozen-lockfile
+
+      - name: Install backend Python dependencies
+        working-directory: backend
+        run: uv sync --frozen --python 3.12
+
+      - name: Build renderer
+        run: pnpm build
+
+      # 语法体检：glob electron/*.cjs 自动覆盖新增文件，无需再手工维护清单。
+      - name: Check Electron scripts
+        run: |
+          for f in electron/*.cjs \
+                   tools/measure_electron_startup.cjs \
+                   tools/notarize-mac.cjs \
+                   tools/verify_release_env.cjs \
+                   electron-builder.config.cjs; do
+            echo "checking $f"
+            node --check "$f"
+          done
+
+      - name: Pack Electron app
+        run: pnpm electron:pack
+

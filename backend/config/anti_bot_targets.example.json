@@ -1,0 +1,22 @@
+[
+  {
+    "name": "cloudflare-real-site",
+    "category": "cloudflare",
+    "target_url": "https://example-protected-site.invalid/",
+    "selector": "main",
+    "fetcher": "stealthy",
+    "extract_mode": "text",
+    "min_count": 1,
+    "timeout_ms": 90000
+  },
+  {
+    "name": "datadome-real-site",
+    "category": "datadome",
+    "target_url": "https://example-datadome-site.invalid/",
+    "selector": "main",
+    "fetcher": "stealthy",
+    "extract_mode": "text",
+    "min_count": 1,
+    "timeout_ms": 90000
+  }
+]

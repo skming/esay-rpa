@@ -1,0 +1,82 @@
+@import "tailwindcss";
+
+/* 与桌面端 src/styles.css 共用同一套 token（配色/阴影），保持扩展弹窗与
+   桌面壳层视觉统一——两边是独立 pnpm workspace，token 值需手动同步，改动时
+   两处一起改。字体沿用系统字体，不引入 @fontsource 变量字体（弹窗体积敏感）。 */
+@theme {
+  --font-sans: "PingFang SC", "Helvetica Neue", system-ui, sans-serif;
+  --font-mono: "Fira Code", Menlo, Consolas, monospace;
+
+  --color-paper: #f8fafc;
+  --color-paper-sunk: #f1f5f9;
+  --color-ink: #0f172a;
+  --color-ink-2: #334155;
+  --color-ink-3: #64748b;
+  --color-ink-4: #94a3b8;
+  --color-rule: rgba(15, 23, 42, 0.08);
+  --color-rule-2: rgba(15, 23, 42, 0.14);
+
+  --color-accent: #6366f1;
+  --color-accent-strong: #2563eb;
+  --color-accent-press: #1d4ed8;
+  --color-accent-bright: #818cf8;
+  --color-accent-soft: rgba(99, 102, 241, 0.1);
+  --color-accent-wash: rgba(99, 102, 241, 0.05);
+  --color-accent-line: rgba(99, 102, 241, 0.38);
+  --color-accent-fg: #ffffff;
+
+  --color-live: #3b82f6;
+  --color-live-soft: rgba(59, 130, 246, 0.12);
+  --color-live-line: rgba(59, 130, 246, 0.45);
+
+  --color-surface: #ffffff;
+
+  --shadow-xs: 0 1px 2px rgba(15, 23, 42, 0.05);
+  --shadow-sm: 0 1px 3px rgba(15, 23, 42, 0.06), 0 1px 2px rgba(15, 23, 42, 0.04);
+  --shadow-md: 0 4px 6px rgba(15, 23, 42, 0.07), 0 2px 4px rgba(15, 23, 42, 0.05);
+  --shadow-panel: 0 10px 30px rgba(15, 23, 42, 0.12), 0 4px 10px rgba(15, 23, 42, 0.06);
+  --shadow-running: 0 2px 16px rgba(59, 130, 246, 0.22);
+}
+
+:root {
+  color-scheme: light;
+  font-family: var(--font-sans);
+}
+
+body {
+  margin: 0;
+  background: transparent;
+}
+
+@keyframes bridge-shell-breathe {
+  0%,
+  100% {
+    box-shadow:
+      inset 0 0 0 1px rgba(59, 130, 246, 0.08),
+      0 0 0 1px rgba(59, 130, 246, 0.16),
+      0 0 14px rgba(59, 130, 246, 0.18);
+  }
+
+  50% {
+    box-shadow:
+      inset 0 0 0 1px rgba(59, 130, 246, 0.14),
+      0 0 0 1px rgba(59, 130, 246, 0.3),
+      0 0 28px rgba(59, 130, 246, 0.36);
+  }
+}
+
+@keyframes bridge-live-ping {
+  0% {
+    transform: scale(0.55);
+    opacity: 0.72;
+  }
+
+  70% {
+    transform: scale(1.3);
+    opacity: 0;
+  }
+
+  100% {
+    opacity: 0;
+  }
+}

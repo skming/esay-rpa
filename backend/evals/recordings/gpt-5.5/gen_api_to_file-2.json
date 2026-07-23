@@ -1,0 +1,120 @@
+{
+  "model": "gpt-5.5",
+  "scenario": "gen_api_to_file",
+  "reply": "",
+  "calls": [
+    {
+      "name": "inspect_page",
+      "args": {
+        "url": "https://api.example.com/orders",
+        "wait_selector": "body"
+      }
+    },
+    {
+      "name": "create_flow",
+      "args": {
+        "name": "订单接口抓取到文件",
+        "description": "调用订单 GET 接口，将返回 JSON 保存为本次运行目录下的文件",
+        "input_variables": [
+          {
+            "name": "orders_api_url",
+            "type": "String",
+            "value": "https://api.example.com/orders",
+            "category": "flow"
+          }
+        ],
+        "nodes": [
+          {
+            "id": "start",
+            "type": "start",
+            "title": "开始",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 100
+            },
+            "description": "开始执行订单接口抓取"
+          },
+          {
+            "id": "n1_request_orders",
+            "type": "http.request",
+            "title": "调用订单接口",
+            "kind": "http",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 220
+            },
+            "method": "GET",
+            "url": "${var.orders_api_url}",
+            "outputVariable": "orders_response",
+            "description": "GET ${var.orders_api_url} → orders_response"
+          },
+          {
+            "id": "n2_parse_json",
+            "type": "data.json.parse",
+            "title": "解析订单 JSON",
+            "kind": "data",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 340
+            },
+            "inputValue": "${var.orders_response}",
+            "outputVariable": "orders_json",
+            "description": "解析接口响应 JSON → orders_json"
+          },
+          {
+            "id": "n3_write_file",
+            "type": "file.write",
+            "title": "写入订单文件",
+            "kind": "file",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 460
+            },
+            "path": "${var.output_prefix}.json",
+            "content": "${var.orders_json}",
+            "description": "将订单 JSON 写入本次运行目录"
+          },
+          {
+            "id": "end",
+            "type": "end",
+            "title": "结束",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 580
+            },
+            "description": "流程结束"
+          }
+        ],
+        "edges": [
+          {
+            "id": "e_start_n1_request_orders",
+            "source": "start",
+            "target": "n1_request_orders"
+          },
+          {
+            "id": "e_n1_request_orders_n2_parse_json",
+            "source": "n1_request_orders",
+            "target": "n2_parse_json"
+          },
+          {
+            "id": "e_n2_parse_json_n3_write_file",
+            "source": "n2_parse_json",
+            "target": "n3_write_file"
+          },
+          {
+            "id": "e_n3_write_file_end",
+            "source": "n3_write_file",
+            "target": "end"
+          }
+        ]
+      }
+    }
+  ]
+}

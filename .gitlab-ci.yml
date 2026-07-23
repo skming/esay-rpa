@@ -1,0 +1,189 @@
+# Easy RPA — GitLab CI/CD
+#
+# Runner requirements:
+#   macos-arm64  — macOS shell runner (Apple Silicon), tag: macos-arm64
+#   windows      — Windows shell runner (x64),         tag: windows
+#   linux-docker — Linux Docker runner,                tag: linux (or no tag)
+#
+# Required CI/CD variables (Settings → CI/CD → Variables):
+#   CSC_LINK                    — base64-encoded .p12 / .pfx code-signing cert
+#   CSC_KEY_PASSWORD            — cert password
+#   APPLE_ID                    — Apple ID for notarization (macOS only)
+#   APPLE_APP_SPECIFIC_PASSWORD — app-specific password (macOS only)
+#   APPLE_TEAM_ID               — Apple Developer Team ID (macOS only)
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/    # release build on version tags
+    - if: $CI_PIPELINE_SOURCE == "web"          # manual trigger
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+stages:
+  - test
+  - build
+  - release
+
+# ─── Shared anchors ──────────────────────────────────────────────────────────
+
+.pnpm_cache: &pnpm_cache
+  key:
+    files:
+      - pnpm-lock.yaml
+  paths:
+    - .pnpm-store
+  policy: pull-push
+
+.uv_cache: &uv_cache
+  key:
+    files:
+      - backend/uv.lock
+  paths:
+    - .uv-cache
+  policy: pull-push
+
+.node_setup: &node_setup
+  before_script:
+    - corepack enable
+    - corepack prepare pnpm@10.24.0 --activate
+    - pnpm config set store-dir .pnpm-store
+    - pnpm install --frozen-lockfile
+
+# test 阶段：push 到默认分支 / 手动 / 版本 tag 都跑；build/release 阶段：只在版本 tag 或手动跑。
+.test_rules: &test_rules
+  - if: $CI_PIPELINE_SOURCE == "push"
+  - if: $CI_PIPELINE_SOURCE == "web"
+  - if: $CI_COMMIT_TAG =~ /^v/
+
+.release_rules: &release_rules
+  - if: $CI_COMMIT_TAG =~ /^v/
+  - if: $CI_PIPELINE_SOURCE == "web"
+
+# ─── Stage: test ─────────────────────────────────────────────────────────────
+
+backend:tests:
+  stage: test
+  image: python:3.12-slim
+  tags: [linux]
+  cache:
+    - <<: *uv_cache
+  before_script:
+    - pip install uv==0.5.31 --quiet
+    - cd backend && uv sync --frozen
+  script:
+    - uv run pytest
+  rules: *test_rules
+
+frontend:typecheck:
+  stage: test
+  image: node:20-slim
+  tags: [linux]
+  cache:
+    - <<: *pnpm_cache
+  <<: *node_setup
+  script:
+    - pnpm build
+    - pnpm test
+  rules: *test_rules
+
+# ─── Stage: build ────────────────────────────────────────────────────────────
+
+build:macos:
+  stage: build
+  tags: [macos-arm64]
+  cache:
+    - <<: *pnpm_cache
+    - <<: *uv_cache
+  before_script:
+    - pnpm config set store-dir .pnpm-store
+    - pnpm install --frozen-lockfile
+    - cd backend && uv sync --frozen && cd ..
+  script:
+    - node tools/verify_release_env.cjs darwin
+    - pnpm electron:dist:signed
+  artifacts:
+    name: release-macos
+    paths:
+      - release/**/*.dmg
+      - release/**/*.zip
+      - release/**/*.blockmap
+    expire_in: 30 days
+    when: on_success
+  rules: *release_rules
+
+build:windows:
+  stage: build
+  tags: [windows]
+  cache:
+    - <<: *pnpm_cache
+    - <<: *uv_cache
+  before_script:
+    - pnpm config set store-dir .pnpm-store
+    - pnpm install --frozen-lockfile
+    - cd backend; uv sync --frozen; cd ..
+  script:
+    - node tools/verify_release_env.cjs win32
+    - pnpm electron:dist:win
+  artifacts:
+    name: release-windows
+    paths:
+      - release/**/*.exe
+      - release/**/*.blockmap
+    expire_in: 30 days
+    when: on_success
+  rules: *release_rules
+
+build:linux:
+  stage: build
+  tags: [linux]
+  image: node:20-slim
+  cache:
+    - <<: *pnpm_cache
+    - <<: *uv_cache
+  before_script:
+    - apt-get update -qq && apt-get install -y --no-install-recommends
+        python3 python3-pip curl libnss3 libatk-bridge2.0-0 libdrm2
+        libxkbcommon0 libgbm1 libasound2 libxrandr2 libxfixes3 libxdamage1
+    - pip install uv==0.5.31 --quiet
+    - pnpm config set store-dir .pnpm-store
+    - pnpm install --frozen-lockfile
+    - cd backend && uv sync --frozen && cd ..
+  script:
+    - pnpm electron:dist:linux
+  artifacts:
+    name: release-linux
+    paths:
+      - release/**/*.AppImage
+      - release/**/*.blockmap
+    expire_in: 30 days
+    when: on_success
+  rules: *release_rules
+
+# ─── Stage: release ──────────────────────────────────────────────────────────
+
+publish:gitlab-release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  tags: [linux]
+  needs:
+    - job: build:macos
+      artifacts: true
+    - job: build:windows
+      artifacts: true
+    - job: build:linux
+      artifacts: true
+  script:
+    - echo "Creating GitLab release for $CI_COMMIT_TAG"
+  release:
+    tag_name: $CI_COMMIT_TAG
+    name: "Easy RPA $CI_COMMIT_TAG"
+    description: "自动构建发布 — $CI_COMMIT_TAG"
+    assets:
+      links:
+        - name: "macOS (Apple Silicon) — .dmg"
+          url: "$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/browse/release?job=build:macos"
+        - name: "Windows — Setup.exe"
+          url: "$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/browse/release?job=build:windows"
+        - name: "Linux — .AppImage"
+          url: "$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/browse/release?job=build:linux"
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/

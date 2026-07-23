@@ -1,0 +1,267 @@
+{
+  "model": "gpt-5.5",
+  "scenario": "gen_login_then_navigate",
+  "reply": "{\"flow_id\":\"dummy\",\"message\":\"placeholder\"}",
+  "calls": [
+    {
+      "name": "inspect_page",
+      "args": {
+        "url": "https://example.com/admin",
+        "wait_selector": "input[type='password'], nav, main"
+      }
+    },
+    {
+      "name": "create_flow",
+      "args": {
+        "name": "订单列表抓取",
+        "description": "登录后抓取订单列表表格并保存为 JSON",
+        "input_variables": [
+          {
+            "name": "username",
+            "type": "String",
+            "value": "demo_user",
+            "category": "credential"
+          },
+          {
+            "name": "password",
+            "type": "String",
+            "value": "demo_pass",
+            "category": "credential",
+            "sensitive": true
+          }
+        ],
+        "nodes": [
+          {
+            "id": "start",
+            "type": "start",
+            "title": "开始",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 100
+            },
+            "description": "流程开始"
+          },
+          {
+            "id": "n1",
+            "type": "browser.ensureLogin",
+            "title": "探测登录态",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 220
+            },
+            "targetUrl": "https://example.com/admin",
+            "selector": ".data-table, table",
+            "targetSelector": "input[type='password']",
+            "firstValueVariable": "login_status",
+            "description": "判断是否已登录"
+          },
+          {
+            "id": "n2",
+            "type": "control.condition",
+            "title": "判断是否需要登录",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 340
+            },
+            "inputValue": "login_status == 'login_required'",
+            "description": "login_required 则执行登录"
+          },
+          {
+            "id": "n3",
+            "type": "browser.fill",
+            "title": "填写用户名",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 320,
+              "y": 460
+            },
+            "selector": "input[placeholder='请输入用户名']",
+            "inputValue": "${var.username}",
+            "description": "输入用户名"
+          },
+          {
+            "id": "n4",
+            "type": "browser.fill",
+            "title": "填写密码",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 320,
+              "y": 580
+            },
+            "selector": "input[type='password']",
+            "inputValue": "${var.password}",
+            "description": "输入密码"
+          },
+          {
+            "id": "n5",
+            "type": "browser.click",
+            "title": "点击登录",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 320,
+              "y": 700
+            },
+            "selector": "button:has-text('登录')",
+            "description": "提交登录表单"
+          },
+          {
+            "id": "n6",
+            "type": "browser.wait",
+            "title": "等待列表页加载",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 320,
+              "y": 820
+            },
+            "selector": ".data-table, table",
+            "timeoutMs": 15000,
+            "description": "等待表格出现"
+          },
+          {
+            "id": "n7",
+            "type": "browser.open",
+            "title": "打开订单列表页",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 940
+            },
+            "targetUrl": "https://example.com/list",
+            "description": "进入订单列表页面"
+          },
+          {
+            "id": "n8",
+            "type": "browser.wait",
+            "title": "等待订单表格",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 1060
+            },
+            "selector": ".data-table tbody tr",
+            "timeoutMs": 15000,
+            "description": "等待订单列表表格渲染完成"
+          },
+          {
+            "id": "n9",
+            "type": "browser.extract",
+            "title": "提取订单列表",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 1180
+            },
+            "selector": ".data-table tbody tr",
+            "extractMode": "table",
+            "outputVariable": "orders_data",
+            "includeInResult": true,
+            "description": "按表格结构提取订单列表"
+          },
+          {
+            "id": "n10",
+            "type": "file.write",
+            "title": "保存 JSON",
+            "kind": "file",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 1300
+            },
+            "path": "${var.output_prefix}.json",
+            "content": "${var.orders_data}",
+            "description": "保存为 JSON 文件"
+          },
+          {
+            "id": "end",
+            "type": "end",
+            "title": "结束",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 1420
+            },
+            "description": "流程结束"
+          }
+        ],
+        "edges": [
+          {
+            "id": "e_start_n1",
+            "source": "start",
+            "target": "n1"
+          },
+          {
+            "id": "e_n1_n2",
+            "source": "n1",
+            "target": "n2"
+          },
+          {
+            "id": "e_n2_n3",
+            "source": "n2",
+            "target": "n3",
+            "label": "true"
+          },
+          {
+            "id": "e_n2_n7",
+            "source": "n2",
+            "target": "n7",
+            "label": "false"
+          },
+          {
+            "id": "e_n3_n4",
+            "source": "n3",
+            "target": "n4"
+          },
+          {
+            "id": "e_n4_n5",
+            "source": "n4",
+            "target": "n5"
+          },
+          {
+            "id": "e_n5_n6",
+            "source": "n5",
+            "target": "n6"
+          },
+          {
+            "id": "e_n6_n7",
+            "source": "n6",
+            "target": "n7"
+          },
+          {
+            "id": "e_n7_n8",
+            "source": "n7",
+            "target": "n8"
+          },
+          {
+            "id": "e_n8_n9",
+            "source": "n8",
+            "target": "n9"
+          },
+          {
+            "id": "e_n9_n10",
+            "source": "n9",
+            "target": "n10"
+          },
+          {
+            "id": "e_n10_end",
+            "source": "n10",
+            "target": "end"
+          }
+        ]
+      }
+    }
+  ]
+}
