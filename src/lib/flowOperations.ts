@@ -7,7 +7,8 @@ export type ComponentDragPayload = {
   label: string;
 };
 
-const nodeSize = {
+/** 步骤节点的标称尺寸，用于串接布局与拖放落点居中。 */
+export const NODE_SIZE = {
   height: 84,
   width: 240
 };
@@ -84,7 +85,7 @@ export function insertNodeAfter(nodes: Node<RpaNodeData>[], edges: Edge[], sourc
     payload,
     {
       x: sourceNode.position.x,
-      y: sourceNode.position.y + nodeSize.height + 30
+      y: sourceNode.position.y + NODE_SIZE.height + 30
     },
     nodes.length + 1
   );
@@ -107,7 +108,7 @@ export function insertNodeBefore(nodes: Node<RpaNodeData>[], edges: Edge[], targ
     payload,
     {
       x: targetNode.position.x,
-      y: targetNode.position.y - nodeSize.height - 30
+      y: targetNode.position.y - NODE_SIZE.height - 30
     },
     nodes.length + 1
   );

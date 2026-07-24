@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import {
   useEdgesState,
   useNodesState,
@@ -34,7 +34,7 @@ export function useFlowCanvas() {
     [onNodesChangeRaw]
   );
 
-  const { pushHistory, undo: undoHistory } = useUndoHistory();
+  const { pushHistory, undo: undoHistory, redo: redoHistory } = useUndoHistory();
 
   const selectedEdgeId = useMemo(() => flowEdges.find((e) => e.selected)?.id ?? null, [flowEdges]);
   // 选中节点被删后 id 会悬空，推导时兜底而非在 effect 里回写 state——回写会先绘一帧属性面板悬空的中间态
@@ -71,11 +71,12 @@ export function useFlowCanvas() {
   const setPropertyPanelActiveTab = usePropertyPanelStore((state) => state.setActiveTab);
 
   const addNodeAtPosition = useCallback(
-    (payload: ComponentDragPayload, position: XYPosition): void => {
+    (payload: ComponentDragPayload, position: XYPosition): string => {
       pushHistory(flowNodes, flowEdges);
       const node = createFlowNode(payload, position, flowNodes.length + 1);
       setFlowNodes((nodes) => [...nodes, node]);
       setSelectedNodeId(node.id);
+      return node.id;
     },
     [flowEdges, flowNodes, pushHistory, setFlowNodes]
   );
@@ -85,13 +86,16 @@ export function useFlowCanvas() {
       const insertion = insertNodeAfter(flowNodes, flowEdges, selectedNodeId, payload);
       if (insertion === null) {
         const selectedPosition = selectedNode?.position ?? { x: 500, y: 500 };
-        addNodeAtPosition(payload, { x: selectedPosition.x + 40, y: selectedPosition.y + 120 });
+        const nodeId = addNodeAtPosition(payload, { x: selectedPosition.x + 40, y: selectedPosition.y + 120 });
+        setFocusNodeRequest((current) => ({ id: (current?.id ?? 0) + 1, nodeId }));
         return;
       }
       pushHistory(flowNodes, flowEdges);
       setFlowNodes((nodes) => [...nodes, insertion.node]);
       setFlowEdges(insertion.edges);
       setSelectedNodeId(insertion.node.id);
+      // 画布不再因为新增节点整体重置视图，所以这里主动把新节点平移到视口中央
+      setFocusNodeRequest((current) => ({ id: (current?.id ?? 0) + 1, nodeId: insertion.node.id }));
     },
     [addNodeAtPosition, flowEdges, flowNodes, pushHistory, selectedNode, selectedNodeId, setFlowEdges, setFlowNodes]
   );
@@ -113,8 +117,33 @@ export function useFlowCanvas() {
   );
 
   const undoAction = useCallback((): void => {
-    undoHistory(setFlowNodes, setFlowEdges);
-  }, [undoHistory, setFlowNodes, setFlowEdges]);
+    undoHistory({ nodes: flowNodes, edges: flowEdges }, setFlowNodes, setFlowEdges);
+  }, [flowEdges, flowNodes, undoHistory, setFlowNodes, setFlowEdges]);
+
+  const redoAction = useCallback((): void => {
+    redoHistory({ nodes: flowNodes, edges: flowEdges }, setFlowNodes, setFlowEdges);
+  }, [flowEdges, flowNodes, redoHistory, setFlowNodes, setFlowEdges]);
+
+  // 拖动节点前存档：位置调整也应该能被 ⌘Z 撤销，否则一次误拖只能手动拖回去。
+  // 拖拽开始事件在按下鼠标时就会触发，所以先暂存快照，等松手确认位置真的变了再入栈，
+  // 否则每次点选节点都会往历史里塞一条空操作，⌘Z 会连按几次都没反应
+  const dragSnapshotRef = useRef<{ nodes: Node<RpaNodeData>[]; edges: Edge[] } | null>(null);
+
+  const beginNodeDrag = useCallback((): void => {
+    dragSnapshotRef.current = { nodes: flowNodes, edges: flowEdges };
+  }, [flowEdges, flowNodes]);
+
+  const endNodeDrag = useCallback((): void => {
+    const snapshot = dragSnapshotRef.current;
+    dragSnapshotRef.current = null;
+    if (snapshot === null) return;
+    const movedNode = flowNodes.find((node) => {
+      const before = snapshot.nodes.find((item) => item.id === node.id);
+      return before !== undefined && (before.position.x !== node.position.x || before.position.y !== node.position.y);
+    });
+    if (movedNode === undefined) return;
+    pushHistory(snapshot.nodes, snapshot.edges);
+  }, [flowNodes, pushHistory]);
 
   const updateNodeData = useCallback(
     (nodeId: string, data: RpaNodeData): void => {
@@ -173,7 +202,7 @@ export function useFlowCanvas() {
     deleteTarget, setDeleteTarget,
     focusNodeRequest,
     addNodeAtPosition, addNodeAfterSelection,
-    connectNodes, deleteEdge, undoAction,
+    connectNodes, deleteEdge, undoAction, redoAction, beginNodeDrag, endNodeDrag,
     updateNodeData, focusNode, updateNodeBreakpoint,
     requestDeleteNode, confirmDeleteNode,
   };

@@ -10,6 +10,16 @@ import { Table, TableBody, TableCell, TableRow } from '../../ui/table';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../../ui/tooltip';
 import { getLogTone } from './bottomPanelUtils';
 
+function findScrollParent(element: HTMLElement | null): HTMLElement | null {
+  let current = element?.parentElement ?? null;
+  while (current !== null) {
+    const overflowY = window.getComputedStyle(current).overflowY;
+    if (overflowY === 'auto' || overflowY === 'scroll') return current;
+    current = current.parentElement;
+  }
+  return null;
+}
+
 function CopyButton({ text }: { text: string }): ReactElement {
   const [copied, setCopied] = useState(false);
 
@@ -37,8 +47,21 @@ export function LogRows({
   rows: RunLogEntry[];
 }): ReactElement {
   const endRef = useRef<HTMLDivElement>(null);
+  // 只在用户本来就贴着底部时才跟随新日志：运行中往回翻查旧日志时不该被拽走
+  const stickToBottomRef = useRef(true);
 
   useEffect(() => {
+    const container = findScrollParent(endRef.current);
+    if (container === null) return;
+    const handleScroll = (): void => {
+      stickToBottomRef.current = container.scrollHeight - container.scrollTop - container.clientHeight < 40;
+    };
+    container.addEventListener('scroll', handleScroll, { passive: true });
+    return () => container.removeEventListener('scroll', handleScroll);
+  }, []);
+
+  useEffect(() => {
+    if (!stickToBottomRef.current) return;
     endRef.current?.scrollIntoView({ block: 'nearest' });
   }, [rows.length]);
 

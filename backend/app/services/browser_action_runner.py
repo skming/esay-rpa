@@ -43,6 +43,11 @@ _BROWSER_ACTION_NODE_TYPES = {
 }
 _MAX_TEXT_VALUES = 200  # 提取结果展示字符串数量上限，防止超大页面把变量/日志撑爆
 _URL_ATTRIBUTE_NAMES = {"href", "src", "action", "poster"}
+_NAV_FIRST_ATTEMPT_TIMEOUT_MS = 15_000  # 首次导航的快速失败阈值
+_NAV_RETRYABLE_ERROR = re.compile(
+    r"timeout|ERR_CONNECTION|ERR_TIMED_OUT|ERR_NETWORK|ERR_EMPTY_RESPONSE|ERR_SOCKET",
+    re.IGNORECASE,
+)
 _SELECTOR_ATTRIBUTE_PATTERN = re.compile(r"^(?P<selector>.+?)::attr\((?P<attribute>[A-Za-z_][A-Za-z0-9_:-]{0,63})\)\s*$")
 
 
@@ -80,6 +85,22 @@ class BrowserActionResult:
             values=self.values,
             structured=self.structured,
         )
+
+
+async def _goto_with_retry(page: object, url: str, *, timeout: int) -> None:
+    """首次 15s 快速失败后重试一次，仍失败才抛出。
+
+    单次 30s 超时会让一次首连抖动直接判整轮流程失败，助手再从头重跑。
+    非超时类错误（证书、无效 URL）不重试，重试结果一样只是多等一次。
+    """
+    first_timeout = min(timeout, _NAV_FIRST_ATTEMPT_TIMEOUT_MS)
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=first_timeout)
+        return
+    except Exception as exc:
+        if not _NAV_RETRYABLE_ERROR.search(str(exc)):
+            raise
+    await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
 
 
 class BrowserActionRunner:
@@ -162,17 +183,17 @@ class BrowserActionRunner:
             # 先导航建立 origin 再清 localStorage/sessionStorage，避免残留 token 阻塞
             # SPA 初始化，随后 reload 使其以未登录态干净启动。
             if clear_storage:
-                await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+                await _goto_with_retry(page, url, timeout=timeout)
                 await page.evaluate("localStorage.clear(); sessionStorage.clear();")
                 await page.reload(wait_until="domcontentloaded", timeout=timeout)
             else:
-                await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+                await _goto_with_retry(page, url, timeout=timeout)
 
             return BrowserActionResult(action_type=action_type, detail=page.url, values=[page.url])
 
         if action_type == "browser.ensureLogin":
             url = variables.resolve_text(_read_required_string(node, "targetUrl"))
-            await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            await _goto_with_retry(page, url, timeout=timeout)
             # SPA 站点跳转/重定向需要短暂稳定期，否则登录态探测会读到中间态。
             await page.wait_for_timeout(1500)
             status = await _detect_login_state(page, node, variables)
@@ -183,7 +204,7 @@ class BrowserActionRunner:
             new_page = await context.page.context.new_page()
             if url is not None:
                 target_url = variables.resolve_text(url)
-                await new_page.goto(target_url, wait_until="domcontentloaded", timeout=timeout)
+                await _goto_with_retry(new_page, target_url, timeout=timeout)
             context.page = new_page
             return BrowserActionResult(action_type=action_type, detail=new_page.url, values=[new_page.url])
 

@@ -29,6 +29,9 @@ export function patchToolCall(
   return next;
 }
 
+// 流式中的增量落盘间隔：一轮可跑几分钟，只在收尾写盘则中途退出后磁盘上只剩用户提问
+const STREAM_PERSIST_INTERVAL_MS = 5_000;
+
 function sessionKey(flowId: string | null): string {
   return flowId ? `flow_${flowId}` : 'local';
 }
@@ -109,6 +112,7 @@ export function useAiChat(flowId: string | null, onFlowChanged?: (flowId: string
   onFlowChangedRef.current = onFlowChanged;
   const aiCreatedFlowRef = useRef(false);
   const persistAfterCommitRef = useRef(false);
+  const lastStreamPersistRef = useRef(0);
   const keyRef = useRef(key);
   keyRef.current = key;
 
@@ -190,7 +194,7 @@ export function useAiChat(flowId: string | null, onFlowChanged?: (flowId: string
     }
   }, [storeSetMessages]);
 
-  // 收尾落库放到提交之后：done/abort 触发时 messagesRef 还停在上一次渲染，
+  // 落库统一放到提交之后：done/abort/流式检查点触发时 messagesRef 还停在上一次渲染，
   // 直接读它会把同一批到达的末尾 token 与 tool_result 一起写丢
   useEffect(() => {
     if (!persistAfterCommitRef.current) return;
@@ -244,6 +248,7 @@ export function useAiChat(flowId: string | null, onFlowChanged?: (flowId: string
 
       // 已持久化标记，防止 finally 重复保存
       let persisted = false;
+      lastStreamPersistRef.current = Date.now();
       // 记录流内最后一条错误：React 批处理下 messagesRef 可能滞后，done 时据此合并
       let streamError: string | null = null;
 
@@ -380,6 +385,12 @@ export function useAiChat(flowId: string | null, onFlowChanged?: (flowId: string
               persistAfterCommitRef.current = true;
               persisted = true;
             }
+          }
+
+          // 按批而非按行判断，避免高频 text delta 让节流判断本身变成开销
+          if (!persisted && Date.now() - lastStreamPersistRef.current >= STREAM_PERSIST_INTERVAL_MS) {
+            lastStreamPersistRef.current = Date.now();
+            persistAfterCommitRef.current = true;
           }
         }
       } catch (err) {

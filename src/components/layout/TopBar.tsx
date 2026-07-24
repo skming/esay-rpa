@@ -1,5 +1,5 @@
 import {
-  Archive, BookOpen, Check, ChevronDown, ChevronRight, Circle,
+  Archive, BookOpen, Check, ChevronDown, ChevronRight,
   Download, FolderTree, Hash, History, Loader2, Pencil,
   CirclePause, Play, Save, Square, Trash2, Variable, Workflow, XCircle,
   CheckCircle2, Bug,
@@ -51,7 +51,6 @@ export function TopBar({
   const activeFlowId = electron.currentFlow?.flowId;
   const activeFlowVersion = electron.currentFlow?.version ?? '草稿';
   const activeFlowStatus = electron.currentFlow?.status ?? 'draft';
-  const recentFlows = electron.flows.slice(0, 5);
 
   if (!visible) return <></>;
 
@@ -74,7 +73,6 @@ export function TopBar({
         <FlowVersionMenu
           activeFlowId={activeFlowId}
           activeStatus={activeFlowStatus}
-          flows={recentFlows}
           label={activeFlowName}
           dirty={draftAutosave.dirty}
           lastAutosavedAt={draftAutosave.lastAutosavedAt}
@@ -82,7 +80,6 @@ export function TopBar({
           onDeleteCurrent={electron.deleteCurrentFlow}
           onExport={electron.exportFlow}
           onLoadFlows={electron.loadFlows}
-          onOpenFlow={electron.openFlowById}
           onOpenPicker={electron.openFlow}
           onOpenVersionHistory={() => { setVersionHistoryOpen(true); void electron.loadFlows(); }}
           onSave={electron.saveFlow}
@@ -95,13 +92,23 @@ export function TopBar({
         >
           <Variable className="h-3.5 w-3.5 text-accent" strokeWidth={1.5} />
           变量管理
+          {/* 直接标出已定义几个变量，省去"点进去才知道是不是空的"这一步 */}
+          {inputVariables.length > 0 && (
+            <Badge className="border-slate-200 bg-slate-50 font-mono text-slate-600 text-[9px]">
+              {inputVariables.length}
+            </Badge>
+          )}
         </Button>
       </div>
 
       <div className="flex shrink-0 items-center gap-2">
-        <StatusPill electron={electron} />
-
-        <div className="mx-1 h-4 w-px shrink-0 bg-slate-200" />
+        {/* ready 是"还没跑过"的默认态，与旁边启用中的「运行」按钮同义，不必再挂标签 */}
+        {electron.runtimeStatus !== 'ready' && (
+          <>
+            <StatusPill electron={electron} />
+            <div className="mx-1 h-4 w-px shrink-0 bg-slate-200" />
+          </>
+        )}
 
         <Button
           className="h-7 text-slate-600 hover:border-slate-300"
@@ -211,7 +218,7 @@ function FlowNameEditor({ name, onRename }: { name: string; onRename: (name: str
 
   return (
     <button
-      className="group flex max-w-44 items-center gap-1 rounded px-1 py-0.5 text-[11px] font-semibold text-slate-700 hover:bg-slate-100"
+      className="group flex max-w-72 items-center gap-1 rounded px-1 py-0.5 text-[11px] font-semibold text-slate-700 hover:bg-slate-100"
       onClick={startEdit}
       title="点击重命名"
       type="button"
@@ -297,7 +304,6 @@ function FlowVersionMenu({
 }: {
   activeFlowId: string | undefined;
   activeStatus: string;
-  flows: ElectronBridgeState['flows'];
   label: string;
   dirty: boolean;
   lastAutosavedAt: string | null;
@@ -305,7 +311,6 @@ function FlowVersionMenu({
   onDeleteCurrent: () => Promise<void>;
   onExport: () => Promise<void>;
   onLoadFlows: () => Promise<void>;
-  onOpenFlow: (flowId: string) => Promise<void>;
   onOpenPicker: () => Promise<boolean>;
   onOpenVersionHistory: () => void;
   onSave: () => Promise<void>;
@@ -314,14 +319,16 @@ function FlowVersionMenu({
   return (
     <DropdownMenu onOpenChange={(open) => { if (open) void onLoadFlows(); }}>
       <DropdownMenuTrigger asChild>
+        {/* 只承载版本与保存状态：流程名已在左侧面包屑里，重复一遍还得截断 */}
         <Button
-          className="flex h-7 max-w-52 shrink-0 items-center gap-2 rounded-lg border border-slate-200 bg-slate-50/60 px-2.5 text-[11px] text-slate-700 transition-all duration-150 hover:bg-white hover:border-slate-300 hover:shadow-xs"
+          aria-label={`${label} · 版本与流程操作`}
+          className="flex h-7 shrink-0 items-center gap-2 rounded-lg border border-slate-200 bg-slate-50/60 px-2.5 text-[11px] text-slate-700 transition-all duration-150 hover:bg-white hover:border-slate-300 hover:shadow-xs"
+          title={`${label} · 版本与流程操作`}
           variant="ghost"
         >
           <Workflow className="h-3.5 w-3.5 shrink-0 text-accent" strokeWidth={1.5} />
-          {dirty && <Circle className="h-2 w-2 shrink-0 fill-amber-400 text-amber-400" strokeWidth={0} />}
-          <span className="truncate font-semibold">{label}</span>
           <Badge className="border-slate-200 bg-white font-mono text-slate-600 text-[9px]">{version}</Badge>
+          {/* dirty 只用文字徽标表达，不再另配一个同义的琥珀圆点 */}
           {dirty && <Badge className="border-amber-100 bg-amber-50 text-amber-700 text-[9px]">未保存</Badge>}
           {activeStatus === 'archived' && <Badge className="border-slate-200 bg-slate-100 text-slate-600 text-[9px]">归档</Badge>}
           <ChevronDown className="h-3 w-3 shrink-0 text-slate-400" strokeWidth={1.5} />

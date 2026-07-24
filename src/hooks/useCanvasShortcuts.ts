@@ -27,6 +27,9 @@ export function useCanvasShortcuts({
   onFitView,
   onModeChange,
   onResetZoom,
+  onToggleFocusMode,
+  onToggleGrid,
+  onToggleMiniMap,
   onZoomIn,
   onZoomOut
 }: {
@@ -34,6 +37,9 @@ export function useCanvasShortcuts({
   onFitView: () => void;
   onModeChange: (mode: CanvasToolMode) => void;
   onResetZoom: () => void;
+  onToggleFocusMode: () => void;
+  onToggleGrid: () => void;
+  onToggleMiniMap: () => void;
   onZoomIn: () => void;
   onZoomOut: () => void;
 }): void {
@@ -73,6 +79,11 @@ export function useCanvasShortcuts({
           onResetZoom();
           return;
         }
+        if (event.key === '\\') {
+          event.preventDefault();
+          onToggleFocusMode();
+          return;
+        }
         return;
       }
 
@@ -95,6 +106,18 @@ export function useCanvasShortcuts({
       if (key === 'f') {
         event.preventDefault();
         onFitView();
+        return;
+      }
+
+      if (key === 'g') {
+        event.preventDefault();
+        onToggleGrid();
+        return;
+      }
+
+      if (key === 'm') {
+        event.preventDefault();
+        onToggleMiniMap();
       }
     };
 
@@ -114,5 +137,5 @@ export function useCanvasShortcuts({
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
     };
-  }, [mode, onFitView, onModeChange, onResetZoom, onZoomIn, onZoomOut]);
+  }, [mode, onFitView, onModeChange, onResetZoom, onToggleFocusMode, onToggleGrid, onToggleMiniMap, onZoomIn, onZoomOut]);
 }

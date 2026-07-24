@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.services.browser_action_runner import BrowserActionContext, BrowserActionResult, BrowserActionRunner, _normalize_table_rows, _raise_if_table_scope_error, apply_browser_result_variables, detect_blocking_overlay
+from app.services.browser_action_runner import BrowserActionContext, BrowserActionResult, BrowserActionRunner, _normalize_table_rows, _goto_with_retry, _raise_if_table_scope_error, apply_browser_result_variables, detect_blocking_overlay
 from app.services.runtime_variables import RuntimeVariableStore
 
 
@@ -667,3 +667,38 @@ def test_table_scope_error_multiple_tables_raises_with_count() -> None:
 
 def test_table_scope_error_passes_through_normal_rows() -> None:
     _raise_if_table_scope_error([["a", "b"], ["c", "d"]], "tbody tr")
+
+
+class _FakePage:
+    """记录每次 goto 的超时值，按 outcomes 依次决定抛错还是成功。"""
+
+    def __init__(self, outcomes: list[Exception | None]) -> None:
+        self._outcomes = outcomes
+        self.timeouts: list[int] = []
+
+    async def goto(self, url: str, *, wait_until: str, timeout: int) -> None:
+        self.timeouts.append(timeout)
+        outcome = self._outcomes.pop(0)
+        if outcome is not None:
+            raise outcome
+
+
+async def test_navigation_retries_once_after_a_fast_first_timeout() -> None:
+    """首次连接抖动不该让整轮流程失败：先 15s 快速失败，再按完整超时重试。"""
+    page = _FakePage([TimeoutError("Page.goto: Timeout 15000ms exceeded"), None])
+
+    await _goto_with_retry(page, "https://example.com", timeout=30_000)
+
+    assert page.timeouts == [15_000, 30_000]
+
+
+async def test_navigation_does_not_retry_non_timeout_failures() -> None:
+    """证书/无效 URL 这类错误重试一遍结果一样，只会多等一次。"""
+    import pytest
+
+    page = _FakePage([RuntimeError("net::ERR_CERT_AUTHORITY_INVALID")])
+
+    with pytest.raises(RuntimeError, match="ERR_CERT_AUTHORITY_INVALID"):
+        await _goto_with_retry(page, "https://example.com", timeout=30_000)
+
+    assert page.timeouts == [15_000]

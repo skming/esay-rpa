@@ -49,11 +49,16 @@ export function BottomPanel({
   const setHeight = useBottomPanelStore((state: ReturnType<typeof useBottomPanelStore.getState>) => state.setHeight);
   const toggleLogLevel = useBottomPanelStore((state: ReturnType<typeof useBottomPanelStore.getState>) => state.toggleLogLevel);
   const logs = electron.logs;
-  const errorRows = useMemo(() => logs.filter((log) => log.level === 'error'), [logs]);
-  const levelCounts = useMemo(
-    () => Object.fromEntries(ALL_LOG_LEVELS.map((l) => [l, logs.filter((e) => e.level === l).length])) as Record<RunLogLevel, number>,
-    [logs]
-  );
+  // 每来一条日志都要重算，所以按等级分桶只走一遍，而不是每个等级各扫一次 logs
+  const { errorRows, levelCounts } = useMemo(() => {
+    const counts = Object.fromEntries(ALL_LOG_LEVELS.map((level) => [level, 0])) as Record<RunLogLevel, number>;
+    const errors: typeof logs = [];
+    for (const log of logs) {
+      counts[log.level] += 1;
+      if (log.level === 'error') errors.push(log);
+    }
+    return { errorRows: errors, levelCounts: counts };
+  }, [logs]);
   const filteredLogs = useMemo(
     () => logs.filter((log) => !hiddenLogLevels.includes(log.level)),
     [logs, hiddenLogLevels]
@@ -66,10 +71,9 @@ export function BottomPanel({
       }, {}),
     [flowNodes]
   );
-  const logContent = useMemo(
-    () => logs.map((log) => `${log.time} [${log.level}] ${log.message}${log.detail !== undefined ? ` ${log.detail}` : ''}`).join('\n'),
-    [logs]
-  );
+  // 只在点导出时拼接，不必每来一条日志就重建整段文本
+  const buildLogContent = (): string =>
+    logs.map((log) => `${log.time} [${log.level}] ${log.message}${log.detail !== undefined ? ` ${log.detail}` : ''}`).join('\n');
   const lastRunId = electron.lastRunId;
   const refreshArtifacts =
     lastRunId === null
@@ -109,7 +113,7 @@ export function BottomPanel({
         errorCount={errorRows.length}
         onActiveTabChange={setActiveTab}
         onClose={onClose}
-        onExportLogs={() => void electron.exportLogs(logContent)}
+        onExportLogs={() => void electron.exportLogs(buildLogContent())}
         onRefresh={refreshArtifacts}
       />
       {activeTab === 'logs' && logs.length > 0 && (

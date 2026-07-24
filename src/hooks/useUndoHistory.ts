@@ -4,33 +4,45 @@ import type { RpaNodeData } from '../types/rpa';
 
 type Snapshot = { nodes: Node<RpaNodeData>[]; edges: Edge[] };
 
+type SetNodes = (nodes: Node<RpaNodeData>[]) => void;
+type SetEdges = (edges: Edge[]) => void;
+
 const MAX_HISTORY = 50;
+
+// 深拷贝节点/边，避免后续对画布状态的原地修改污染已入栈的历史快照
+function cloneSnapshot(nodes: Node<RpaNodeData>[], edges: Edge[]): Snapshot {
+  return {
+    nodes: nodes.map((n) => ({ ...n, position: { ...n.position }, data: { ...n.data } })),
+    edges: edges.map((e) => ({ ...e }))
+  };
+}
 
 export function useUndoHistory(): {
   pushHistory: (nodes: Node<RpaNodeData>[], edges: Edge[]) => void;
-  undo: (
-    setNodes: (nodes: Node<RpaNodeData>[]) => void,
-    setEdges: (edges: Edge[]) => void
-  ) => boolean;
+  undo: (current: Snapshot, setNodes: SetNodes, setEdges: SetEdges) => boolean;
+  redo: (current: Snapshot, setNodes: SetNodes, setEdges: SetEdges) => boolean;
 } {
-  const stackRef = useRef<Snapshot[]>([]);
+  const undoStackRef = useRef<Snapshot[]>([]);
+  const redoStackRef = useRef<Snapshot[]>([]);
 
-  // 深拷贝节点/边，避免后续对画布状态的原地修改污染已入栈的历史快照
   const pushHistory = useCallback((nodes: Node<RpaNodeData>[], edges: Edge[]): void => {
-    const snapshot: Snapshot = {
-      nodes: nodes.map((n) => ({ ...n, position: { ...n.position }, data: { ...n.data } })),
-      edges: edges.map((e) => ({ ...e }))
-    };
-    stackRef.current.push(snapshot);
-    if (stackRef.current.length > MAX_HISTORY) {
-      stackRef.current.shift();
+    undoStackRef.current.push(cloneSnapshot(nodes, edges));
+    if (undoStackRef.current.length > MAX_HISTORY) {
+      undoStackRef.current.shift();
     }
+    // 新操作让原有的重做链失效，否则重做会跳到一条已被覆盖的分支上
+    redoStackRef.current = [];
   }, []);
 
-  const undo = useCallback(
-    (setNodes: (nodes: Node<RpaNodeData>[]) => void, setEdges: (edges: Edge[]) => void): boolean => {
-      const snapshot = stackRef.current.pop();
+  // 撤销/重做互为镜像：弹出目标栈的快照并把当前画布压入另一侧
+  const step = useCallback(
+    (from: Snapshot[], to: Snapshot[], current: Snapshot, setNodes: SetNodes, setEdges: SetEdges): boolean => {
+      const snapshot = from.pop();
       if (snapshot === undefined) return false;
+      to.push(cloneSnapshot(current.nodes, current.edges));
+      if (to.length > MAX_HISTORY) {
+        to.shift();
+      }
       setNodes(snapshot.nodes);
       setEdges(snapshot.edges);
       return true;
@@ -38,5 +50,17 @@ export function useUndoHistory(): {
     []
   );
 
-  return { pushHistory, undo };
+  const undo = useCallback(
+    (current: Snapshot, setNodes: SetNodes, setEdges: SetEdges): boolean =>
+      step(undoStackRef.current, redoStackRef.current, current, setNodes, setEdges),
+    [step]
+  );
+
+  const redo = useCallback(
+    (current: Snapshot, setNodes: SetNodes, setEdges: SetEdges): boolean =>
+      step(redoStackRef.current, undoStackRef.current, current, setNodes, setEdges),
+    [step]
+  );
+
+  return { pushHistory, undo, redo };
 }

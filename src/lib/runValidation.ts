@@ -135,6 +135,47 @@ export function validateNodeConfigurationInFlow(
   return [...baseIssues, ...structureIssues, ...variableIssues];
 }
 
+/**
+ * Batch form of `validateNodeConfigurationInFlow`: reachability / structure / variable-dependency
+ * analysis runs once for the whole flow instead of once per node. Callers that need issues for
+ * every node (the canvas badges) must use this — the single-node variant is O(n²) when looped.
+ */
+export function validateFlowConfigurations(
+  nodes: Node<RpaNodeData>[],
+  edges: Edge[],
+  availableVariableNames: string[]
+): Map<string, RunValidationIssue[]> {
+  const reachableNodeIds = collectReachableNodeIds(nodes, edges, 'start');
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const orderedNodes = reachableNodeIds
+    .map((nodeId) => nodeById.get(nodeId))
+    .filter((item): item is Node<RpaNodeData> => item !== undefined);
+
+  const issuesByNodeId = new Map<string, RunValidationIssue[]>();
+  const addIssue = (issue: RunValidationIssue): void => {
+    const current = issuesByNodeId.get(issue.nodeId);
+    if (current === undefined) {
+      issuesByNodeId.set(issue.nodeId, [issue]);
+      return;
+    }
+    current.push(issue);
+  };
+
+  for (const node of nodes) {
+    for (const issue of validateNodeConfiguration(node)) {
+      addIssue(issue);
+    }
+  }
+  for (const issue of validateFlowStructure(nodes, edges, reachableNodeIds, 'full')) {
+    addIssue(issue);
+  }
+  for (const issue of validateVariableDependencies(orderedNodes, availableVariableNames)) {
+    addIssue(issue);
+  }
+
+  return issuesByNodeId;
+}
+
 function collectReachableNodeIds(nodes: Node<RpaNodeData>[], edges: Edge[], startNodeId: string): string[] {
   const nodeById = new Map(nodes.map((node) => [node.id, node]));
   if (!nodeById.has(startNodeId)) {

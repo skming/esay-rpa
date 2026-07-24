@@ -15,6 +15,7 @@ export function useStudioShortcuts({
   onDeleteEdge,
   onFocusProperties,
   onSave,
+  onRedo,
   onSelectNode,
   onUndo,
   selectedEdgeId,
@@ -24,6 +25,7 @@ export function useStudioShortcuts({
   onDeleteEdge: (edgeId: string) => void;
   onFocusProperties?: () => void;
   onSave: () => void;
+  onRedo: () => void;
   onSelectNode: (nodeId: string) => void;
   onUndo: () => void;
   selectedEdgeId: string | null;
@@ -59,6 +61,13 @@ export function useStudioShortcuts({
         return;
       }
 
+      // ⌘⇧Z / ⌘Y 重做，⌘Z 撤销
+      if (modifier && (key === 'y' || (key === 'z' && event.shiftKey))) {
+        event.preventDefault();
+        onRedo();
+        return;
+      }
+
       if (modifier && key === 'z') {
         event.preventDefault();
         onUndo();
@@ -91,5 +100,5 @@ export function useStudioShortcuts({
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onContextAction, onDeleteEdge, onSave, onSelectNode, onUndo, selectedEdgeId, selectedNodeId]);
+  }, [onContextAction, onDeleteEdge, onRedo, onSave, onSelectNode, onUndo, selectedEdgeId, selectedNodeId]);
 }

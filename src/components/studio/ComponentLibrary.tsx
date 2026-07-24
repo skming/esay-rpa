@@ -5,6 +5,7 @@ import { useMemo, useState } from 'react';
 import { componentGroups, kindStyles, totalComponents } from '../../data/studioData';
 import type { ComponentItem, NodeKind } from '../../types/rpa';
 import type { ComponentDragPayload } from '../../lib/flowOperations';
+import { useStudioLayoutStore } from '../../stores/useStudioLayoutStore';
 import { Badge } from '../ui/badge';
 import { IconButton } from '../ui/button';
 import { Input } from '../ui/input';
@@ -16,7 +17,9 @@ export function ComponentLibrary({
 }: {
   onQuickAdd: (payload: ComponentDragPayload) => void;
 }): ReactElement {
-  const [collapsed, setCollapsed] = useState(false);
+  // 折叠状态放 store：专注模式要能一并收起组件库
+  const collapsed = useStudioLayoutStore((state) => state.libraryCollapsed);
+  const setCollapsed = useStudioLayoutStore((state) => state.setLibraryCollapsed);
   const [query, setQuery] = useState('');
   const [expanded, setExpanded] = useState<Record<NodeKind, boolean>>({
     browser: true, excel: false, ui: false, file: false,
@@ -43,7 +46,7 @@ export function ComponentLibrary({
       className={cn(
         'flex shrink-0 flex-col border-r border-slate-200/70 bg-white text-[11px]',
         'overflow-hidden transition-[width] duration-200 ease-in-out',
-        collapsed ? 'w-10' : 'w-56',
+        collapsed ? 'w-10' : 'w-52',
       )}
     >
       {/* Header — 折叠按钮放最左保证 w-10 时仍可见 */}
@@ -137,7 +140,7 @@ export function ComponentLibrary({
           collapsed ? 'pointer-events-none opacity-0' : 'opacity-100',
         )}
       >
-        共 {totalComponents} 个组件
+        <span className="truncate">共 {totalComponents} 个组件 · 拖拽或双击添加</span>
       </div>
     </aside>
   );
@@ -166,8 +169,16 @@ function ComponentLibraryItem({
         'active:cursor-grabbing active:scale-[0.98]',
       )}
       draggable
-      onClick={() => onQuickAdd(payload)}
+      // 单击只是浏览组件，误点不该往画布塞节点：拖拽为主，双击（键盘 Enter）作为快捷添加
+      onDoubleClick={() => onQuickAdd(payload)}
       onDragStart={handleDragStart}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          onQuickAdd(payload);
+        }
+      }}
+      title={`${item.label} · 拖拽到画布，或双击添加到选中节点之后`}
       type="button"
     >
       <span className="h-1.5 w-1.5 shrink-0 rounded-full opacity-70" style={{ background: style.accent }} />

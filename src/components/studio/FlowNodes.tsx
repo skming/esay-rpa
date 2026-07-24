@@ -2,6 +2,7 @@ import { AlertCircle, Ban, CheckCircle2, Circle, Copy, Dot, Loader2, Pencil, Tra
 import { Handle, Position, type Node, type NodeProps } from '@xyflow/react';
 import type { LucideIcon } from 'lucide-react';
 import type { MouseEvent, ReactElement } from 'react';
+import { memo } from 'react';
 
 import { kindStyles } from '../../data/studioData';
 import { cn } from '../../lib/utils';
@@ -196,7 +197,8 @@ function NodeAction({
   );
 }
 
+// memo 生效的前提是 FlowCanvas 保持 data 引用稳定（见 nodeDataCacheRef）
 export const nodeTypes = {
-  rpaStep: RpaStepNode,
-  startEnd: StartEndNode,
+  rpaStep: memo(RpaStepNode),
+  startEnd: memo(StartEndNode),
 };

@@ -5,6 +5,8 @@ import type { useAiPanelState } from '../../hooks/useAiPanelState';
 import type { useElectronBridge } from '../../hooks/useElectronBridge';
 import type { ContextMenuAction, RuntimeVariable } from '../../types/rpa';
 import { cn } from '../../lib/utils';
+import { usePropertyPanelStore } from '../../stores/usePropertyPanelStore';
+import { useStudioLayoutStore } from '../../stores/useStudioLayoutStore';
 import { AiPanel } from './ai-panel/AiPanel';
 import { BottomPanel } from './bottom-panel/BottomPanel';
 import { ComponentLibrary } from './ComponentLibrary';
@@ -30,6 +32,36 @@ export function StudioWorkspace({
   setBottomPanelOpen,
   handleContextAction,
 }: StudioWorkspaceProps): ReactElement {
+  const focusSnapshot = useStudioLayoutStore((state) => state.focusSnapshot);
+  const setFocusSnapshot = useStudioLayoutStore((state) => state.setFocusSnapshot);
+  const libraryCollapsed = useStudioLayoutStore((state) => state.libraryCollapsed);
+  const setLibraryCollapsed = useStudioLayoutStore((state) => state.setLibraryCollapsed);
+  const propertyCollapsed = usePropertyPanelStore((state) => state.collapsed);
+  const setPropertyCollapsed = usePropertyPanelStore((state) => state.setCollapsed);
+
+  // 专注模式：一键收起组件库/属性面板/日志面板/AI 面板，把工作区让给画布；
+  // 退出时按进入前的快照还原，而不是一律展开——否则会把用户本来就收着的面板打开
+  const toggleFocusMode = (): void => {
+    if (focusSnapshot !== null) {
+      setLibraryCollapsed(focusSnapshot.libraryCollapsed);
+      setPropertyCollapsed(focusSnapshot.propertyCollapsed);
+      setBottomPanelOpen(focusSnapshot.bottomPanelOpen);
+      ai.setAiPanelOpen(focusSnapshot.aiPanelOpen);
+      setFocusSnapshot(null);
+      return;
+    }
+    setFocusSnapshot({
+      aiPanelOpen: ai.aiPanelOpen,
+      bottomPanelOpen,
+      libraryCollapsed,
+      propertyCollapsed,
+    });
+    setLibraryCollapsed(true);
+    setPropertyCollapsed(true);
+    setBottomPanelOpen(false);
+    ai.setAiPanelOpen(false);
+  };
+
   const aiNodeLookup = useMemo(
     () => Object.fromEntries(
       canvas.flowNodes.map((node) => [
@@ -51,6 +83,8 @@ export function StudioWorkspace({
         <FlowCanvas
           aiPanelOpen={ai.aiPanelOpen}
           onAddNode={canvas.addNodeAtPosition}
+          onBeginNodeDrag={canvas.beginNodeDrag}
+          onEndNodeDrag={canvas.endNodeDrag}
           bottomPanelOpen={bottomPanelOpen}
           focusNodeRequest={canvas.focusNodeRequest}
           hasMissingStartEnd={canvas.hasMissingStartEnd}
@@ -69,6 +103,8 @@ export function StudioWorkspace({
           progress={electron.progress}
           selectedNodeId={canvas.selectedNodeId}
           canvasFitVersion={electron.canvasFitVersion}
+          focusMode={focusSnapshot !== null}
+          onToggleFocusMode={toggleFocusMode}
         />
         {/* BottomPanel: 始终挂载，用 grid-rows 动画展开/收起，避免状态丢失 */}
         <div

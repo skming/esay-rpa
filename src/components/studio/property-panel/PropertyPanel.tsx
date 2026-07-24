@@ -102,7 +102,7 @@ export function PropertyPanel({
       )}
     >
       {/* Header — 折叠按钮放最左，保证 w-10 时仍可见 */}
-      <div className="flex h-8 shrink-0 items-center gap-1.5 border-b border-slate-100 px-1.5">
+      <div className="flex h-10 shrink-0 items-center gap-1.5 border-b border-slate-100 px-1.5">
         <IconButton
           label={collapsed ? '展开属性面板' : '折叠属性面板'}
           onClick={() => setCollapsed(!collapsed)}

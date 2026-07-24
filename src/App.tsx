@@ -123,6 +123,7 @@ export default function App(): ReactElement {
     onDeleteEdge: canvas.deleteEdge,
     onFocusProperties: () => canvas.focusNode(canvas.selectedNodeId),
     onSave: () => void electron.saveFlow(),
+    onRedo: canvas.redoAction,
     onSelectNode: canvas.setSelectedNodeId,
     onUndo: canvas.undoAction,
     selectedEdgeId: canvas.selectedEdgeId,

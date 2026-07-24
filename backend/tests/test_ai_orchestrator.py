@@ -15,7 +15,10 @@ from app.services.ai_orchestrator import (
     _detect_turn_intents,
     _expand_history_tool_calls,
     _FlowContext,
+    _MAX_REPAIR_CYCLES,
     _OLD_SCREENSHOT_PLACEHOLDER,
+    _orchestrator_guard_after_tool,
+    _orchestrator_guard_before_tool,
     _split_partial_tag_suffix,
     _ThinkTagFilter,
 )
@@ -65,6 +68,31 @@ def test_blocked_write_gets_no_success_guidance_and_does_not_end_the_round() -> 
     # apply_node_fix 是增量修复，注入引导但不打断本轮
     guidance, stop = _after_tool_guidance("apply_node_fix", {"status": "ok"})
     assert guidance and not stop
+
+
+def test_repeated_failed_runs_lock_further_repair_attempts() -> None:
+    state: dict[str, Any] = {}
+    failure = {"status": "error", "error": "Page.goto: Timeout 30000ms exceeded"}
+    for _ in range(_MAX_REPAIR_CYCLES - 1):
+        _orchestrator_guard_after_tool("run_flow", failure, state)
+    assert _orchestrator_guard_before_tool("update_flow", {}, state) is None
+
+    _orchestrator_guard_after_tool("run_flow", failure, state)
+    blocked = _orchestrator_guard_before_tool("update_flow", {}, state)
+    assert blocked and blocked["required_action"] == "report_to_user_and_stop"
+    # 写入和再次运行都得拦住，只放诊断类工具
+    assert _orchestrator_guard_before_tool("run_flow", {}, state) is not None
+    assert _orchestrator_guard_before_tool("get_run_error", {}, state) is None
+
+
+def test_successful_run_clears_the_repair_cycle_counter() -> None:
+    """跑通之后接着提新需求，不该背着上一轮的失败计数。"""
+    state: dict[str, Any] = {}
+    for _ in range(_MAX_REPAIR_CYCLES - 1):
+        _orchestrator_guard_after_tool("run_flow", {"status": "error"}, state)
+    _orchestrator_guard_after_tool("run_flow", {"status": "success"}, state)
+    _orchestrator_guard_after_tool("run_flow", {"status": "error"}, state)
+    assert _orchestrator_guard_before_tool("update_flow", {}, state) is None
 
 
 def test_create_intent_needs_url_and_is_suppressed_by_repair_intent() -> None:

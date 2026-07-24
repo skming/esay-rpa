@@ -1,18 +1,26 @@
-import { Crosshair, Gauge, Loader2, SearchCheck } from 'lucide-react';
+import { SearchCheck } from 'lucide-react';
 import type { ReactElement } from 'react';
 
-import type { ElectronBridgeState } from '../../../../hooks/useElectronBridge';
-import { Badge } from '../../../ui/badge';
 import { Button } from '../../../ui/button';
 import { CodeEditor } from '../../../ui/CodeBlock';
 import { Field, Segmented, TextareaField } from '../../../ui/FormControls';
-import { Input } from '../../../ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../../../ui/select';
-import type { ExtractMode } from '../../../../types/rpa';
+import { LabelLike } from './FieldLayout';
 import { VariableNameField } from '../VariableNameField';
 import { VariablePickerField } from '../VariablePickerField';
-import { LabelLike } from './FieldLayout';
+import { CheckedStateField, ExtractModeField, InlineHint, SelectorField, SiteAnalysisSummary } from './BrowserFieldParts';
+import { readBrowserHintText, readBrowserHintTone } from './browserHints';
 import type { ActionFieldsProps } from './types';
+
+// 需要选择器输入框的动作；不在表里的（如 browser.scroll、browser.tab.*）不显示拾取器区块
+const SELECTOR_ACTION_TYPES = new Set([
+  'browser.fetch', 'browser.click', 'browser.hover', 'browser.fill', 'browser.wait', 'browser.waitFor',
+  'browser.extract', 'browser.dismiss', 'browser.clickLoadMore', 'browser.paginateNext', 'browser.screenshot',
+  'browser.select', 'browser.check', 'browser.drag',
+  'ui.click', 'ui.fill', 'ui.wait', 'ui.extract', 'ui.screenshot', 'ui.select', 'ui.check', 'ui.drag'
+]);
+// 定位到单个元素才谈得上"备选选择器/文字锚点"自愈；抓取类与拖拽类不适用
+const RESILIENCE_EXCLUDED_TYPES = new Set(['browser.dismiss', 'browser.screenshot', 'browser.drag', 'browser.fetch', 'ui.drag']);
 
 export function BrowserActionFields({ draft, electron, flowTargetUrl, node, onDraftPatch }: ActionFieldsProps): ReactElement {
   const actionType = node.data.action?.type ?? `${node.data.kind}.step`;
@@ -30,21 +38,8 @@ export function BrowserActionFields({ draft, electron, flowTargetUrl, node, onDr
           value={draft.selector}
         />
         <Field label="列表项选择器" mono onChange={(event) => onDraftPatch('targetSelector', event.target.value)} placeholder=".item::text" value={draft.targetSelector} />
-        <LabelLike text="提取方式">
-          <Select onValueChange={(value) => onDraftPatch('extractMode', value as ExtractMode)} value={draft.extractMode}>
-            <SelectTrigger className="font-mono text-[11px]">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="text">文本</SelectItem>
-              <SelectItem value="html">HTML</SelectItem>
-              <SelectItem value="attribute">属性</SelectItem>
-              <SelectItem value="count">数量</SelectItem>
-              <SelectItem value="table">表格</SelectItem>
-            </SelectContent>
-          </Select>
-        </LabelLike>
-        {draft.extractMode === 'attribute' && <Field label="属性名" mono onChange={(event) => onDraftPatch('attribute', event.target.value)} placeholder="href" value={draft.attribute} />}
+        <ExtractModeField onChange={(value) => onDraftPatch('extractMode', value)} value={draft.extractMode} />
+        {draft.extractMode === 'attribute' &&<Field label="属性名" mono onChange={(event) => onDraftPatch('attribute', event.target.value)} placeholder="href" value={draft.attribute} />}
         <Field label={isNextPagination ? '最大页数' : '最大点击次数'} onChange={(event) => onDraftPatch('maxIterations', Math.max(1, Number.parseInt(event.target.value, 10) || 1))} type="number" value={String(draft.maxIterations)} />
         <Field label="点击后等待(ms)" onChange={(event) => onDraftPatch('delayMs', Math.max(0, Number.parseInt(event.target.value, 10) || 0))} type="number" value={String(draft.delayMs)} />
         <VariableNameField label="输出变量" mode="target" onChange={(value) => onDraftPatch('responseVariable', value)} placeholder={isNextPagination ? 'paged_items' : 'loaded_items'} value={draft.responseVariable} variables={availableVariables} />
@@ -99,17 +94,7 @@ export function BrowserActionFields({ draft, electron, flowTargetUrl, node, onDr
     return (
       <>
         <SelectorField electron={electron} label="复选元素 (CSS)" onChange={(value) => onDraftPatch('selector', value)} targetUrl={resolvedTargetUrl} value={draft.selector} />
-        <LabelLike text="复选状态">
-          <Select onValueChange={(value) => onDraftPatch('checked', value === 'true')} value={String(draft.checked)}>
-            <SelectTrigger className="font-mono text-[11px]">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="true">选中</SelectItem>
-              <SelectItem value="false">取消选中</SelectItem>
-            </SelectContent>
-          </Select>
-        </LabelLike>
+        <CheckedStateField onChange={(value) => onDraftPatch('checked', value)} value={draft.checked} />
         <VariableNameField label="输出变量" mode="target" onChange={(value) => onDraftPatch('responseVariable', value)} placeholder="check_result" value={draft.responseVariable} variables={availableVariables} />
       </>
     );
@@ -139,7 +124,11 @@ export function BrowserActionFields({ draft, electron, flowTargetUrl, node, onDr
   }
 
   const selectorLabel = node.data.kind === 'ui' ? '目标控件 (CSS)' : '目标元素 (CSS)';
-  const usesSelector = shouldShowSelectorControls(actionType);
+  const usesSelector = SELECTOR_ACTION_TYPES.has(actionType);
+  const isExtract = actionType === 'browser.extract' || actionType === 'ui.extract';
+  const hasExtractMode = isExtract || actionType === 'browser.fetch';
+  const isWaitFor = actionType === 'browser.waitFor';
+  const isFill = actionType === 'browser.fill' || actionType === 'ui.fill';
   return (
     <>
       {(actionType === 'browser.fetch' || actionType === 'browser.open' || actionType === 'browser.tab.open') && (
@@ -154,7 +143,7 @@ export function BrowserActionFields({ draft, electron, flowTargetUrl, node, onDr
       {usesSelector && (
         <SelectorField electron={electron} label={selectorLabel} onChange={(value) => onDraftPatch('selector', value)} targetUrl={resolvedTargetUrl} value={draft.selector} />
       )}
-      {(actionType === 'browser.fetch' || actionType === 'browser.fill' || actionType === 'ui.fill') && (
+      {(actionType === 'browser.fetch' || isFill) && (
         <InlineHint
           tone={readBrowserHintTone(actionType, draft)}
           text={readBrowserHintText(actionType, draft)}
@@ -169,7 +158,7 @@ export function BrowserActionFields({ draft, electron, flowTargetUrl, node, onDr
           {electron.siteAnalysis !== null && <SiteAnalysisSummary analysis={electron.siteAnalysis} onSelect={(selector) => onDraftPatch('selector', selector)} />}
         </>
       )}
-      {usesSelector && actionType !== 'browser.dismiss' && actionType !== 'browser.screenshot' && actionType !== 'browser.drag' && actionType !== 'ui.drag' && actionType !== 'browser.fetch' && (
+      {usesSelector && !RESILIENCE_EXCLUDED_TYPES.has(actionType) && (
         <>
           <TextareaField
             hint="每行一个，主选择器未命中时自动尝试"
@@ -189,26 +178,11 @@ export function BrowserActionFields({ draft, electron, flowTargetUrl, node, onDr
           />
         </>
       )}
-      {(actionType === 'browser.extract' || actionType === 'ui.extract' || actionType === 'browser.fetch') && (
-        <LabelLike text="提取方式">
-          <Select onValueChange={(value) => onDraftPatch('extractMode', value as ExtractMode)} value={draft.extractMode}>
-            <SelectTrigger className="font-mono text-[11px]">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="text">文本</SelectItem>
-              <SelectItem value="html">HTML</SelectItem>
-              <SelectItem value="attribute">属性</SelectItem>
-              <SelectItem value="count">数量</SelectItem>
-              <SelectItem value="table">表格</SelectItem>
-            </SelectContent>
-          </Select>
-        </LabelLike>
-      )}
-      {(actionType === 'browser.extract' || actionType === 'ui.extract' || actionType === 'browser.fetch') && draft.extractMode === 'attribute' && (
+      {hasExtractMode && <ExtractModeField onChange={(value) => onDraftPatch('extractMode', value)} value={draft.extractMode} />}
+      {hasExtractMode && draft.extractMode === 'attribute' && (
         <Field label="属性名" mono onChange={(event) => onDraftPatch('attribute', event.target.value)} placeholder="href" value={draft.attribute} />
       )}
-      {(actionType === 'browser.extract' || actionType === 'ui.extract' || actionType === 'browser.clickLoadMore' || actionType === 'browser.paginateNext') && (
+      {(isExtract || actionType === 'browser.clickLoadMore' || actionType === 'browser.paginateNext') && (
         <div>
           {/* outputSchema 需与后端提取协议对齐：JSON 数组，每项 {name, aliases?, required?}，required 字段未命中会中断执行 */}
           <span className="mb-1 block text-[11px] font-medium text-slate-600">输出字段 Schema</span>
@@ -222,7 +196,7 @@ export function BrowserActionFields({ draft, electron, flowTargetUrl, node, onDr
           <span className="mt-1 block text-[10px] leading-4 font-normal text-slate-500">JSON 数组，声明期望字段；必需字段未命中时报错</span>
         </div>
       )}
-      {actionType === 'browser.waitFor' && (
+      {isWaitFor && (
         <LabelLike text="等待条件">
           <Select onValueChange={(value) => onDraftPatch('waitCondition', value as 'visible' | 'hidden' | 'textContains')} value={draft.waitCondition}>
             <SelectTrigger className="font-mono text-[11px]">
@@ -236,34 +210,22 @@ export function BrowserActionFields({ draft, electron, flowTargetUrl, node, onDr
           </Select>
         </LabelLike>
       )}
-      {actionType === 'browser.waitFor' && draft.waitCondition === 'textContains' && (
+      {isWaitFor && draft.waitCondition === 'textContains' && (
         <Field label="期望包含的文本" onChange={(event) => onDraftPatch('inputValue', event.target.value)} placeholder="加载完成" value={draft.inputValue} />
       )}
-      {(actionType === 'browser.fill' || actionType === 'ui.fill' || actionType === 'ui.select') && <VariablePickerField onChange={(value) => onDraftPatch('inputValue', value)} value={draft.inputValue} variables={availableVariables} />}
-      {(actionType === 'browser.extract' || actionType === 'ui.extract' || actionType === 'ui.screenshot' || actionType === 'ui.select' || actionType === 'ui.check' || actionType === 'ui.drag') && (
+      {(isFill || actionType === 'ui.select') && <VariablePickerField onChange={(value) => onDraftPatch('inputValue', value)} value={draft.inputValue} variables={availableVariables} />}
+      {(isExtract || actionType === 'ui.screenshot' || actionType === 'ui.select' || actionType === 'ui.check' || actionType === 'ui.drag') && (
         <VariableNameField label="输出变量" mode="target" onChange={(value) => onDraftPatch('responseVariable', value)} placeholder="ui_values" value={draft.responseVariable} variables={availableVariables} />
       )}
-      {(actionType === 'browser.extract' || actionType === 'ui.extract') && (
+      {isExtract && (
         <>
           <VariableNameField label="首值变量" mode="target" onChange={(value) => onDraftPatch('firstValueVariable', value)} placeholder="first_text" value={draft.firstValueVariable} variables={availableVariables} />
           <VariableNameField label="命中数量变量" mode="target" onChange={(value) => onDraftPatch('statusVariable', value)} placeholder="match_count" value={draft.statusVariable} variables={availableVariables} />
         </>
       )}
       {actionType === 'ui.drag' && <Field label="目标控件" mono onChange={(event) => onDraftPatch('targetSelector', event.target.value)} placeholder="#target" value={draft.targetSelector} />}
-      {actionType === 'ui.check' && (
-        <LabelLike text="复选状态">
-          <Select onValueChange={(value) => onDraftPatch('checked', value === 'true')} value={String(draft.checked)}>
-            <SelectTrigger className="font-mono text-[11px]">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="true">选中</SelectItem>
-              <SelectItem value="false">取消选中</SelectItem>
-            </SelectContent>
-          </Select>
-        </LabelLike>
-      )}
-      {(actionType === 'browser.fill' || actionType === 'ui.fill') && (
+      {actionType === 'ui.check' && <CheckedStateField onChange={(value) => onDraftPatch('checked', value)} value={draft.checked} />}
+      {isFill && (
         // UI 选项"直接赋值"落到后端 fillMode 值 'js'（走 JS 赋值执行路径），与展示文案不同名
         <Segmented
           label="输入方式"
@@ -280,161 +242,3 @@ export function BrowserActionFields({ draft, electron, flowTargetUrl, node, onDr
   );
 }
 
-function shouldShowSelectorControls(actionType: string): boolean {
-  return (
-    actionType === 'browser.fetch' ||
-    actionType === 'browser.click' ||
-    actionType === 'browser.hover' ||
-    actionType === 'browser.fill' ||
-    actionType === 'browser.wait' ||
-    actionType === 'browser.waitFor' ||
-    actionType === 'browser.extract' ||
-    actionType === 'browser.dismiss' ||
-    actionType === 'browser.clickLoadMore' ||
-    actionType === 'browser.paginateNext' ||
-    actionType === 'browser.screenshot' ||
-    actionType === 'browser.select' ||
-    actionType === 'browser.check' ||
-    actionType === 'browser.drag' ||
-    actionType === 'ui.click' ||
-    actionType === 'ui.fill' ||
-    actionType === 'ui.wait' ||
-    actionType === 'ui.extract' ||
-    actionType === 'ui.screenshot' ||
-    actionType === 'ui.select' ||
-    actionType === 'ui.check' ||
-    actionType === 'ui.drag'
-  );
-}
-
-function SelectorField({
-  electron,
-  label,
-  onChange,
-  targetUrl,
-  value
-}: {
-  electron: ElectronBridgeState;
-  label: string;
-  onChange: (value: string) => void;
-  targetUrl?: string;
-  value: string;
-}): ReactElement {
-  const effectiveUrl = targetUrl?.trim() || undefined;
-
-  const picking = electron.pickerActive;
-
-  // 拾取器依赖已解析的目标网址（本节点 targetUrl 或流程级 flowTargetUrl），缺失时静默拒绝并仅提示，不抛错
-  const handlePickerClick = (): void => {
-    if (picking) return;
-    if (!effectiveUrl) {
-      electron.pushToast('info', '请先在"打开网页"节点配置目标页面地址');
-      return;
-    }
-    void electron.openPicker(effectiveUrl);
-  };
-
-  return (
-    <div>
-      <div className="mb-1 flex items-center justify-between gap-2">
-        <span className="text-[11px] font-medium text-slate-600">{label}</span>
-        <Button
-          className="h-6 px-2 text-indigo-500"
-          disabled={picking}
-          onClick={handlePickerClick}
-          title={picking ? '拾取器已打开，请在浏览器中点击元素' : effectiveUrl ? `启动拾取器（${effectiveUrl}）` : '启动元素拾取器'}
-          variant="ghost"
-        >
-          {picking ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.5} />
-          ) : (
-            <Crosshair className="h-3.5 w-3.5" strokeWidth={1.5} />
-          )}
-          {picking ? '拾取中…' : '拾取'}
-        </Button>
-      </div>
-      <Input className="font-mono text-[11px]" onChange={(event) => onChange(event.target.value)} tone="blue" value={value} />
-      {effectiveUrl && (
-        <p className="mt-0.5 truncate font-mono text-[10px] text-slate-500" title={effectiveUrl}>
-          {effectiveUrl}
-        </p>
-      )}
-    </div>
-  );
-}
-
-function InlineHint({ text, tone = 'default' }: { text: string; tone?: 'default' | 'warn' }): ReactElement {
-  return (
-    <div className={`rounded-md border px-2 py-1.5 text-[10px] leading-4 ${tone === 'warn' ? 'border-amber-200 bg-amber-50 text-amber-800' : 'border-slate-200 bg-slate-50 text-slate-500'}`}>
-      {text}
-    </div>
-  );
-}
-
-function readBrowserHintTone(actionType: string, draft: ActionFieldsProps['draft']): 'default' | 'warn' {
-  if (actionType === 'browser.fetch' && draft.targetUrl.trim() === '') {
-    return 'warn';
-  }
-  if ((actionType === 'browser.fill' || actionType === 'ui.fill') && draft.inputValue.trim() === '') {
-    return 'warn';
-  }
-  if (draft.selector.trim() === '') {
-    return 'warn';
-  }
-  return 'default';
-}
-
-function readBrowserHintText(actionType: string, draft: ActionFieldsProps['draft']): string {
-  if (actionType === 'browser.fetch' && draft.targetUrl.trim() === '') {
-    return '建议先填写目标网址，再使用拾取器或稳定性分析生成选择器。';
-  }
-  if (draft.selector.trim() === '') {
-    return '缺少选择器时节点无法稳定执行，优先使用拾取器或站点分析候选。';
-  }
-  if ((actionType === 'browser.fill' || actionType === 'ui.fill') && draft.inputValue.trim() === '') {
-    return '输入类节点建议绑定变量或直接填写输入内容，否则运行时会被校验拦截。';
-  }
-  return actionType === 'browser.fetch'
-    ? '当前节点会以这里的目标网址与选择器作为抓取入口。'
-    : '选择器将直接决定当前操作组件的执行目标。';
-}
-
-function SiteAnalysisSummary({ analysis, onSelect }: { analysis: NonNullable<ElectronBridgeState['siteAnalysis']>; onSelect: (selector: string) => void }): ReactElement {
-  return (
-    <div className="space-y-2 rounded-md border border-slate-200 bg-slate-50 p-2">
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-1.5 text-[11px] font-medium text-slate-700">
-          <Gauge className="h-3.5 w-3.5 text-blue-500" strokeWidth={1.5} />
-          <span className="truncate">{analysis.title ?? '站点分析'}</span>
-        </div>
-        <Badge variant={analysis.riskLevel === 'high' ? 'red' : analysis.riskLevel === 'medium' ? 'amber' : 'emerald'}>
-          {analysis.riskLevel === 'high' ? '高风险' : analysis.riskLevel === 'medium' ? '中风险' : '低风险'}
-        </Badge>
-      </div>
-      {analysis.checkedSelector !== null && analysis.checkedSelector !== undefined && (
-        <div className="font-mono text-[10px] text-slate-500">
-          当前命中 {analysis.checkedSelector.matchCount} 个元素 · {analysis.checkedSelector.stable ? '稳定' : '需优化'}
-        </div>
-      )}
-      {analysis.warnings.slice(0, 2).map((warning) => (
-        <div className="rounded border border-amber-200 bg-amber-50 px-2 py-1 text-[10px] leading-4 text-amber-800" key={warning}>
-          {warning}
-        </div>
-      ))}
-      <div className="space-y-1">
-        {analysis.candidates.slice(0, 3).map((candidate) => (
-          <Button
-            className="flex h-auto w-full items-center justify-between gap-2 rounded border border-slate-200 bg-white px-2 py-1.5 text-left hover:border-blue-200 hover:bg-blue-50"
-            key={candidate.selector}
-            onClick={() => onSelect(candidate.selector)}
-            title={candidate.reasons.join('；')}
-            variant="ghost"
-          >
-            <span className="min-w-0 truncate font-mono text-[10px] text-slate-700">{candidate.selector}</span>
-            <span className="shrink-0 text-[10px] text-blue-600">{candidate.stabilityScore}</span>
-          </Button>
-        ))}
-      </div>
-    </div>
-  );
-}

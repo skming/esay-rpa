@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { Edge, Node } from '@xyflow/react';
 
-import { getBlockingRunIssue, validateRunConfiguration } from './runValidation';
+import { getBlockingRunIssue, validateFlowConfigurations, validateNodeConfigurationInFlow, validateRunConfiguration } from './runValidation';
 import type { RpaNodeData } from '../types/rpa';
 
 function createNode(id: string, overrides: Partial<RpaNodeData> = {}): Node<RpaNodeData> {
@@ -358,5 +358,38 @@ describe('runValidation', () => {
     });
 
     expect(result.issues.some((issue) => issue.nodeId === 'condition' && issue.message.includes('裸变量名'))).toBe(true);
+  });
+  // validateFlowConfigurations 是画布徽标用的批量版，逐节点跑单节点版会是 O(n²)；
+  // 两者必须给出同样的结果，否则批量优化会改变画布上的告警
+  it('批量校验与逐节点校验结果一致', () => {
+    const nodes: Node<RpaNodeData>[] = [
+      createNode('start'),
+      createNode('fetch', {
+        title: '采集节点',
+        action: { type: 'browser.fetch', selector: '.item' }
+      }),
+      createNode('fill', {
+        title: '填写节点',
+        action: { type: 'browser.fill', selector: '#kw', inputValue: '${var.keyword}' }
+      }),
+      createNode('orphan', {
+        title: '孤儿节点',
+        action: { type: 'variable.log', inputValue: 'hi' }
+      }),
+      createNode('end')
+    ];
+    const edges: Edge[] = [
+      { id: 'e1', source: 'start', target: 'fetch' },
+      { id: 'e2', source: 'fetch', target: 'fill' },
+      { id: 'e3', source: 'fill', target: 'end' }
+    ];
+
+    const batch = validateFlowConfigurations(nodes, edges, []);
+
+    for (const node of nodes) {
+      expect(batch.get(node.id) ?? []).toEqual(validateNodeConfigurationInFlow(node, nodes, edges, []));
+    }
+    expect((batch.get('fetch') ?? []).length).toBeGreaterThan(0);
+    expect((batch.get('fill') ?? []).length).toBeGreaterThan(0);
   });
 });

@@ -1433,18 +1433,23 @@ def _build_few_shot_block(model: str, relayed: bool) -> list[dict[str, Any]]:
     return [*_FEW_SHOT_MESSAGES[:-1], tail]
 
 
-def _log_prompt_cache_usage(model: str, round_num: int, usage: Any) -> None:
-    """记录提示词缓存命中量，用于验证断点是否真的生效。"""
+def _log_prompt_cache_usage(model: str, round_num: int, usage: Any, elapsed_s: float | None = None) -> None:
+    """记录每轮输入规模、缓存命中量与耗时。
+
+    缓存数为 0 也照记：只打印非零命中会让缓存完全没生效的会话一条日志都没有，
+    正好是最需要排查的那种。
+    """
     if usage is None:
         return
     details = getattr(usage, "prompt_tokens_details", None)
     cached = getattr(details, "cached_tokens", None) if details is not None else None
     created = getattr(usage, "cache_creation_input_tokens", None)
-    if not cached and not created:
-        return
     logger.info(
-        "prompt cache (model=%s round=%s): 命中 %s tokens，写入 %s tokens，输入合计 %s",
-        model, round_num, cached or 0, created or 0, getattr(usage, "prompt_tokens", "?"),
+        "llm round (model=%s round=%s): 输入 %s tokens（缓存命中 %s / 写入 %s），输出 %s tokens，耗时 %s",
+        model, round_num,
+        getattr(usage, "prompt_tokens", "?"), cached or 0, created or 0,
+        getattr(usage, "completion_tokens", "?"),
+        f"{elapsed_s:.1f}s" if elapsed_s is not None else "?",
     )
 
 
@@ -1851,6 +1856,7 @@ class AiOrchestrator:
             think_filter = _ThinkTagFilter()
             # 记录已发出 tool_start 的流式索引，避免工具执行后重复发卡片
             emitted_tool_starts: set[int] = set()
+            round_started_at = time.monotonic()
 
             try:
                 effective_model, extra = await self._completion_kwargs(model)
@@ -1860,6 +1866,10 @@ class AiOrchestrator:
                     tools=TOOL_SCHEMAS,
                     tool_choice="auto",
                     stream=True,
+                    # 流式响应默认不带 usage，缺了它缓存命中就没有任何数据可查
+                    stream_options={"include_usage": True},
+                    # 不认识上述参数的厂商交给 litellm 丢弃，而不是整轮 400 失败
+                    drop_params=True,
                     timeout=LLM_REQUEST_TIMEOUT,
                     **extra,
                 )
@@ -1943,7 +1953,9 @@ class AiOrchestrator:
                 for kind, text in think_filter.flush():
                     (collected_thinking if kind == "thinking" else collected_text).append(text)
                     yield {"type": kind, "delta": text}
-                _log_prompt_cache_usage(effective_model, round_num, round_usage)
+                _log_prompt_cache_usage(
+                    effective_model, round_num, round_usage, time.monotonic() - round_started_at
+                )
             except Exception as stream_exc:
                 if not vision_fallback_done and _is_vision_error(str(stream_exc)) and _strip_image_messages(full_messages):
                     # 已 yield 的本轮部分文本无法撤回，重试后可能出现重复段落——
@@ -2014,6 +2026,26 @@ class AiOrchestrator:
             full_messages.append(assistant_msg)
 
             tool_items = list(collected_tool_calls.items())
+
+            # 只读工具先并发起跑，串行循环走到它时直接取结果，省掉逐个 await 的串行往返。
+            # 少于两个不预取：单个并发没收益，只多一层任务管理。
+            prefetched: dict[int, asyncio.Task[Any]] = {}
+            if sum(1 for _, _tc in tool_items if _tc["name"] in _PARALLEL_SAFE_TOOLS) > 1:
+                for _pf_idx, _pf_tc in tool_items:
+                    if _pf_tc["name"] not in _PARALLEL_SAFE_TOOLS:
+                        continue
+                    try:
+                        _pf_args, _pf_dups = (
+                            _parse_tool_arguments(_pf_tc["arguments"]) if _pf_tc["arguments"].strip() else ({}, [])
+                        )
+                    except json.JSONDecodeError:
+                        continue  # 参数非法交给下面的串行分支报错，这里不抢着执行
+                    if _pf_dups:
+                        continue
+                    prefetched[_pf_idx] = asyncio.create_task(
+                        self._executor.execute(_pf_tc["name"], _pf_args, {})
+                    )
+
             _stop_after: int | None = None
             for _exec_idx, (stream_idx, tc) in enumerate(tool_items):
                 tool_name = tc["name"]
@@ -2060,7 +2092,12 @@ class AiOrchestrator:
                             yield {"type": "status", "delta": _executing_status_text(tool_name)}
                             # 用 task 执行工具并每 5s 发心跳，避免长时任务（run_flow 等）期间 SSE 看似冻结
                             progress_sink: dict[str, Any] = {}
-                            tool_task = asyncio.create_task(self._executor.execute(tool_name, args, progress_sink))
+                            # 只读工具可能已在本轮开头并发起跑了，直接接管那个任务
+                            tool_task = prefetched.pop(stream_idx, None)
+                            if tool_task is None:
+                                tool_task = asyncio.create_task(
+                                    self._executor.execute(tool_name, args, progress_sink)
+                                )
                             tool_started_at = time.monotonic()
                             while not tool_task.done():
                                 try:
@@ -2116,6 +2153,11 @@ class AiOrchestrator:
                     _stop_after = _exec_idx
                     break
 
+            # 被 guard 拦下或 break 跳过的预取任务不会有人来取结果，留着会变成孤儿任务
+            for _orphan in prefetched.values():
+                _orphan.cancel()
+            prefetched.clear()
+
             if _stop_after is not None and _stop_after + 1 < len(tool_items):
                 # assistant 消息里已记录本轮全部 tool_calls；break 跳过的调用若不补
                 # tool 应答，严格的 OpenAI 兼容端点会在下一轮以 400 拒绝整个对话。
@@ -2157,6 +2199,21 @@ _BLOCKING_LINT_ISSUES = {
 
 _NON_EXECUTED_STATUSES = {"blocked_by_orchestrator_guard", "skipped", "error"}
 
+# 可并发起跑的工具：纯读、无副作用、不参与 guard 计数。
+# 不含 inspect_page / inspect_screenshot / get_run_error——它们会改熔断计数与
+# fresh_page_evidence，并发会让「连续 inspect 3 次」这类按顺序计数的护栏失效。
+_PARALLEL_SAFE_TOOLS = frozenset({
+    "get_flow",
+    "get_run_logs",
+    "get_run_output",
+    "get_run_status",
+    "lint_flow",
+    "list_flows",
+    "list_node_types",
+    "list_schedules",
+    "validate_flow",
+})
+
 
 def _tool_call_succeeded(result: Any) -> bool:
     """这次工具调用是否真的执行成功了——guard 拦截结果里没有 error 字段。"""
@@ -2169,6 +2226,11 @@ def _tool_call_succeeded(result: Any) -> bool:
 
 _MAX_CONSECUTIVE_INSPECT_PAGE = 3  # 连续调用超过此数视为卡死，guard 强制换策略
 _NODE_SELECTOR_FIX_BUDGET = 2  # 同一节点 selector 反复改仍失败超过此数，判定为方向性错误而非手误
+
+# 「改流程 → 跑 → 又失败」的总次数上限。其余护栏都按节点/按问题类型计数，
+# 模型每轮换个节点改就一条都不触发，能一路空转到 MAX_TOOL_ROUNDS；
+# 这条不关心改的是哪里，只认「又跑了一次、又没成」。
+_MAX_REPAIR_CYCLES = 3
 
 
 def _parse_tool_arguments(raw_args: str) -> tuple[dict[str, Any], list[str]]:
@@ -2686,6 +2748,31 @@ def _orchestrator_guard_before_tool(
                 ],
             }
 
+    # 放在其它 budget 之前：它比那些都粗，没被它们命中的循环正要靠这条兜住
+    if state.get("repair_cycle_lock") and tool_name in {*_FLOW_WRITE_TOOLS, "run_flow"}:
+        locked = state["repair_cycle_lock"]
+        return {
+            "status": "blocked_by_orchestrator_guard",
+            "blocked_tool": tool_name,
+            "required_action": "report_to_user_and_stop",
+            "message": (
+                f"本轮已经「修改流程 → 运行 → 仍失败」{locked.get('cycles')} 次，达到修复次数上限。"
+                "继续改下去大概率还是同样的结果——问题多半不在流程定义里，"
+                "而在页面状态、登录态、网络或需求本身的歧义。"
+                "请立即停止修改与运行，改为用文字向用户说明：已经试过哪些方向、"
+                "各自失败在哪一步、你判断的根因是什么、需要用户提供什么信息才能继续。"
+            ),
+            "user_message": (
+                f"我连续修了 {locked.get('cycles')} 次仍然没跑通，先停下来避免空转。"
+                "下面是我已经试过的方向和判断，需要你确认或补充信息后再继续。"
+            ),
+            "last_error": locked.get("last_error"),
+            "allowed_next_tools": [
+                "get_run_error", "get_run_logs", "get_flow", "lint_flow",
+                "inspect_page", "inspect_screenshot", "get_run_output",
+            ],
+        }
+
     if state.get("quality_budget_lock") and tool_name in {"update_flow", "run_flow"}:
         locked = state["quality_budget_lock"]
         return {
@@ -2891,6 +2978,16 @@ def _orchestrator_guard_after_tool(tool_name: str, result: Any, state: dict[str,
         state["run_attempted"] = True
         if result.get("status") == "success":
             state["run_succeeded"] = True
+            # 跑通了就重新给满预算：后续用户再提新需求不该背着上一轮的失败计数
+            state["failed_run_cycles"] = 0
+        else:
+            cycles = int(state.get("failed_run_cycles") or 0) + 1
+            state["failed_run_cycles"] = cycles
+            if cycles >= _MAX_REPAIR_CYCLES:
+                state["repair_cycle_lock"] = {
+                    "cycles": cycles,
+                    "last_error": str(result.get("error") or result.get("message") or "")[:400],
+                }
 
     # 记录本会话内每个节点的 selector 修改次数；每次修改消耗一次页面证据。
     if tool_name in {"update_flow", "apply_node_fix"} and not result.get("error"):

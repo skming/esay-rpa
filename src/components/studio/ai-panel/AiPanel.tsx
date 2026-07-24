@@ -1,4 +1,4 @@
-import { Maximize2, Minimize2, PanelRightClose, Sparkles, Trash2 } from 'lucide-react';
+import { Maximize2, Minimize2, PanelRightClose, Sparkles } from 'lucide-react';
 import type { ReactElement } from 'react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
@@ -6,6 +6,7 @@ import { cn } from '../../../lib/utils';
 import { IconButton } from '../../ui/button';
 import { ChatInput } from './ChatInput';
 import { ChatMessages } from './ChatMessages';
+import { ClearChatButton } from './ClearChatButton';
 import { useAiChat } from './useAiChat';
 import type { NodeLookupItem } from './aiPanelTypes';
 
@@ -36,7 +37,7 @@ function defaultFloat(): Rect {
 }
 
 function ResizeHandles({ rectRef, onRectChange }: {
-  rectRef: React.MutableRefObject<Rect>;
+  rectRef: React.RefObject<Rect>;
   onRectChange: (r: Rect) => void;
 }): ReactElement {
   const applyResize = useCallback((dir: ResizeDir, dx: number, dy: number, orig: Rect): Rect => {
@@ -190,12 +191,20 @@ export function AiPanel({
   }, [pending]);
 
   const header = (
-    <div className="flex h-9 shrink-0 items-center gap-2 border-b border-slate-200 px-3">
+    <div className="flex h-10 shrink-0 items-center gap-2 border-b border-slate-200 px-3">
       <Sparkles className="h-3.5 w-3.5 shrink-0 text-accent" />
-      <span className="flex-1 text-[12px] font-semibold text-slate-700">RPA 助手</span>
-      <IconButton className="text-slate-500 hover:text-slate-600" label="清空对话" onClick={clearMessages}>
-        <Trash2 className="h-3.5 w-3.5" />
-      </IconButton>
+      <span className="shrink-0 text-[12px] font-semibold text-slate-700">RPA 助手</span>
+      {/* 浮窗模式下输入框可能被拖出视野，标题栏保留一个生成中的指示 */}
+      {pending && (
+        <span className="flex min-w-0 items-center gap-1 text-[11px] text-accent-strong">
+          <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-current" />
+          <span className="truncate">生成中</span>
+        </span>
+      )}
+      <span className="flex-1" />
+      <ClearChatButton messageCount={messages.length} onClear={clearMessages} pending={pending} />
+      {/* 左边是对话内容操作，右边是窗口操作，分隔开避免误点「清空」 */}
+      <span className="mx-0.5 h-4 w-px shrink-0 bg-slate-200" />
       {mode === 'sidebar' ? (
         <IconButton label="弹出浮窗" onClick={() => switchMode('float')}>
           <Maximize2 className="h-3.5 w-3.5" />

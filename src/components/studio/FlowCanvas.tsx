@@ -18,9 +18,9 @@ import type { DragEvent, MouseEvent as ReactMouseEvent, ReactElement } from 'rea
 import { useEffect, useMemo, useRef, useState } from 'react';
 
 import { cn } from '../../lib/utils';
-import { canConnectEdge, parseComponentDragPayload, type ComponentDragPayload } from '../../lib/flowOperations';
+import { canConnectEdge, NODE_SIZE, parseComponentDragPayload, type ComponentDragPayload } from '../../lib/flowOperations';
 import { mergeRuntimeVariables } from '../../lib/runtimeVariables';
-import { validateNodeConfigurationInFlow } from '../../lib/runValidation';
+import { validateFlowConfigurations } from '../../lib/runValidation';
 import { useCanvasShortcuts } from '../../hooks/useCanvasShortcuts';
 import type { CanvasToolMode, ContextMenuAction, ContextMenuState, NodeRuntimeState, RpaNodeData, RuntimeProgress, RuntimeVariable } from '../../types/rpa';
 import { CanvasToolbar } from './canvas-toolbar/CanvasToolbar';
@@ -31,12 +31,15 @@ export function FlowCanvas({
   aiPanelOpen,
   bottomPanelOpen,
   canvasFitVersion,
+  focusMode,
   focusNodeRequest,
   flowEdges,
   flowNodes,
   hasMissingStartEnd,
   inputVariables,
   onAddNode,
+  onBeginNodeDrag,
+  onEndNodeDrag,
   onConnectNodes,
   onContextAction,
   nodeStates,
@@ -46,18 +49,22 @@ export function FlowCanvas({
   progress,
   onToggleAiPanel,
   onToggleBottomPanel,
+  onToggleFocusMode,
   selectedNodeId,
   onSelectedNodeChange
 }: {
   aiPanelOpen: boolean;
   bottomPanelOpen: boolean;
   canvasFitVersion: number;
+  focusMode: boolean;
   focusNodeRequest: { id: number; nodeId: string } | null;
   flowEdges: Edge[];
   flowNodes: Node<RpaNodeData>[];
   hasMissingStartEnd: boolean;
   inputVariables: RuntimeVariable[];
   onAddNode: (payload: ComponentDragPayload, position: XYPosition) => void;
+  onBeginNodeDrag: () => void;
+  onEndNodeDrag: () => void;
   onConnectNodes: (edge: Edge) => void;
   onContextAction: (action: ContextMenuAction, nodeId: string) => void;
   nodeStates: Record<string, NodeRuntimeState>;
@@ -67,6 +74,7 @@ export function FlowCanvas({
   progress: RuntimeProgress;
   onToggleAiPanel: () => void;
   onToggleBottomPanel: () => void;
+  onToggleFocusMode: () => void;
   selectedNodeId: string;
   onSelectedNodeChange: (nodeId: string) => void;
 }): ReactElement {
@@ -76,6 +84,7 @@ export function FlowCanvas({
         aiPanelOpen={aiPanelOpen}
         bottomPanelOpen={bottomPanelOpen}
         canvasFitVersion={canvasFitVersion}
+        focusMode={focusMode}
         focusNodeRequest={focusNodeRequest}
         flowEdges={flowEdges}
         flowNodes={flowNodes}
@@ -83,6 +92,8 @@ export function FlowCanvas({
         inputVariables={inputVariables}
         nodeStates={nodeStates}
         onAddNode={onAddNode}
+        onBeginNodeDrag={onBeginNodeDrag}
+        onEndNodeDrag={onEndNodeDrag}
         onConnectNodes={onConnectNodes}
         onContextAction={onContextAction}
         onEdgesChange={onEdgesChange}
@@ -92,6 +103,7 @@ export function FlowCanvas({
         onSelectedNodeChange={onSelectedNodeChange}
         onToggleAiPanel={onToggleAiPanel}
         onToggleBottomPanel={onToggleBottomPanel}
+        onToggleFocusMode={onToggleFocusMode}
         selectedNodeId={selectedNodeId}
       />
     </ReactFlowProvider>
@@ -102,6 +114,7 @@ function FlowCanvasInner({
   aiPanelOpen,
   bottomPanelOpen,
   canvasFitVersion,
+  focusMode,
   focusNodeRequest,
   flowEdges,
   flowNodes,
@@ -109,6 +122,8 @@ function FlowCanvasInner({
   inputVariables,
   nodeStates,
   onAddNode,
+  onBeginNodeDrag,
+  onEndNodeDrag,
   onConnectNodes,
   onContextAction,
   onEdgesChange,
@@ -117,12 +132,14 @@ function FlowCanvasInner({
   progress,
   onToggleAiPanel,
   onToggleBottomPanel,
+  onToggleFocusMode,
   selectedNodeId,
   onSelectedNodeChange
 }: {
   aiPanelOpen: boolean;
   bottomPanelOpen: boolean;
   canvasFitVersion: number;
+  focusMode: boolean;
   focusNodeRequest: { id: number; nodeId: string } | null;
   flowEdges: Edge[];
   flowNodes: Node<RpaNodeData>[];
@@ -130,6 +147,8 @@ function FlowCanvasInner({
   inputVariables: RuntimeVariable[];
   nodeStates: Record<string, NodeRuntimeState>;
   onAddNode: (payload: ComponentDragPayload, position: XYPosition) => void;
+  onBeginNodeDrag: () => void;
+  onEndNodeDrag: () => void;
   onConnectNodes: (edge: Edge) => void;
   onContextAction: (action: ContextMenuAction, nodeId: string) => void;
   onEdgesChange: OnEdgesChange<Edge>;
@@ -138,57 +157,74 @@ function FlowCanvasInner({
   progress: RuntimeProgress;
   onToggleAiPanel: () => void;
   onToggleBottomPanel: () => void;
+  onToggleFocusMode: () => void;
   selectedNodeId: string;
   onSelectedNodeChange: (nodeId: string) => void;
 }): ReactElement {
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
   const [gridVisible, setGridVisible] = useState(true);
+  const [miniMapVisible, setMiniMapVisible] = useState(true);
   const [mode, setMode] = useState<CanvasToolMode>('pan');
   const canvasRef = useRef<HTMLDivElement>(null);
   const handledFocusRequestRef = useRef<number | null>(null);
   const initialFitDoneRef = useRef(false);
   const lastAutoFitSignatureRef = useRef('');
+  const lastFitNodeIdsRef = useRef<string[]>([]);
   const { screenToFlowPosition, setViewport, getViewport, fitView } = useReactFlow<Node<RpaNodeData>, Edge>();
   const viewport = useViewport();
   const availableVariableNames = useMemo(() => mergeRuntimeVariables(inputVariables, []).map((variable) => variable.name), [inputVariables]);
 
-  const visibleNodes = useMemo(
+  // 校验只取决于流程结构，与运行时状态无关：单独 memo，避免每个进度事件重跑全流程校验
+  const validationByNodeId = useMemo(
+    () => validateFlowConfigurations(flowNodes, flowEdges, availableVariableNames),
+    [availableVariableNames, flowEdges, flowNodes]
+  );
+
+  // 基础节点：只随流程结构变化重建，运行时状态变化时保持 data 引用不变，
+  // 这样没有运行态的节点在整轮运行里一次都不会重渲染
+  const baseNodes = useMemo(
     () =>
       flowNodes.map((node) => {
-        const validationIssues = validateNodeConfigurationInFlow(node, flowNodes, flowEdges, availableVariableNames);
-        const validationSeverity: RpaNodeData['validationSeverity'] =
-          validationIssues.some((issue) => issue.severity === 'error')
-            ? 'error'
-            : validationIssues.length > 0
-              ? 'warn'
-              : undefined;
+        const validationIssues = validationByNodeId.get(node.id);
+        const hasIssues = validationIssues !== undefined && validationIssues.length > 0;
+        return {
+          ...node,
+          // 选中态一律由 selectedNodeId 决定，不沿用 flowNodes 上 ReactFlow 自己写入的 selected
+          selected: false,
+          data: {
+            ...node.data,
+            onAction: (action: ContextMenuAction) => onContextAction(action, node.id),
+            validationCount: hasIssues ? validationIssues.length : undefined,
+            validationSeverity: (!hasIssues
+              ? undefined
+              : validationIssues.some((issue) => issue.severity === 'error')
+                ? 'error'
+                : 'warn') as RpaNodeData['validationSeverity']
+          }
+        };
+      }),
+    [flowNodes, onContextAction, validationByNodeId]
+  );
+
+  const visibleNodes = useMemo(
+    () =>
+      baseNodes.map((node) => {
         const runtimeState = nodeStates[node.id];
+        const selected = node.id === selectedNodeId;
         if (runtimeState === undefined) {
-          return {
-            ...node,
-            data: {
-              ...node.data,
-              onAction: (action: ContextMenuAction) => onContextAction(action, node.id),
-              validationCount: validationIssues.length > 0 ? validationIssues.length : undefined,
-              validationSeverity
-            },
-            selected: node.id === selectedNodeId
-          };
+          return selected ? { ...node, selected: true } : node;
         }
         return {
           ...node,
           data: {
             ...node.data,
             badge: runtimeState.badge ?? (runtimeState.status === node.data.status ? node.data.badge : undefined),
-            onAction: (action: ContextMenuAction) => onContextAction(action, node.id),
-            status: runtimeState.status,
-            validationCount: validationIssues.length > 0 ? validationIssues.length : undefined,
-            validationSeverity
+            status: runtimeState.status
           },
-          selected: node.id === selectedNodeId
+          selected
         };
       }),
-    [availableVariableNames, flowEdges, flowNodes, nodeStates, onContextAction, selectedNodeId]
+    [baseNodes, nodeStates, selectedNodeId]
   );
 
   const visibleEdges = useMemo(() => {
@@ -210,20 +246,25 @@ function FlowCanvasInner({
     });
   }, [flowEdges, nodeStates]);
 
-  const toolbarStats = useMemo(
-    () => ({
-      doneSteps: visibleNodes.filter((node) => node.data.status === 'done' && node.id !== 'start' && node.id !== 'end').length,
-      runningSteps: visibleNodes.filter((node) => node.data.status === 'running').length,
-      totalSteps: visibleNodes.filter((node) => node.id !== 'start' && node.id !== 'end').length
-    }),
-    [visibleNodes]
-  );
+  const toolbarStats = useMemo(() => {
+    let doneSteps = 0;
+    let runningSteps = 0;
+    let totalSteps = 0;
+    for (const node of visibleNodes) {
+      if (node.data.status === 'running') runningSteps += 1;
+      if (node.id === 'start' || node.id === 'end') continue;
+      totalSteps += 1;
+      if (node.data.status === 'done') doneSteps += 1;
+    }
+    return { doneSteps, runningSteps, totalSteps };
+  }, [visibleNodes]);
   const contextMenuNode = flowNodes.find((node) => node.id === (contextMenu?.nodeId ?? selectedNodeId));
+  // 只描述结构（节点集合 + 连线），不含坐标：坐标一起算会让拖动节点也触发自动 fitView，视口被拽回去
   const flowLayoutSignature = useMemo(
-    () => JSON.stringify({
-      edges: flowEdges.map((edge) => `${edge.source}->${edge.target}:${typeof edge.label === 'string' ? edge.label : ''}`).sort(),
-      nodes: flowNodes.map((node) => `${node.id}:${Math.round(node.position.x)},${Math.round(node.position.y)}`).sort()
-    }),
+    () => [
+      flowNodes.map((node) => node.id).sort().join(','),
+      flowEdges.map((edge) => `${edge.source}>${edge.target}:${typeof edge.label === 'string' ? edge.label : ''}`).sort().join(',')
+    ].join('|'),
     [flowEdges, flowNodes]
   );
 
@@ -264,8 +305,14 @@ function FlowCanvasInner({
     if (payload === null) {
       return;
     }
-    onAddNode(payload, screenToFlowPosition({ x: event.clientX, y: event.clientY }));
+    // 落点按节点中心对齐光标：默认换算给的是左上角，视觉上节点会整体偏右下
+    const dropPoint = screenToFlowPosition({ x: event.clientX, y: event.clientY });
+    onAddNode(payload, { x: dropPoint.x - NODE_SIZE.width / 2, y: dropPoint.y - NODE_SIZE.height / 2 });
   };
+
+  // 交给 ReactFlow 在连线拖拽过程中实时判定，落点非法时不会亮起可连接高亮
+  const isValidConnection = (connection: Connection | Edge): boolean =>
+    canConnectEdge(flowEdges, connection.source, connection.target);
 
   const handleConnect = (connection: Connection): void => {
     if (!canConnectEdge(flowEdges, connection.source, connection.target)) {
@@ -351,6 +398,9 @@ function FlowCanvasInner({
     onFitView: handleFitView,
     onModeChange: setMode,
     onResetZoom: handleResetZoom,
+    onToggleFocusMode,
+    onToggleGrid: () => setGridVisible((visible) => !visible),
+    onToggleMiniMap: () => setMiniMapVisible((visible) => !visible),
     onZoomIn: handleZoomIn,
     onZoomOut: handleZoomOut
   });
@@ -360,19 +410,30 @@ function FlowCanvasInner({
     if (initialFitDoneRef.current || flowNodes.length === 0) return;
     initialFitDoneRef.current = true;
     lastAutoFitSignatureRef.current = flowLayoutSignature;
+    lastFitNodeIdsRef.current = flowNodes.map((node) => node.id);
     const id = requestAnimationFrame(() => fitView({ padding: 0.18, maxZoom: 0.9 }));
     return () => cancelAnimationFrame(id);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [flowNodes.length]);
 
-  // AI create/update 可能在画布已加载后整体替换布局；按结构签名重新 fit，避免节点散落在视口外
+  // AI create/update 可能在画布已加载后整体替换布局；这种情况才重新 fit，避免节点散落在视口外。
+  // 增删单个节点属于增量编辑：留住用户当前的视口与缩放，否则每加一个节点画布都会被拉回全局视图
   useEffect(() => {
     if (!initialFitDoneRef.current || flowNodes.length === 0) return;
     if (lastAutoFitSignatureRef.current === flowLayoutSignature) return;
     lastAutoFitSignatureRef.current = flowLayoutSignature;
+
+    const currentNodeIds = new Set(flowNodes.map((node) => node.id));
+    const previousNodeIds = lastFitNodeIdsRef.current;
+    lastFitNodeIdsRef.current = flowNodes.map((node) => node.id);
+
+    // 保留了半数以上的旧节点就当作增量编辑；整体被换掉（如 AI 新建流程）才重新框选
+    const retainedCount = previousNodeIds.filter((nodeId) => currentNodeIds.has(nodeId)).length;
+    if (previousNodeIds.length > 0 && retainedCount * 2 >= previousNodeIds.length) return;
+
     const id = requestAnimationFrame(() => fitView({ padding: 0.2, maxZoom: 0.95 }));
     return () => cancelAnimationFrame(id);
-  }, [fitView, flowLayoutSignature, flowNodes.length]);
+  }, [fitView, flowLayoutSignature, flowNodes]);
 
   // 冷启动画布恢复（如刷新页面且无草稿）时的显式 fit 请求，只框定流程顶部让开始节点立即可见
   useEffect(() => {
@@ -414,19 +475,24 @@ function FlowCanvasInner({
   }, [flowNodes, focusNodeRequest]);
 
   return (
-    <main className="flex min-w-0 flex-1 flex-col" style={{ background: '#f3f4f8' }}>
+    <main className="flex min-w-0 flex-1 flex-col bg-canvas">
       <CanvasToolbar
         aiPanelOpen={aiPanelOpen}
         bottomPanelOpen={bottomPanelOpen}
+        focusMode={focusMode}
         gridVisible={gridVisible}
         hasMissingStartEnd={hasMissingStartEnd}
+        miniMapVisible={miniMapVisible}
         mode={mode}
         onFitView={handleFitView}
         onModeChange={setMode}
+        onResetZoom={handleResetZoom}
         onRestoreStartEnd={onRestoreStartEnd}
         onToggleAiPanel={onToggleAiPanel}
         onToggleBottomPanel={onToggleBottomPanel}
+        onToggleFocusMode={onToggleFocusMode}
         onToggleGrid={() => setGridVisible((visible) => !visible)}
+        onToggleMiniMap={() => setMiniMapVisible((visible) => !visible)}
         onZoomIn={handleZoomIn}
         onZoomOut={handleZoomOut}
         progress={progress}
@@ -460,7 +526,10 @@ function FlowCanvasInner({
             nodeTypes={nodeTypes}
             nodesDraggable={mode === 'select'}
             deleteKeyCode={null}
+            isValidConnection={isValidConnection}
             onConnect={handleConnect}
+            onNodeDragStart={onBeginNodeDrag}
+            onNodeDragStop={onEndNodeDrag}
             onEdgesChange={onEdgesChange}
             onNodeClick={(_, node) => {
               onSelectedNodeChange(node.id);
@@ -468,34 +537,39 @@ function FlowCanvasInner({
             }}
             onNodesChange={onNodesChange}
             onPaneClick={() => { setContextMenu(null); onSelectedNodeChange(''); }}
-            panOnDrag={mode === 'pan'}
+            // 选择模式下保留中键拖拽平移（不含右键，右键要留给节点菜单），不必为了挪一下视图去切工具
+            panOnDrag={mode === 'pan' ? true : [1]}
             proOptions={{ hideAttribution: true }}
             selectionOnDrag={mode === 'select'}
             snapGrid={[10, 10]}
             snapToGrid
+            minZoom={0.2}
+            maxZoom={1.6}
           >
             {gridVisible && <Background color="#c6cdd9" gap={22} size={1.4} variant={BackgroundVariant.Dots} />}
-            <MiniMap
-              maskColor="rgba(248,250,252,0.82)"
-              nodeBorderRadius={5}
-              nodeColor={(node) => {
-                const status = (node.data as RpaNodeData | undefined)?.status;
-                if (status === 'done') return '#10b981';
-                if (status === 'running') return '#3b82f6';
-                if (status === 'error') return '#ef4444';
-                if (status === 'skipped') return '#cbd5e1';
-                return '#dde1ea';
-              }}
-              nodeStrokeWidth={0}
-              pannable
-              style={{
-                backgroundColor: '#f8fafc',
-                borderRadius: 10,
-                overflow: 'hidden',
-                boxShadow: '0 2px 10px rgba(15,23,42,0.10), 0 0 0 1px rgba(226,232,240,0.7)',
-              }}
-              zoomable
-            />
+            {miniMapVisible && (
+              <MiniMap
+                maskColor="rgba(248,250,252,0.82)"
+                nodeBorderRadius={5}
+                nodeColor={(node) => {
+                  const status = (node.data as RpaNodeData | undefined)?.status;
+                  if (status === 'done') return '#10b981';
+                  if (status === 'running') return '#3b82f6';
+                  if (status === 'error') return '#ef4444';
+                  if (status === 'skipped') return '#cbd5e1';
+                  return '#dde1ea';
+                }}
+                nodeStrokeWidth={0}
+                pannable
+                style={{
+                  backgroundColor: 'var(--color-canvas)',
+                  borderRadius: 10,
+                  overflow: 'hidden',
+                  boxShadow: '0 2px 10px rgba(15,23,42,0.10), 0 0 0 1px rgba(226,232,240,0.7)',
+                }}
+                zoomable
+              />
+            )}
           </ReactFlow>
         </div>
       </ContextMenu>
