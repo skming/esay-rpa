@@ -72,7 +72,7 @@ def build_generic_date_recipe(inputs: list[dict[str, Any]]) -> dict[str, Any] | 
         f"browser.fill trigger  [inputValue = {'开始' if is_range else '目标'}日期文本，格式照 {fmt}；fillMode: 'type'，delayMs: 500]",
     ]
     if is_range:
-        steps.append(f"browser.fill end_input  [inputValue = 结束日期文本，格式同上，delayMs: 500]")
+        steps.append("browser.fill end_input  [inputValue = 结束日期文本，格式同上，delayMs: 500]")
     steps += [
         f"browser.press Enter on {'end_input' if is_range else 'trigger'}  "
         "[提交并关闭弹层；Enter 必须打在日期输入框自身，打在 body 上不会冒泡到组件的按键处理，delayMs: 800]",
