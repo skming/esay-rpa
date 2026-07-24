@@ -19,6 +19,10 @@ describe('isPersistableMessage', () => {
     expect(isPersistableMessage(agentTurn)).toBe(true);
   });
 
+  it('只有 error 的回合也要保留（断流时正文为空，丢掉历史里只剩用户提问）', () => {
+    expect(isPersistableMessage(msg({ error: '连接中断' }))).toBe(true);
+  });
+
   it('既无正文也无 toolCalls 的空 assistant 消息丢弃', () => {
     expect(isPersistableMessage(msg({ content: '  ' }))).toBe(false);
   });

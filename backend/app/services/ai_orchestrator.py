@@ -220,7 +220,7 @@ SYSTEM_PROMPT = """你是 NF2Flow RPA 流程助手，职责范围仅限于：创
 
 **`variable.input` 会让流程暂停等待人工输入**，因此只用于运行时才能确定的值：图形/短信验证码、TOTP、授权确认。账号密码这类固定凭据在 `input_variables` 里声明（`category:"credential"`，密码加 `sensitive:true`），节点用 `${var.xxx}` 引用；用错会被 `credential_in_variable_input` 拦下。
 
-若 `run_flow` 超时且流程含 `variable.input`，那就是它用错了位置，不要重复 `run_flow`。
+`run_flow` 返回 `waiting_for_user_input` 时，若该处本该是固定凭据，那就是 `variable.input` 用错了位置；无论如何都不要重复 `run_flow`。
 
 **选择器可靠性规范（构建流程时必须遵守）**：
 
@@ -340,17 +340,16 @@ inspect_page(url="...", scope_selector=".search-form")  // 只看筛选区域
 - 构建或修改流程
 - **调用 `lint_flow`**：对流程进行程序化静态检查（孤儿节点、缺失 outputVariable、foreach/condition 断路、凭据误用等），逐项用 `apply_node_fix` 或 `update_flow` 修复 `severity=error` 的问题；注意：`create_flow`/`update_flow` 的返回结果已内置 `lint_findings`，若结果里已有则直接修复，无需再单独调用 `lint_flow`
 - **调用 `validate_flow`**：检查变量引用完整性（`is_valid: false` 时先用 `apply_node_fix` 或 `update_flow` 修复，再重新验证，确认 `is_valid: true` 才继续）
-- **运行前检查**：如果流程的 `input_variables` 中有凭据字段（如 `username`/`password`）且 `value` 为空 → **不要自动 run_flow**，而是告知用户「流程已创建，请先在右侧"输入变量"面板填写账号密码，再点击运行」。判空只看 `get_flow` 返回的 `value` 字段；用户在面板里填过的值就存在这里，不存在的字段名一律不作为「凭据为空」的依据
-- 上述条件满足（无空凭据或无 input_variables）时，调用 `run_flow` 运行（该工具内部自动等待流程完成，直接返回最终 status，**无需再调用 `get_run_status` 轮询**）
+- **运行前检查**：凭据是否就绪由工具判定，不要自己目测变量值——`get_flow` 返回的 `run_readiness.ready=false` 时按 `empty_credential_fields` 告知用户「请先在右侧"输入变量"面板填写账号密码，再点击运行」，不要自动 `run_flow`；`run_flow` 返回 `empty_credential_variables` 同理，此时**绝不编造凭据值**重试
+- 上述条件满足（`run_readiness.ready` 或无 input_variables）时，调用 `run_flow` 运行（该工具内部自动等待流程完成，直接返回最终 status，**无需再调用 `get_run_status` 轮询**）
 - 若 status=`success`：调用 `get_run_output` 查看输出变量和产物；**抓取/筛选/导出类流程必须继续调用 `assert_run_output(task_id, requirement_text=用户原始需求)` 做通用质量审计**，审计通过后才能向用户汇报成功
 - 若 `assert_run_output.passed=false`：**禁止汇报成功**；必须优先按返回的 `repair_plan` 调用工具修复流程结构，然后重新 `run_flow → get_run_output → assert_run_output`。不要只解释问题。常见方向：抽取结果扁平化 → 检查 extract selector 是否对准数据行并使用 `extractMode="table"`；筛选相关 lint 风险 → 检查筛选控件交互是否真正提交；需求约束不可验证 → 检查表头/字段是否被结构化抽取。
 - 若 status=`error`：调用 `get_run_error`；若返回含 `inspect_hint`（selector 超时）→ **必须先调 `inspect_page(url=last_browser_url)`** 取真实 DOM 再修节点，禁止盲猜或插入截图节点；然后重新运行
-- **get_run_error 返回 status=`success` 时**：立即停止修复，直接向用户汇报「流程已成功运行」；`message` 字段中提到的 continueOnError 节点是预期跳过行为，**禁止因此修改流程**
+- **get_run_error 返回 status=`success` 时**：看它有没有带 `quality_audit`。没带→立即停止修复，直接向用户汇报「流程已成功运行」；带了→说明节点没报错但输出不合格，按 `quality_audit.issues` 修输出结构，不要去找节点报错。`message` 中提到的 continueOnError 节点是预期跳过行为，**禁止因此修改流程**
 - **内部/运行器错误（如 `'X' object has no attribute 'Y'`、执行器兼容性异常、`AttributeError`/`TypeError` 等程序异常）不是流程结构问题**：这类报错是产品缺陷或环境问题，**绝不能靠删除或降级用户明确要求的节点来"绕过"**——尤其禁止把 `control.human_takeover` / `variable.input` 换成 `control.delay`、`browser.wait` 或直接删掉。正确做法：如实向用户说明是内部错误、指出疑似失败节点，保留用户要求的节点原样，让用户决定（如换执行器、上报缺陷），而不是替用户砍掉他点名要的能力。
 - 若工具返回 `required_action="needs_user_navigation_target"`：**停止继续工具调用**，直接把 `user_message` 转述给用户，说明需要目标页面 URL、完整菜单路径，或让用户手动打开目标页后再继续。
-- 若 status=`timeout`：
-  - **先判断流程是否含 `variable.input` 或 `control.human_takeover` 节点**。若含有，则超时原因是**流程正在等待用户操作**，不是运行缓慢；此时**绝对不能重新调用 `run_flow`**（会启动一个新任务并把旧任务留在后台），也**无需调用 `get_run_status`**（它只会显示 `running`）。应直接告知用户：含 `variable.input` 时→「流程已暂停，正在等待您在界面底部输入变量，请填写后点击"继续"。」；含 `control.human_takeover` 时→「流程已暂停等待您操作，浏览器窗口已在桌面打开，请完成操作后在界面顶部弹出的卡片中点击"已完成，继续"恢复流程。」
-  - 若流程不含 `variable.input`，则说明流程运行时间超过限制，可用 `get_run_status` 手动查询实际状态
+- 若 status=`paused_for_human` / `waiting_for_user_input`：流程停下来是**轮到用户操作了**，不是运行缓慢。把 `message` 转述给用户即可；**绝对不能重新调用 `run_flow`**（会启动新任务并把旧任务留在后台），也无需 `get_run_status`（只会显示 running）
+- 若 status=`timeout`：流程运行时间超过限制，可用 `get_run_status` 查询实际状态
 
 **⚠️ 工具调用诚信原则（最高优先级）**：
 - **只能描述你实际调用过的工具的结果**。禁止在对话文字里写"检查了页面结构、页面有 xxx 布局、发现了 xxx 字段"等内容，除非本轮已实际调用 `inspect_page` 并看到返回值。
@@ -373,7 +372,7 @@ inspect_page(url="...", scope_selector=".search-form")  // 只看筛选区域
 - 拿不到运行证据时，结论要落在**用户下一步该做什么**上（"请点运行，或告诉我可以由我来跑"），不能只把措辞降级就交还给用户。
 
 **⚠️ 执行器选择（浏览器扩展 vs Playwright）**：
-- 用户要求"用 Chrome 扩展""复用真实登录态""不要用 Playwright"等 → 这是 `run_flow` 的 `browser_executor="extension"` **调用参数**，绝不是流程变量；把它塞进 `variables` 对运行没有任何效果，`run_flow` 会照常用默认的 Playwright 执行。
+- 用户要求"用 Chrome 扩展""复用真实登录态""不要用 Playwright"等 → 这是 `run_flow` 的 `browser_executor="extension"` **调用参数**，不是流程变量（写进 `variables` 会被 `misplaced_call_parameters` 判错）。
 - 传 `browser_executor="extension"` 前必须先调用 `check_extension_connection`；未连接时**停止并如实告知用户**"扩展未连接，请先打开 Chrome 扩展并确认已登录目标网站"，不要静默改用 Playwright，也不要只在流程里加一个提示性的 `variable.log` 节点替代真实检查。
 - `run_flow` 本身在 `browser_executor="extension"` 且未连接时也会直接拦截并返回 `status=extension_not_connected`；收到这个 status 时同样应停止并提示用户，不得重试或换回 Playwright 掩盖问题。
 
@@ -680,6 +679,21 @@ _GUIDANCE_AFTER_RUN_ERROR = (
 _GUIDANCE_AFTER_AUDIT_FAIL = (
     "质量审计未通过（passed=false）。编排层已锁定下次 run_flow。\n"
     "必须按返回的 repair_plan 修复流程结构，再重新 run_flow → get_run_output → assert_run_output。"
+)
+
+# 这些拦截意味着「工具走不下去了，得让用户拿主意」，与那些只是改道的拦截不同
+_TERMINAL_GUARD_ACTIONS = frozenset({
+    "report_to_user_and_stop",
+    "needs_user_navigation_target",
+})
+
+_GUIDANCE_AFTER_TERMINAL_BLOCK = (
+    "本轮到此结束：编排层判定继续调用工具不会推进任务，需要用户参与。\n"
+    "接下来只输出面向用户的自然语言收尾，不要再调用任何工具，内容包含：\n"
+    "1. 已经做了什么、卡在哪一步；\n"
+    "2. 你判断的根因；\n"
+    "3. 需要用户提供什么信息或做什么决定才能继续。\n"
+    "工具结果里的 user_message 是给用户看的原话，可直接引用或改写。"
 )
 
 # 用户提出修复意图时注入，引导模型走诊断优先路径
@@ -1676,6 +1690,13 @@ def _after_tool_guidance(tool_name: str, result: Any) -> tuple[str | None, bool]
     """返回 (要注入的系统引导, 是否跳过本轮剩余的并行调用)。"""
     if not isinstance(result, dict):
         return None, False
+    if (
+        result.get("status") == "blocked_by_orchestrator_guard"
+        and result.get("required_action") in _TERMINAL_GUARD_ACTIONS
+    ):
+        # 拦截本身不产出正文。不明确要求收尾，模型常常直接空轮结束，
+        # 用户只看到一个空气泡，既不知道被挡住了也不知道该给什么。
+        return _GUIDANCE_AFTER_TERMINAL_BLOCK, True
     if tool_name == "create_flow" and _tool_call_succeeded(result) and result.get("flow_id"):
         return _GUIDANCE_AFTER_CREATE, True
     if tool_name == "update_flow" and _tool_call_succeeded(result):
@@ -2175,7 +2196,15 @@ class AiOrchestrator:
                         "content": json.dumps(_skip_result, ensure_ascii=False),
                     })
 
-        yield {"type": "text", "delta": "\n（已达到最大工具调用轮次，请尝试分步操作）"}
+        # 唯一一条不经模型的收尾路径，措辞要能独立成话：这轮的正文可能一个字都没有
+        yield {
+            "type": "text",
+            "delta": (
+                f"\n\n已连续调用 {effective_max_rounds} 轮工具仍未收敛，我在这里停下来，避免继续空转。\n"
+                "上面的处理时间线是这轮实际做过的操作。请告诉我优先解决哪一个问题，"
+                "或把任务拆成更小的一步再发给我，我接着这里继续。"
+            ),
+        }
         yield {"type": "done"}
 
 
@@ -2231,6 +2260,9 @@ _NODE_SELECTOR_FIX_BUDGET = 2  # 同一节点 selector 反复改仍失败超过�
 # 模型每轮换个节点改就一条都不触发，能一路空转到 MAX_TOOL_ROUNDS；
 # 这条不关心改的是哪里，只认「又跑了一次、又没成」。
 _MAX_REPAIR_CYCLES = 3
+
+# run_flow 停在这些状态是「轮到用户了」，不是流程没修好
+_RUN_WAITING_STATUSES = frozenset({"paused_for_human", "waiting_for_user_input"})
 
 
 def _parse_tool_arguments(raw_args: str) -> tuple[dict[str, Any], list[str]]:
@@ -2814,8 +2846,11 @@ def _orchestrator_guard_before_tool(
             "navigation_budget_lock": locked,
         }
 
+    # 这道闸只该挡「未定位根因就批量改流程」。纯读工具挡掉等于没收了诊断手段，
+    # 模型只能在剩下几个工具间空转（list_node_types 被挡就是这么来的）。
     if state.get("failure_budget_lock") and tool_name not in {
-        "get_run_error", "get_run_logs", "get_flow", "lint_flow", "inspect_page", "inspect_screenshot", "apply_node_fix",
+        *_PARALLEL_SAFE_TOOLS,
+        "get_run_error", "inspect_page", "inspect_screenshot", "apply_node_fix",
     }:
         locked = state["failure_budget_lock"]
         return {
@@ -2920,6 +2955,20 @@ def _orchestrator_guard_before_tool(
     return None
 
 
+def _count_repair_cycle(state: dict[str, Any], last_error: Any) -> None:
+    """记一次「改了又跑、跑了又没成」，到上限就上锁。
+
+    运行报错和质量审计不合格都算：对用户来说两者是同一件事——又白跑了一轮。
+    """
+    cycles = int(state.get("failed_run_cycles") or 0) + 1
+    state["failed_run_cycles"] = cycles
+    if cycles >= _MAX_REPAIR_CYCLES:
+        state["repair_cycle_lock"] = {
+            "cycles": cycles,
+            "last_error": str(last_error or "")[:400],
+        }
+
+
 def _orchestrator_guard_after_tool(tool_name: str, result: Any, state: dict[str, Any]) -> None:
     if not isinstance(result, dict):
         return
@@ -2948,7 +2997,13 @@ def _orchestrator_guard_after_tool(tool_name: str, result: Any, state: dict[str,
             # 业务校验通过 = 问题已解决，之前的失败尝试不该再挡住后续正常编辑
             state["node_selector_fix_counts"] = {}
             state["node_field_history"] = {}
+            state["failed_run_cycles"] = 0
             _repair_ledger.clear(state.get("flow_id"))
+        else:
+            # 质量审计不合格是这类空转循环的主要形态：跑得起来但交付不了，
+            # 只盯 run_flow 的失败状态会完全数不到
+            first = next((i for i in (result.get("issues") or []) if isinstance(i, dict)), {})
+            _count_repair_cycle(state, first.get("message"))
         issues = result.get("issues") or []
         if any(
             isinstance(item, dict) and item.get("issue") == "output_content_may_not_match_requirement"
@@ -2977,17 +3032,13 @@ def _orchestrator_guard_after_tool(tool_name: str, result: Any, state: dict[str,
         # 超时/暂停/扩展未连接也算尝试过：这些是真拦路条件，不该再催模型去跑
         state["run_attempted"] = True
         if result.get("status") == "success":
+            # 只记跑通，不清零修复计数：质量审计不合格的运行 status 同样是 success，
+            # 在这里清零会让「跑成功 → 审计不过 → 再改」的循环永远攒不满次数
             state["run_succeeded"] = True
-            # 跑通了就重新给满预算：后续用户再提新需求不该背着上一轮的失败计数
-            state["failed_run_cycles"] = 0
-        else:
-            cycles = int(state.get("failed_run_cycles") or 0) + 1
-            state["failed_run_cycles"] = cycles
-            if cycles >= _MAX_REPAIR_CYCLES:
-                state["repair_cycle_lock"] = {
-                    "cycles": cycles,
-                    "last_error": str(result.get("error") or result.get("message") or "")[:400],
-                }
+        elif result.get("status") not in _RUN_WAITING_STATUSES:
+            # 停下来等人不是一次失败的修复：流程没跑完是因为轮到用户了，
+            # 记进熔断计数会让「等一次人工接管」白白吃掉三分之一的修复预算
+            _count_repair_cycle(state, result.get("error") or result.get("message"))
 
     # 记录本会话内每个节点的 selector 修改次数；每次修改消耗一次页面证据。
     if tool_name in {"update_flow", "apply_node_fix"} and not result.get("error"):

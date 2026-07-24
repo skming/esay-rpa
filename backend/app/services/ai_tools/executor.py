@@ -25,9 +25,13 @@ from app.services.ai_tools.diagnostics import (
     build_navigation_trace,
     build_navigation_verdict,
     _check_structured_rows,
+    _describe_output_variables,
+    _find_document_output,
+    _MIN_DOCUMENT_CHARS,
     _find_header_variable,
     _find_swallowed_critical_failures,
     _find_table_candidates,
+    _requirement_wants_document,
     _guess_date_field,
     _guess_enum_field,
     _extract_requirement_targets,
@@ -59,6 +63,15 @@ _LOGIN_URL_TOKENS = ("login", "signin", "sign-in", "auth", "sso", "passport")
 
 
 _CONDITION_NODE_TYPES = ("control.condition", "condition.step", "condition", "control.step")
+
+# run_flow 的调用参数名。塞进 variables 既不报错也不生效，是最难自查的一类静默失效
+_RUN_CALL_PARAM_NAMES = frozenset({"browser_executor", "flow_id", "task_id"})
+
+# category/sensitive 没标全时的兜底：凭据字段的命名相当稳定
+_CREDENTIAL_NAME_TOKENS = (
+    "password", "passwd", "pwd", "username", "user_name", "account",
+    "token", "secret", "apikey", "api_key", "credential",
+)
 
 
 def _splice_branch_placeholder_noops(
@@ -266,6 +279,38 @@ class RpaToolExecutor:
     async def _list_node_types(self) -> dict[str, Any]:
         return {"node_types": NODE_TYPE_CATALOG}
 
+    @staticmethod
+    def _credential_readiness(flow: Any, supplied: set[str] | None = None) -> dict[str, Any]:
+        """判定「凭据填好了没」。
+
+        这件事本该由工具算：字段是不是凭据、值算不算空、节点到底引没引用它，
+        三个条件缺一不可，交给模型逐字段目测 `value` 只会得到时对时错的结论
+        （少一个字段就当没填、面板里填过的又看不见）。
+        """
+        supplied = supplied or set()
+        definition_text = json.dumps(flow.definition or {}, ensure_ascii=False)
+        empty: list[str] = []
+        for var in flow.input_variables:
+            is_credential = var.category == "credential" or var.sensitive or any(
+                token in var.name.lower() for token in _CREDENTIAL_NAME_TOKENS
+            )
+            if not is_credential or var.name in supplied:
+                continue
+            if (var.value or "").strip():
+                continue
+            # 声明了却没人引用的空凭据不影响运行，报出来只会引出一次无谓的追问
+            if f"${{var.{var.name}}}" not in definition_text:
+                continue
+            empty.append(var.name)
+        return {
+            "ready": not empty,
+            "empty_credential_fields": empty,
+            "message": (
+                f"凭据变量 {empty} 有引用但没有值，运行必然失败。"
+                "请告知用户先在右侧「输入变量」面板填写后再运行，不要自动 run_flow。"
+            ) if empty else None,
+        }
+
     async def _get_flow(self, flow_id: str) -> dict[str, Any]:
         flow = await self._flow_service.get_flow(flow_id)
         if flow is None:
@@ -280,6 +325,7 @@ class RpaToolExecutor:
                 f"新增节点必须优先引用已有变量 {existing_var_names}（如 ${{var.{existing_var_names[0]}}}），"
                 "禁止为同一概念重复声明不同名称的变量。"
             )
+            data["run_readiness"] = self._credential_readiness(flow)
         return data
 
     async def _validate_flow(self, flow_id: str) -> dict[str, Any]:
@@ -1131,6 +1177,35 @@ class RpaToolExecutor:
         if failure_gate is not None:
             return failure_gate
 
+        # 调用参数塞进 variables 会被当成普通运行时变量吞掉：不报错、不生效、照常跑完。
+        # 用户以为切了执行器、实际没切，事后只能从产物反推，必须在起跑前判错。
+        misplaced = sorted(set(variables or {}) & _RUN_CALL_PARAM_NAMES)
+        if misplaced:
+            return {
+                "status": "misplaced_call_parameters",
+                "misplaced_variables": misplaced,
+                "message": (
+                    f"{misplaced} 是 run_flow 的调用参数，不是流程变量。"
+                    "写在 variables 里不会生效，运行会照常使用默认执行器。"
+                    "请把它们作为 run_flow 的顶层参数重新调用，例如 browser_executor=\"extension\"。"
+                ),
+            }
+
+        # 凭据为空时运行必然失败，且失败现场看起来像选择器问题，助手会一路查错方向。
+        # 注意判据必须基于「调用方真的传了什么」：_build_input_variable_defaults 会把每个
+        # 声明过的变量名都塞进 merged_variables（值可能是空串），拿合并结果判空永远判不出来。
+        readiness = self._credential_readiness(flow, supplied=set(variables or {}))
+        if not readiness["ready"]:
+            return {
+                "status": "empty_credential_variables",
+                "empty_credential_fields": readiness["empty_credential_fields"],
+                "message": (
+                    f"凭据变量 {readiness['empty_credential_fields']} 有引用但没有值，运行必然失败。"
+                    "**不要自行编造或猜测凭据值**，也不要改用 variable.input 绕开——"
+                    "请告知用户在右侧「输入变量」面板填写后再运行。"
+                ),
+            }
+
         # 模型常在 input_variables 无默认值时也不传 variables，导致运行中途报"变量未定义"，这里提前拦截
         input_defaults = _build_input_variable_defaults(list(flow.input_variables))
         merged_variables: dict[str, Any] = {**input_defaults, **(variables or {})}
@@ -1229,6 +1304,7 @@ class RpaToolExecutor:
                 pass  # 经验记录失败不能影响 run_flow 本身
 
         has_input_nodes = any(n.get("type") == "variable.input" for n in nodes)
+        has_takeover_nodes = any(n.get("type") == "control.human_takeover" for n in nodes)
         result: dict[str, Any] = {
             "task_id": task.task_id,
             "status": task.status if task.status in _TERMINAL else "timeout",
@@ -1236,7 +1312,18 @@ class RpaToolExecutor:
             "progress": task.progress.model_dump(mode="json") if task.progress else {},
         }
         if task.status not in _TERMINAL:
-            if has_input_nodes:
+            # 「跑得慢」和「停下来等人」都表现为非终态，但处理方式相反：前者继续等，
+            # 后者重跑只会再起一个任务、把旧的留在后台继续等。这个判断由本工具给出，
+            # 不能丢给模型自己翻流程定义猜——它猜错的代价是一个孤儿任务。
+            if task.status == "paused_for_human" or has_takeover_nodes:
+                result["status"] = "paused_for_human"
+                result["waiting_for_user_action"] = True
+                result["message"] = (
+                    "流程已暂停等待人工接管，浏览器窗口已在桌面打开。"
+                    "请提示用户完成操作后在界面顶部卡片点击【已完成，继续】，不要重新运行流程。"
+                )
+            elif has_input_nodes:
+                result["status"] = "waiting_for_user_input"
                 result["message"] = (
                     "流程含 variable.input 节点，正在等待用户在界面输入变量后继续。"
                     "请提示用户到 RPA 界面底部填写输入后点击【继续】，不要重新运行流程。"
@@ -1384,6 +1471,9 @@ class RpaToolExecutor:
         # 成功运行返回精简结果，不带 error_logs，避免诱使 AI 去"修复"本就按预期工作的 continueOnError 节点
         if is_success:
             tolerated = [entry.node_id for entry in error_logs if entry.node_id]
+            # 质量审计不合格的任务 task.status 仍是 success：照直说"无需修复"会和
+            # failure budget 「先 get_run_error 再修」的指令正面矛盾，模型只能瞎猜
+            quality_issues = self._recorded_quality_issues(task_id)
             result: dict[str, Any] = {
                 "task_id": task_id,
                 "status": "success",
@@ -1391,7 +1481,13 @@ class RpaToolExecutor:
                 "failed_node_id": None,
                 "failed_node_config": None,
                 "message": (
-                    "流程整体运行成功，无需修复。"
+                    (
+                        "流程执行本身没有报错，但这次运行的质量审计未通过："
+                        f"{'、'.join(quality_issues)}。"
+                        "根因在输出结构或抽取范围，不在节点报错，请据此修复后重跑。"
+                        if quality_issues
+                        else "流程整体运行成功，无需修复。"
+                    )
                     + (
                         f"节点 {list(dict.fromkeys(tolerated))} 启用了 continueOnError，"
                         "其局部失败已被容忍——这是预期行为，请勿修改这些节点。"
@@ -1399,6 +1495,8 @@ class RpaToolExecutor:
                     )
                 ),
             }
+            if quality_issues:
+                result["quality_audit"] = {"passed": False, "issues": quality_issues}
             if last_browser_url:
                 result["last_browser_url"] = last_browser_url
             # 成功运行也可能一路停在错误页面上（取到的是别的页的数据），照样给出证据
@@ -1781,9 +1879,37 @@ class RpaToolExecutor:
             })
 
         if selected is None:
+            # 用户要的是一篇文档时，「没有表格」不是缺陷；按表格审只会逼助手
+            # 凭空造一个 rows 变量来喂审计，真正要交付的那篇文档反而没人验
+            document = (
+                _find_document_output(variables)
+                if _requirement_wants_document(requirement_text or "")
+                else None
+            )
+            if document is not None:
+                issues.extend(self._audit_document_output(
+                    task, document, requirement_text or "", content_match_confirmed
+                ))
+                blocking = [i for i in issues if i.get("severity") != "warning"]
+                if flow is not None and blocking:
+                    self._record_quality_failure(flow.flow_id, task_id, blocking)
+                return {
+                    "task_id": task_id,
+                    "passed": not blocking,
+                    "delivery_shape": "document",
+                    "selected_variable": document["name"],
+                    "issues": blocking,
+                    "warnings": [i for i in issues if i.get("severity") == "warning"],
+                    "lint_findings": lint_findings[:12],
+                    "repair_plan": _build_quality_repair_plan(blocking),
+                }
             issues.append({
                 "issue": "no_table_like_output",
-                "message": "未找到表格型输出变量。抓取流程应输出按行结构化的表格变量，而不是只保存截图/文本/空产物。",
+                "message": (
+                    "未找到表格型输出变量。抓取流程应输出按行结构化的表格变量（list[dict]），"
+                    "而不是只保存截图/文本/空产物。observed_variables 列出了本次实际产出的变量"
+                    "以及各自不算表格的原因，请据此改抽取节点，不要换个写法重试同一个方案。"
+                ),
             })
             if flow is not None:
                 self._record_quality_failure(flow.flow_id, task_id, issues)
@@ -1792,6 +1918,7 @@ class RpaToolExecutor:
                 "passed": False,
                 "issues": issues,
                 "candidates": [],
+                "observed_variables": _describe_output_variables(variables),
                 "lint_findings": lint_findings[:12],
                 "repair_plan": _build_quality_repair_plan(issues),
             }
@@ -1859,13 +1986,18 @@ class RpaToolExecutor:
                 "allowed_values": allowed_values,
             })
 
-        passed = not issues
+        # severity=warning 的检查项只提示不拦：零星噪声推翻整次抓取，只会让助手
+        # 反复重改一个本来能交付的流程，用户看到的就是「一直在修」
+        warnings = [issue for issue in issues if issue.get("severity") == "warning"]
+        blocking = [issue for issue in issues if issue.get("severity") != "warning"]
+        passed = not blocking
         if flow is not None and not passed:
-            self._record_quality_failure(flow.flow_id, task_id, issues)
+            self._record_quality_failure(flow.flow_id, task_id, blocking)
 
         return {
             "task_id": task_id,
             "passed": passed,
+            "warnings": warnings,
             "selected_variable": selected["name"],
             "row_count": row_count,
             "headers": headers,
@@ -1877,18 +2009,89 @@ class RpaToolExecutor:
                 "enum_field": enum_field,
                 "allowed_values": allowed_values,
             },
-            "issues": issues,
-            "repair_plan": _build_quality_repair_plan(issues),
+            "issues": blocking,
+            "repair_plan": _build_quality_repair_plan(blocking),
             "lint_findings": lint_findings[:12],
             "sample_rows": rows[:3],
             "requirement_alignment": alignment,
             "content_match_confirmed": content_match_confirmed,
             "message": (
-                _alignment_pass_message(alignment, content_match_confirmed)
+                (
+                    _alignment_pass_message(alignment, content_match_confirmed)
+                    # 提示项照常交付，但要在汇报里写明，别让用户以为结果是完全干净的
+                    + ("" if not warnings else f" 另有 {len(warnings)} 条提示未构成不合格，请在汇报中如实说明。")
+                )
                 if passed
                 else "运行质量审计失败，必须继续诊断并修复流程。"
             ),
         }
+
+    def _audit_document_output(
+        self,
+        task: Any,
+        document: dict[str, Any],
+        requirement_text: str,
+        content_match_confirmed: bool,
+    ) -> list[dict[str, Any]]:
+        """文档型交付物的审计：真落盘了、有正文、内容对得上需求。
+
+        表格审计那套（行数/日期范围/枚举）对一篇 Markdown 全无意义，套上去只会
+        让每次调用都返回同一条不可执行的结论。
+        """
+        issues: list[dict[str, Any]] = []
+        body = document["value"]
+        if document["kind"] == "file":
+            path = Path(document["value"])
+            if not path.is_absolute():
+                path = storage.resolve_workspace_root() / path
+            if not path.is_file():
+                return [{
+                    "issue": "document_file_missing",
+                    "message": f"变量 `{document['name']}` 指向的产物文件不存在：{document['value']}。",
+                    "fix": "检查写文件节点的路径与 outputVariable，确认文件真的落盘后再重跑。",
+                }]
+            try:
+                body = path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                return [{
+                    "issue": "document_file_unreadable",
+                    "message": f"产物文件读取失败：{exc}",
+                }]
+
+        if len(body.strip()) < _MIN_DOCUMENT_CHARS:
+            issues.append({
+                "issue": "document_too_short",
+                "message": (
+                    f"文档只有 {len(body.strip())} 个字符，达不到一篇可交付内容的最低量。"
+                    "多半是抽取节点只取到标题或首条，正文没进来。"
+                ),
+                "fix": "用 inspect_page 确认正文容器 selector，确保抽取的是整篇内容而不是单个元素。",
+            })
+
+        targets = _extract_requirement_targets(requirement_text)
+        # rows 传单元素列表：对齐检查对非 dict/list 行按整段文本比对
+        alignment = _check_requirement_alignment(targets, [body[:20_000]], None)
+        if alignment is not None and not alignment["aligned"] and not content_match_confirmed:
+            issues.append({
+                "issue": "document_content_may_not_match_requirement",
+                "message": (
+                    f"需求指向 {alignment['targets']}，但文档正文里找不到任何一个。"
+                    "文档非空只能证明写出了东西，不能证明写对了内容。"
+                ),
+                "fix": (
+                    "读一遍文档开头与用户需求逐条比对：确实是用户要的内容，就重新调用本工具并传 "
+                    "content_match_confirmed=true；不是，则修复抽取节点后重跑。"
+                ),
+            })
+        return issues
+
+    def _recorded_quality_issues(self, task_id: str) -> list[str]:
+        """这个 task 是否有记录在案的质量审计失败（按 issue 名）。"""
+        for records in self._quality_failures_by_flow.values():
+            for record in records:
+                if record.get("task_id") == task_id:
+                    return [str(name) for name in record.get("issues") or []]
+        return []
 
     def _record_quality_failure(self, flow_id: str, task_id: str, issues: list[dict[str, Any]]) -> None:
         issue_names = [

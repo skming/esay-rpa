@@ -48,7 +48,9 @@ async function backendLoad(key: string): Promise<AiMessage[]> {
 // 有 toolCalls 但正文为空的回合也要保留：只看 content 会在流式中途的保存里丢掉整个回合
 export function isPersistableMessage(m: AiMessage): boolean {
   if (m.role === 'user') return true;
-  return m.role === 'assistant' && (m.content.trim() !== '' || (m.toolCalls?.length ?? 0) > 0);
+  // error 也算内容：断流/请求失败的回合正文是空的，丢掉的话历史里只剩用户那条提问
+  return m.role === 'assistant'
+    && (m.content.trim() !== '' || (m.toolCalls?.length ?? 0) > 0 || (m.error ?? '') !== '');
 }
 
 async function backendSave(key: string, messages: AiMessage[]): Promise<void> {
@@ -377,7 +379,12 @@ export function useAiChat(flowId: string | null, onFlowChanged?: (flowId: string
                   if (m.id !== assistantId) return m;
                   const error = m.error ?? streamError ?? undefined;
                   if (m.content.trim() === '' && !error) {
-                    return finishAssistantMessage(m, { content: '未返回内容，请检查 API Key 或更换模型' });
+                    // 调过工具却零正文多半是被 guard 拦下后直接收尾，让用户去查 API Key 是南辕北辙
+                    return finishAssistantMessage(m, {
+                      content: (m.toolCalls ?? []).length > 0
+                        ? '本轮结束但没有给出文字说明，具体做过什么见上面的处理时间线。可以让我接着说明或继续下一步。'
+                        : '未返回内容，请检查 API Key 或更换模型',
+                    });
                   }
                   return finishAssistantMessage(m, { error });
                 })
@@ -400,7 +407,10 @@ export function useAiChat(flowId: string | null, onFlowChanged?: (flowId: string
               if (m.id !== assistantId) return m;
               return {
                 ...m,
-                content: m.content || '',
+                // 正文为空的助手消息会被 isPersistableMessage 丢掉，重开会话只剩用户自己那条提问
+                content: m.content || ((m.toolCalls ?? []).length > 0
+                  ? '已按你的要求停止。上面的处理时间线是停止前完成的操作，告诉我下一步怎么走我再继续。'
+                  : '已按你的要求停止，本轮没有产生任何改动。'),
                 // running 工具卡片标记为 stopped，避免永远转圈
                 toolCalls: (m.toolCalls ?? []).map((tc) =>
                   tc.status === 'running' ? { ...tc, status: 'stopped' as const } : tc
@@ -426,9 +436,13 @@ export function useAiChat(flowId: string | null, onFlowChanged?: (flowId: string
         // 兜底：流没发 done 就结束（后端崩溃/断网）时补一次持久化
         if (!persisted) {
           setMessages((prev) =>
-            prev.map((m) =>
-              m.id === assistantId && m.processingMs === undefined ? finishAssistantMessage(m) : m
-            )
+            prev.map((m) => {
+              if (m.id !== assistantId || m.processingMs !== undefined) return m;
+              // 走到这里说明流被掐断（后端崩溃/断网），空正文就补一句可重试的说明
+              return finishAssistantMessage(m, m.content.trim() ? {} : {
+                error: '连接中断，本轮没有收到完整回复。上面的处理时间线是中断前完成的操作，可以重试继续。',
+              });
+            })
           );
           persistAfterCommitRef.current = true;
         }

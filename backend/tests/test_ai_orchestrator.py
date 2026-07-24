@@ -70,6 +70,48 @@ def test_blocked_write_gets_no_success_guidance_and_does_not_end_the_round() -> 
     assert guidance and not stop
 
 
+def test_terminal_guard_block_forces_a_closing_statement() -> None:
+    """要用户拿主意的拦截必须逼出收尾正文，否则用户只看到一个空气泡。"""
+    for action in ("report_to_user_and_stop", "needs_user_navigation_target"):
+        guidance, stop = _after_tool_guidance("run_flow", {
+            "status": "blocked_by_orchestrator_guard",
+            "required_action": action,
+        })
+        assert guidance and "不要再调用任何工具" in guidance
+        assert stop
+
+    # 只是改道的拦截仍按原样放行，强行收尾会打断本该继续的诊断
+    assert _after_tool_guidance("update_flow", {
+        "status": "blocked_by_orchestrator_guard",
+        "required_action": "call_inspect_page_first",
+    }) == (None, False)
+
+
+def test_waiting_for_the_user_does_not_burn_the_repair_budget() -> None:
+    """停下来等人不是一次失败的修复，记进熔断计数等于罚用户操作慢。"""
+    state: dict[str, Any] = {}
+    for _ in range(_MAX_REPAIR_CYCLES + 2):
+        _orchestrator_guard_after_tool("run_flow", {"status": "paused_for_human"}, state)
+        _orchestrator_guard_after_tool("run_flow", {"status": "waiting_for_user_input"}, state)
+    assert not state.get("repair_cycle_lock")
+    assert _orchestrator_guard_before_tool("run_flow", {}, state) is None
+
+    # 真失败照常计数
+    for _ in range(_MAX_REPAIR_CYCLES):
+        _orchestrator_guard_after_tool("run_flow", {"status": "error", "error": "boom"}, state)
+    assert _orchestrator_guard_before_tool("run_flow", {}, state) is not None
+
+
+def test_failure_budget_lock_still_allows_read_only_diagnosis() -> None:
+    """挡掉纯读工具等于没收诊断手段，模型只能在剩下几个工具间空转。"""
+    state: dict[str, Any] = {"failure_budget_lock": {"flow_id": "f1"}}
+    for tool in ("list_node_types", "get_run_output", "validate_flow", "get_flow"):
+        assert _orchestrator_guard_before_tool(tool, {}, state) is None
+    # 写入与运行仍然挡住，这才是这道闸的本职
+    assert _orchestrator_guard_before_tool("update_flow", {}, state) is not None
+    assert _orchestrator_guard_before_tool("run_flow", {}, state) is not None
+
+
 def test_repeated_failed_runs_lock_further_repair_attempts() -> None:
     state: dict[str, Any] = {}
     failure = {"status": "error", "error": "Page.goto: Timeout 30000ms exceeded"}
@@ -85,12 +127,22 @@ def test_repeated_failed_runs_lock_further_repair_attempts() -> None:
     assert _orchestrator_guard_before_tool("get_run_error", {}, state) is None
 
 
-def test_successful_run_clears_the_repair_cycle_counter() -> None:
-    """跑通之后接着提新需求，不该背着上一轮的失败计数。"""
+def test_quality_failures_count_as_repair_cycles() -> None:
+    """跑得起来但审计不合格是这类循环的主要形态，只数 run_flow 失败会完全数不到。"""
+    state: dict[str, Any] = {}
+    audit_failed = {"passed": False, "issues": [{"issue": "mixed_ui_rows", "message": "混入 UI 行"}]}
+    for _ in range(_MAX_REPAIR_CYCLES):
+        _orchestrator_guard_after_tool("run_flow", {"status": "success"}, state)
+        _orchestrator_guard_after_tool("assert_run_output", audit_failed, state)
+    assert _orchestrator_guard_before_tool("update_flow", {}, state) is not None
+
+
+def test_passing_audit_clears_the_repair_cycle_counter() -> None:
+    """审计通过才是一轮闭环，之后提新需求不该背着旧的失败计数。"""
     state: dict[str, Any] = {}
     for _ in range(_MAX_REPAIR_CYCLES - 1):
         _orchestrator_guard_after_tool("run_flow", {"status": "error"}, state)
-    _orchestrator_guard_after_tool("run_flow", {"status": "success"}, state)
+    _orchestrator_guard_after_tool("assert_run_output", {"passed": True}, state)
     _orchestrator_guard_after_tool("run_flow", {"status": "error"}, state)
     assert _orchestrator_guard_before_tool("update_flow", {}, state) is None
 

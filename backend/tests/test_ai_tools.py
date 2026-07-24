@@ -524,6 +524,154 @@ async def test_run_flow_threads_browser_executor_into_request_when_extension_con
     assert result.get("status") != "extension_not_connected"
 
 
+class _CredentialFlowService:
+    """凭据就绪判定的测试流程：变量是否被节点引用由 definition 决定。"""
+
+    def __init__(self, variables: list[dict[str, Any]], reference: str | None = "${var.password}") -> None:
+        self._variables = variables
+        self._reference = reference
+
+    async def get_flow(self, flow_id: str) -> FlowSnapshot:
+        now = datetime.now(UTC)
+        return FlowSnapshot(
+            flowId=flow_id,
+            name="凭据测试",
+            version="v1.0.0",
+            status="active",
+            inputVariables=self._variables,
+            definition={
+                "nodes": [
+                    {"id": "start", "type": "start"},
+                    {"id": "n1", "type": "browser.fill", "selector": "#pwd", "inputValue": self._reference or "x"},
+                ],
+                "edges": [{"source": "start", "target": "n1"}],
+            },
+            createdAt=now,
+            updatedAt=now,
+        )
+
+
+def _cred(name: str, value: str = "", category: str = "credential") -> dict[str, Any]:
+    return {"name": name, "type": "String", "value": value, "category": category}
+
+
+async def test_get_flow_computes_credential_readiness_instead_of_leaving_it_to_the_model() -> None:
+    """判空条件有三个（是不是凭据/值空不空/有没有被引用），交给模型目测必然时对时错。"""
+    executor = RpaToolExecutor(  # type: ignore[arg-type]
+        flow_service=_CredentialFlowService([_cred("password")]),
+        task_manager=FakeTaskManager(with_failing_tasks=False),
+    )
+
+    data = await executor._get_flow("flow-1")
+
+    assert data["run_readiness"]["ready"] is False
+    assert data["run_readiness"]["empty_credential_fields"] == ["password"]
+
+
+async def test_credential_readiness_ignores_filled_and_unreferenced_fields() -> None:
+    filled = RpaToolExecutor._credential_readiness(
+        await _CredentialFlowService([_cred("password", "hunter2")]).get_flow("f")
+    )
+    assert filled["ready"] is True
+
+    # 声明了却没人引用的空凭据不影响运行，报出来只会引出一次无谓的追问
+    unreferenced = RpaToolExecutor._credential_readiness(
+        await _CredentialFlowService([_cred("password")], reference=None).get_flow("f")
+    )
+    assert unreferenced["ready"] is True
+
+
+async def test_run_flow_tells_the_model_to_ask_the_user_not_to_invent_credentials() -> None:
+    """普通变量缺失可以让模型自己补，凭据不行——编一个密码只会换来一轮查选择器。"""
+    task_manager = FakeTaskManager(with_failing_tasks=False)
+    executor = RpaToolExecutor(  # type: ignore[arg-type]
+        flow_service=_CredentialFlowService([_cred("password")]),
+        task_manager=task_manager,
+    )
+
+    result = await executor._run_flow("flow-1")
+
+    assert result["status"] == "empty_credential_variables"
+    assert result["empty_credential_fields"] == ["password"]
+    assert "不要自行编造" in result["message"]
+    assert task_manager.started is False
+
+    # 调用方真的传了值就照常跑：判据看的是 variables 参数，不是被默认值填满的 merged_variables
+    ok = await executor._run_flow("flow-1", variables={"password": "hunter2"})
+    assert ok["status"] != "empty_credential_variables"
+
+
+async def _fake_sleep(_seconds: float) -> None:
+    """轮询等待在测试里没有意义，真睡 90s 会把整个套件拖死。"""
+    return None
+
+
+async def test_run_flow_rejects_call_parameters_smuggled_into_variables() -> None:
+    """browser_executor 写进 variables 会被当普通变量吞掉：不报错、不生效、照常跑完。"""
+    task_manager = FakeTaskManager(with_failing_tasks=False, extension_connected=True)
+    executor = RpaToolExecutor(flow_service=_SimpleFlowService(), task_manager=task_manager)  # type: ignore[arg-type]
+
+    result = await executor._run_flow("flow-1", variables={"browser_executor": "extension"})
+
+    assert result["status"] == "misplaced_call_parameters"
+    assert result["misplaced_variables"] == ["browser_executor"]
+    assert task_manager.started is False
+
+
+class _TakeoverFlowService:
+    """含人工接管节点的流程：运行会停在非终态等人，而不是跑得慢。"""
+
+    def __init__(self, node_type: str) -> None:
+        self._node_type = node_type
+
+    async def get_flow(self, flow_id: str) -> FlowSnapshot:
+        now = datetime.now(UTC)
+        return FlowSnapshot(
+            flowId=flow_id,
+            name="等待用户测试",
+            version="v1.0.0",
+            status="active",
+            inputVariables=[],
+            definition={
+                "nodes": [
+                    {"id": "start", "type": "start"},
+                    {"id": "n1", "type": self._node_type, "title": "等用户"},
+                ],
+                "edges": [{"source": "start", "target": "n1"}],
+            },
+            createdAt=now,
+            updatedAt=now,
+        )
+
+
+async def test_run_flow_reports_paused_for_human_instead_of_timeout(monkeypatch) -> None:
+    """判成 timeout 会让助手重跑，旧任务留在后台继续等——用户面前多一个孤儿任务。"""
+    import asyncio as _asyncio
+
+    monkeypatch.setattr(_asyncio, "sleep", _fake_sleep)
+    task_manager = FakeTaskManager(with_failing_tasks=False, extension_connected=True)
+    executor = RpaToolExecutor(flow_service=_TakeoverFlowService("control.human_takeover"), task_manager=task_manager)  # type: ignore[arg-type]
+
+    result = await executor._run_flow("flow-1")
+
+    assert result["status"] == "paused_for_human"
+    assert result["waiting_for_user_action"] is True
+    assert "不要重新运行流程" in result["message"]
+
+
+async def test_run_flow_reports_waiting_for_user_input_instead_of_timeout(monkeypatch) -> None:
+    import asyncio as _asyncio
+
+    monkeypatch.setattr(_asyncio, "sleep", _fake_sleep)
+    task_manager = FakeTaskManager(with_failing_tasks=False, extension_connected=True)
+    executor = RpaToolExecutor(flow_service=_TakeoverFlowService("variable.input"), task_manager=task_manager)  # type: ignore[arg-type]
+
+    result = await executor._run_flow("flow-1")
+
+    assert result["status"] == "waiting_for_user_input"
+    assert result["waiting_for_user_input"] is True
+
+
 async def test_get_run_error_returns_root_cause_hints_for_login_detection_failure() -> None:
     task_manager = FakeTaskManager()
     executor = RpaToolExecutor(flow_service=FakeFlowService(), task_manager=task_manager)  # type: ignore[arg-type]

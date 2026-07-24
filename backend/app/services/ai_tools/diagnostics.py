@@ -233,6 +233,84 @@ def _find_table_candidates(variables: dict[str, Any]) -> list[dict[str, Any]]:
     return candidates
 
 
+# 需求里出现这些词，说明用户明确要的是按行/按列的结构化数据
+_TABLE_REQUIREMENT_TOKENS = (
+    "表格", "表头", "csv", "excel", "xlsx", "每行", "每一行", "逐行", "清单", "列表", "字段",
+)
+# 出现这些词，用户要的交付物是一篇文档
+_DOCUMENT_REQUIREMENT_TOKENS = (
+    "markdown", "md 格式", "总结", "摘要", "报告", "纪要", "综述", "文档", "文章",
+)
+_MIN_DOCUMENT_CHARS = 200  # 少于这个量的「总结」通常只有标题没正文
+_DOCUMENT_FILE_SUFFIXES = (".md", ".markdown", ".txt", ".html", ".htm", ".docx", ".pdf")
+
+
+def _requirement_wants_document(requirement_text: str) -> bool:
+    """需求要的是一篇文档，而不是一张按行结构化的表。
+
+    形态判错的代价是单向的：把文档需求按表格审，助手只能临时造一个 rows 变量
+    去喂审计，用户真正要的那篇文档反而没人验。所以需求里同时出现表格类词就
+    退回按表格审——宁可漏判，不可误判。
+    """
+    text = (requirement_text or "").lower()
+    if any(token in text for token in _TABLE_REQUIREMENT_TOKENS):
+        return False
+    return any(token in text for token in _DOCUMENT_REQUIREMENT_TOKENS)
+
+
+def _looks_like_document_path(value: str) -> bool:
+    return (
+        "\n" not in value
+        and len(value) < 400
+        and value.lower().endswith(_DOCUMENT_FILE_SUFFIXES)
+    )
+
+
+def _find_document_output(variables: dict[str, Any]) -> dict[str, Any] | None:
+    """挑出这次运行最像交付文档的输出：写出去的文件路径，或够长的正文文本。"""
+    best: dict[str, Any] | None = None
+    for name, value in variables.items():
+        if not isinstance(value, str):
+            continue
+        if _looks_like_document_path(value):
+            # 文件路径优先于正文变量：正文往往是中间量，落盘的那份才是交付物
+            candidate = {"name": name, "kind": "file", "value": value, "score": 1000 + len(name)}
+        elif len(value) >= _MIN_DOCUMENT_CHARS:
+            candidate = {"name": name, "kind": "text", "value": value, "score": min(len(value), 20_000)}
+        else:
+            continue
+        if best is None or candidate["score"] > best["score"]:
+            best = candidate
+    return best
+
+
+def _describe_output_variables(variables: dict[str, Any]) -> list[dict[str, Any]]:
+    """如实列出这次运行到底产出了什么，以及每个变量为什么不算表格。
+
+    只说「没有表格型变量」而不说有什么，模型除了换个写法再试一次别无选择，
+    重复调用拿回的还是同一句话——空转就是这么烧出来的。
+    """
+    described: list[dict[str, Any]] = []
+    for name, value in variables.items():
+        item: dict[str, Any] = {"name": name}
+        if isinstance(value, list):
+            item["kind"] = f"list（{len(value)} 项）"
+            item["sample"] = [str(v)[:60] for v in value[:2]]
+            if value and not _coerce_table_rows(value):
+                item["why_not_table"] = "元素是纯文本，不是 dict/list，无法按行结构化"
+        elif isinstance(value, dict):
+            item["kind"] = f"dict（{len(value)} 键）"
+            item["sample"] = list(value)[:8]
+            item["why_not_table"] = "单个对象不是行集合；要成表需要 list[dict]"
+        else:
+            text = str(value)
+            item["kind"] = f"text（{len(text)} 字符）"
+            item["sample"] = text[:80]
+            item["why_not_table"] = "标量文本不是行集合"
+        described.append(item)
+    return described[:20]
+
+
 def _coerce_table_rows(value: Any) -> list[Any]:
     if isinstance(value, list):
         if value and all(isinstance(item, str) for item in value):
@@ -333,6 +411,11 @@ def _is_header_echo_row(row: dict[str, Any]) -> bool:
     return all(key == value for key, value in filled)
 
 
+_UI_CONTROL_TOKENS = frozenset({"上一页", "下一页", "确定", "取消", "今天", "清空"})
+_UI_CONTROL_CELL_MAX_LEN = 8  # 控件文案都很短，超过这个长度的单元格按正文看待
+_MIXED_UI_ROWS_TOLERANCE = 0.05  # 噪声行占比低于此值只提示，不判整次抓取不合格
+_MIXED_UI_ROWS_TOLERATED_MAX = 3
+
 _SPARSE_ROW_FILL_RATIO = 0.5  # 有效字段占比低于此值视为空行
 _SPARSE_ROWS_SHARE = 0.3  # 稀疏行占比超过此值才报，少量合计/备注行属正常
 
@@ -362,10 +445,30 @@ def _detect_sparse_rows(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     }
 
 
+def _is_ui_control_row(compact: list[str]) -> bool:
+    """整行是否是日历面板 / 分页 / 按钮这类控件行。
+
+    控件关键词只在短单元格上全等匹配。之前是把整行拼起来做子串扫描，
+    结果「不确定」命中「确定」，一条 500 字的论坛评论被判成分页控件——
+    助手据此反复收窄一个本来就正确的 selector，直到撞上 failure budget。
+    """
+    weekday_set = {"日", "一", "二", "三", "四", "五", "六"}
+    if len(compact) == 7 and set(compact) <= weekday_set:
+        return True
+    numeric_cells = sum(1 for value in compact if re.fullmatch(r"\d{1,2}", value))
+    if len(compact) in {6, 7} and numeric_cells >= 5:
+        return True
+    return any(
+        len(value) <= _UI_CONTROL_CELL_MAX_LEN and value in _UI_CONTROL_TOKENS
+        for value in compact
+    )
+
+
 def _detect_mixed_ui_rows(rows: list[Any]) -> dict[str, Any] | None:
     """检测抓取结果是否混入日期面板、分页、按钮等非业务 UI 行。"""
-    ui_like_indexes: list[int] = []
-    for index, row in enumerate(rows[:80]):
+    ui_like: list[tuple[int, str]] = []
+    scanned = rows[:80]
+    for index, row in enumerate(scanned):
         values: list[str]
         if isinstance(row, dict):
             values = [str(value).strip() for value in row.values()]
@@ -374,29 +477,28 @@ def _detect_mixed_ui_rows(rows: list[Any]) -> dict[str, Any] | None:
         else:
             continue
         compact = [value for value in values if value]
-        if not compact:
-            continue
-        joined = "|".join(compact)
-        weekday_set = {"日", "一", "二", "三", "四", "五", "六"}
-        if len(compact) == 7 and set(compact) <= weekday_set:
-            ui_like_indexes.append(index)
-            continue
-        numeric_cells = sum(1 for value in compact if re.fullmatch(r"\d{1,2}", value))
-        if len(compact) in {6, 7} and numeric_cells >= 5:
-            ui_like_indexes.append(index)
-            continue
-        if any(token in joined for token in ("上一页", "下一页", "确定", "取消", "今天", "清空")):
-            ui_like_indexes.append(index)
-            continue
-    if not ui_like_indexes:
+        if compact and _is_ui_control_row(compact):
+            ui_like.append((index, "|".join(compact)[:120]))
+    if not ui_like:
         return None
+    # 页首导航这类零星噪声不该推翻整次抓取：降级为提示，由 AI 拿着样本自行判断是否值得收窄
+    tolerated = (
+        len(ui_like) <= _MIXED_UI_ROWS_TOLERATED_MAX
+        and len(ui_like) / len(scanned) <= _MIXED_UI_ROWS_TOLERANCE
+    )
     return {
         "issue": "mixed_ui_rows",
+        "severity": "warning" if tolerated else "blocking",
         "message": (
+            f"{len(ui_like)}/{len(scanned)} 行疑似日历、分页或按钮等非业务 UI 控件行，占比很低。"
+            "样本确实是噪声就收窄 selector 后重跑；只是正文碰巧短小则可以照常交付，无需为此重改流程。"
+            if tolerated else
             "结果中混入了日历、分页、按钮或其他非业务 UI 控件行。"
             "这说明抽取 selector/scope 过宽，虽然有行数据，但不能证明业务筛选和字段约束可信。"
         ),
-        "ui_like_row_indexes": ui_like_indexes[:10],
+        "ui_like_row_indexes": [index for index, _ in ui_like[:10]],
+        # 只给行号，模型无从判断是真噪声还是误报，只能盲改 selector
+        "ui_like_row_samples": [{"row_index": index, "text": text} for index, text in ui_like[:5]],
     }
 
 
@@ -719,6 +821,28 @@ def _build_quality_repair_plan(issues: list[dict[str, Any]]) -> list[dict[str, A
                 "确保表头和数据行被结构化输出；必要时单独抽取表头并设置 includeInResult=false。",
                 "使用 table 模式输出 list[list] 或 list[dict]，避免纯文本拼接。",
                 "重新运行 assert_run_output，让工具自动从表头/行值匹配约束字段。",
+            ],
+        })
+    if "no_table_like_output" in issue_names:
+        plan.append({
+            "action": "produce_structured_rows",
+            "reason": "整次运行没有任何可按行读取的变量，抓取结果无法验证。",
+            "steps": [
+                "先看本次返回的 observed_variables：那是实际产出，含每个变量不算表格的原因。",
+                "若已有一个 list 里装的是纯文本，改抽取节点 extractMode='table' 让它直接产出 list[dict]，"
+                "不要再加一个脚本节点把文本二次拼成表——那只是把同一个问题往后挪一格。",
+                "若这次交付物本来就该是一篇文档，说明需求文本没体现出这一点："
+                "直接向用户确认交付形态，不要造 rows 变量来迎合本条检查。",
+            ],
+        })
+    if any(name.startswith("document_") for name in issue_names):
+        plan.append({
+            "action": "fix_document_content",
+            "reason": "文档型交付物已写出，但内容量或内容本身对不上需求。",
+            "steps": [
+                "用 inspect_page 确认正文容器 selector 抓的是整篇内容，而非单个标题元素。",
+                "分页/展开类内容确认循环真的翻完了，检查 countVariable 的实际值。",
+                "确认文档内容确实是用户要的之后，传 content_match_confirmed=true 重新调用本工具。",
             ],
         })
     if not plan and issues:
