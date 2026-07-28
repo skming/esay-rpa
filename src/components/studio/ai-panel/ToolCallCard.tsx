@@ -1,4 +1,4 @@
-import { CheckCircle2, ChevronRight, CircleAlert, CircleSlash, Loader2, ShieldAlert } from 'lucide-react';
+import { CheckCircle2, ChevronRight, ChevronUp, CircleAlert, CircleSlash, Loader2, ShieldAlert } from 'lucide-react';
 import type { ReactElement } from 'react';
 import { useState } from 'react';
 import { cn } from '../../../lib/utils';
@@ -110,12 +110,19 @@ function summarize(toolCall: ToolCallState): string | null {
 export function ToolCallCard({
   toolCall,
   live = true,
+  expanded: controlledExpanded,
+  onToggle,
 }: {
   toolCall: ToolCallState;
   live?: boolean;
+  /** 传入即受控，由外层做「同时只展开一条」；不传则自管，供单独渲染的场景使用 */
+  expanded?: boolean;
+  onToggle?: () => void;
   onFocusNode?: (nodeId: string) => void;
 }): ReactElement {
-  const [expanded, setExpanded] = useState(false);
+  const [selfExpanded, setSelfExpanded] = useState(false);
+  const expanded = controlledExpanded ?? selfExpanded;
+  const toggle = onToggle ?? ((): void => setSelfExpanded((value) => !value));
   const label = TOOL_LABELS[toolCall.tool] ?? toolCall.tool;
   const detail = summarize(toolCall);
   // A "running" card in a non-live (historical) conversation means the session ended mid-stream.
@@ -135,8 +142,9 @@ export function ToolCallCard({
       )}
     >
       <button
+        aria-expanded={expanded}
         className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left hover:bg-black/2"
-        onClick={() => setExpanded((value) => !value)}
+        onClick={toggle}
         type="button"
       >
         {status === 'running' ? (
@@ -189,6 +197,15 @@ export function ToolCallCard({
               <CodeBlock code={JSON.stringify(toolCall.result, null, 2)} language="json" maxHeight={192} variant="light" />
             </div>
           )}
+          {/* 展开体高到读完就看不见标题行了，底部再给一个收起入口，省掉反向滚动去找折叠箭头 */}
+          <button
+            className="flex w-full items-center justify-center gap-1 border-t border-slate-100 py-1.5 text-[10px] font-medium text-slate-400 transition-colors hover:bg-slate-50 hover:text-slate-600"
+            onClick={toggle}
+            type="button"
+          >
+            <ChevronUp className="h-3 w-3" strokeWidth={2} />
+            收起
+          </button>
         </div>
       )}
     </div>
