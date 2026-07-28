@@ -129,6 +129,13 @@ Easy RPA 是一款运行在本地的桌面端 RPA（机器人流程自动化）�
 
 > Python 脚本中可直接用 `_vars['xxx']` 访问所有流程变量，无需额外导入。可用内置包仅限：`json`、`os`、`re`、`csv`、`datetime`、`math`、`pathlib`、`urllib`、`hashlib`、`openpyxl`。
 
+**脚本的能力边界**（`backend/app/services/ai_tools/script_capabilities.py` 单点声明，写进节点说明的同时也是 lint 的放行范围）：
+
+| 能力         | 当前状态                                                                                                                                                          |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 产出格式     | 标准库格式（`.csv/.json/.md/.txt/.html/.xml/.zip`）随便写；第三方库按环境实际探测（`find_spec`），当前 `.xlsx` 可用（openpyxl），`.pdf/.docx/.pptx` 缺库不可用。缺库时不允许自己拼字节流——那样照样跑成 `success`，坏在用户打开文件那一刻，所以 lint 以 `unavailable_artifact_format`（error）在运行前拦下，出路是换格式或让用户装库。往 `pyproject` 加一个库，节点说明与放行范围同时生效，无需改代码 |
+| 语义加工     | **没有**会调模型的节点，脚本只能做规则处理（原文摘录、按句截取、词频统计、正则抽取）。声称「总结/摘要/改写/翻译」会被 `claimed_semantic_capability_unavailable`（error）拦下，出路是告诉用户平台只能给规则产物、并把节点与文档里的说法改成实际做的事 |
+
 ### 3.7 文件操作（9 种）
 
 `file.read` / `file.write` / `file.copy` / `file.move` / `file.delete` / `file.list` / `file.compress` / `file.rename` / `file.watch`
@@ -206,7 +213,7 @@ RPA 助手（对话面板）通过工具调用（Function Calling）直接操作
 - **检查页面 DOM**：读取当前页面的输入框、按钮、链接、表格、可见选项和页面布局（`inspect_page`）
 - **识别日期控件并给出交互配方**：`inspect_page` 会返回 `date_controls[].interaction_recipe`——命中 Element UI / Ant Design 时用内置配方；其他组件库（Arco/Vant/iView/自研）按输入框的日期特征推断出 `library:"generic"` 的通用配方，selector 同样取自真实 DOM。两者都以「键入日期文本 + Enter + 回读硬门控」为主路线
 - **校验变量引用**完整性（`validate_flow`）
-- **审计运行质量**：运行成功后检查输出是否可验证、是否混入 UI 行、是否满足日期/枚举等需求约束（`assert_run_output`）
+- **审计运行质量**：运行成功后检查输出是否可验证、是否混入 UI 行、是否满足日期/枚举等需求约束（`assert_run_output`）。文档型交付（md/html/pdf…）额外比对本次抓取到的数据是否真的出现在正文里（`document_missing_run_data`）——正文整篇由脚本写出，只比需求关键词等于让模型拿自己写的标题自证，这条不接受自证
 - **发布流程**（`publish_flow`，将状态改为 `active`，使其可被调度和子流程调用）
 
 对话面板会实时显示本轮的轮次、token 消耗（含缓存命中比例）、模型耗时与被护栏拦下的次数，
@@ -218,8 +225,13 @@ RPA 助手**无法做到**：
 - 保证首次生成的选择器（CSS selector）一定匹配目标页面；选择器基于 DOM 检查和运行反馈持续修复
 - 记住跨会话的对话内容本身（新对话从空上下文开始；跨会话延续的只有下方「站点经验档案」「修复台账」「会话检查点」这三份**由真实运行结果沉淀**的结构化记录）
 - 操作需要强验证或反爬保护的网站
+- **做语义加工**：平台没有会调模型的节点，所以「总结/摘要/润色/翻译」只能得到规则产物（原文摘录、按句截取、词频统计）。助手会先说明这件事，由用户决定接受还是改需求；把规则产物命名成「总结」会被 lint 在运行前拦下
+- 生成当前环境缺库的产物格式（见 3.6「脚本的能力边界」）：会停下来问用户装库还是换格式，不会自己拼字节流糊过去
 
 ### RPA 助手质量闸门
+
+闸门的判据一律挂在**节点实际做的事**上，不挂节点类型白名单：同一个缺陷换一种脚本语言写、
+换一个等价节点做，必须一样拦得住——否则闸门的宽严取决于模型的写法偏好，而抹平模型差异正是它的目的。
 
 RPA 助手的关键安全规则不只依赖 system prompt，而是在编排层和工具层硬执行。这些护栏登记在
 一张策略表里（`backend/app/services/ai_guards.py`），提示词中的「系统硬约束」段落由该表自动
@@ -230,7 +242,7 @@ RPA 助手的关键安全规则不只依赖 system prompt，而是在编排层�
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Selector 失败熔断 | `get_run_error` 返回 `inspect_hint` 后，编排层会阻止继续 `run_flow` 或盲目修节点，直到调用 `inspect_page` 获取真实 DOM                                                    |
 | 质量审计熔断      | `assert_run_output.passed=false` 后，未按 `repair_plan` 修复前会阻止再次 `run_flow`                                                                                       |
-| 阻断级 lint       | `critical_action_continue_on_error`、`script_uses_browser_dom`、`table_extract_selector_targets_container`、`date_filter_missing_verification`、`submit_key_on_body`、`client_side_filter_masks_page_filter`、`login_without_navigation_to_data_page`、`probe_extract_without_continue_on_error` 等发现会阻止不可信运行 |
+| 阻断级 lint       | `critical_action_continue_on_error`、`script_uses_browser_dom`、`table_extract_selector_targets_container`、`date_filter_missing_verification`、`submit_key_on_body`、`client_side_filter_masks_page_filter`、`login_without_navigation_to_data_page`、`probe_extract_without_continue_on_error`、`unavailable_artifact_format`、`claimed_semantic_capability_unavailable` 等发现会阻止不可信运行 |
 | 重复修复去重      | 同一对话中重复提交完全相同的节点 patch 会被拒绝，防止弱模型反复无效尝试                                                                                                   |
 | 节点级修复熔断    | 同一节点的 selector 累计修改 2 次后，第 3 次修改会被阻断，必须先获取新页面证据（`inspect_page` / `inspect_screenshot` / `get_run_error` 失败截图）；疑似验证码时会被引导改插 `control.human_takeover` 而非继续改 selector |
 | 跨会话修复台账    | 上述计数落盘在 `~/.easy-rpa/ai/repairs/flow_<id>.json`，新会话读回后继续累计；开场即把「这些节点改过几次、试过哪些 selector」告知模型，避免用户回一句「还是不行」就重试同一批失败方案。`assert_run_output` 通过即清账 |

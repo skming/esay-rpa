@@ -2213,6 +2213,24 @@ def test_justified_fixed_count_chain_is_downgraded_to_warn():
     assert bare["severity"] == "error"
 
 
+def test_unrolled_load_more_chain_is_flagged_like_any_other_repeat():
+    """规则的 fix 文案点名了「点到加载更多消失」，却漏掉了 browser.clickLoadMore 本身。
+
+    加载更多是这条规则最典型的形态，而它的行选择器叫 targetSelector——
+    字段名换一个就整条规避，等于闸门只对模型选了 browser.click 的那一半生效。
+    """
+    nodes = [
+        {"id": f"m{i}", "type": "browser.clickLoadMore", "title": "加载更多",
+         "targetSelector": ".load-more"}
+        for i in range(4)
+    ]
+    edges = [{"source": f"m{i}", "target": f"m{i + 1}"} for i in range(3)]
+
+    finding = next(f for f in _lint_flow(nodes, edges) if f["issue"] == "unrolled_repeat_click_chain")
+    assert finding["severity"] == "error"
+    assert finding["chain_node_ids"] == ["m0", "m1", "m2", "m3"]
+
+
 def test_two_identical_clicks_are_not_a_chain():
     nodes, edges = _click_chain(2, ".next-month")
     assert not any(f["issue"] == "unrolled_repeat_click_chain" for f in _lint_flow(nodes, edges))
@@ -2340,6 +2358,10 @@ def test_text_only_scrape_flow_is_warned_before_running() -> None:
     # 脚本把文本整理成行也不报：脚本输出形态静态不可知，宁可漏报不误报
     parser = {"id": "n11b", "type": "script.python", "title": "整理为结构化行", "outputVariable": "stats_rows"}
     assert _lint_scrape_flow_without_table_output([text_extract, parser]) == []
+    # 这是豁免不是判据：换成 JS 脚本或列变换节点做同一件事，同样不该凭空多一条误报
+    for node_type in ("script.javascript", "data.list.map", "data.convert"):
+        equivalent = {**parser, "id": "n11c", "type": node_type}
+        assert _lint_scrape_flow_without_table_output([text_extract, equivalent]) == [], node_type
     # 没有抽取节点的流程（纯填单/点击）不在这条规则管辖内
     assert _lint_scrape_flow_without_table_output([{"id": "n1", "type": "browser.fill", "selector": "#a"}]) == []
 
@@ -2652,6 +2674,72 @@ def test_client_side_filter_is_blocked_as_masking_for_any_field() -> None:
     ]
 
 
+def test_client_side_filter_is_judged_the_same_in_every_script_language() -> None:
+    """静默丢数据与用哪种脚本语言写无关，这条规则却跑在三种通道上只认 Python 写法。
+
+    两个方向都错：JS 的 filter/push 查不出来（漏掉真实数据缺失），
+    JS 的 throw 又不被当断言（把正确写法判成过滤）。
+    """
+    from app.services.ai_tools.lint_scenarios import _lint_client_side_filter_masks_page_filter
+
+    page_filter = {
+        "id": "n_d1", "type": "browser.fill", "title": "填写开始日期",
+        "selector": "input[placeholder='开始日期']", "inputValue": "${var.date_start}",
+    }
+    js_filtering = {
+        "id": "n_js", "type": "script.javascript", "title": "整理数据",
+        "code": (
+            "const start = vars.date_start;\n"
+            "const kept = rows.filter(r => r.date >= start);\n"
+            "console.log(JSON.stringify(kept));\n"
+        ),
+    }
+    js_asserting = dict(js_filtering, id="n_js_ok", code=(
+        "const start = vars.date_start;\n"
+        "const bad = rows.filter(r => r.date < start);\n"
+        "if (bad.length) { throw new Error('日期越界，页面筛选没生效'); }\n"
+    ))
+
+    assert [f["issue"] for f in _lint_client_side_filter_masks_page_filter([page_filter, js_filtering])] == [
+        "client_side_filter_masks_page_filter"
+    ]
+    assert _lint_client_side_filter_masks_page_filter([page_filter, js_asserting]) == []
+
+
+def test_date_readback_gate_counts_whichever_language_wrote_it() -> None:
+    """回读硬门控是不是门控，取决于「不一致就让流程失败」，不取决于用 Python 还是 JS 写。
+
+    只扫 script.python 的话，同样一道比对写成 script.javascript 就被判成缺门控——
+    这是 error 级，会直接拦住一个本来正确的流程。
+    """
+    from app.services.ai_tools.lint_scenarios import _lint_filter_control_risks
+
+    write = {"id": "n_w", "type": "browser.fill", "title": "填写开始日期",
+             "selector": ".start", "inputValue": "${var.date_start}"}
+    readback = {"id": "n_r", "type": "browser.extract", "title": "回读开始日期",
+                "selector": ".start", "extractMode": "attribute", "attribute": "value",
+                "firstValueVariable": "start_actual"}
+    js_gate = {"id": "n_g", "type": "script.javascript", "title": "校验日期已提交",
+               "code": "if (vars.start_actual !== vars.date_start) { throw new Error('日期未提交'); }\n"}
+
+    assert [f["issue"] for f in _lint_filter_control_risks([write, readback])] == [
+        "date_filter_missing_verification"
+    ], "没有任何比对时必须报"
+    assert _lint_filter_control_risks([write, readback, js_gate]) == []
+
+
+def test_date_filter_written_through_a_dropdown_still_needs_the_gate() -> None:
+    """日期条件用 select 写、或走桌面通道写，静默失效的方式完全一样。"""
+    from app.services.ai_tools.lint_scenarios import _lint_filter_control_risks
+
+    for node_type in ("browser.select", "ui.fill"):
+        node = {"id": "n_w", "type": node_type, "title": "选择开始时间",
+                "selector": ".start", "inputValue": "2026-07-01"}
+        assert [f["issue"] for f in _lint_filter_control_risks([node])] == [
+            "date_filter_missing_verification"
+        ], node_type
+
+
 def test_navigation_trace_flags_route_guard_redirect() -> None:
     """导航被路由守卫打回时，证据要由工具给出，而不是让 AI 自己翻日志拼。"""
     nodes = [
@@ -2745,6 +2833,22 @@ def test_probe_extract_feeding_a_branch_must_tolerate_zero_matches() -> None:
     assert "probe_extract_without_continue_on_error" not in {
         f["issue"] for f in _lint_flow(standalone, [])
     }
+
+
+def test_probe_count_feeding_a_loop_exit_has_the_same_zero_ambiguity() -> None:
+    """「数到 0」的歧义与消费它的是 if 还是循环退出条件无关。
+
+    只认 control.condition 的话，模型改用 control.repeat_until 表达同一件事就不再提示，
+    而元素不存在时运行器抛的仍然是超时，流程照样直接失败。
+    """
+    nodes = [
+        {"id": "n_probe", "type": "browser.extract", "selector": ".load-more",
+         "extractMode": "count", "countVariable": "more_count"},
+        {"id": "n_loop", "type": "control.repeat_until", "condition": "more_count == 0"},
+    ]
+    edges = [{"source": "n_probe", "target": "n_loop"}]
+
+    assert "probe_extract_without_continue_on_error" in {f["issue"] for f in _lint_flow(nodes, edges)}
 
 
 def test_runtime_variable_type_accepts_any_case() -> None:

@@ -29,6 +29,15 @@ from app.services.ai_tools.variables import (
 # 两类循环节点的出边契约完全一致（body/exit），结构规则共用
 _LOOP_LIKE_NODE_TYPES = frozenset({"control.foreach", "control.repeat_until"})
 
+# 「后面还要拿结果」的节点：等待、取数、落盘。被吞掉的失败要归因错，前提是下游还有这么一步；
+# 少收一类（脚本落盘、桌面通道取数、翻页）就等于换个写法同一个错误归因不再提示。
+_RESULT_STEP_NODE_TYPES = frozenset({
+    "browser.wait", "browser.extract", "browser.paginateNext",
+    "ui.wait", "ui.extract",
+    "file.write", "excel.addrow", "excel.save", "excel.write",
+    "script.python", "script.javascript", "script.shell",
+})
+
 # Credential-like variable name keywords
 _CREDENTIAL_KEYWORDS = frozenset({
     "password", "passwd", "pwd", "username", "account", "user",
@@ -478,7 +487,7 @@ def _lint_critical_continue_on_error(nodes: list[Any], edges: list[Any]) -> list
             continue
         downstream = _collect_downstream_nodes(str(node.get("id")), downstream_by_source, node_map, limit=8)
         has_result_step = any(
-            str(candidate.get("type")) in {"browser.wait", "browser.extract", "file.write", "excel.addrow", "excel.save"}
+            str(candidate.get("type")) in _RESULT_STEP_NODE_TYPES
             for candidate in downstream
         )
         if not has_result_step:

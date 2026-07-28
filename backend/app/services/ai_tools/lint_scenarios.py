@@ -273,6 +273,15 @@ def _lint_navigation_risks(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return findings
 
 
+# 把值写进筛选控件的动作，浏览器与桌面两条通道对等：同一个日期筛选用哪条通道写、
+# 用输入框还是下拉还是日历格，都可能「显示了值但组件没提交」。
+# browser.press 不在此列——它按的是键（Enter），不携带筛选值，收进来只会把 "enter" 当条件值。
+_VALUE_WRITE_NODE_TYPES = frozenset({
+    "browser.fill", "browser.click", "browser.select", "browser.check",
+    "ui.fill", "ui.click", "ui.select", "ui.check",
+})
+
+
 def _lint_filter_control_risks(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     def _is_date_related(node: dict[str, Any]) -> bool:
@@ -283,17 +292,20 @@ def _lint_filter_control_risks(nodes: list[dict[str, Any]]) -> list[dict[str, An
     # 页面于是返回全量数据、流程一路绿灯。所以拦的不是写法，而是缺少回读校验这件事。
     date_write_nodes = [
         node for node in nodes
-        if node.get("type") in ("browser.fill", "browser.click") and _is_date_related(node)
+        if node.get("type") in _VALUE_WRITE_NODE_TYPES and _is_date_related(node)
     ]
     readback_vars = {
         str(node.get("firstValueVariable") or node.get("outputVariable") or "")
         for node in nodes
-        if node.get("type") == "browser.extract"
+        if node.get("type") in _EXTRACT_NODE_TYPES
         and str(node.get("attribute", "")).lower() == "value"
         and _is_date_related(node)
     } - {""}
+    # 门控用哪种语言写不影响它是不是门控；只认 script.python 会把 JS/shell 写的同一道比对判成缺门控。
+    # control.condition 不算：它只分支，false 分支接到 end 就是静默放过，不会让运行失败。
     script_code = "\n".join(
-        str(node.get("code", "")) for node in nodes if node.get("type") == "script.python"
+        str(node.get("code", "")) for node in nodes
+        if node.get("type") in _SCRIPT_CHANNEL_NODE_TYPES
     )
     gated = any(var in script_code for var in readback_vars)
     if date_write_nodes and not gated:
@@ -431,7 +443,12 @@ _TABLE_HINT_KEYWORDS: tuple[str, ...] = (
 _UNROLLED_CHAIN_MIN_LENGTH = 3
 # 够写下「为什么是这个次数」的最短长度；空串和「点击」这种占位描述算不上依据
 _REPEAT_JUSTIFICATION_MIN_LENGTH = 8
-_UNROLLABLE_NODE_TYPES = ("browser.click", "browser.press", "browser.scroll")
+# 能被「重复 N 次」展开的动作。clickLoadMore 是这条规则最典型的案例（fix 文案里点了名的
+# 「点到加载更多消失」），漏掉它等于放过主要形态；桌面通道的点击同理。
+_UNROLLABLE_NODE_TYPES = (
+    "browser.click", "browser.press", "browser.scroll", "browser.clickLoadMore",
+    "ui.click",
+)
 
 
 def _lint_unrolled_repeat_chain(nodes: list[Any], edges: list[Any]) -> list[dict[str, Any]]:
@@ -454,7 +471,8 @@ def _lint_unrolled_repeat_chain(nodes: list[Any], edges: list[Any]) -> list[dict
         node = node_map.get(node_id)
         if not isinstance(node, dict) or node.get("type") not in _UNROLLABLE_NODE_TYPES:
             return None
-        selector = str(node.get("selector") or "").strip()
+        # 同一个「点哪儿」在不同节点类型上叫不同字段名（clickLoadMore 用 targetSelector）
+        selector = str(node.get("selector") or node.get("targetSelector") or "").strip()
         return (str(node["type"]), selector) if selector else None
 
     findings: list[dict[str, Any]] = []
@@ -510,7 +528,8 @@ def _lint_unrolled_repeat_chain(nodes: list[Any], edges: list[Any]) -> list[dict
     return findings
 
 
-_EXTRACT_NODE_TYPES = ("browser.extract", "ui.extract")
+# 抽取节点：浏览器与桌面两条通道，凡是判「抽取」的规则都用这一份
+_EXTRACT_NODE_TYPES = frozenset({"browser.extract", "ui.extract"})
 _BARE_CLASS_SELECTOR = re.compile(r"(?:div|span|section|ul|ol)?\.[A-Za-z0-9_-]+$")
 
 
@@ -556,8 +575,13 @@ _ROW_SELECTOR_FIELD_BY_TYPE = {
 }
 
 
-# 输出形态静态不可知的节点，一律按「可能出表」放行，避免误报
-_ROW_PRODUCING_TYPES = frozenset({"script.python", "data.json.parse", "excel.read", "http.request"})
+# 输出形态静态不可知的节点，一律按「可能出表」放行，避免误报。
+# 这是豁免而不是判据：漏一个类型就是凭空多一条误报，所以三种脚本通道和所有列变换节点都要在内。
+_ROW_PRODUCING_TYPES = frozenset({
+    "script.python", "script.javascript", "script.shell",
+    "data.json.parse", "data.list.map", "data.convert",
+    "excel.read", "http.request",
+})
 
 
 def _lint_scrape_flow_without_table_output(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -788,11 +812,18 @@ _ERROR_MESSAGE_CALL = re.compile(
 _STDERR_REDIRECT = re.compile(r">&\s*2|>>?\s*/dev/stderr")
 
 
-# 「按条件保留子集」的脚本特征：既做比较，又把命中的行收进一个新集合
-_SUBSET_BUILD_RE = re.compile(r"\.append\(|\[[^\]]{0,120}\bfor\b[^\]]{0,120}\bif\b")
-_CONDITION_COMPARE_RE = re.compile(r"[<>]=?|==|!=|\bin\b|between|startswith|endswith")
-# 把筛选条件写进页面的节点类型：填输入框、选下拉、勾选框
-_FILTER_WRITE_NODE_TYPES = ("browser.fill", "browser.select", "browser.check")
+# 「按条件保留子集」的脚本特征：既做比较，又把命中的行收进一个新集合。
+# 三种脚本通道的写法都要认：只认 Python 的 append/推导式，同一处静默丢数据换成
+# JS 的 filter/push 就查不出来了——而这条规则拦的正是「所有信号都显示成功」的数据缺失。
+_SUBSET_BUILD_RE = re.compile(
+    r"\.append\(|\[[^\]]{0,120}\bfor\b[^\]]{0,120}\bif\b|"
+    r"\.filter\(|\.push\(|\bgrep\b|\bawk\b"
+)
+_CONDITION_COMPARE_RE = re.compile(
+    r"[<>]=?|===?|!==?|\bin\b|between|startsWith|startswith|endsWith|endswith|includes\("
+)
+# 断言型写法：发现不合条件的数据就让流程失败。各通道的「失败」都算。
+_SCRIPT_ASSERTION_RE = re.compile(r"\braise\b|\bthrow\b|process\.exit\(|\bexit [1-9]|SystemExit")
 _VAR_REF_RE = re.compile(r"\$\{var\.([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
@@ -805,7 +836,9 @@ def _collect_page_filter_tokens(nodes: list[dict[str, Any]]) -> set[str]:
     """
     tokens: set[str] = set()
     for node in nodes:
-        if node.get("type") not in _FILTER_WRITE_NODE_TYPES:
+        # 与日期门控同一份写值节点表：填输入框、选下拉、勾选框，浏览器与桌面通道对等。
+        # click 类节点通常不带值，收进来也取不到 token，不必单独排除。
+        if node.get("type") not in _VALUE_WRITE_NODE_TYPES:
             continue
         raw = str(node.get("inputValue") or node.get("value") or "")
         if not raw:
@@ -847,7 +880,7 @@ def _lint_client_side_filter_masks_page_filter(nodes: list[dict[str, Any]]) -> l
             continue
         if not _SUBSET_BUILD_RE.search(code) or not _CONDITION_COMPARE_RE.search(code):
             continue
-        if "raise " in code:
+        if _SCRIPT_ASSERTION_RE.search(code):
             continue  # 断言型脚本正是我们想要的写法
         findings.append({
             "severity": "error",
@@ -1197,8 +1230,11 @@ def _lint_visual_layout(nodes: list[Any]) -> list[dict[str, Any]]:
 
 
 _LOGIN_FIELD_KEYWORDS = ("password", "passwd", "pwd", "密码")
-_NAVIGATION_NODE_TYPES = frozenset({"browser.open", "browser.click", "browser.hover", "browser.ensureLogin"})
-_DATA_READ_NODE_TYPES = frozenset({"browser.extract", "browser.paginateNext"})
+_NAVIGATION_NODE_TYPES = frozenset({
+    "browser.open", "browser.click", "browser.hover", "browser.ensureLogin",
+    "browser.tab.open", "browser.tab.switch", "ui.click",
+})
+_DATA_READ_NODE_TYPES = frozenset({"browser.extract", "browser.paginateNext", "ui.extract"})
 
 
 def _reachable_from(start_ids: set[str], adjacency: dict[str, list[str]]) -> set[str]:
@@ -1229,7 +1265,7 @@ def _lint_login_without_navigation_to_data_page(
 
     password_fills = {
         nid for nid, node in node_map.items()
-        if node.get("type") == "browser.fill"
+        if node.get("type") in ("browser.fill", "ui.fill")
         and any(kw in f"{node.get('selector', '')}{node.get('title', '')}".lower() for kw in _LOGIN_FIELD_KEYWORDS)
     }
     if not password_fills:
@@ -1276,15 +1312,17 @@ def _lint_probe_extract_without_continue_on_error(
         if isinstance(edge, dict) and edge.get("source") and edge.get("target"):
             adjacency.setdefault(str(edge["source"]), []).append(str(edge["target"]))
 
+    # 「数到 0」的歧义与消费它的是 if 还是循环退出条件无关：control.repeat_until 的
+    # condition 同样在等这个计数，探测节点一抛超时，两种写法都是流程直接失败。
     condition_expressions = " ".join(
         str(node.get("condition") or node.get("expression") or node.get("inputValue") or "")
         for node in node_map.values()
-        if node.get("type") == "control.condition"
+        if str(node.get("type") or "").startswith("control.")
     )
 
     findings: list[dict[str, Any]] = []
     for nid, node in node_map.items():
-        if node.get("type") != "browser.extract" or node.get("continueOnError"):
+        if node.get("type") not in _EXTRACT_NODE_TYPES or node.get("continueOnError"):
             continue
         count_var = str(node.get("countVariable") or "").strip()
         if not count_var or count_var not in condition_expressions:
@@ -1308,10 +1346,16 @@ def _lint_probe_extract_without_continue_on_error(
 
 # 1 秒以下按动画/防抖收尾处理，不报；以上视为在猜页面加载耗时。
 _BLIND_DELAY_THRESHOLD_MS = 1000
+# 「必须先有这个元素才做得成」的节点。少收一个类型，同样的盲等就只因为下游换了个
+# 等价节点（clickLoadMore 代替 click、ui 通道代替 browser）而不报。
 _SELECTOR_DEPENDENT_TYPES = frozenset({
     "browser.click", "browser.fill", "browser.wait", "browser.extract",
     "browser.press", "browser.select", "browser.check", "browser.hover",
+    "browser.drag", "browser.clickLoadMore", "browser.paginateNext",
+    "ui.click", "ui.fill", "ui.wait", "ui.extract", "ui.select", "ui.check", "ui.drag",
 })
+# 等元素出现的节点：下游已经在等了，前面那个 delay 至多冗余
+_WAIT_NODE_TYPES = frozenset({"browser.wait", "ui.wait"})
 
 
 def _lint_blind_delay_instead_of_wait(nodes: list[Any], edges: list[Any]) -> list[dict[str, Any]]:
@@ -1329,7 +1373,7 @@ def _lint_blind_delay_instead_of_wait(nodes: list[Any], edges: list[Any]) -> lis
             continue
         successors = [node_map[t] for t in downstream.get(nid, []) if t in node_map]
         # 下游已经在等元素了，这个 delay 至多是冗余，不值得报
-        if any(s.get("type") == "browser.wait" for s in successors):
+        if any(s.get("type") in _WAIT_NODE_TYPES for s in successors):
             continue
         if not any(s.get("type") in _SELECTOR_DEPENDENT_TYPES for s in successors):
             continue
