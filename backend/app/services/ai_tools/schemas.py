@@ -478,7 +478,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "type": "boolean",
                         "description": (
                             "声明你已把 sample_rows 与用户需求逐条比对、确认抓到的就是用户要的数据。"
-                            "仅在工具报出 output_content_may_not_match_requirement、"
+                            "仅在工具报出 output_content_may_not_match_requirement 或 "
+                            "document_content_may_not_match_requirement、"
                             "而你核对后确认输出无误时才传 true；不确定就修流程重跑，不要用它消警告。"
                             "本会话未报出该问题前传 true 会被系统忽略并按 false 处理。"
                         ),

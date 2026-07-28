@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 _NAVIGATION_NODE_TYPES = frozenset({"browser.open", "browser.ensureLogin"})
@@ -31,6 +32,15 @@ SELECTOR_NOT_VISIBLE_KINDS = frozenset({
 })
 
 SELECTOR_DIAGNOSTIC_KINDS = SELECTOR_FALSIFYING_KINDS | SELECTOR_NOT_VISIBLE_KINDS
+
+# 交付内容对不上需求：表格与文档两条审计路径各报各的名字。
+OUTPUT_CONTENT_MISMATCH = "output_content_may_not_match_requirement"
+DOCUMENT_CONTENT_MISMATCH = "document_content_may_not_match_requirement"
+
+# 报出其中任意一条，模型的 content_match_confirmed 才解锁（编排层消费）。漏掉一条，
+# 那条路径上的确认位就永远解不开：照 fix 传 true 会被剥掉，拿回一模一样的失败，
+# 两次即触发质量熔断，流程锁死在一个它无论如何都满足不了的判据上。
+CONTENT_MISMATCH_ISSUES = frozenset({OUTPUT_CONTENT_MISMATCH, DOCUMENT_CONTENT_MISMATCH})
 
 
 def _read_log_url(log: Any) -> str | None:
@@ -266,6 +276,18 @@ _DOCUMENT_REQUIREMENT_TOKENS = (
 _MIN_DOCUMENT_CHARS = 200  # 少于这个量的「总结」通常只有标题没正文
 _DOCUMENT_FILE_SUFFIXES = (".md", ".markdown", ".txt", ".html", ".htm", ".docx", ".pdf")
 
+# 正文压在压缩流/CID 编码里，按 UTF-8 读出来的是容器字节，不是人看到的字。
+# 值是该格式的文件头：能验「这确实是一个 .pdf」，验不了「里面写了什么」。
+_BINARY_DOCUMENT_FORMATS: dict[str, bytes] = {
+    ".pdf": b"%PDF-",
+    ".docx": b"PK\x03\x04",
+    ".xlsx": b"PK\x03\x04",
+    ".pptx": b"PK\x03\x04",
+    ".doc": b"\xd0\xcf\x11\xe0",
+    ".xls": b"\xd0\xcf\x11\xe0",
+}
+_MIN_BINARY_DOCUMENT_BYTES = 256  # 比最小的合法单页 PDF 还小，只兜空壳文件
+
 
 def _requirement_wants_document(requirement_text: str) -> bool:
     """需求要的是一篇文档，而不是一张按行结构化的表。
@@ -304,6 +326,47 @@ def _find_document_output(variables: dict[str, Any]) -> dict[str, Any] | None:
         if best is None or candidate["score"] > best["score"]:
             best = candidate
     return best
+
+
+def _audit_binary_document(document: dict[str, Any], path: Path) -> list[dict[str, Any]]:
+    """二进制产物只验「确实是这个格式、不是空壳」，正文一律不验。
+
+    把 PDF/Office 文件按 UTF-8 读出来的是容器字节，需求关键词逐字比对必然落空：一份内容
+    完全正确的 PDF 会被判成内容不符，助手照 fix 传 content_match_confirmed 也救不回来，
+    同一条失败两次就触发质量熔断，流程锁死在一个它无论如何都满足不了的判据上。
+    验不了就明说验不了——用一个必然失败的判据冒充审计，比不审更坏。
+    """
+    header = _BINARY_DOCUMENT_FORMATS[path.suffix.lower()]
+    size = path.stat().st_size
+    if size < _MIN_BINARY_DOCUMENT_BYTES:
+        return [{
+            "issue": "document_binary_too_small",
+            "message": f"产物 `{document['name']}` 只有 {size} 字节，装不下一篇内容，多半是写文件节点只落了个空壳。",
+            "fix": "检查生成节点：确认正文变量非空、写入过程没有异常被吞掉，再重跑。",
+        }]
+    with path.open("rb") as handle:
+        magic = handle.read(len(header))
+    if magic != header:
+        return [{
+            "issue": "document_binary_header_mismatch",
+            "message": (
+                f"产物 `{document['name']}` 扩展名是 {path.suffix.lower()}，但文件头不是 {header!r}，"
+                "多数查看器会直接打不开。"
+            ),
+            "fix": "检查生成节点是否按该格式的规范写入（自己拼字节流尤其容易漏文件头），或改用成熟的库生成。",
+        }]
+    return [{
+        "severity": "warning",
+        "issue": "document_content_not_text_verifiable",
+        "message": (
+            f"产物 `{document['name']}` 是 {path.suffix.lower()} 二进制文档（{size} 字节），"
+            "本工具读不到它的正文，已跳过与需求的关键词比对——这不代表内容已核对。"
+        ),
+        "fix": (
+            "核对喂给该文档的源变量（正文/摘要变量）与需求是否一致；"
+            "内容是否正确请交给用户过目，不要在没看过正文的情况下宣称验收通过。"
+        ),
+    }]
 
 
 _SWEEP_NODE_TYPES = {"browser.paginateNext", "browser.clickLoadMore"}

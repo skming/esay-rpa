@@ -736,7 +736,8 @@ def _mutate_requirement_provenance(tool_name: str, args: dict[str, Any], state: 
 
     requirement_text 和 content_match_confirmed 都由被审计方自己填：模型可以把需求
     复述成本轮的修复任务，再顺手把确认位置 true，对齐检查就永远命中不了真实需求。
-    确认位只在工具真报过 output_content_may_not_match_requirement 之后才作数。
+    确认位只在工具真报过内容不匹配问题之后才作数（表格与文档两条路径的问题名见
+    ai_orchestrator._CONTENT_MISMATCH_ISSUES）。
     """
     session_requirement = str(state.get("user_requirement_text") or "").strip()
     if session_requirement and args.get("requirement_text") != session_requirement:

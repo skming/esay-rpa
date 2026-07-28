@@ -30,6 +30,7 @@ from app.services.ai_tools import RpaToolExecutor
 from app.services.ai_tools.diagnostics import (
     _check_requirement_alignment,
     _check_structured_rows,
+    _audit_binary_document,
     _extract_requirement_targets,
     _find_incomplete_sweeps,
     build_navigation_trace,
@@ -2053,6 +2054,24 @@ def test_content_match_confirmed_is_honored_once_the_mismatch_was_reported():
     assert args["content_match_confirmed"] is True
 
 
+def test_content_match_confirmed_is_honored_for_document_deliveries_too():
+    """文档路径报的是另一个问题名，漏掉它 = 确认位对文档产物永远解不开。
+
+    真实后果：助手照工具给的 fix 传 true，拿回一模一样的失败，两次即触发质量熔断，
+    流程锁死在一个它无论如何都满足不了的判据上。
+    """
+    state = {"user_requirement_text": "采集帖子内容，生成总结，导出pdf文件"}
+    _orchestrator_guard_after_tool(
+        "assert_run_output",
+        {"passed": False, "issues": [{"issue": "document_content_may_not_match_requirement"}]},
+        state,
+    )
+
+    args = {"task_id": "t3", "content_match_confirmed": True}
+    _orchestrator_guard_before_tool("assert_run_output", args, state)
+    assert args["content_match_confirmed"] is True
+
+
 def test_static_checks_alone_cannot_be_called_acceptance():
     state: dict = {}
     correction = _overstated_result_claim("审查结果：验收通过，lint_flow 与 validate_flow 均无问题。", state)
@@ -2824,6 +2843,37 @@ def test_count_variable_is_derived_from_output_variable() -> None:
     assert "table_extract_missing_count" not in {
         f["issue"] for f in _lint_flow(nodes, [])
     }
+
+
+def test_pdf_content_is_never_keyword_matched_as_utf8_text(tmp_path) -> None:
+    """PDF 正文压在 CID 编码里，按 UTF-8 读到的是容器字节。
+
+    照旧读法，一份内容完全正确的 PDF 也永远命中不了需求关键词——这条误判正是把
+    「导出 PDF」类流程逼进质量熔断的原因。验不了就出警告，不能报成内容不符。
+    """
+    pdf = tmp_path / "summary.pdf"
+    # 正文是 UTF-16BE 十六进制，「帖子」二字在字节流里逐字找不到
+    pdf.write_bytes(b"%PDF-1.4\n<0056003200450058> Tj\n" + b"x" * 400)
+
+    findings = _audit_binary_document({"name": "pdf_path", "value": str(pdf)}, pdf)
+
+    assert [f["issue"] for f in findings] == ["document_content_not_text_verifiable"]
+    assert findings[0]["severity"] == "warning", "读不到正文是「没验」，不是「验不过」，不能计入熔断"
+
+
+def test_binary_document_that_cannot_open_is_still_a_blocking_defect(tmp_path) -> None:
+    """扩展名对、文件头不对：查看器直接打不开，这是实打实的缺陷，不能只出警告。"""
+    broken = tmp_path / "summary.pdf"
+    broken.write_bytes(b"not a pdf at all" + b"x" * 400)
+    empty = tmp_path / "empty.pdf"
+    empty.write_bytes(b"%PDF-1.4\n")
+
+    assert [f["issue"] for f in _audit_binary_document({"name": "p", "value": str(broken)}, broken)] == [
+        "document_binary_header_mismatch"
+    ]
+    assert [f["issue"] for f in _audit_binary_document({"name": "p", "value": str(empty)}, empty)] == [
+        "document_binary_too_small"
+    ]
 
 
 def test_incomplete_sweep_is_detected_when_paginate_output_equals_upstream_extract() -> None:

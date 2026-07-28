@@ -25,10 +25,14 @@ from app.services.ai_tools.diagnostics import (
     _build_input_variable_defaults,
     _build_quality_repair_plan,
     _build_run_root_cause_hints,
+    _audit_binary_document,
+    _BINARY_DOCUMENT_FORMATS,
     _check_requirement_alignment,
     build_navigation_trace,
     build_navigation_verdict,
     _check_structured_rows,
+    DOCUMENT_CONTENT_MISMATCH,
+    OUTPUT_CONTENT_MISMATCH,
     _describe_output_variables,
     _find_document_output,
     _MIN_DOCUMENT_CHARS,
@@ -1969,7 +1973,7 @@ class RpaToolExecutor:
         )
         if alignment is not None and not alignment["aligned"] and not content_match_confirmed:
             issues.append({
-                "issue": "output_content_may_not_match_requirement",
+                "issue": OUTPUT_CONTENT_MISMATCH,
                 "message": (
                     f"需求指向 {alignment['targets']}，但输出的表头和数据里找不到任何一个。"
                     "结构校验只能证明抓到了「一张表」，不能证明抓对了表。"
@@ -2059,6 +2063,8 @@ class RpaToolExecutor:
                     "message": f"变量 `{document['name']}` 指向的产物文件不存在：{document['value']}。",
                     "fix": "检查写文件节点的路径与 outputVariable，确认文件真的落盘后再重跑。",
                 }]
+            if path.suffix.lower() in _BINARY_DOCUMENT_FORMATS:
+                return _audit_binary_document(document, path)
             try:
                 body = path.read_text(encoding="utf-8", errors="replace")
             except OSError as exc:
@@ -2082,7 +2088,7 @@ class RpaToolExecutor:
         alignment = _check_requirement_alignment(targets, [body[:20_000]], None)
         if alignment is not None and not alignment["aligned"] and not content_match_confirmed:
             issues.append({
-                "issue": "document_content_may_not_match_requirement",
+                "issue": DOCUMENT_CONTENT_MISMATCH,
                 "message": (
                     f"需求指向 {alignment['targets']}，但文档正文里找不到任何一个。"
                     "文档非空只能证明写出了东西，不能证明写对了内容。"

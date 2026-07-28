@@ -24,7 +24,7 @@ from app.services.ai_guards import (
 )
 from app.services.ai_prompts import get_system_prompt
 from app.services.ai_tools import TOOL_SCHEMAS, RpaToolExecutor
-from app.services.ai_tools.diagnostics import SELECTOR_DIAGNOSTIC_KINDS
+from app.services.ai_tools.diagnostics import CONTENT_MISMATCH_ISSUES, SELECTOR_DIAGNOSTIC_KINDS
 
 logger = logging.getLogger(__name__)
 
@@ -2133,7 +2133,7 @@ def _orchestrator_guard_after_tool(tool_name: str, result: Any, state: dict[str,
             _count_repair_cycle(state, first.get("message"))
         issues = result.get("issues") or []
         if any(
-            isinstance(item, dict) and item.get("issue") == "output_content_may_not_match_requirement"
+            isinstance(item, dict) and item.get("issue") in CONTENT_MISMATCH_ISSUES
             for item in issues
         ):
             state["content_mismatch_reported"] = True
@@ -2144,7 +2144,7 @@ def _orchestrator_guard_after_tool(tool_name: str, result: Any, state: dict[str,
         if state.pop("content_match_confirm_stripped", False):
             result["content_match_confirmed_ignored"] = (
                 "content_match_confirmed 已被忽略并按 false 处理："
-                "本会话尚未出现 output_content_may_not_match_requirement，该确认位只在工具报出该问题后才作数。"
+                "本会话尚未出现内容不匹配问题，该确认位只在工具报出该问题后才作数。"
             )
 
     # get_run_error 带回失败现场截图也算新证据。
