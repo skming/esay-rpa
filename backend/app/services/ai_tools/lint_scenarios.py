@@ -10,6 +10,11 @@ from typing import Any
 
 from app.services.ai_tools.graph import _collect_downstream_nodes
 from app.services.ai_tools.normalize import _nodes_visually_overlap
+from app.services.ai_tools.script_capabilities import (
+    library_for_format,
+    missing_library_hint,
+    unsupported_formats,
+)
 from app.services.ai_tools.selectors import _is_broad_table_row_selector, _is_table_container_selector
 from app.services.ai_tools.variables import _SCRIPT_CHANNEL_NODE_TYPES, _find_script_http_fetch_marker
 
@@ -73,6 +78,7 @@ def _lint_flow_semantic_quality(nodes: list[Any]) -> list[dict[str, Any]]:
     findings.extend(_lint_script_environment_risks(business_nodes))
     findings.extend(_lint_script_http_flow_drift(business_nodes))
     findings.extend(_lint_script_hardcoded_content(business_nodes))
+    findings.extend(_lint_unavailable_artifact_format(business_nodes))
     findings.extend(_lint_client_side_filter_masks_page_filter(business_nodes))
     return findings
 
@@ -848,6 +854,64 @@ def _lint_client_side_filter_masks_page_filter(nodes: list[dict[str, Any]]) -> l
                 "不要删行、不要覆盖结果变量。页面筛选是否真的生效，只能由页面自己证明——"
                 "回读输入框 value 只能说明文本写进去了，不能说明组件已提交筛选条件"
                 "（直接给 input.value 赋值的执行器下它必然通过）。真正的证据是：抓回的数据全部符合条件。"
+            ),
+        })
+    return findings
+
+
+# 已有的文件搬过来（下载、复制）不需要任何库，那是传输不是生成
+_ARTIFACT_TRANSPORT_MARKERS = (
+    "requests.", "httpx", "aiohttp", "urllib", "urlretrieve", "curl ",
+    "shutil.copy", "shutil.move", "read_bytes(", "download",
+)
+_ARTIFACT_SUFFIX_PATTERN = re.compile(r"(\.[a-z0-9]{2,5})\b", re.IGNORECASE)
+
+
+def _lint_unavailable_artifact_format(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """环境里没有对应库的格式，不许生成——这条必须是 error，warn 拦不住。
+
+    缺库不会让脚本报错：模型会拿标准库手拼字节流，跑完 success、产物也在，
+    坏在打开的时候才知道（真实案例：手搓的 PDF 字体没内嵌，换个查看器就是空白页）。
+    「跑得起来」在这里不是能力证明，所以判据只能放在运行之前。
+
+    只查 script.python：可用性是 import 出来的，只对它跑的那个解释器成立。
+    """
+    blocked = set(unsupported_formats())
+    if not blocked:
+        return []
+    findings: list[dict[str, Any]] = []
+    for node in nodes:
+        node_type = node.get("type")
+        if node_type == "script.python":
+            text = str(node.get("code") or "")
+            if any(marker in text.lower() for marker in _ARTIFACT_TRANSPORT_MARKERS):
+                continue
+        elif node_type == "file.write":
+            text = str(node.get("path") or "")
+        else:
+            continue
+
+        # 后缀集合从能力表推出来，不在这里重写一份：加一个库就少拦一个格式，不该改两处
+        suffix = next(
+            (m.group(1).lower() for m in _ARTIFACT_SUFFIX_PATTERN.finditer(text) if m.group(1).lower() in blocked),
+            None,
+        )
+        if suffix is None:
+            continue
+        findings.append({
+            "severity": "error",
+            "node_id": str(node.get("id", "?")),
+            "node_title": str(node.get("title") or node.get("id", "?")),
+            "issue": "unavailable_artifact_format",
+            "message": (
+                f"节点要生成 {suffix} 文件，但当前运行环境没有能生成它的库（需要 {missing_library_hint(suffix)}）。"
+                "不装库也能写出这个后缀的文件，只是内容多半打不开，而流程会照常报 success。"
+            ),
+            "fix": (
+                f"改成环境支持的交付格式（.md/.html/.csv"
+                + (f"/.xlsx（{library_for_format('.xlsx')}）" if library_for_format(".xlsx") else "")
+                + f"），或者停下来告诉用户「当前环境缺 {missing_library_hint(suffix)}，装上后才能导出 {suffix}」，"
+                "由用户决定装库还是换格式。不要自己拼字节流绕过去。"
             ),
         })
     return findings

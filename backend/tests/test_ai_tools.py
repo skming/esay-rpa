@@ -37,6 +37,8 @@ from app.services.ai_tools.diagnostics import (
     build_navigation_verdict,
 )
 from app.services.ai_tools.lint import _lint_flow
+from app.services.ai_tools.lint_scenarios import _lint_unavailable_artifact_format
+from app.services.ai_tools.script_capabilities import describe_script_capabilities
 from app.services.ai_tools.normalize import _normalize_generated_edges, _normalize_generated_nodes
 
 
@@ -2843,6 +2845,48 @@ def test_count_variable_is_derived_from_output_variable() -> None:
     assert "table_extract_missing_count" not in {
         f["issue"] for f in _lint_flow(nodes, [])
     }
+
+
+def test_generating_a_format_the_environment_cannot_produce_is_blocked_before_running() -> None:
+    """缺库不会让脚本报错，它会手拼字节流跑成 success，坏在用户打开的那一刻。
+
+    所以只能在运行前拦，且必须是 error：warn 拦不住 run_flow。
+    """
+    nodes = [{
+        "id": "n4_pdf", "type": "script.python", "title": "生成总结PDF",
+        "code": "pdf_path = out_dir / f'summary_{ts}.pdf'\npdf_path.write_bytes(pdf)",
+    }]
+
+    findings = _lint_unavailable_artifact_format(nodes)
+
+    assert [f["issue"] for f in findings] == ["unavailable_artifact_format"]
+    assert findings[0]["severity"] == "error"
+    assert "reportlab" in findings[0]["message"]
+    assert "告诉用户" in findings[0]["fix"], "出路要写明「问用户」，否则模型只会换个写法再拼一次"
+
+
+def test_installed_library_formats_and_downloads_are_left_alone() -> None:
+    """xlsx 有 openpyxl 就该放行；把已有的 PDF 下载下来是传输，不需要任何库。
+
+    这两类误报的代价是把本来能跑的流程判死，比漏报更贵。
+    """
+    excel = [{"id": "n1", "type": "script.python", "code": "wb.save(out / 'report.xlsx')"}]
+    download = [{
+        "id": "n2", "type": "script.python",
+        "code": "import requests\nopen(out / 'spec.pdf', 'wb').write(requests.get(url).content)",
+    }]
+
+    assert _lint_unavailable_artifact_format(excel) == []
+    assert _lint_unavailable_artifact_format(download) == []
+
+
+def test_capability_blurb_names_both_what_works_and_what_does_not() -> None:
+    """只说「可以执行 Python」等于没给边界，模型只能靠猜——它猜错的代价用户才看得见。"""
+    blurb = describe_script_capabilities()
+
+    assert ".xlsx" in blurb and "openpyxl" in blurb
+    assert ".pdf" in blurb and "reportlab" in blurb
+    assert "告诉用户" in blurb
 
 
 def test_pdf_content_is_never_keyword_matched_as_utf8_text(tmp_path) -> None:

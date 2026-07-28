@@ -1,6 +1,8 @@
 """节点类型目录：供 list_node_types 工具告知模型有哪些节点可用。"""
 from __future__ import annotations
 
+from app.services.ai_tools.script_capabilities import describe_script_capabilities
+
 
 # type 字段为点分字符串，所有配置字段平铺在节点根层（不嵌套在 config 对象中）。
 # output_var_field: 该节点用于定义输出变量的字段名（填入变量名后该变量在后续节点可用）
@@ -367,6 +369,7 @@ NODE_TYPE_CATALOG: list[dict[str, str]] = [
             "——直接写变量名（如 data=my_var）会报 NameError。"
             "【输出文件】产物写到 _v['output_dir'] 下、文件名带 _v['run_timestamp']（如 "
             "os.path.join(_v['output_dir'], 'data_%s.json' % _v['run_timestamp'])），先 os.makedirs(_v['output_dir'], exist_ok=True)。"
+            + describe_script_capabilities()
         ),
     },
     {
