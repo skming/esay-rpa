@@ -254,6 +254,81 @@ def test_repeated_over_budget_replaces_the_drop_notice_instead_of_stacking() -> 
     assert messages[-1]["content"] == "最后一轮"
 
 
+def test_dropping_history_keeps_the_users_hard_requirements() -> None:
+    """约束通常只在最早那几轮说一次，正好是超预算时最先被丢掉的部分。
+
+    丢完之后模型会安静地退回默认做法，用户只能再说一遍——而且往往看不出是上下文没了。
+    """
+    messages = [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "抓一下订单页。日期必须用键盘输入，不要点日历控件。" + "x" * 3_000},
+        {"role": "assistant", "content": "好的"},
+        {"role": "user", "content": "最后一轮"},
+    ]
+    _compact_tool_messages(messages, budget=1_000, protect_prefix=1)
+
+    kept = [m for m in messages if str(m.get("content") or "").startswith("【用户此前提出的硬性要求】")]
+    assert len(kept) == 1
+    body = str(kept[0]["content"])
+    assert "日期必须用键盘输入" in body
+    assert "不要点日历控件" in body
+    # 摘的是原句，不是改写——改写过的约束就成了模型自己的话，没有任何东西能校验它
+    assert "抓一下订单页" not in body
+
+
+def test_kept_requirements_survive_a_second_round_of_dropping() -> None:
+    """摘要本身也躺在会被删的区间里；第二次超预算时它不该跟着原文一起消失。"""
+    messages = [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "导出必须是 xlsx，不要 csv。"},
+        {"role": "assistant", "content": "好"},
+        {"role": "user", "content": "y" * 3_000},
+        {"role": "assistant", "content": "好"},
+        {"role": "user", "content": "最后一轮"},
+    ]
+    _compact_tool_messages(messages, budget=1_500, protect_prefix=1)
+    _compact_tool_messages(messages, budget=200, protect_prefix=1)
+
+    kept = [m for m in messages if str(m.get("content") or "").startswith("【用户此前提出的硬性要求】")]
+    assert len(kept) == 1, "摘要要合并而不是层层叠加"
+    assert "导出必须是 xlsx" in str(kept[0]["content"])
+
+
+def test_chit_chat_does_not_become_a_standing_requirement() -> None:
+    """把闲聊当成硬性要求钉进上下文，比丢掉它更糟：模型会一直照着它做。"""
+    messages = [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "帮我看看这个页面能不能抓" + "x" * 3_000},
+        {"role": "user", "content": "最后一轮"},
+    ]
+    _compact_tool_messages(messages, budget=1_000, protect_prefix=1)
+
+    assert not any(str(m.get("content") or "").startswith("【用户此前提出的硬性要求】") for m in messages)
+
+
+def test_navigation_budget_fires_on_every_selector_diagnostic() -> None:
+    """诊断名写错不会报错，只会让这条判据永远不命中，而下面的关键词兜底会替它遮住。
+
+    所以 selector 特意用不含任何导航关键词的写法把兜底那条路堵死：还能熔断，
+    就只可能是诊断类型这条判据真的生效了。
+    """
+    from app.services.ai_guards import NAV_FAILURE_BUDGET
+    from app.services.ai_orchestrator import _orchestrator_guard_after_tool
+    from app.services.ai_tools.diagnostics import SELECTOR_DIAGNOSTIC_KINDS
+
+    for kind in SELECTOR_DIAGNOSTIC_KINDS:
+        state: dict[str, Any] = {}
+        for _ in range(NAV_FAILURE_BUDGET):
+            _orchestrator_guard_after_tool("get_run_error", {
+                "inspect_hint": True,
+                "last_browser_url": "https://x.test/",
+                "failed_node_id": "n_go",
+                "failed_node_config": {"id": "n_go", "type": "browser.click", "selector": ".c1 .c2"},
+                "selector_diagnostic": {"kind": kind},
+            }, state)
+        assert state.get("navigation_budget_lock"), kind
+
+
 def test_context_budget_follows_the_model_window() -> None:
     """40 万字符的固定阈值对 13 万窗口的小模型等于毫无保护。"""
     # 小窗口模型按窗口收紧
@@ -577,3 +652,55 @@ def test_seed_catalog_holds_together() -> None:
 
     # 调试用的假模型不该随安装包发出去
     assert not [m for m in catalog if "debug" in m["id"] or "test-model" in m["id"]]
+
+
+async def test_usage_events_report_rounds_tokens_and_blocked_calls(monkeypatch) -> None:
+    """用量只进 logger 时，用户无从判断"再让它试一次"要付多少代价。
+
+    这里同时钉住三件事：累计而非增量、护栏拦下的调用也计数、done 之前必有一条终值。
+    """
+    import litellm
+
+    def _usage_chunk(prompt: int, completion: int, cached: int) -> Any:
+        usage = SimpleNamespace(
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=cached),
+        )
+        return SimpleNamespace(choices=[], usage=usage)
+
+    rounds = iter([
+        _FakeStream([
+            _chunk(tool_calls=[_tool_call_chunk(0, call_id="c1", name="lint_flow", arguments='{"flow_id": "f1"}')]),
+            # 没先 inspect_page 就建流程会被 pre_create_inspect_gate 拦掉，
+            # 被拦的调用不该从计数里消失——它同样烧了一轮
+            _chunk(tool_calls=[_tool_call_chunk(1, call_id="c2", name="create_flow", arguments='{"name": "x"}')],
+                   finish="tool_calls"),
+            _usage_chunk(1000, 200, 800),
+        ]),
+        _FakeStream([_chunk(content="检查完了。", finish="stop"), _usage_chunk(1500, 100, 1400)]),
+    ])
+
+    async def fake_acompletion(**kwargs: Any) -> Any:
+        return next(rounds)
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+
+    orchestrator = AiOrchestrator(tool_executor=_FakeExecutor())  # type: ignore[arg-type]
+    events = [e async for e in orchestrator.stream(
+        messages=[{"role": "user", "content": "帮我建个流程抓 https://a.test 的表格"}], model="test-model",
+    )]
+
+    usages = [e["usage"] for e in events if e["type"] == "usage"]
+    assert usages, "每轮都该推一次用量"
+    assert usages[0]["rounds"] == 1 and usages[0]["prompt_tokens"] == 1000
+    final = usages[-1]
+    assert final["rounds"] == 2
+    assert final["prompt_tokens"] == 2500 and final["completion_tokens"] == 300
+    assert final["cached_tokens"] == 2200
+    assert final["total_tokens"] == 2800
+    assert final["tool_calls"] == 2
+    assert final["blocked_calls"] == 1
+    assert final["max_rounds"] > 0
+    assert events[-1] == {"type": "done"}
+    assert events[-2]["type"] == "usage", "终值必须在 done 之前发出，否则最后一次计数丢失"

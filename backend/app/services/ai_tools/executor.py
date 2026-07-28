@@ -16,6 +16,10 @@ from typing import TYPE_CHECKING, Any
 from app.core import storage
 from app.services.ai_tools.catalog import NODE_TYPE_CATALOG
 from app.services.ai_tools.diagnostics import (
+    SELECTOR_MATCH_HIDDEN_OR_NOT_VISIBLE,
+    SELECTOR_MATCH_NOT_VISIBLE,
+    SELECTOR_MULTI_MATCH_FIRST_NOT_ACTIONABLE,
+    SELECTOR_ZERO_MATCH,
     _assert_allowed_values,
     _assert_date_range,
     _build_input_variable_defaults,
@@ -1550,7 +1554,7 @@ class RpaToolExecutor:
             element_not_visible = "element is not visible" in error_lower or "not visible" in error_lower
             if selector_count == 0:
                 selector_diagnostic = {
-                    "kind": "selector_zero_match",
+                    "kind": SELECTOR_ZERO_MATCH,
                     "matched_count": 0,
                     "message": "selector 在当前页面没有命中任何元素，需要修正 selector 或检查页面导航是否正确。",
                     "repair_directions": [
@@ -1562,7 +1566,7 @@ class RpaToolExecutor:
                 # Element(s) found but not clickable due to non-display CSS hiding.
                 # Changing the selector is almost never the right fix here.
                 selector_diagnostic = {
-                    "kind": "selector_match_not_visible",
+                    "kind": SELECTOR_MATCH_NOT_VISIBLE,
                     "matched_count": selector_count,
                     "message": (
                         f"selector 命中了 {selector_count} 个元素，但元素对 Playwright 仍不可见/不可点击。"
@@ -1580,7 +1584,7 @@ class RpaToolExecutor:
                 }
             elif selector_count is not None and selector_count > 1:
                 selector_diagnostic = {
-                    "kind": "selector_multi_match_first_not_actionable",
+                    "kind": SELECTOR_MULTI_MATCH_FIRST_NOT_ACTIONABLE,
                     "matched_count": selector_count,
                     "message": (
                         f"selector 命中了 {selector_count} 个元素，Playwright 尝试第一个但其不可操作。"
@@ -1593,7 +1597,7 @@ class RpaToolExecutor:
                 }
             elif element_not_visible:
                 selector_diagnostic = {
-                    "kind": "selector_match_hidden_or_not_visible",
+                    "kind": SELECTOR_MATCH_HIDDEN_OR_NOT_VISIBLE,
                     "matched_count": None,
                     "message": (
                         "selector 命中的元素不可见（Playwright 未能从错误信息中解析出匹配数量）。"

@@ -2491,7 +2491,7 @@ def test_repair_ledger_carries_failed_attempts_across_sessions(tmp_path, monkeyp
     仍未修好的机械原因。台账落盘后，新会话读回历史，护栏第一次就拦得住。
     """
     from app.services import ai_repair_ledger as ledger
-    from app.services.ai_orchestrator import _detect_field_oscillation
+    from app.services.ai_guards import apply_pre_tool_guards
 
     monkeypatch.setattr(ledger, "resolve_ai_dir", lambda: tmp_path)
 
@@ -2511,12 +2511,13 @@ def test_repair_ledger_carries_failed_attempts_across_sessions(tmp_path, monkeyp
     assert state["node_selector_fix_counts"]["n_date"] == 2
 
     # 把 selector 改回上一会话试过并失败的旧值 → 立刻拦下
-    blocked = _detect_field_oscillation(
+    blocked = apply_pre_tool_guards(
         "apply_node_fix",
         {"node_id": "n_date", "config_patch": {"selector": ".a-picker input"}},
         state,
     )
     assert blocked is not None
+    assert blocked["guard_id"] == "field_oscillation"
     assert blocked["required_action"] == "stop_oscillating_between_known_failed_options"
 
     # 摘要要把历史尝试直接摆给模型看

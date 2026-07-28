@@ -4,7 +4,7 @@ import type { ReactElement } from 'react';
 import { cn } from '../../../lib/utils';
 import { Collapsible } from '../../ui/collapsible';
 import { Marker, MarkerContent, MarkerIcon } from '../../ui/marker';
-import type { ToolCallState } from './aiPanelTypes';
+import type { AiUsage, ToolCallState } from './aiPanelTypes';
 import { ToolCallCard } from './ToolCallCard';
 
 /** 把一轮对话的工具调用折叠成一条「处理中/已处理/需要确认」时间线。 */
@@ -63,15 +63,44 @@ function buildProcessingSummary(toolCalls: ToolCallState[], processingMs?: numbe
   };
 }
 
+function formatTokens(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n);
+}
+
+/** 展开后底部那行用量：轮次是会话是否在空转的第一信号，缓存命中决定同样轮数差几倍成本。 */
+function UsageFooter({ usage }: { usage: AiUsage }): ReactElement {
+  const cacheRate = usage.prompt_tokens > 0
+    ? Math.round((usage.cached_tokens / usage.prompt_tokens) * 100)
+    : 0;
+  const nearLimit = usage.rounds >= usage.max_rounds - 3;
+  return (
+    <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-slate-100 px-1 pt-1.5 font-mono text-[10px] tabular-nums text-slate-400">
+      <span className={cn(nearLimit && 'text-amber-600')}>
+        {usage.rounds}/{usage.max_rounds} 轮
+      </span>
+      <span>
+        {formatTokens(usage.total_tokens)} tokens
+        {usage.cached_tokens > 0 && <span className="text-slate-300"> · 缓存 {cacheRate}%</span>}
+      </span>
+      <span>模型耗时 {usage.llm_seconds}s</span>
+      {usage.blocked_calls > 0 && (
+        <span className="text-amber-600">{usage.blocked_calls} 次被护栏拦下</span>
+      )}
+    </div>
+  );
+}
+
 export function ProcessingTimeline({
   toolCalls,
   processingMs,
   streamingPending,
+  usage,
   onFocusNode,
 }: {
   toolCalls: ToolCallState[];
   processingMs?: number;
   streamingPending?: boolean;
+  usage?: AiUsage;
   onFocusNode?: (nodeId: string) => void;
 }): ReactElement {
   const summary = buildProcessingSummary(toolCalls, processingMs, streamingPending);
@@ -124,6 +153,7 @@ export function ProcessingTimeline({
         {toolCalls.map((tc) => (
           <ToolCallCard key={tc.id} onFocusNode={onFocusNode} toolCall={tc} live={streamingPending} />
         ))}
+        {usage && <UsageFooter usage={usage} />}
       </div>
     </Collapsible>
   );

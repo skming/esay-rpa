@@ -1,6 +1,10 @@
 """按域名沉淀 RPA 助手的站点经验：哪些 selector 实际生效、是否需登录、UI 框架等，
 存为 <ai_dir>/site_knowledge.json。后续对话提到同域名时，orchestrator 把画像注入
 system context，让模型复用已验证的 selector 而不是重新猜测。
+
+档案分两半：成功沉淀（哪些 selector 真跑通过）与失败沉淀（哪些 selector 真跑挂过）。
+只留前一半的话，同一个坑换个流程就能被重踩一遍——[[ai_repair_ledger]] 手里有这份信息，
+但它按 flow 存，跨流程抓同一站点时等于没学过。两者都只记真实运行结果，不记模型的判断。
 """
 from __future__ import annotations
 
@@ -8,11 +12,15 @@ import json
 import logging
 import re
 import threading
+import time
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse
 
 from app.core import storage
+# 只沉淀真正在证伪 selector 的那两类诊断。元素存在但不可见的两类不算：
+# 提示词里明确写着「这类问题改 selector 无效」，记成黑名单会把模型推向错误的修法。
+from app.services.ai_tools.diagnostics import SELECTOR_FALSIFYING_KINDS
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +40,10 @@ _FRAMEWORK_HINTS = (
 
 _MAX_SELECTORS_PER_TYPE = 12  # 每种节点类型只留最近验证过的若干个，避免画像随流程迭代无限膨胀
 _MAX_DOMAINS = 200  # 超出后淘汰最久未更新的域名，防止 JSON 文件无限增长
+_MAX_FAILED_SELECTORS = 20
+# 失败比成功过期得快：selector 跑通说明它当时确实指对了元素，而跑挂可能只是页面那天在改版。
+# 两周后还拿它当禁令，就会挡住页面已经改回去的正确答案。
+_FAILED_TTL_SECONDS = 14 * 24 * 3600
 
 
 def _now_iso() -> str:
@@ -53,6 +65,19 @@ def extract_domains(text: str) -> list[str]:
         if d and d not in seen:
             seen.append(d)
     return seen
+
+
+def _fresh_failures(raw: Any) -> list[dict[str, Any]]:
+    """过滤掉过期与格式不对的失败记录；读写都先过一遍，避免陈旧禁令越积越多。"""
+    if not isinstance(raw, list):
+        return []
+    now = time.time()
+    return [
+        item for item in raw
+        if isinstance(item, dict)
+        and item.get("selector")
+        and now - float(item.get("at_ts") or 0) <= _FAILED_TTL_SECONDS
+    ]
 
 
 def _guess_framework(selectors: list[str]) -> str | None:
@@ -166,6 +191,12 @@ class SiteKnowledgeStore:
                             bucket.append(sel)
                     merged[ntype] = bucket[-_MAX_SELECTORS_PER_TYPE:]  # 保留最近的
                 profile["selectors"] = merged
+                # 跑通即撤销禁令：能跑通说明当时挂的是别的原因（时序、登录态、页面在改版），
+                # 禁令留着会让模型绕开这个正确答案去猜别的写法。
+                profile["failed_selectors"] = [
+                    f for f in _fresh_failures(profile.get("failed_selectors"))
+                    if f.get("selector") not in all_selectors
+                ]
                 verified = profile.get("verified_urls") or []
                 for u in urls:
                     if _domain_of(u) == domain and u not in verified:
@@ -174,6 +205,53 @@ class SiteKnowledgeStore:
                 data[domain] = profile
             self._save(data)
         logger.info("site_knowledge updated for domains: %s", domains)
+
+    def record_selector_failure(
+        self,
+        url: str | None,
+        selector: str,
+        *,
+        node_type: str = "",
+        diagnostic_kind: str = "",
+    ) -> None:
+        """记下「这个 selector 在这个站点真的跑挂过」。
+
+        调用点必须持有真实失败现场（get_run_error 的 selector_diagnostic），
+        不接受模型的判断——否则档案会变成模型自我强化的猜测，而不是证据。
+        """
+        domain = _domain_of(url or "")
+        selector = (selector or "").strip()
+        if not domain or not selector or diagnostic_kind not in SELECTOR_FALSIFYING_KINDS:
+            return
+
+        with self._lock:
+            data = self._load()
+            profile = data.get(domain) or {
+                "domain": domain,
+                "success_count": 0,
+                "selectors": {},
+                "verified_urls": [],
+            }
+            failures = _fresh_failures(profile.get("failed_selectors"))
+            for item in failures:
+                # 同一个 selector 重复踩不占新条目：次数本身就是最强的信号
+                if item.get("selector") == selector:
+                    item["count"] = int(item.get("count") or 1) + 1
+                    item["at_ts"] = time.time()
+                    item["kind"] = diagnostic_kind
+                    break
+            else:
+                failures.append({
+                    "selector": selector,
+                    "node_type": node_type,
+                    "kind": diagnostic_kind,
+                    "count": 1,
+                    "at_ts": time.time(),
+                })
+            profile["failed_selectors"] = failures[-_MAX_FAILED_SELECTORS:]
+            profile["updated_at"] = _now_iso()
+            data[domain] = profile
+            self._save(data)
 
     def get_profile(self, domain: str) -> dict[str, Any] | None:
         with self._lock:
@@ -213,10 +291,18 @@ class SiteKnowledgeStore:
                 for ntype, sels in selectors.items():
                     shown = "、".join(f"`{s}`" for s in sels[-4:])
                     lines.append(f"  - {ntype}: {shown}")
+            failures = _fresh_failures(p.get("failed_selectors"))
+            if failures:
+                lines.append("- 已证伪的 selector（真实运行时未命中，换个写法再试大概率还是这个结果）：")
+                for f in sorted(failures, key=lambda x: -int(x.get("count") or 1))[:6]:
+                    times = int(f.get("count") or 1)
+                    suffix = f"（已踩 {times} 次）" if times > 1 else ""
+                    lines.append(f"  - `{f['selector']}` — {f.get('kind') or '运行失败'}{suffix}")
             lines.append("")
         lines.append(
-            "以上 selector 均来自真实成功运行。构建/修复同站点流程时**优先直接复用**，"
-            "只有页面确实改版（inspect_page 证实旧 selector 不存在）时才替换。"
+            "以上 selector 均来自真实运行结果。构建/修复同站点流程时**优先直接复用已验证的**，"
+            "只有页面确实改版（inspect_page 证实旧 selector 不存在）时才替换；"
+            "**已证伪的不要再写进流程**，除非这次 inspect_page 亲眼看到它确实存在。"
         )
         return "\n".join(lines)
 

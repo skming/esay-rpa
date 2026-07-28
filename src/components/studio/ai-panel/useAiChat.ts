@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { DEFAULT_MODEL, useAiChatStore } from '../../../stores/useAiChatStore';
-import type { AiAttachment, AiMessage, FlowDiff, ToolCallState } from './aiPanelTypes';
+import type { AiAttachment, AiMessage, AiUsage, FlowDiff, ToolCallState } from './aiPanelTypes';
 import { backend } from '../../../lib/backendClient';
 
 function nanoid(): string {
@@ -289,6 +289,7 @@ export function useAiChat(flowId: string | null, onFlowChanged?: (flowId: string
               type: string; delta?: string; tool?: string; args?: string; result?: unknown; message?: string;
               call_id?: string;
               elapsed_s?: number; progress?: { current_step?: number; total_steps?: number; percent?: number } | null;
+              usage?: AiUsage;
             };
             try { chunk = JSON.parse(raw); } catch { continue; }
 
@@ -298,6 +299,14 @@ export function useAiChat(flowId: string | null, onFlowChanged?: (flowId: string
               const detail = formatToolProgress(chunk.elapsed_s, chunk.progress);
               setMessages((prev) =>
                 prev.map((m) => (m.id === assistantId ? { ...m, statusDetail: detail } : m))
+              );
+              continue;
+            }
+            if (chunk.type === 'usage' && chunk.usage) {
+              // 后端每轮推的是累计值，直接覆盖；这条不改正文，不该触发持久化节流以外的开销
+              const usage = chunk.usage;
+              setMessages((prev) =>
+                prev.map((m) => (m.id === assistantId ? { ...m, usage } : m))
               );
               continue;
             }

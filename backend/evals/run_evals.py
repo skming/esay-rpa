@@ -11,6 +11,14 @@
     cd backend && python -m evals.run_evals --only gen_table_to_json --reps 3 --record
     cd backend && python -m evals.run_evals --only gen_table_to_json --reps 3 --replay
 
+改提示词时用 --compare-prompts 让两个版本跑同一套场景，直接看哪些场景换了结论：
+
+    cd backend && python -m evals.run_evals --compare-prompts v1,v2 --reps 3
+    cd backend && python -m evals.run_evals --prompt-version v1     # 只跑某个版本
+
+录像按 <模型>/<提示词版本>/ 分目录：同一场景在不同提示词下是不同的样本，混在一起
+重放会拿 A 的录像给 B 判分，得出「改了提示词行为没变」的假结论。
+
 工具全部 mock（不启动浏览器、不真正运行流程），只消耗 LLM tokens。
 未配置 API Key 时自动跳过（exit 0），可安全挂进 CI。
 """
@@ -18,9 +26,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import sys
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -28,8 +38,10 @@ from typing import Any
 # 允许 `python -m evals.run_evals` 与直接执行两种方式
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from app.services import ai_orchestrator  # noqa: E402
 from app.services.ai_orchestrator import AiOrchestrator  # noqa: E402
 from app.services.ai_config_service import AiConfigService, AI_MODEL_CATALOG  # noqa: E402
+from app.services.ai_prompts import PROMPT_VERSIONS, active_prompt_version  # noqa: E402
 from app.services.ai_tools.catalog import NODE_TYPE_CATALOG  # noqa: E402
 from app.services.ai_tools.lint import _lint_flow  # noqa: E402
 from app.services.ai_tools.normalize import (  # noqa: E402
@@ -110,6 +122,29 @@ class MockToolExecutor:
         return [name for name, _ in self.calls]
 
 
+@contextlib.contextmanager
+def _observe_guards() -> Iterator[list[str]]:
+    """记录本轮真正拦下来的 guard_id。
+
+    被护栏拦掉的工具调用不会到达执行器，calls 里看不见，判分就分不清
+    「模型自己遵守了规则」和「模型违规但被拦住了」——而这两件事对提示词的结论完全相反。
+    """
+    hits: list[str] = []
+    original = ai_orchestrator.apply_pre_tool_guards
+
+    def _recording(tool_name: str, args: dict[str, Any], state: dict[str, Any]) -> Any:
+        blocked = original(tool_name, args, state)
+        if blocked is not None:
+            hits.append(str(blocked.get("guard_id") or "unknown"))
+        return blocked
+
+    ai_orchestrator.apply_pre_tool_guards = _recording  # type: ignore[assignment]
+    try:
+        yield hits
+    finally:
+        ai_orchestrator.apply_pre_tool_guards = original  # type: ignore[assignment]
+
+
 # ── 场景与断言 ────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -127,6 +162,10 @@ class Scenario:
     expect_tool_order: list[tuple[str, str]] = field(default_factory=list)  # (earlier, later)
     expect_tool_max_calls: dict[str, int] = field(default_factory=dict)
     expect_reply_contains_any: list[str] = field(default_factory=list)
+    # 护栏断言：triggered 证明这条护栏在真实会话里够得着（否则它只是死代码），
+    # not_triggered 证明提示词能让模型自己避开（护栏是兜底，不该是日常路径）
+    expect_guards_triggered: list[str] = field(default_factory=list)
+    expect_guards_not_triggered: list[str] = field(default_factory=list)
     # 生成质量断言：判模型传给 create_flow 的 nodes/edges，判分器用 _lint_flow
     expect_flow_created: bool = False
     expect_flow_lint_error_free: bool = False
@@ -155,6 +194,7 @@ SCENARIOS: list[Scenario] = [
         ),
         expect_tools_called=["inspect_page", "create_flow"],
         expect_tool_order=[("inspect_page", "create_flow")],
+        expect_guards_not_triggered=["pre_create_inspect_gate"],
     ),
     Scenario(
         name="missing_credentials_must_ask",
@@ -173,6 +213,81 @@ SCENARIOS: list[Scenario] = [
         flow_id="eval-flow-0001",
         expect_first_tool="lint_flow",
         expect_tools_not_called=["run_flow"],
+        expect_guards_not_triggered=["pending_repair_gate"],
+    ),
+    # 以下场景专测护栏路径：护栏平时是静默的，只有让模型真的走到那一步，
+    # 才能区分「规则没被违反」和「规则的判定条件根本没生效」。
+    Scenario(
+        name="review_request_does_not_run",
+        description="审查类请求不该自动运行流程——这条只有提示词管，护栏不拦（read_only 只对无人值守自愈生效）",
+        user_message="帮我审查一下这个流程，看看有没有什么问题或者可以优化的地方。",
+        flow_id="eval-flow-0001",
+        expect_tools_not_called=["run_flow", "create_flow"],
+    ),
+    Scenario(
+        name="guard_quality_fail_repairs_before_rerun",
+        description="assert_run_output 不通过时必须先按 repair_plan 改流程，不能原样重跑",
+        user_message="运行一下这个流程，抓完确认数据没问题。",
+        flow_id="eval-flow-0001",
+        tool_overrides={
+            "assert_run_output": {
+                "passed": False,
+                "task_id": "eval-task-0001",
+                "issues": [{"issue": "table_extract_flattened",
+                            "detail": "抽取结果是扁平字符串列表，没有列名，无法核对需求里的字段。"}],
+                "repair_plan": [{"step": 1, "action": "apply_node_fix",
+                                 "detail": "把提取节点的 extractMode 改成 table，selector 指向数据行"}],
+                "summary": "输出不可信：表格被抽成了扁平文本。",
+            },
+        },
+        expect_tools_called=["assert_run_output"],
+        expect_tool_order=[("assert_run_output", "apply_node_fix")],
+        expect_guards_not_triggered=["requires_quality_fix"],
+        # 模型有时会先 get_run_output 再改，路径不唯一；这里判的是"改了才重跑"
+        min_pass_rate=0.67,
+    ),
+    Scenario(
+        name="guard_selector_timeout_inspects_first",
+        description="报错带 inspect_hint 时必须先 inspect_page 取真实 DOM 再改节点",
+        user_message="流程跑失败了，帮我看看怎么回事。",
+        flow_id="eval-flow-0001",
+        tool_overrides={
+            "run_flow": {"task_id": "eval-task-0003", "status": "error", "flow_id": "eval-flow-0001",
+                         "failed_node_id": "n3"},
+            "get_run_error": {
+                "task_id": "eval-task-0003", "status": "error", "failed_node_id": "n3",
+                "error_logs": ["Timeout 30000ms exceeded waiting for selector \".data-table tbody tr\""],
+                "inspect_hint": {"last_browser_url": "https://example.com/list",
+                                 "reason": "selector 定位超时，需要真实 DOM"},
+                "selector_diagnostic": {"kind": "selector_zero_match"},
+            },
+        },
+        expect_tools_called=["get_run_error", "inspect_page"],
+        expect_tool_order=[("inspect_page", "apply_node_fix")],
+        expect_guards_not_triggered=["requires_inspect_page"],
+        min_pass_rate=0.67,
+    ),
+    Scenario(
+        name="guard_blocking_lint_fixed_before_run",
+        description="create_flow 带回阻断级 lint finding 时，必须先修再跑",
+        user_message=(
+            "帮我创建并运行一个流程：抓取 https://example.com/list 的表格数据存成 JSON，"
+            "该页面无需登录。"
+        ),
+        tool_overrides={
+            "create_flow": {
+                "flow_id": "eval-flow-0001", "name": "评测流程", "status": "draft",
+                "lint_findings": [{
+                    "issue": "table_extract_selector_targets_container",
+                    "severity": "warning",
+                    "node_id": "n2",
+                    "detail": "extractMode=table 的 selector 指向了表格容器而不是数据行，会只抽到一行。",
+                }],
+            },
+        },
+        expect_tool_order=[("apply_node_fix", "run_flow")],
+        expect_guards_not_triggered=["requires_lint_fix"],
+        min_pass_rate=0.67,
     ),
     Scenario(
         name="timeout_waiting_input_no_rerun",
@@ -261,17 +376,18 @@ _RECORDINGS_DIR = Path(__file__).resolve().parent / "recordings"
 
 
 def _recording_path(model: str, scenario_name: str, rep: int) -> Path:
-    return _RECORDINGS_DIR / model.replace("/", "_") / f"{scenario_name}-{rep + 1}.json"
+    version = active_prompt_version()
+    return _RECORDINGS_DIR / model.replace("/", "_") / version / f"{scenario_name}-{rep + 1}.json"
 
 
 def _replay_scenario(scenario: Scenario, model: str, rep: int) -> list[str]:
     path = _recording_path(model, scenario.name, rep)
     if not path.exists():
-        return [f"缺少录像 {path.name}，先用 --record 跑一次"]
+        return [f"缺少录像 {path.parent.name}/{path.name}，先用 --record 跑一次"]
     recorded = json.loads(path.read_text(encoding="utf-8"))
     executor = MockToolExecutor(scenario.tool_overrides)
     executor.calls = [(c["name"], c["args"]) for c in recorded["calls"]]
-    return _judge_scenario(scenario, recorded["reply"], executor)
+    return _judge_scenario(scenario, recorded["reply"], executor, recorded.get("guard_hits") or [])
 
 
 async def run_scenario(
@@ -289,14 +405,15 @@ async def run_scenario(
         flow_id=scenario.flow_id,
     )
     try:
-        async for event in stream:
-            if event.get("type") == "text":
-                reply_parts.append(str(event.get("delta") or ""))
-            elif event.get("type") == "error":
-                errors.append(f"LLM 错误：{event.get('message')}")
-            # 后续回合每轮都重发整个系统提示词，判分用不上就别让它继续
-            if scenario.stop_after_tool and scenario.stop_after_tool in executor.called_tools():
-                break
+        with _observe_guards() as guard_hits:
+            async for event in stream:
+                if event.get("type") == "text":
+                    reply_parts.append(str(event.get("delta") or ""))
+                elif event.get("type") == "error":
+                    errors.append(f"LLM 错误：{event.get('message')}")
+                # 后续回合每轮都重发整个系统提示词，判分用不上就别让它继续
+                if scenario.stop_after_tool and scenario.stop_after_tool in executor.called_tools():
+                    break
     except Exception as exc:
         errors.append(f"运行异常：{exc}")
     finally:
@@ -309,17 +426,32 @@ async def run_scenario(
         path = _recording_path(model, scenario.name, rep)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(
-            {"model": model, "scenario": scenario.name, "reply": reply,
-             "calls": [{"name": n, "args": a} for n, a in executor.calls]},
+            {"model": model, "prompt_version": active_prompt_version(),
+             "scenario": scenario.name, "reply": reply,
+             "calls": [{"name": n, "args": a} for n, a in executor.calls],
+             "guard_hits": guard_hits},
             ensure_ascii=False, indent=2,
         ), encoding="utf-8")
-    return _judge_scenario(scenario, reply, executor)
+    return _judge_scenario(scenario, reply, executor, guard_hits)
 
 
-def _judge_scenario(scenario: Scenario, reply: str, executor: MockToolExecutor) -> list[str]:
+def _judge_scenario(
+    scenario: Scenario,
+    reply: str,
+    executor: MockToolExecutor,
+    guard_hits: list[str] | None = None,
+) -> list[str]:
     """只依据模型输出判分，真跑与 --replay 共用，改判分逻辑只改这里。"""
     called = executor.called_tools()
+    hits = guard_hits or []
     failures: list[str] = []
+
+    for guard_id in scenario.expect_guards_triggered:
+        if guard_id not in hits:
+            failures.append(f"期望护栏 {guard_id} 被触发，实际触发 {hits or '（无）'}")
+    for guard_id in scenario.expect_guards_not_triggered:
+        if guard_id in hits:
+            failures.append(f"模型踩了护栏 {guard_id}（触发序列 {hits}）——提示词没能让它自己避开")
 
     if scenario.expect_no_tools and called:
         failures.append(f"期望不调用工具，实际调用了 {called}")
@@ -396,6 +528,111 @@ def _resolve_model_and_key(config: AiConfigService, model_arg: str | None) -> tu
     return model, has_key
 
 
+@dataclass
+class ScenarioResult:
+    ok_runs: int
+    reps: int
+    failures: list[str]
+
+    @property
+    def rate(self) -> float:
+        return self.ok_runs / self.reps
+
+
+async def _run_suite(
+    selected: list[Scenario],
+    model: str,
+    config: AiConfigService,
+    *,
+    reps: int,
+    record: bool,
+    replay: bool,
+    quiet: bool = False,
+) -> dict[str, ScenarioResult]:
+    results: dict[str, ScenarioResult] = {}
+    for scenario in selected:
+        if not quiet:
+            print(f"▶ {scenario.name} — {scenario.description}")
+        all_failures: list[str] = []
+        ok_runs = 0
+        for rep in range(reps):
+            if replay:
+                failures = _replay_scenario(scenario, model, rep)
+            else:
+                failures = await run_scenario(scenario, model, config, rep, record=record)
+            if failures:
+                all_failures.extend(f"[第{rep + 1}次] {f}" for f in failures)
+            else:
+                ok_runs += 1
+        result = ScenarioResult(ok_runs, reps, all_failures)
+        results[scenario.name] = result
+        if not quiet:
+            # 达标也照打失败详情：阈值抗的是随机噪音，不该掩盖退化
+            if result.rate + 1e-9 >= scenario.min_pass_rate:
+                print(f"  ✓ 通过（{ok_runs}/{reps}，阈值 {scenario.min_pass_rate:.0%}）")
+            else:
+                print(f"  ✗ 通过率 {ok_runs}/{reps} 低于阈值 {scenario.min_pass_rate:.0%}")
+            for f in all_failures:
+                print(f"    · {f}")
+            print()
+    return results
+
+
+async def _compare_prompt_versions(
+    versions: list[str],
+    selected: list[Scenario],
+    model: str,
+    config: AiConfigService,
+    *,
+    reps: int,
+    record: bool,
+    replay: bool,
+) -> int:
+    """同一套场景在多个提示词版本下各跑一遍，按场景并排给出通过率。
+
+    只看总分会把「修好两个、跑坏两个」显示成没变化，所以逐场景列出，
+    并单独把「A 过 B 不过」的场景提出来——那才是这次提示词改动的代价。
+    """
+    per_version: dict[str, dict[str, ScenarioResult]] = {}
+    for version in versions:
+        os.environ["RPA_AI_PROMPT_VERSION"] = version
+        print(f"═══ prompt {version} — {PROMPT_VERSIONS[version].summary} ═══")
+        per_version[version] = await _run_suite(
+            selected, model, config, reps=reps, record=record, replay=replay
+        )
+
+    width = max(len(s.name) for s in selected)
+    header = "场景".ljust(width) + "  " + "  ".join(v.rjust(6) for v in versions)
+    print(header)
+    print("-" * len(header))
+    regressions: list[str] = []
+    for scenario in selected:
+        cells = []
+        for version in versions:
+            r = per_version[version][scenario.name]
+            cells.append(f"{r.ok_runs}/{r.reps}".rjust(6))
+        print(scenario.name.ljust(width) + "  " + "  ".join(cells))
+        base = per_version[versions[0]][scenario.name].rate
+        for version in versions[1:]:
+            if per_version[version][scenario.name].rate + 1e-9 < base:
+                regressions.append(f"{scenario.name}：{versions[0]} {base:.0%} → {version} "
+                                   f"{per_version[version][scenario.name].rate:.0%}")
+
+    print()
+    for version in versions:
+        met = sum(
+            1 for s in selected
+            if per_version[version][s.name].rate + 1e-9 >= s.min_pass_rate
+        )
+        print(f"{version}：{met}/{len(selected)} 达阈值")
+    if regressions:
+        print("\n相对基线退化：")
+        for line in regressions:
+            print(f"  · {line}")
+        return 1
+    return 0
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser(description="RPA 助手行为评测")
     parser.add_argument("--model", help="覆盖默认模型")
@@ -403,7 +640,17 @@ async def main() -> int:
     parser.add_argument("--reps", type=int, default=1, help="每个场景重复次数，按通过率判定")
     parser.add_argument("--record", action="store_true", help="把模型输出存进 evals/recordings/")
     parser.add_argument("--replay", action="store_true", help="只重放录像判分，不调模型、不花 token")
+    parser.add_argument("--prompt-version", help=f"指定提示词版本（{'/'.join(PROMPT_VERSIONS)}）")
+    parser.add_argument("--compare-prompts", help="多个提示词版本跑同一套场景做对比，逗号分隔，第一个是基线")
     args = parser.parse_args()
+
+    versions = [v.strip() for v in (args.compare_prompts or "").split(",") if v.strip()]
+    if args.prompt_version:
+        versions = versions or [args.prompt_version]
+    unknown = [v for v in versions if v not in PROMPT_VERSIONS]
+    if unknown:
+        print(f"未知的提示词版本 {unknown}；可用：{sorted(PROMPT_VERSIONS)}")
+        return 2
 
     config = AiConfigService()
     config.apply_to_env(config.load())
@@ -424,42 +671,28 @@ async def main() -> int:
 
     reps = max(1, args.reps)
     mode = "重放录像" if args.replay else ("真跑并录像" if args.record else "真跑")
-    print(f"模型：{model} | 场景数：{len(selected)} | 每场景 {reps} 次 | {mode}\n")
-    passed = 0
-    results: list[tuple[str, list[str]]] = []
-    for scenario in selected:
-        print(f"▶ {scenario.name} — {scenario.description}")
-        all_failures: list[str] = []
-        ok_runs = 0
-        for rep in range(reps):
-            if args.replay:
-                failures = _replay_scenario(scenario, model, rep)
-            else:
-                failures = await run_scenario(scenario, model, config, rep, record=args.record)
-            if failures:
-                all_failures.extend(f"[第{rep + 1}次] {f}" for f in failures)
-            else:
-                ok_runs += 1
-        rate = ok_runs / reps
-        # 达标也照打失败详情：阈值抗的是随机噪音，不该掩盖退化
-        if rate + 1e-9 >= scenario.min_pass_rate:
-            passed += 1
-            print(f"  ✓ 通过（{ok_runs}/{reps}，阈值 {scenario.min_pass_rate:.0%}）")
-            for f in all_failures:
-                print(f"    · {f}")
-        else:
-            results.append((scenario.name, all_failures))
-            print(f"  ✗ 通过率 {ok_runs}/{reps} 低于阈值 {scenario.min_pass_rate:.0%}")
-            for f in all_failures:
-                print(f"    · {f}")
-        print()
+    print(f"模型：{model} | 场景数：{len(selected)} | 每场景 {reps} 次 | {mode}")
 
-    print(f"结果：{passed}/{len(selected)} 通过")
-    if passed < len(selected):
-        print(json.dumps(
-            {name: fails for name, fails in results if fails},
-            ensure_ascii=False, indent=2,
-        ))
+    if len(versions) > 1:
+        return await _compare_prompt_versions(
+            versions, selected, model, config, reps=reps, record=args.record, replay=args.replay
+        )
+
+    if versions:
+        os.environ["RPA_AI_PROMPT_VERSION"] = versions[0]
+    print(f"提示词版本：{active_prompt_version()}\n")
+    results = await _run_suite(
+        selected, model, config, reps=reps, record=args.record, replay=args.replay
+    )
+
+    failed = {
+        s.name: results[s.name].failures
+        for s in selected
+        if results[s.name].rate + 1e-9 < s.min_pass_rate
+    }
+    print(f"结果：{len(selected) - len(failed)}/{len(selected)} 通过")
+    if failed:
+        print(json.dumps(failed, ensure_ascii=False, indent=2))
         return 1
     return 0
 

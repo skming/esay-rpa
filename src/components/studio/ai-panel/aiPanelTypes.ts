@@ -30,6 +30,19 @@ export interface NodeLookupItem {
   type?: string;
 }
 
+/** 一轮对话累计的用量，由后端 usage 事件推送（每轮刷新一次，值是累计值不是增量）。 */
+export interface AiUsage {
+  rounds: number;
+  max_rounds: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cached_tokens: number;
+  total_tokens: number;
+  tool_calls: number;
+  blocked_calls: number;
+  llm_seconds: number;
+}
+
 export interface AiMessage {
   id: string;
   role: 'user' | 'assistant';
@@ -43,6 +56,7 @@ export interface AiMessage {
   statusDetail?: string;
   reasoning?: string;
   processingMs?: number;
+  usage?: AiUsage;
   createdAt: number;
   finishedAt?: number;
 }

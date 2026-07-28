@@ -151,6 +151,7 @@ export const MessageBubble = memo(function MessageBubble({
               processingMs={message.processingMs}
               streamingPending={streamingPending}
               toolCalls={message.toolCalls}
+              usage={message.usage}
             />
           </div>
         )}

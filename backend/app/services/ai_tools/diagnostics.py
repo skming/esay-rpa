@@ -10,6 +10,28 @@ from typing import Any
 
 _NAVIGATION_NODE_TYPES = frozenset({"browser.open", "browser.ensureLogin"})
 
+# 诊断类型名产在这里、消费在编排层与站点档案，必须引常量而不是各处写字面量：
+# 名字对不上不会报错，只会让那条判据永远不命中，表现和"没写过这条判据"一模一样。
+SELECTOR_ZERO_MATCH = "selector_zero_match"
+SELECTOR_MULTI_MATCH_FIRST_NOT_ACTIONABLE = "selector_multi_match_first_not_actionable"
+SELECTOR_MATCH_NOT_VISIBLE = "selector_match_not_visible"
+SELECTOR_MATCH_HIDDEN_OR_NOT_VISIBLE = "selector_match_hidden_or_not_visible"
+
+# 元素压根不在，或选得太宽以致选中的不是要操作的那个——这两类是 selector 本身写错了。
+SELECTOR_FALSIFYING_KINDS = frozenset({
+    SELECTOR_ZERO_MATCH,
+    SELECTOR_MULTI_MATCH_FIRST_NOT_ACTIONABLE,
+})
+
+# 元素找到了但点不动，改 selector 一律无效（出路是 continueOnError / force / 等时机）。
+# 两者不能各自判断：区别只在 Playwright 有没有在报错里报出匹配数量，成因与修法完全相同。
+SELECTOR_NOT_VISIBLE_KINDS = frozenset({
+    SELECTOR_MATCH_NOT_VISIBLE,
+    SELECTOR_MATCH_HIDDEN_OR_NOT_VISIBLE,
+})
+
+SELECTOR_DIAGNOSTIC_KINDS = SELECTOR_FALSIFYING_KINDS | SELECTOR_NOT_VISIBLE_KINDS
+
 
 def _read_log_url(log: Any) -> str | None:
     detail = str(getattr(log, "detail", "") or "")
