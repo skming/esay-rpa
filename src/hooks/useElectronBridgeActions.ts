@@ -9,7 +9,9 @@ import { cloneFlowTemplate, type FlowTemplate } from '../lib/flowTemplates';
 import { isSafeVariableName } from '../lib/variableNaming';
 import { getBlockingRunIssue, validateRunConfiguration } from '../lib/runValidation';
 import { useBottomPanelStore } from '../stores/useBottomPanelStore';
+import { useFlowDraftStore } from '../stores/useFlowDraftStore';
 import { usePropertyPanelStore } from '../stores/usePropertyPanelStore';
+import { useWorkspaceStore } from '../stores/useWorkspaceStore';
 import { applyPendingDraftToNodes } from '../lib/pendingNodeDraft';
 import { buildInitialFlowPayload, buildUpdatePayload, hasDefinitionChanged } from '../lib/flowVersioning';
 import type {
@@ -290,8 +292,15 @@ export function useElectronBridgeActions({
       },
       openFlowById: async (flowId: string) => {
         // 直接取单个流程，避免全量 listFlows 往返及其偶发的 500 错误
-        let target = await fetchFlowSnapshot(flowId);
+        const fetched = await fetchFlowSnapshot(flowId);
+        if (fetched.kind === 'missing') {
+          forgetDeletedFlow(flowId);
+          setFlows((current) => current.filter((flow) => flow.flowId !== flowId));
+          pushToast('error', '该流程已被删除');
+          return;
+        }
 
+        let target: FlowSnapshot | null = fetched.kind === 'ok' ? fetched.flow : null;
         if (target === null) {
           const flows = await callBridge((api) => api.listFlows());
           if (flows === null) return;
@@ -312,8 +321,15 @@ export function useElectronBridgeActions({
         openFlowSnapshot(target, { pushToast, setCurrentFlow, setFlowEdges, setFlowNodes, setInputVariables });
       },
       silentlyRestoreCurrentFlow: async (flowId: string, options?: { restoreCanvas?: boolean }) => {
-        const flow = await fetchFlowSnapshot(flowId);
-        if (flow === null) return;
+        const fetched = await fetchFlowSnapshot(flowId);
+        if (fetched.kind === 'missing') {
+          // 流程已被删除：不清掉引用的话，每次启动都会再对同一个 id 发一次注定 404 的请求
+          forgetDeletedFlow(flowId);
+          pushToast('info', '上次打开的流程已被删除');
+          return;
+        }
+        if (fetched.kind !== 'ok') return;
+        const flow = fetched.flow;
         setCurrentFlow(flow);
         if (options?.restoreCanvas === true) {
           applyFlowDefinitionToCanvas(flow.definition, setFlowNodes, setFlowEdges);
@@ -322,8 +338,9 @@ export function useElectronBridgeActions({
         }
       },
       applyAiFlowUpdate: async (flowId: string) => {
-        const flow = await fetchFlowSnapshot(flowId);
-        if (flow === null) return; // 取不到时画布保持原状
+        const fetched = await fetchFlowSnapshot(flowId);
+        if (fetched.kind !== 'ok') return; // 取不到时画布保持原状
+        const flow = fetched.flow;
         // 故意不调用 setInputVariables：AI 工具只改节点/边，调用它会清掉用户未保存的本地变量编辑
         setCurrentFlow(flow);
         setFlows(upsertFlow(flow));
@@ -388,8 +405,14 @@ export function useElectronBridgeActions({
       },
       exportFlowById: async (flowId: string) => {
         // 优先从已加载列表取，避免 open flow（会替换 currentFlow/画布状态）及 stale closure
-        const flow = flows.find((f) => f.flowId === flowId) ?? await fetchFlowSnapshot(flowId);
-        if (flow === null || flow === undefined) {
+        const cached = flows.find((f) => f.flowId === flowId);
+        const fetched = cached === undefined ? await fetchFlowSnapshot(flowId) : null;
+        if (fetched?.kind === 'missing') {
+          forgetDeletedFlow(flowId);
+          setFlows((current) => current.filter((f) => f.flowId !== flowId));
+        }
+        const flow = cached ?? (fetched?.kind === 'ok' ? fetched.flow : null);
+        if (flow === null) {
           pushToast('error', '未找到指定流程');
           return;
         }
@@ -458,6 +481,7 @@ export function useElectronBridgeActions({
           resetRunView();
           setCurrentFlow(null);
           setFlows((current) => current.filter((item) => item.flowId !== flowId));
+          forgetDeletedFlow(flowId);
           pushToast('success', '流程版本已删除');
         }
       },
@@ -469,6 +493,7 @@ export function useElectronBridgeActions({
             setCurrentFlow(null);
           }
           setFlows((current) => current.filter((item) => item.flowId !== flowId));
+          forgetDeletedFlow(flowId);
           pushToast('success', '流程版本已删除');
         }
       },
@@ -920,6 +945,18 @@ export function useElectronBridgeActions({
       setVariables
     ]
   );
+}
+
+/**
+ * 抹掉所有指向该流程的持久化引用。删除流程后不做这一步，下次启动会拿着已不存在的 id
+ * 去恢复"上次打开的流程"，每次都换来一个 404。
+ */
+function forgetDeletedFlow(flowId: string): void {
+  const workspace = useWorkspaceStore.getState();
+  if (workspace.lastOpenedFlowId === flowId) {
+    workspace.setLastOpenedFlowId(null);
+  }
+  useFlowDraftStore.getState().detachFlowId(flowId);
 }
 
 async function persistCurrentFlow({

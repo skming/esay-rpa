@@ -32,6 +32,17 @@ type HealthResponse = {
   service: string;
 };
 
+/** 带状态码的后端错误。断网、超时抛的是普通 Error，据此才能把"后端说没有"和"没问到后端"分开。 */
+export class BackendHttpError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'BackendHttpError';
+    this.status = status;
+  }
+}
+
 type RequestOptions = {
   method: 'DELETE' | 'GET' | 'PATCH' | 'POST' | 'PUT';
   body?: unknown;
@@ -439,7 +450,7 @@ export class BackendClient {
       const text = await response.text();
       const data = parseJson(text);
       if (!response.ok) {
-        throw new Error(readErrorDetail(data) ?? `后端请求失败：${response.status}`);
+        throw new BackendHttpError(readErrorDetail(data) ?? `后端请求失败：${response.status}`, response.status);
       }
       return data as T;
     } catch (error) {
@@ -457,12 +468,22 @@ export class BackendClient {
 /** 全应用唯一的后端 HTTP 入口。自己拼 URL 调 fetch 会绕开超时和错误解析。 */
 export const backend = new BackendClient();
 
-/** 取单个流程，失败一律返回 null。调用方都是"取到就用、取不到走兜底"，不需要区分 404 / 超时 / 断网。 */
-export async function fetchFlowSnapshot(flowId: string): Promise<FlowSnapshot | null> {
+export type FlowFetchResult =
+  | { kind: 'ok'; flow: FlowSnapshot }
+  /** 后端明确回 404：流程已被删除，指向它的持久化引用应当就地清掉 */
+  | { kind: 'missing' }
+  /** 超时、断网、5xx：流程可能还在，据此清引用会把后端抖动变成用户数据丢失 */
+  | { kind: 'unavailable' };
+
+/** 取单个流程。区分 404 与"没问到后端"：只有前者才允许调用方丢弃对该流程的引用。 */
+export async function fetchFlowSnapshot(flowId: string): Promise<FlowFetchResult> {
   try {
-    return await backend.getFlow(flowId);
-  } catch {
-    return null;
+    return { flow: await backend.getFlow(flowId), kind: 'ok' };
+  } catch (error) {
+    if (error instanceof BackendHttpError && error.status === 404) {
+      return { kind: 'missing' };
+    }
+    return { kind: 'unavailable' };
   }
 }
 
