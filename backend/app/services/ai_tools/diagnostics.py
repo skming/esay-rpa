@@ -9,6 +9,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from app.services.ai_tools.variables import _RUNTIME_BUILTINS
+
 _NAVIGATION_NODE_TYPES = frozenset({"browser.open", "browser.ensureLogin"})
 
 # 诊断类型名产在这里、消费在编排层与站点档案，必须引常量而不是各处写字面量：
@@ -41,6 +43,10 @@ DOCUMENT_CONTENT_MISMATCH = "document_content_may_not_match_requirement"
 # 那条路径上的确认位就永远解不开：照 fix 传 true 会被剥掉，拿回一模一样的失败，
 # 两次即触发质量熔断，流程锁死在一个它无论如何都满足不了的判据上。
 CONTENT_MISMATCH_ISSUES = frozenset({OUTPUT_CONTENT_MISMATCH, DOCUMENT_CONTENT_MISMATCH})
+
+# 文档正文与本次抓取数据无交集：与上面两条不同，这条不接受 content_match_confirmed 自证，
+# 因为它比的就是「模型自己写的字」之外的证据。
+DOCUMENT_MISSING_RUN_DATA = "document_missing_run_data"
 
 
 def _read_log_url(log: Any) -> str | None:
@@ -326,6 +332,72 @@ def _find_document_output(variables: dict[str, Any]) -> dict[str, Any] | None:
         if best is None or candidate["score"] > best["score"]:
             best = candidate
     return best
+
+
+_WHITESPACE_RUN = re.compile(r"\s+")
+# 抓取值里取多长一段去正文里找。中文 8 字已经不可能撞车；再长会被脚本的换行/加粗切断。
+_PROVENANCE_FRAGMENT = 8
+_PROVENANCE_SAMPLE_VALUES = 40
+
+
+def _collapse(text: str) -> str:
+    return _WHITESPACE_RUN.sub(" ", text)
+
+
+def _run_data_fragments(variables: dict[str, Any], document_name: str) -> list[str]:
+    """从本次运行抓到的变量里取若干原文片段，用来验证文档正文确实装了这些数据。
+
+    排除交付物变量自己和运行时内置量（路径、时间戳）：拿产物路径去产物正文里找，
+    找到的只是脚本把路径写进了页脚。
+    """
+    fragments: list[str] = []
+    for name, value in variables.items():
+        if name == document_name or name in _RUNTIME_BUILTINS:
+            continue
+        items = value if isinstance(value, list) else [value]
+        for item in items:
+            if isinstance(item, dict):
+                item = " ".join(str(v) for v in item.values())
+            text = _collapse(str(item)).strip()
+            if len(text) < _PROVENANCE_FRAGMENT or text.startswith(("http://", "https://", "/")):
+                continue
+            fragments.append(text[:_PROVENANCE_FRAGMENT])
+            middle = len(text) // 2
+            if len(text) >= _PROVENANCE_FRAGMENT * 3:
+                fragments.append(text[middle : middle + _PROVENANCE_FRAGMENT])
+            if len(fragments) >= _PROVENANCE_SAMPLE_VALUES * 2:
+                return fragments
+    return fragments
+
+
+def _audit_document_provenance(
+    document: dict[str, Any], body: str, variables: dict[str, Any]
+) -> dict[str, Any] | None:
+    """文档正文里是否留下了本次运行抓到的数据。
+
+    需求关键词比对挡不住这一类：文档正文整篇由脚本写出，把需求原话写成标题
+    （「# 帖子内容总结」「## 生成总结」）就能让关键词判据通过，而这比修抽取节点便宜得多——
+    模型上一轮已经明说要这么干。所以文档必须拿抓取值来验，不能拿它自己写的字自证。
+    平台没有语义改写类节点，脚本只能搬运原文，因此逐字找不到就是真没搬进去。
+    """
+    fragments = _run_data_fragments(variables, str(document.get("name") or ""))
+    if not fragments:
+        return None
+    haystack = _collapse(body)
+    if any(fragment in haystack for fragment in fragments):
+        return None
+    return {
+        "issue": DOCUMENT_MISSING_RUN_DATA,
+        "message": (
+            f"文档 `{document['name']}` 里找不到本次运行抓到的任何一段原文"
+            f"（比对了 {len(fragments)} 个片段，例如 {fragments[:3]}）。"
+            "正文是生成节点自己写的固定文案，抓来的数据没有进到交付物里。"
+        ),
+        "fix": (
+            "检查生成节点：确认它读的是抽取节点的输出变量，且写文件时用的是这个变量的内容，"
+            "不是脚本里的示例文本或标题模板。"
+        ),
+    }
 
 
 def _audit_binary_document(document: dict[str, Any], path: Path) -> list[dict[str, Any]]:
@@ -968,7 +1040,19 @@ def _build_quality_repair_plan(issues: list[dict[str, Any]]) -> list[dict[str, A
                 "直接向用户确认交付形态，不要造 rows 变量来迎合本条检查。",
             ],
         })
-    if any(name.startswith("document_") for name in issue_names):
+    if DOCUMENT_MISSING_RUN_DATA in issue_names:
+        plan.append({
+            "action": "wire_document_to_extracted_data",
+            "reason": "文档写出来了，但正文里没有本次抓取到的任何原文，生成节点用的不是抽取节点的输出。",
+            "steps": [
+                "用 get_run_output 看抽取变量的实际值：先确认它非空、装的是正文而不是标题或计数。",
+                "读生成节点的代码：它读的变量名是否就是那个抽取变量，写文件时写进去的是不是这个变量的内容。",
+                "把需求原话写成文档标题对这条判据无效——它比的是抓取值，不是需求关键词。",
+                "改完重跑，再调用本工具。",
+            ],
+        })
+    # 上一条的出路不是自证：content_match_confirmed 解不开「正文里没有抓取数据」
+    if any(name.startswith("document_") and name != DOCUMENT_MISSING_RUN_DATA for name in issue_names):
         plan.append({
             "action": "fix_document_content",
             "reason": "文档型交付物已写出，但内容量或内容本身对不上需求。",

@@ -26,6 +26,7 @@ from app.services.ai_tools.diagnostics import (
     _build_quality_repair_plan,
     _build_run_root_cause_hints,
     _audit_binary_document,
+    _audit_document_provenance,
     _BINARY_DOCUMENT_FORMATS,
     _check_requirement_alignment,
     build_navigation_trace,
@@ -1901,7 +1902,7 @@ class RpaToolExecutor:
             )
             if document is not None:
                 issues.extend(self._audit_document_output(
-                    task, document, requirement_text or "", content_match_confirmed
+                    task, document, requirement_text or "", content_match_confirmed, variables
                 ))
                 blocking = [i for i in issues if i.get("severity") != "warning"]
                 if flow is not None and blocking:
@@ -2045,6 +2046,7 @@ class RpaToolExecutor:
         document: dict[str, Any],
         requirement_text: str,
         content_match_confirmed: bool,
+        variables: dict[str, Any],
     ) -> list[dict[str, Any]]:
         """文档型交付物的审计：真落盘了、有正文、内容对得上需求。
 
@@ -2082,6 +2084,10 @@ class RpaToolExecutor:
                 ),
                 "fix": "用 inspect_page 确认正文容器 selector，确保抽取的是整篇内容而不是单个元素。",
             })
+
+        provenance = _audit_document_provenance(document, body, variables)
+        if provenance is not None:
+            issues.append(provenance)
 
         targets = _extract_requirement_targets(requirement_text)
         # rows 传单元素列表：对齐检查对非 dict/list 行按整段文本比对

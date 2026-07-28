@@ -776,6 +776,12 @@ _LITERAL_PROSE_PATTERN = re.compile(
     r"(?<![fF])(['\"])((?:(?!\1).){24,})\1"
 )
 _CJK_SENTENCE_PUNCTUATION = ("。", "，", "！", "？", "；", "：")
+# 报错/日志文案不是交付内容：它只在数据为空或异常时出现，写死是对的。
+# 不豁免 print——script 节点靠 stdout 交付，那里的固定长文本正是这条规则要抓的。
+_ERROR_MESSAGE_CALL = re.compile(
+    r"(?:raise\s+\w+\s*\(|SystemExit\s*\(|assert\s|sys\.stderr\.write\s*\(|"
+    r"\.(?:error|warning|warn|exception|critical)\s*\()[^\n]*$"
+)
 
 
 # 「按条件保留子集」的脚本特征：既做比较，又把命中的行收进一个新集合
@@ -949,6 +955,8 @@ def _lint_script_hardcoded_content(nodes: list[dict[str, Any]]) -> list[dict[str
         for match in _LITERAL_PROSE_PATTERN.finditer(code):
             literal = match.group(2)
             if not any(mark in literal for mark in _CJK_SENTENCE_PUNCTUATION):
+                continue
+            if _ERROR_MESSAGE_CALL.search(code[: match.start()].rsplit("\n", 1)[-1]):
                 continue
             findings.append({
                 "severity": "warn",

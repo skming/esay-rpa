@@ -31,13 +31,17 @@ from app.services.ai_tools.diagnostics import (
     _check_requirement_alignment,
     _check_structured_rows,
     _audit_binary_document,
+    _audit_document_provenance,
     _extract_requirement_targets,
     _find_incomplete_sweeps,
     build_navigation_trace,
     build_navigation_verdict,
 )
 from app.services.ai_tools.lint import _lint_flow
-from app.services.ai_tools.lint_scenarios import _lint_unavailable_artifact_format
+from app.services.ai_tools.lint_scenarios import (
+    _lint_script_hardcoded_content,
+    _lint_unavailable_artifact_format,
+)
 from app.services.ai_tools.script_capabilities import describe_script_capabilities
 from app.services.ai_tools.normalize import _normalize_generated_edges, _normalize_generated_nodes
 
@@ -2918,6 +2922,58 @@ def test_binary_document_that_cannot_open_is_still_a_blocking_defect(tmp_path) -
     assert [f["issue"] for f in _audit_binary_document({"name": "p", "value": str(empty)}, empty)] == [
         "document_binary_too_small"
     ]
+
+
+def test_document_full_of_requirement_words_but_no_scraped_text_is_rejected(tmp_path) -> None:
+    """事故复盘：文档正文整篇由脚本写出，把需求原话写成标题就能骗过关键词判据。
+
+    模型上一轮已明说要「让文档正文显式包含需求关键词后重新验收」——这比修抽取节点便宜，
+    所以判据必须比抓取值，不能比它自己写的字。
+    """
+    doc = tmp_path / "summary.md"
+    doc.write_text("# 帖子内容总结\n\n## 生成总结\n\n" + "本文档为交付说明。\n" * 20, encoding="utf-8")
+    variables = {"post_texts": ["全系支持 92 号、95 号、98 号汽油；", "感觉都是文字游戏"], "md_path": str(doc)}
+
+    finding = _audit_document_provenance(
+        {"name": "md_path", "value": str(doc)}, doc.read_text(encoding="utf-8"), variables
+    )
+
+    assert finding is not None and finding["issue"] == "document_missing_run_data"
+
+
+def test_document_carrying_the_scraped_text_passes_even_after_reformatting(tmp_path) -> None:
+    """脚本会压空白、加 markdown 前缀重排正文，判据必须容得下这些改写。"""
+    doc = tmp_path / "summary.md"
+    doc.write_text("# 总结\n\n1. 全系支持 92 号、95 号、98\n   号汽油；\n", encoding="utf-8")
+    variables = {"post_texts": ["全系支持 92 号、95 号、98 号汽油；\n"], "md_path": str(doc)}
+
+    assert _audit_document_provenance(
+        {"name": "md_path", "value": str(doc)}, doc.read_text(encoding="utf-8"), variables
+    ) is None
+
+
+def test_error_message_literals_are_not_read_as_hardcoded_deliverable_content() -> None:
+    """`raise SystemExit('未提取到内容…')` 只在数据为空时出现，写死是对的。
+
+    误报会跟着每一次 lint/apply_node_fix/assert 反复回给模型，教它整体忽略 lint 结论。
+    """
+    error_path = {
+        "id": "n4",
+        "title": "生成总结MD",
+        "type": "script.python",
+        "code": "x = _vars['a']\nif not x:\n    raise SystemExit('未提取到帖子内容，无法生成 Markdown 总结')\n",
+    }
+    hardcoded = {
+        "id": "n5",
+        "title": "生成总结MD",
+        "type": "script.python",
+        "code": "print('本季度营收同比增长 12%，主要来自华东区域的渠道扩张。')\n",
+    }
+
+    assert _lint_script_hardcoded_content([error_path]) == []
+    assert [f["issue"] for f in _lint_script_hardcoded_content([hardcoded])] == [
+        "script_hardcoded_prose_literal"
+    ], "stdout 是 script 节点的交付通道，那里的固定长文本仍必须报"
 
 
 def test_incomplete_sweep_is_detected_when_paginate_output_equals_upstream_extract() -> None:
