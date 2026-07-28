@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -110,6 +112,33 @@ def test_every_node_type_offered_to_the_model_is_actually_runnable() -> None:
     unsupported = sorted(t for t in catalog_types if not is_executable_node({"type": t, "condition": "ready"}))
 
     assert unsupported == []
+
+
+def test_every_node_type_a_runner_dispatches_on_is_offered_to_the_model() -> None:
+    """反方向同样要管：实现了但没写进目录的能力，对模型等于不存在。
+
+    模型看不见的那一步只能绕——用 delayMs 猜等待时长、用脚本拼一段本该有节点做的事——
+    绕出来的写法又会撞上别的 lint 门控，于是问题现象离真实原因很远（browser.waitFor 就这么漏了很久）。
+    判据只能扫 runner 源码里的类型字面量：is_executable_node 这类前缀判断（startswith("file.")）
+    接受无穷多类型，问不出「实现了哪些」。有人加 dispatch 分支忘了登记目录，这条立刻红。
+    """
+    catalog_types = {
+        node_type.strip()
+        for entry in NODE_TYPE_CATALOG
+        for node_type in entry["type"].split("/")
+    }
+    node_type_literal = re.compile(
+        r'["\']((?:browser|ui|control|file|excel|script|data|http|variable)\.[A-Za-z_.]+)["\']'
+    )
+    runner_dir = Path(__file__).resolve().parents[1] / "app" / "services"
+
+    dispatched = {
+        node_type
+        for runner in runner_dir.glob("*_action_runner.py")
+        for node_type in node_type_literal.findall(runner.read_text(encoding="utf-8"))
+    }
+
+    assert sorted(dispatched - catalog_types) == []
 
 
 async def test_flow_run_service_starts_task_from_browser_fetch_node() -> None:
