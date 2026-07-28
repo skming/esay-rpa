@@ -38,11 +38,17 @@ from app.services.ai_tools.diagnostics import (
     build_navigation_verdict,
 )
 from app.services.ai_tools.lint import _lint_flow
+from app.services.ai_tools.catalog import NODE_TYPE_CATALOG
 from app.services.ai_tools.lint_scenarios import (
+    _lint_claimed_semantic_capability,
     _lint_script_hardcoded_content,
     _lint_unavailable_artifact_format,
 )
-from app.services.ai_tools.script_capabilities import describe_script_capabilities
+from app.services.ai_tools.script_capabilities import (
+    SEMANTIC_NODE_PREFIXES,
+    describe_script_capabilities,
+    semantic_rewrite_node_types,
+)
 from app.services.ai_tools.normalize import _normalize_generated_edges, _normalize_generated_nodes
 
 
@@ -2891,6 +2897,8 @@ def test_capability_blurb_names_both_what_works_and_what_does_not() -> None:
     assert ".xlsx" in blurb and "openpyxl" in blurb
     assert ".pdf" in blurb and "reportlab" in blurb
     assert "告诉用户" in blurb
+    # 语义加工的边界和格式的边界同等重要：不写，模型就拿切句子冒充总结
+    assert "语义加工" in blurb and "原文摘录" in blurb
 
 
 def test_pdf_content_is_never_keyword_matched_as_utf8_text(tmp_path) -> None:
@@ -2922,6 +2930,57 @@ def test_binary_document_that_cannot_open_is_still_a_blocking_defect(tmp_path) -
     assert [f["issue"] for f in _audit_binary_document({"name": "p", "value": str(empty)}, empty)] == [
         "document_binary_too_small"
     ]
+
+
+def test_claiming_a_summary_without_any_model_node_is_blocked_before_running() -> None:
+    """事故复盘：交付的「## 生成总结」是回复列表前 8 条原文逐字，助手回「已验收通过」。
+
+    缺的是能力不是语法：切前 8 句照样 success、文件非空、内容也确实来自抓取数据，
+    所以判据只能放在运行之前，且必须是 error——warn 拦不住 run_flow。
+    """
+    node = {
+        "id": "n4_pdf",
+        "type": "script.python",
+        "title": "生成总结MD",
+        "description": "基于采集文本生成 Markdown 总结文件",
+        "outputVariable": "md_path",
+    }
+
+    findings = _lint_claimed_semantic_capability([node])
+
+    assert [f["issue"] for f in findings] == ["claimed_semantic_capability_unavailable"]
+    assert findings[0]["severity"] == "error"
+    assert "由用户决定" in findings[0]["fix"], "出路必须包含停下来问用户，否则模型只会换个写法再切一次"
+
+
+def test_honest_rule_based_wording_is_left_alone() -> None:
+    """能力就是「原文摘录」，说成原文摘录不算冒充；这条规则管的是说法与实做不符。"""
+    honest = {
+        "id": "n4",
+        "type": "script.python",
+        "title": "生成原文摘录MD",
+        "description": "把采集到的回复按原文摘录写成 Markdown",
+        "outputVariable": "md_path",
+    }
+    unrelated = {"id": "n5", "type": "script.python", "title": "导出明细表", "outputVariable": "csv_path"}
+
+    assert _lint_claimed_semantic_capability([honest]) == []
+    assert _lint_claimed_semantic_capability([unrelated]) == []
+
+
+def test_semantic_node_types_stay_in_sync_with_the_catalog() -> None:
+    """catalog 里出现了会调模型的节点，能力声明必须同时更新。
+
+    catalog 在导入期就要调 script_capabilities 拼节点说明，反过来引 catalog 会成环，
+    两处一致只能靠这条测试守：漏改不会报错，只会让闸门在能力已经有了之后继续拦。
+    """
+    in_catalog = {
+        str(entry.get("type"))
+        for entry in NODE_TYPE_CATALOG
+        if str(entry.get("type", "")).startswith(SEMANTIC_NODE_PREFIXES)
+    }
+
+    assert in_catalog == set(semantic_rewrite_node_types())
 
 
 def test_document_full_of_requirement_words_but_no_scraped_text_is_rejected(tmp_path) -> None:

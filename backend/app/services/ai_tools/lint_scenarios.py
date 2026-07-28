@@ -13,6 +13,7 @@ from app.services.ai_tools.normalize import _nodes_visually_overlap
 from app.services.ai_tools.script_capabilities import (
     library_for_format,
     missing_library_hint,
+    semantic_rewrite_node_types,
     unsupported_formats,
 )
 from app.services.ai_tools.selectors import _is_broad_table_row_selector, _is_table_container_selector
@@ -79,6 +80,7 @@ def _lint_flow_semantic_quality(nodes: list[Any]) -> list[dict[str, Any]]:
     findings.extend(_lint_script_http_flow_drift(business_nodes))
     findings.extend(_lint_script_hardcoded_content(business_nodes))
     findings.extend(_lint_unavailable_artifact_format(business_nodes))
+    findings.extend(_lint_claimed_semantic_capability(business_nodes))
     findings.extend(_lint_client_side_filter_masks_page_filter(business_nodes))
     return findings
 
@@ -914,10 +916,62 @@ def _lint_unavailable_artifact_format(nodes: list[dict[str, Any]]) -> list[dict[
                 "不装库也能写出这个后缀的文件，只是内容多半打不开，而流程会照常报 success。"
             ),
             "fix": (
-                f"改成环境支持的交付格式（.md/.html/.csv"
+                "改成环境支持的交付格式（.md/.html/.csv"
                 + (f"/.xlsx（{library_for_format('.xlsx')}）" if library_for_format(".xlsx") else "")
                 + f"），或者停下来告诉用户「当前环境缺 {missing_library_hint(suffix)}，装上后才能导出 {suffix}」，"
                 "由用户决定装库还是换格式。不要自己拼字节流绕过去。"
+            ),
+        })
+    return findings
+
+
+# 用户看得见的地方声称做了语义加工：节点标题、说明、输出变量名、产物文件名
+_SEMANTIC_CLAIM_PATTERN = re.compile(
+    r"总结|摘要|概述|归纳|提炼|润色|改写|翻译|summar|abstract|rewrite|paraphrase|translat",
+    re.IGNORECASE,
+)
+# 已经说清楚是规则产物的说法，不算冒充
+_SEMANTIC_HONEST_MARKERS = ("原文摘录", "摘录", "要点提取", "节选", "excerpt")
+
+
+def _lint_claimed_semantic_capability(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """没有会调模型的节点时，不许把规则处理命名成「总结」——这条必须是 error。
+
+    与缺库同理，缺的是能力而不是语法：脚本取前 8 句照样 success、文件照样在，
+    审计也能通过（正文确实来自抓取数据），坏在用户以为自己拿到的是总结。
+    真实案例 flow ce71c23a：交付的「## 生成总结」是回复列表前 8 条原文逐字，
+    「## 关键词」是正则噪音，助手回的是「已验收通过」，全程没说这不是总结。
+
+    出路是改说法 + 告诉用户，不是换个写法再切一次——所以判据放在节点的对外字段上。
+    """
+    if semantic_rewrite_node_types():
+        return []
+    findings: list[dict[str, Any]] = []
+    for node in nodes:
+        if node.get("type") not in _SCRIPT_CHANNEL_NODE_TYPES and node.get("type") != "file.write":
+            continue
+        claims = " ".join(
+            str(node.get(field) or "")
+            for field in ("title", "description", "outputVariable", "path")
+        )
+        if not _SEMANTIC_CLAIM_PATTERN.search(claims):
+            continue
+        if any(marker in claims for marker in _SEMANTIC_HONEST_MARKERS):
+            continue
+        findings.append({
+            "severity": "error",
+            "node_id": str(node.get("id", "?")),
+            "node_title": str(node.get("title") or node.get("id", "?")),
+            "issue": "claimed_semantic_capability_unavailable",
+            "message": (
+                "节点对外声称做总结/摘要/改写一类的语义加工，但当前没有任何会调模型的节点类型，"
+                "脚本只能截取、正则、统计——产出必然是原文的子集，不是新表述。"
+                "这类冒充不会报错：流程 success、文件非空、内容也确实来自抓取数据。"
+            ),
+            "fix": (
+                "先告诉用户「平台没有语义加工能力，只能给原文摘录/要点提取，要真总结需要接入模型节点」，"
+                "由用户决定接受还是改需求；用户接受后，把节点标题、description、输出变量名和文档里的标题"
+                "都改成实际做的事（如「原文摘录」「要点提取」），不要保留「总结」的说法。"
             ),
         })
     return findings
