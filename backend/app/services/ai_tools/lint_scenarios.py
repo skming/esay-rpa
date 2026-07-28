@@ -1349,13 +1349,13 @@ _BLIND_DELAY_THRESHOLD_MS = 1000
 # 「必须先有这个元素才做得成」的节点。少收一个类型，同样的盲等就只因为下游换了个
 # 等价节点（clickLoadMore 代替 click、ui 通道代替 browser）而不报。
 _SELECTOR_DEPENDENT_TYPES = frozenset({
-    "browser.click", "browser.fill", "browser.wait", "browser.extract",
+    "browser.click", "browser.fill", "browser.wait", "browser.waitFor", "browser.extract",
     "browser.press", "browser.select", "browser.check", "browser.hover",
     "browser.drag", "browser.clickLoadMore", "browser.paginateNext",
     "ui.click", "ui.fill", "ui.wait", "ui.extract", "ui.select", "ui.check", "ui.drag",
 })
 # 等元素出现的节点：下游已经在等了，前面那个 delay 至多冗余
-_WAIT_NODE_TYPES = frozenset({"browser.wait", "ui.wait"})
+_WAIT_NODE_TYPES = frozenset({"browser.wait", "browser.waitFor", "ui.wait"})
 
 
 def _lint_blind_delay_instead_of_wait(nodes: list[Any], edges: list[Any]) -> list[dict[str, Any]]:
@@ -1388,7 +1388,9 @@ def _lint_blind_delay_instead_of_wait(nodes: list[Any], edges: list[Any]) -> lis
                 "看起来像 selector 写错了。"
             ),
             "fix": (
-                "在两者之间插入 browser.wait 等目标元素出现，把 delayMs 调小或删掉；"
+                "在两者之间插入 browser.wait 等目标元素出现，或用 browser.waitFor "
+                "（waitCondition='hidden' 等 loading 遮罩消失、'textContains' 等结果文案出现），"
+                "把 delayMs 调小或删掉；"
                 "确实没有元素可等（动画收尾、输入防抖）时才保留固定延时。"
             ),
         })

@@ -93,6 +93,18 @@ NODE_TYPE_CATALOG: list[dict[str, str]] = [
         "description": "等待元素出现，需 selector。等待可选元素时加 continueOnError: true，超时不中断流程。",
     },
     {
+        "type": "browser.waitFor",
+        "key_fields": "selector, waitCondition（visible|hidden|textContains）, inputValue（textContains 时的期望文本）",
+        "output_var_field": "（无输出变量）",
+        # 这条能力过去没写进清单，模型于是只能用 delayMs 猜 loading 要转多久——
+        # 「等某个东西消失」browser.wait 表达不了，缺了它盲等就是唯一写法。
+        "description": (
+            "等待条件成立：hidden 等元素消失（loading 遮罩、骨架屏），"
+            "textContains 等元素文本出现期望内容（异步渲染的结果文案、状态变为「已完成」）。"
+            "点击后要等页面就绪时用它，不要用 delayMs 猜耗时。"
+        ),
+    },
+    {
         "type": "browser.scroll",
         "key_fields": "direction, distance",
         "output_var_field": "（无输出变量）",

@@ -32,7 +32,7 @@ _LOOP_LIKE_NODE_TYPES = frozenset({"control.foreach", "control.repeat_until"})
 # 「后面还要拿结果」的节点：等待、取数、落盘。被吞掉的失败要归因错，前提是下游还有这么一步；
 # 少收一类（脚本落盘、桌面通道取数、翻页）就等于换个写法同一个错误归因不再提示。
 _RESULT_STEP_NODE_TYPES = frozenset({
-    "browser.wait", "browser.extract", "browser.paginateNext",
+    "browser.wait", "browser.waitFor", "browser.extract", "browser.paginateNext",
     "ui.wait", "ui.extract",
     "file.write", "excel.addrow", "excel.save", "excel.write",
     "script.python", "script.javascript", "script.shell",
