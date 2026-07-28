@@ -13,7 +13,11 @@ from app.services.ai_orchestrator import (
     _context_char_budget,
     _model_caps,
     _detect_turn_intents,
+    _elide_repeated_result,
+    _ELIDE_MIN_CHARS,
     _expand_history_tool_calls,
+    _mark_history_cache_anchor,
+    _stable_prefix_end,
     _FlowContext,
     _MAX_REPAIR_CYCLES,
     _OLD_SCREENSHOT_PLACEHOLDER,
@@ -292,6 +296,89 @@ def test_kept_requirements_survive_a_second_round_of_dropping() -> None:
     kept = [m for m in messages if str(m.get("content") or "").startswith("【用户此前提出的硬性要求】")]
     assert len(kept) == 1, "摘要要合并而不是层层叠加"
     assert "导出必须是 xlsx" in str(kept[0]["content"])
+
+
+def _tool_msg(index: int, size: int = 100) -> dict[str, Any]:
+    return {"role": "tool", "tool_call_id": f"c{index}", "content": f"r{index}" * size}
+
+
+def test_cache_anchor_stays_behind_the_rewrite_frontier() -> None:
+    """锚点必须落在还会被压缩改写的两条之前，否则一次改写让整段缓存作废。"""
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": "SYS"},
+        _tool_msg(1),
+        _tool_msg(2),
+        _tool_msg(3),
+        _tool_msg(4),
+    ]
+    _mark_history_cache_anchor(messages, "claude-sonnet-5", relayed=False)
+
+    anchored = [i for i, m in enumerate(messages) if m.get("cache_control")]
+    assert anchored == [2], "第 3、4 条是保留全文窗口，锚点只能打在第 2 条"
+
+
+def test_cache_anchor_never_crosses_the_newest_screenshot() -> None:
+    """最新截图会在下一张到来时被换成占位符，划进稳定区就等于锚在会变的内容上。"""
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": "SYS"},
+        _tool_msg(1),
+        {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:x"}}]},
+        _tool_msg(2),
+        _tool_msg(3),
+        _tool_msg(4),
+    ]
+    _mark_history_cache_anchor(messages, "claude-sonnet-5", relayed=False)
+
+    anchored = [i for i, m in enumerate(messages) if m.get("cache_control")]
+    assert anchored == [1]
+
+
+def test_cache_anchor_moves_instead_of_accumulating() -> None:
+    """Anthropic 断点上限 4 个、system 与 few-shot 已占 2 个，旧锚点不撤就会顶掉新的。"""
+    messages: list[dict[str, Any]] = [{"role": "system", "content": "SYS"}, _tool_msg(1), _tool_msg(2), _tool_msg(3)]
+    _mark_history_cache_anchor(messages, "claude-sonnet-5", relayed=False)
+    messages.extend([_tool_msg(4), _tool_msg(5)])
+    _mark_history_cache_anchor(messages, "claude-sonnet-5", relayed=False)
+
+    anchored = [i for i, m in enumerate(messages) if m.get("cache_control")]
+    assert anchored == [3], "只留一个锚点，且跟着前沿前移"
+
+
+def test_cache_anchor_is_skipped_when_the_provider_cannot_read_it() -> None:
+    """非 Anthropic 与中转透传都不认 cache_control，多送一个字段可能直接被判非法参数。"""
+    for model, relayed in (("zai/glm-4.6", False), ("claude-sonnet-5", True)):
+        messages: list[dict[str, Any]] = [{"role": "system", "content": "SYS"}, _tool_msg(1), _tool_msg(2), _tool_msg(3)]
+        _mark_history_cache_anchor(messages, model, relayed=relayed)
+        assert not any(m.get("cache_control") for m in messages)
+
+
+def test_stable_prefix_is_empty_before_enough_tool_results() -> None:
+    """工具结果不够填满保留窗口时没有稳定区，此时打锚点等于锚在下一轮就要改的内容上。"""
+    messages: list[dict[str, Any]] = [{"role": "system", "content": "SYS"}, _tool_msg(1), _tool_msg(2)]
+    assert _stable_prefix_end(messages) == 0
+    _mark_history_cache_anchor(messages, "claude-sonnet-5", relayed=False)
+    assert not any(m.get("cache_control") for m in messages)
+
+
+def test_identical_repeated_tool_result_is_elided_but_a_changed_one_is_not() -> None:
+    """逐字相同才折叠：页面被改动过结果就不相等，不存在把旧状态当新状态交出去的路径。"""
+    seen: dict[tuple[str, str], str] = {}
+    args = '{"url":"https://x/list"}'
+    big = {"html": "a" * _ELIDE_MIN_CHARS}
+
+    assert "_unchanged" not in _elide_repeated_result("inspect_page", args, big, seen)
+    assert '"_unchanged": true' in _elide_repeated_result("inspect_page", args, big, seen)
+    assert "_unchanged" not in _elide_repeated_result("inspect_page", args, {"html": "b" * _ELIDE_MIN_CHARS}, seen)
+    # 换了参数就是另一个页面，与上一次相同与否无关
+    assert "_unchanged" not in _elide_repeated_result("inspect_page", '{"url":"https://x/2"}', big, seen)
+
+
+def test_small_repeated_results_are_resent_in_full() -> None:
+    """指针本身也占字符，小结果重发比指回去更省。"""
+    seen: dict[tuple[str, str], str] = {}
+    small = {"ok": True}
+    _elide_repeated_result("get_flow", "{}", small, seen)
+    assert "_unchanged" not in _elide_repeated_result("get_flow", "{}", small, seen)
 
 
 def test_chit_chat_does_not_become_a_standing_requirement() -> None:

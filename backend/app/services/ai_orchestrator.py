@@ -924,6 +924,70 @@ def _compact_tool_messages(
     _drop_oldest_turns(messages, protect_prefix, budget)
 
 
+_ELIDE_MIN_CHARS = 2_000  # 小结果重发比指回去更省，指针本身也要占字符
+
+
+def _elide_repeated_result(
+    tool_name: str, arguments: str, result: Any, seen: dict[tuple[str, str], str]
+) -> str:
+    """同参数同结果的工具调用只送一次全文，之后送一句指回原文的话。
+
+    inspect_page 一次一万七千字符，同一页反复探是常态。这里是「已执行、逐字比对后确认相同」
+    才折叠，不是跳过调用——页面被点击改变过就不会相等，也就不会折叠，不存在读到旧状态的风险。
+    """
+    payload = json.dumps(result, ensure_ascii=False)
+    key = (tool_name, arguments)
+    previous = seen.get(key)
+    if previous is not None and previous == payload and len(payload) >= _ELIDE_MIN_CHARS:
+        return json.dumps({
+            "_unchanged": True,
+            "message": f"本次 {tool_name} 的返回与上一次同参数调用逐字相同，内容见上文，未重复输出。",
+        }, ensure_ascii=False)
+    seen[key] = payload
+    return payload
+
+
+def _stable_prefix_end(messages: list[dict[str, Any]]) -> int:
+    """返回第一条「后续轮次还可能被改写」的消息下标，其之前的内容逐字不变。
+
+    压缩与截图占位都是一次性的（`_COMPACTED_MARK` / 内容已不是 image_url 就不再改），
+    所以改写前沿只会前进不会回头；前沿之前是可缓存的稳定前缀。
+    """
+    tool_indices = [
+        i for i, m in enumerate(messages)
+        if m.get("role") == "tool" and isinstance(m.get("content"), str)
+    ]
+    end = tool_indices[-_KEEP_FULL_TOOL_RESULTS] if len(tool_indices) > _KEEP_FULL_TOOL_RESULTS else 0
+    image_indices = [
+        i for i, m in enumerate(messages)
+        if isinstance(m.get("content"), list)
+        and any(isinstance(p, dict) and p.get("type") == "image_url" for p in m["content"])
+    ]
+    if image_indices:
+        # 最新一张截图会在下一张到来时被替换成占位符，不能划进稳定区
+        end = min(end, image_indices[-1])
+    return max(end, 0)
+
+
+def _mark_history_cache_anchor(messages: list[dict[str, Any]], model: str, relayed: bool) -> None:
+    """在稳定前缀的末尾打第三个缓存断点，让历史对话也走缓存读。
+
+    system 与 few-shot 的断点只覆盖静态前缀；真正随轮次膨胀的是工具结果，28 轮能到十万字符，
+    没有断点就每轮原价重发。断点必须打在改写前沿之前，否则一次改写让整段缓存作废。
+    锚点打在 tool 消息上：litellm 只对 role=tool 读取消息顶层的 cache_control。
+    """
+    if relayed or not _model_caps(model).supports_cache_control:
+        return
+    # Anthropic 断点上限 4 个，system/few-shot 已占 2 个，旧锚点必须先撤
+    for message in messages:
+        if message.get("role") == "tool":
+            message.pop("cache_control", None)
+    for index in range(_stable_prefix_end(messages) - 1, -1, -1):
+        if messages[index].get("role") == "tool":
+            messages[index]["cache_control"] = {"type": "ephemeral"}
+            return
+
+
 def _split_partial_tag_suffix(text: str, tag: str) -> tuple[str, str]:
     """若 text 以 tag 的真前缀结尾（如 "<thi"——标签被流式 chunk 边界劈开），
     把该前缀扣下留到拼上下一个 chunk 后再判定，返回 (可安全发出的部分, 扣下的部分)。"""
@@ -1448,6 +1512,7 @@ class AiOrchestrator:
         last_tool_name: str | None = None
         consecutive_empty_rounds = 0
         meter = _SessionMeter()
+        repeated_results: dict[tuple[str, str], str] = {}
 
         for round_num in range(effective_max_rounds):
             if round_num == 0:
@@ -1457,6 +1522,7 @@ class AiOrchestrator:
 
             # 每轮请求前压缩旧的大体积工具结果，控制上下文规模。
             _compact_tool_messages(full_messages, context_budget, protect_prefix)
+            _mark_history_cache_anchor(full_messages, model, relayed)
             collected_tool_calls: dict[int, dict[str, str]] = {}
             round_usage: Any = None
             collected_text: list[str] = []
@@ -1748,7 +1814,7 @@ class AiOrchestrator:
                 full_messages.append({
                     "role": "tool",
                     "tool_call_id": tc["id"],
-                    "content": json.dumps(result, ensure_ascii=False),
+                    "content": _elide_repeated_result(tool_name, tc["arguments"], result, repeated_results),
                 })
 
                 if _image_b64 and not guard_state.get("model_no_vision"):
