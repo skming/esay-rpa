@@ -17,6 +17,7 @@ from app.services.browser_action_runner import (
     BrowserActionResult,
     FlowNode,
     SelectorConfig,
+    SweepOutcome,
     _build_extract_result,
     _healing_candidates,
     _normalize_action_type,
@@ -354,14 +355,16 @@ class ExtensionExecutor:
         if action_type == "browser.clickLoadMore":
             button_selector = variables.resolve_text(_read_required_string(node, "selector"))
             target_selector_config = _read_target_selector_config(node, variables)
-            rows = await self._click_load_more_and_extract(button_selector, target_selector_config, variables, node, timeout_seconds=timeout_seconds)
-            return _build_extract_result(action_type, f"{button_selector} -> {target_selector_config.selector}", rows)
+            outcome = await self._click_load_more_and_extract(button_selector, target_selector_config, variables, node, timeout_seconds=timeout_seconds)
+            detail = f"{button_selector} -> {target_selector_config.selector} · {outcome.note}"
+            return _build_extract_result(action_type, detail, outcome.rows)
 
         if action_type == "browser.paginateNext":
             next_selector = variables.resolve_text(_read_required_string(node, "selector"))
             target_selector_config = _read_target_selector_config(node, variables)
-            rows = await self._paginate_next_and_extract(next_selector, target_selector_config, variables, node, timeout_seconds=timeout_seconds)
-            return _build_extract_result(action_type, f"{next_selector} -> {target_selector_config.selector}", rows)
+            outcome = await self._paginate_next_and_extract(next_selector, target_selector_config, variables, node, timeout_seconds=timeout_seconds)
+            detail = f"{next_selector} -> {target_selector_config.selector} · {outcome.note}"
+            return _build_extract_result(action_type, detail, outcome.rows)
 
         selector = variables.resolve_text(_read_required_string(node, "selector"))
         await self._wait_for_selector(selector, timeout_ms=timeout_ms)
@@ -469,29 +472,48 @@ class ExtensionExecutor:
         node: FlowNode,
         *,
         timeout_seconds: float,
-    ) -> list[object]:
+    ) -> SweepOutcome:
         max_iterations = max(1, _read_int(node, "maxIterations", default=5))
         delay_ms = max(0, _read_int(node, "delayMs", default=500))
         current_values = await self._extract_selector_values(target_selector_config, timeout_seconds=timeout_seconds)
         previous_count = len(current_values)
+        counts = [previous_count]
+        clicks = 0
+        exists = False
+        stop_reason = "max_iterations_reached"
 
         for _index in range(max_iterations):
             state = await self._element_state(button_selector, timeout_seconds=timeout_seconds)
+            exists = bool(state.get("exists", False))
+            if not exists:
+                stop_reason = "trigger_not_found"
+                break
             if state.get("hidden", True):
+                stop_reason = "trigger_hidden"
                 break
             await self._bridge.execute({"type": "browser.click", "selector": button_selector}, timeout=timeout_seconds)
+            clicks += 1
             if delay_ms > 0:
                 await asyncio.sleep(delay_ms / 1000)
             next_values = await self._extract_selector_values(target_selector_config, timeout_seconds=timeout_seconds)
             if len(next_values) <= previous_count:
+                stop_reason = "no_new_items"
                 break
             previous_count = len(next_values)
+            counts.append(previous_count)
             current_values = next_values
 
         count_variable = _read_optional_string(node, "loadedCountVariable")
         if count_variable is not None:
             variables.set(count_variable, previous_count, scope="局部")
-        return current_values
+        return SweepOutcome(
+            rows=current_values,
+            rounds=clicks + 1,
+            progress_counts=counts,
+            stop_reason=stop_reason,
+            trigger_matches=1 if exists else 0,
+            unit=" 轮加载",
+        )
 
     async def _paginate_next_and_extract(
         self,
@@ -501,20 +523,33 @@ class ExtensionExecutor:
         node: FlowNode,
         *,
         timeout_seconds: float,
-    ) -> list[object]:
+    ) -> SweepOutcome:
         max_iterations = max(1, _read_int(node, "maxIterations", default=20))
         delay_ms = max(0, _read_int(node, "delayMs", default=500))
         pages_visited = 0
         all_values: list[object] = []
+        per_page_counts: list[int] = []
         previous_fingerprint = ""
+        stop_reason = "max_iterations_reached"
+        exists = False
 
         for _index in range(max_iterations):
             current_values = await self._extract_selector_values(target_selector_config, timeout_seconds=timeout_seconds)
             all_values.extend(current_values)
+            per_page_counts.append(len(current_values))
             pages_visited += 1
 
             state = await self._element_state(next_selector, timeout_seconds=timeout_seconds)
-            if state.get("hidden", True) or state.get("disabled", False):
+            exists = bool(state.get("exists", False))
+            if not exists:
+                # 末页的按钮仍然 exists，只是 hidden/disabled；不存在只能是 selector 错了
+                stop_reason = "next_selector_not_found"
+                break
+            if state.get("hidden", True):
+                stop_reason = "next_button_hidden"
+                break
+            if state.get("disabled", False):
+                stop_reason = "next_button_disabled"
                 break
 
             before_fingerprint = _fingerprint_rows(current_values)
@@ -524,13 +559,30 @@ class ExtensionExecutor:
             after_values = await self._extract_selector_values(target_selector_config, timeout_seconds=timeout_seconds)
             after_fingerprint = _fingerprint_rows(after_values)
             if after_fingerprint == before_fingerprint or after_fingerprint == previous_fingerprint:
+                stop_reason = "duplicate_content"
                 break
             previous_fingerprint = before_fingerprint
 
         pages_variable = _read_optional_string(node, "pageCountVariable")
         if pages_variable is not None:
             variables.set(pages_variable, pages_visited, scope="局部")
-        return all_values
+
+        if pages_visited <= 1 and stop_reason == "next_selector_not_found":
+            # 判据与 Playwright 执行器一致，见 browser_action_runner._paginate_next_and_extract
+            raise ValueError(
+                f"分页未生效：下一页 selector `{next_selector}` 在页面上不存在，"
+                f"只采集到第 1 页共 {len(all_values)} 条。请用 inspect_page 确认真实的分页控件"
+                "——若该站是数字页码而非「下一页」按钮，改用按 URL 翻页（?p=N）而不是点击翻页。"
+            )
+
+        return SweepOutcome(
+            rows=all_values,
+            rounds=pages_visited,
+            progress_counts=per_page_counts,
+            stop_reason=stop_reason,
+            trigger_matches=1 if exists else 0,
+            unit=" 页",
+        )
 
 
 def _fingerprint_rows(rows: list[object]) -> str:

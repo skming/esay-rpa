@@ -31,6 +31,7 @@ from app.services.ai_tools.diagnostics import (
     _check_requirement_alignment,
     _check_structured_rows,
     _extract_requirement_targets,
+    _find_incomplete_sweeps,
     build_navigation_trace,
     build_navigation_verdict,
 )
@@ -2823,3 +2824,41 @@ def test_count_variable_is_derived_from_output_variable() -> None:
     assert "table_extract_missing_count" not in {
         f["issue"] for f in _lint_flow(nodes, [])
     }
+
+
+def test_incomplete_sweep_is_detected_when_paginate_output_equals_upstream_extract() -> None:
+    """翻页输出与上游提取逐字相同 = 一页都没翻。
+
+    这类残缺不报错：success、变量非空、行数正常，只是少了第 2 页往后的全部数据。
+    """
+    nodes = [
+        {"id": "n3_extract", "type": "browser.extract", "selector": "#Main .reply_content",
+         "outputVariable": "topic_texts"},
+        {"id": "n3_paginate", "type": "browser.paginateNext", "selector": "a.normal_page_right",
+         "targetSelector": "#Main .reply_content", "outputVariable": "paged_topic_texts"},
+    ]
+    page_one = ["回复 1", "回复 2", "回复 3"]
+
+    findings = _find_incomplete_sweeps(nodes, {
+        "topic_texts": page_one,
+        "paged_topic_texts": list(page_one),
+    })
+
+    assert [f["issue"] for f in findings] == ["sweep_never_advanced"]
+    assert findings[0]["node_id"] == "n3_paginate"
+    assert "a.normal_page_right" in findings[0]["fix"]
+
+
+def test_incomplete_sweep_is_not_reported_when_pagination_actually_collected_more() -> None:
+    """真翻到第 2 页就不能报警：误报会把助手推去改一个本来正确的 selector。"""
+    nodes = [
+        {"id": "n1", "type": "browser.extract", "outputVariable": "page_one"},
+        {"id": "n2", "type": "browser.paginateNext", "outputVariable": "all_pages"},
+    ]
+
+    findings = _find_incomplete_sweeps(nodes, {
+        "page_one": ["A", "B"],
+        "all_pages": ["A", "B", "C", "D"],
+    })
+
+    assert findings == []

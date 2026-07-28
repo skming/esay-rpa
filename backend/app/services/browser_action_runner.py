@@ -63,6 +63,30 @@ class BrowserActionContext:
 
 
 @dataclass(frozen=True)
+class SweepOutcome:
+    """翻页/加载更多的抓取结果。
+
+    只返回 rows 时，「翻了 5 页」和「一页没翻」在输出里完全相同，调用方只能靠重跑去猜。
+    stop_reason 让循环的每条退出路径各不相同。
+    """
+
+    rows: list[object]
+    # 翻页是页数，加载更多是点击轮次（含未点击的首轮）
+    rounds: int
+    # 翻页是每页条数，加载更多是每轮点完后的 DOM 累计条数
+    progress_counts: list[int]
+    stop_reason: str
+    # 0=selector 没命中任何元素，与「按钮在但已到末页」是两回事；None=该 locator 报不出匹配数
+    trigger_matches: int | None
+
+    unit: str = "轮"
+
+    @property
+    def note(self) -> str:
+        return f"{self.rounds}{self.unit} · {self.progress_counts} · stop={self.stop_reason}"
+
+
+@dataclass(frozen=True)
 class BrowserActionResult:
     action_type: str
     detail: str
@@ -372,15 +396,17 @@ class BrowserActionRunner:
 
         if action_type == "browser.clickLoadMore":
             target_selector_config = _read_target_selector_config(node, variables)
-            rows = await self._click_load_more_and_extract(page, selector, target_selector_config, variables, node, timeout=timeout)
-            rows, schema_note = _apply_output_schema(rows, node)
-            return _build_extract_result(action_type, _with_schema_note(f"{selector} -> {target_selector_config.selector}", schema_note), rows)
+            outcome = await self._click_load_more_and_extract(page, selector, target_selector_config, variables, node, timeout=timeout)
+            rows, schema_note = _apply_output_schema(outcome.rows, node)
+            detail = f"{selector} -> {target_selector_config.selector} · {outcome.note}"
+            return _build_extract_result(action_type, _with_schema_note(detail, schema_note), rows)
 
         if action_type == "browser.paginateNext":
             target_selector_config = _read_target_selector_config(node, variables)
-            rows = await self._paginate_next_and_extract(page, selector, target_selector_config, variables, node, timeout=timeout)
-            rows, schema_note = _apply_output_schema(rows, node)
-            return _build_extract_result(action_type, _with_schema_note(f"{selector} -> {target_selector_config.selector}", schema_note), rows)
+            outcome = await self._paginate_next_and_extract(page, selector, target_selector_config, variables, node, timeout=timeout)
+            rows, schema_note = _apply_output_schema(outcome.rows, node)
+            detail = f"{selector} -> {target_selector_config.selector} · {outcome.note}"
+            return _build_extract_result(action_type, _with_schema_note(detail, schema_note), rows)
 
         if action_type == "browser.select":
             input_value = variables.resolve_text(_read_required_string(node, "inputValue", fallback_keys=("value",)))
@@ -436,27 +462,48 @@ class BrowserActionRunner:
         node: FlowNode,
         *,
         timeout: int,
-    ) -> list[object]:
+    ) -> SweepOutcome:
         max_iterations = max(1, _read_int(node, "maxIterations", default=5))
         delay_ms = max(0, _read_int(node, "delayMs", default=500))
         previous_count = await _count_locator(page, target_selector_config.selector)
+        counts = [previous_count]
+        clicks = 0
+        trigger_matches = await _optional_match_count(page, button_selector)
+        stop_reason = "max_iterations_reached"
 
         for _index in range(max_iterations):
-            button = _first_locator(_target_locator(page, button_selector))
+            trigger_matches = await _optional_match_count(page, button_selector)
+            if trigger_matches == 0:
+                stop_reason = "trigger_not_found"
+                break
+            button = _first_locator(await _acting_locator(page, button_selector))
             if await _is_locator_hidden(button):
+                stop_reason = "trigger_hidden"
                 break
             await button.click(timeout=timeout)
+            clicks += 1
             if delay_ms > 0:
                 await page.wait_for_timeout(delay_ms)
             next_count = await _count_locator(page, target_selector_config.selector)
             if next_count <= previous_count:
+                # 点了但条数没涨：按钮还在也没意义，再点也是同样结果
+                stop_reason = "no_new_items"
                 break
+            counts.append(next_count)
             previous_count = next_count
 
         count_variable = _read_optional_string(node, "loadedCountVariable")
         if count_variable is not None:
             variables.set(count_variable, previous_count, scope="局部")
-        return await _extract_locator_values(page, target_selector_config, timeout=timeout)
+        rows = await _extract_locator_values(page, target_selector_config, timeout=timeout)
+        return SweepOutcome(
+            rows=rows,
+            rounds=clicks + 1,
+            progress_counts=counts,
+            stop_reason=stop_reason,
+            trigger_matches=trigger_matches,
+            unit=" 轮加载",
+        )
 
     async def _paginate_next_and_extract(
         self,
@@ -467,20 +514,33 @@ class BrowserActionRunner:
         node: FlowNode,
         *,
         timeout: int,
-    ) -> list[object]:
+    ) -> SweepOutcome:
         max_iterations = max(1, _read_int(node, "maxIterations", default=20))
         delay_ms = max(0, _read_int(node, "delayMs", default=500))
         pages_visited = 0
         all_values: list[object] = []
+        per_page_counts: list[int] = []
         previous_fingerprint = ""
+        stop_reason = "max_iterations_reached"
+        trigger_matches: int | None = None
 
         for _index in range(max_iterations):
             current_values = await _extract_locator_values(page, target_selector_config, timeout=timeout)
             all_values.extend(current_values)
+            per_page_counts.append(len(current_values))
             pages_visited += 1
 
-            next_button = _first_locator(_target_locator(page, next_selector))
-            if await _is_locator_hidden(next_button) or await _is_locator_disabled(next_button):
+            trigger_matches = await _optional_match_count(page, next_selector)
+            if trigger_matches == 0:
+                # 末页至少还能匹配到一个 hidden/disabled 的按钮，一个都匹配不到只能是 selector 错了
+                stop_reason = "next_selector_not_found"
+                break
+            next_button = _first_locator(await _acting_locator(page, next_selector))
+            if await _is_locator_hidden(next_button):
+                stop_reason = "next_button_hidden"
+                break
+            if await _is_locator_disabled(next_button):
+                stop_reason = "next_button_disabled"
                 break
 
             before_url = _read_page_url(page)
@@ -492,13 +552,31 @@ class BrowserActionRunner:
             after_url = _read_page_url(page)
             after_fingerprint = _build_page_fingerprint(after_url, after_values)
             if after_fingerprint == before_fingerprint or after_fingerprint == previous_fingerprint:
+                stop_reason = "duplicate_content"
                 break
             previous_fingerprint = before_fingerprint
 
         pages_variable = _read_optional_string(node, "pageCountVariable")
         if pages_variable is not None:
             variables.set(pages_variable, pages_visited, scope="局部")
-        return all_values
+
+        if pages_visited <= 1 and stop_reason == "next_selector_not_found":
+            # 配 paginateNext 就是断言「这里有下一页」；断言不成立还当成功，交出去的数据
+            # 只有第 1 页且看不出残缺。clickLoadMore 不这样判：内容加载完时按钮本就不存在。
+            raise ValueError(
+                f"分页未生效：下一页 selector `{next_selector}` 在页面上没有匹配到任何元素，"
+                f"只采集到第 1 页共 {len(all_values)} 条。请用 inspect_page 确认真实的分页控件"
+                "——若该站是数字页码而非「下一页」按钮，改用按 URL 翻页（?p=N）而不是点击翻页。"
+            )
+
+        return SweepOutcome(
+            rows=all_values,
+            rounds=pages_visited,
+            progress_counts=per_page_counts,
+            stop_reason=stop_reason,
+            trigger_matches=trigger_matches,
+            unit=" 页",
+        )
 
     async def _dismiss_overlays(self, page: object, selector: str, variables: RuntimeVariableStore, node: FlowNode, *, timeout: int) -> int:
         selectors = _split_selector_candidates(selector)
@@ -704,6 +782,55 @@ def _target_locator(page: object, selector: str) -> object:
             return page.locator(selector)
         scope = frame_locator(frame_selector)
     return scope.locator(parts[-1])
+
+
+def _split_union_selector(value: str) -> list[str]:
+    """按顶层逗号切分 selector 组；引号与括号内的逗号属于内层语法，切开会得到非法 selector。
+
+    含 ">>>" 的跨 frame 写法不切：分段路径拆散后每段都定位不到。
+    """
+    if ">>>" in value:
+        return [value]
+    parts: list[str] = []
+    current = ""
+    quote: str | None = None
+    depth = 0
+    for char in value:
+        if quote is not None:
+            current += char
+            if char == quote:
+                quote = None
+            continue
+        if char in "\"'":
+            quote = char
+        elif char in "([":
+            depth += 1
+        elif char in ")]":
+            depth = max(0, depth - 1)
+        elif char == "," and depth == 0:
+            if current.strip():
+                parts.append(current.strip())
+            current = ""
+            continue
+        current += char
+    if current.strip():
+        parts.append(current.strip())
+    return parts or [value]
+
+
+async def _acting_locator(page: object, selector: str) -> object:
+    """要点/悬停单个元素时，按书写顺序取第一组有命中的 selector。
+
+    `locator("A, B")` 按 DOM 顺序返回首个匹配，扩展执行器的 querySelectorAllDeep 按书写
+    顺序；同一份流程两个执行器会点到不同元素。写作顺序即优先级，与扩展对齐。
+    提取仍走整串：那里要的是全部匹配，顺序不改变集合。
+    """
+    parts = _split_union_selector(selector)
+    if len(parts) > 1:
+        for part in parts:
+            if await _count_locator(page, part) > 0:
+                return _target_locator(page, part)
+    return _target_locator(page, selector)
 
 
 # 运行时自愈 selector
@@ -1389,8 +1516,24 @@ def _normalize_table_rows(raw_rows: object) -> list[object]:
     return rows
 
 
-async def _count_locator(page: object, selector: str) -> int:
+async def _optional_match_count(page: object, selector: str) -> int | None:
+    """selector 命中的元素数；locator 报不出 count 时返回 None。
+
+    _count_locator 把「问不出来」也返回 0，而这里正要靠 0 断言 selector 没命中，会变成误报。
+    """
     locator = _target_locator(page, selector)
+    count = getattr(locator, "count", None)
+    if not callable(count):
+        return None
+    value = await count()
+    return value if isinstance(value, int) else None
+
+
+async def _count_locator(page: object, selector: str) -> int:
+    return await _count_locator_of(_target_locator(page, selector))
+
+
+async def _count_locator_of(locator: object) -> int:
     count = getattr(locator, "count", None)
     if not callable(count):
         return 0
@@ -1399,8 +1542,8 @@ async def _count_locator(page: object, selector: str) -> int:
 
 
 async def _click_first_visible(page: object, selector: str, *, timeout: int) -> None:
-    locator = _target_locator(page, selector)
-    count = await _count_locator(page, selector)
+    locator = await _acting_locator(page, selector)
+    count = await _count_locator_of(locator)
     if count <= 1:
         await _first_locator(locator).click(timeout=timeout)
         return

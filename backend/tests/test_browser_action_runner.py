@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from app.services.browser_action_runner import BrowserActionContext, BrowserActionResult, BrowserActionRunner, _normalize_table_rows, _goto_with_retry, _raise_if_table_scope_error, apply_browser_result_variables, detect_blocking_overlay
 from app.services.runtime_variables import RuntimeVariableStore
 
@@ -325,7 +327,7 @@ async def test_browser_click_load_more_clicks_until_no_growth_and_extracts_value
     assert page.clicked_count == 3
     assert page.waited_timeouts == [100, 100, 100]
     assert page.waited_selectors == [".product-card"]
-    assert result.detail == "button.load-more -> .product-card"
+    assert result.detail == "button.load-more -> .product-card · 4 轮加载 · [0, 1, 2] · stop=no_new_items"
     assert result.values == ["A", "B"]
     assert variables.get("loaded_dom_count") == 2
 
@@ -351,9 +353,74 @@ async def test_browser_paginate_next_collects_each_page_until_button_disabled() 
 
     assert page.clicked_count == 2
     assert page.waited_timeouts == [50, 50]
-    assert result.detail == "a.next -> .row"
+    assert result.detail == "a.next -> .row · 3 页 · [2, 2, 1] · stop=next_button_disabled"
     assert result.values == ["A1", "A2", "B1", "B2", "C1"]
     assert variables.get("visited_pages") == 3
+
+
+async def test_browser_paginate_next_fails_loudly_when_next_selector_matches_nothing() -> None:
+    """配了 paginateNext 就是断言「这里有下一页」，断言不成立必须当场失败。
+
+    否则表现是 success + 只有第 1 页的数据，没有任何字段能看出残缺。
+    """
+    variables = RuntimeVariableStore.from_initial({})
+    page = FakeUnmatchedPaginatePage()
+    context = BrowserActionContext(playwright=object(), browser=object(), page=page)
+
+    with pytest.raises(ValueError, match="分页未生效"):
+        await BrowserActionRunner().run(
+            {
+                "type": "browser.paginateNext",
+                "selector": "a.normal_page_right",
+                "targetSelector": ".row::text",
+            },
+            variables,
+            context,
+            timeout_ms=1000,
+        )
+
+
+async def test_browser_paginate_next_picks_union_selector_candidates_in_written_order() -> None:
+    """逗号组按书写顺序取第一组有命中的，不按 DOM 顺序。
+
+    `locator("A, B")` 返回 DOM 里靠前的那个，扩展执行器返回写在前面的那个；同一份流程
+    两个执行器点到不同元素。写「下一页, 第2页链接」时 DOM 顺序会在第 3 页点回第 2 页，
+    翻页被判成 duplicate_content 提前收工，且仍然 success。
+    """
+    variables = RuntimeVariableStore.from_initial({})
+    page = FakeUnionPaginatePage()
+    context = BrowserActionContext(playwright=object(), browser=object(), page=page)
+
+    result = await BrowserActionRunner().run(
+        {
+            "type": "browser.paginateNext",
+            "selector": 'a.next_page, a.page_normal[href*="?p=2"]',
+            "targetSelector": ".row::text",
+            "outputVariable": "rows",
+        },
+        variables,
+        context,
+        timeout_ms=1000,
+    )
+
+    assert result.rows == ["A1", "A2", "B1", "B2", "C1"]
+    assert page.clicked_selectors == ["a.next_page", "a.next_page"]
+
+
+async def test_browser_paginate_next_keeps_running_when_locator_cannot_report_match_count() -> None:
+    """报不出匹配数 != 匹配数为 0，否则不支持 count() 的 locator 会被误判成分页坏了。"""
+    variables = RuntimeVariableStore.from_initial({})
+    page = FakePaginatePage()
+    context = BrowserActionContext(playwright=object(), browser=object(), page=page)
+
+    result = await BrowserActionRunner().run(
+        {"type": "browser.paginateNext", "selector": "a.next", "targetSelector": ".row::text"},
+        variables,
+        context,
+        timeout_ms=1000,
+    )
+
+    assert result.values == ["A1", "A2", "B1", "B2", "C1"]
 
 
 async def test_browser_dismiss_clicks_visible_candidates_and_waits_target() -> None:
@@ -607,6 +674,52 @@ class FakePaginateLocator:
 
     async def evaluate_all(self, script: str, attribute: str | None = None) -> list[str | None]:
         return await self.all_text_contents()
+
+
+class FakeUnionPaginatePage(FakePaginatePage):
+    """两个分页控件都在：`a.next_page` 前进一页，`a.page_normal` 是回到第 2 页的页码链接。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.clicked_selectors: list[str] = []
+
+    def locator(self, selector: str) -> "FakeUnionPaginateLocator":
+        return FakeUnionPaginateLocator(self, selector)
+
+
+class FakeUnionPaginateLocator(FakePaginateLocator):
+    async def count(self) -> int:
+        return 1
+
+    async def is_disabled(self) -> bool:
+        return self._selector == "a.next_page" and self._page.page_index >= len(self._page.pages) - 1
+
+    async def click(self, *, timeout: int) -> None:
+        self._page.clicked_selectors.append(self._selector)
+        if self._selector == "a.next_page":
+            self._page.page_index = min(self._page.page_index + 1, len(self._page.pages) - 1)
+        else:
+            self._page.page_index = 1
+
+    async def all_text_contents(self) -> list[str | None]:
+        if self._selector == ".row":
+            return self._page.pages[self._page.page_index]
+        return []
+
+
+class FakeUnmatchedPaginatePage(FakePaginatePage):
+    """分页控件存在，但节点配的 selector 一个都没匹配上。"""
+
+    def locator(self, selector: str) -> "FakeUnmatchedPaginateLocator":
+        return FakeUnmatchedPaginateLocator(self, selector)
+
+
+class FakeUnmatchedPaginateLocator(FakePaginateLocator):
+    async def count(self) -> int:
+        return 0 if self._selector == "a.normal_page_right" else len(self._page.pages)
+
+    async def is_visible(self) -> bool:
+        return self._selector != "a.normal_page_right"
 
 
 class FakeDismissPage:

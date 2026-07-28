@@ -306,6 +306,43 @@ def _find_document_output(variables: dict[str, Any]) -> dict[str, Any] | None:
     return best
 
 
+_SWEEP_NODE_TYPES = {"browser.paginateNext", "browser.clickLoadMore"}
+
+
+def _find_incomplete_sweeps(nodes: list[Any], variables: dict[str, Any]) -> list[dict[str, Any]]:
+    """翻页节点的输出与上游提取逐字相同 —— 一页都没翻动。
+
+    这类残缺不报错：success、变量非空、行数正常，只是少了第 2 页往后的全部数据。
+    两个列表相等是铁证，不花任何额外调用。
+    """
+    findings: list[dict[str, Any]] = []
+    for node in nodes:
+        if not isinstance(node, dict) or node.get("type") not in _SWEEP_NODE_TYPES:
+            continue
+        swept = variables.get(node.get("outputVariable"))
+        if not isinstance(swept, list) or not swept:
+            continue
+        for name, value in variables.items():
+            if name == node.get("outputVariable") or not isinstance(value, list):
+                continue
+            if value and value == swept:
+                findings.append({
+                    "issue": "sweep_never_advanced",
+                    "node_id": node.get("id"),
+                    "message": (
+                        f"节点 {node.get('id')}（{node.get('type')}）的输出 `{node.get('outputVariable')}` "
+                        f"与 `{name}` 完全相同，共 {len(swept)} 条：说明翻页/加载更多一次也没生效，"
+                        "只采到了第一页。"
+                    ),
+                    "fix": (
+                        f"用 inspect_page 确认真实的分页控件，再修 selector `{node.get('selector')}`；"
+                        "若该站是数字页码而非「下一页」按钮，改用按 URL 翻页（?p=N）而不是点击翻页。"
+                    ),
+                })
+                break
+    return findings
+
+
 def _describe_output_variables(variables: dict[str, Any]) -> list[dict[str, Any]]:
     """如实列出这次运行到底产出了什么，以及每个变量为什么不算表格。
 
@@ -843,6 +880,17 @@ def _build_quality_repair_plan(issues: list[dict[str, Any]]) -> list[dict[str, A
                 "确保表头和数据行被结构化输出；必要时单独抽取表头并设置 includeInResult=false。",
                 "使用 table 模式输出 list[list] 或 list[dict]，避免纯文本拼接。",
                 "重新运行 assert_run_output，让工具自动从表头/行值匹配约束字段。",
+            ],
+        })
+    if "sweep_never_advanced" in issue_names:
+        plan.append({
+            "action": "fix_pagination_trigger",
+            "reason": "翻页节点的输出与翻页前的提取逐字相同，只采到了第一页。",
+            "steps": [
+                "先 inspect_page 读真实的分页控件，再改 selector——不要凭常见类名猜「下一页」。",
+                "若该站是数字页码而不是「下一页」按钮，点击式翻页走不通："
+                "改成按 URL 遍历（?p=N）放进循环，比点按钮稳且不依赖任何按钮 selector。",
+                "重跑后看节点 detail 里的 `N 页 · [每页条数] · stop=…`，确认页数大于 1 再谈验收。",
             ],
         })
     if "no_table_like_output" in issue_names:

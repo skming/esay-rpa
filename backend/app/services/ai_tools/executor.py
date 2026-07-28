@@ -33,6 +33,7 @@ from app.services.ai_tools.diagnostics import (
     _find_document_output,
     _MIN_DOCUMENT_CHARS,
     _find_header_variable,
+    _find_incomplete_sweeps,
     _find_swallowed_critical_failures,
     _find_table_candidates,
     _requirement_wants_document,
@@ -1881,6 +1882,10 @@ class RpaToolExecutor:
                 "message": finding.get("message"),
                 "fix": finding.get("fix"),
             })
+
+        # 采集完整性与交付形态无关：文档和表格都可能只装着第一页，所以在分叉之前判
+        if flow is not None:
+            issues.extend(_find_incomplete_sweeps(flow.definition.get("nodes", []), variables))
 
         if selected is None:
             # 用户要的是一篇文档时，「没有表格」不是缺陷；按表格审只会逼助手

@@ -550,3 +550,26 @@ async def test_screenshot_does_not_throttle_when_interval_already_elapsed(
     await executor.screenshot(context)
     clock["now"] += 2.0
     await executor.screenshot(context)
+
+
+async def test_browser_paginate_next_fails_loudly_when_next_selector_does_not_exist() -> None:
+    """扩展执行器与 Playwright 执行器共用判据，两边都要拦——漏一边等于没修。"""
+    bridge = FakeBridge(
+        responses={
+            "browser.extract": [{"values": ["row1", "row2"]}],
+            "browser.elementState": [{"exists": False, "hidden": True, "disabled": False}],
+        }
+    )
+    executor, context = await make_context(bridge)
+    variables = RuntimeVariableStore.from_initial({})
+
+    with pytest.raises(ValueError, match="分页未生效"):
+        await executor.run(
+            {"type": "browser.paginateNext", "selector": "a.normal_page_right",
+             "targetSelector": ".row", "delayMs": 0},
+            variables,
+            context,
+            timeout_ms=1000,
+        )
+
+    assert [call for call in bridge.calls if call["type"] == "browser.click"] == []
