@@ -44,21 +44,22 @@ function createTray(showMainWindow, openWeb) {
   trayIcon.setTemplateImage(true);
   const instance = new Tray(trayIcon);
   instance.setToolTip('Easy RPA');
-  instance.setContextMenu(
-    Menu.buildFromTemplate([
-      { label: '打开主界面', click: showMainWindow },
-      { label: '在浏览器中打开', click: openWeb },
-      { type: 'separator' },
-      {
-        label: '退出',
-        click: () => {
-          app.__rpaQuitting = true;
-          app.quit();
-        }
+  const contextMenu = Menu.buildFromTemplate([
+    { label: '打开主界面', click: showMainWindow },
+    { label: '在浏览器中打开', click: openWeb },
+    { type: 'separator' },
+    {
+      label: '退出',
+      click: () => {
+        app.__rpaQuitting = true;
+        app.quit();
       }
-    ])
-  );
-  instance.on('click', showMainWindow);
+    }
+  ]);
+  instance.setContextMenu(contextMenu);
+  if (process.platform !== 'darwin') {
+    instance.on('click', () => instance.popUpContextMenu(contextMenu));
+  }
   return instance;
 }
 
