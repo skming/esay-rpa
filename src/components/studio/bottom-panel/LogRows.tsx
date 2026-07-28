@@ -1,11 +1,10 @@
-import { Check, Copy, ExternalLink } from 'lucide-react';
+import { Check, Copy } from 'lucide-react';
 import type { ReactElement } from 'react';
 import { useEffect, useRef, useState } from 'react';
 
 import { cn } from '../../../lib/utils';
 import type { RunLogEntry } from '../../../types/rpa';
 import { Button } from '../../ui/button';
-import { Badge } from '../../ui/badge';
 import { Table, TableBody, TableCell, TableRow } from '../../ui/table';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../../ui/tooltip';
 import { getLogTone } from './bottomPanelUtils';
@@ -98,31 +97,31 @@ export function LogRows({
                     </TooltipContent>
                   </Tooltip>
                 </TableCell>
-                <TableCell className="w-30 py-1">
+                <TableCell className="w-36 py-1">
                   {canJump ? (
-                    <Badge className="max-w-full truncate justify-start px-1.5 text-[10px]" variant="default">
-                      {nodeTitle === undefined ? `节点 ${row.nodeId}` : `${nodeTitle} · ${row.nodeId}`}
-                    </Badge>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <button
+                          aria-label={`定位到节点 ${nodeTitle ?? row.nodeId}`}
+                          className="flex h-5 max-w-full items-center rounded-full border border-slate-200 bg-slate-100 px-1.5 text-[10px] font-medium text-slate-600 transition-colors hover:border-slate-300 hover:bg-slate-200/70 hover:text-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-line"
+                          onClick={() => onJumpToNode(row.nodeId as string)}
+                          type="button"
+                        >
+                          <span className="truncate">{nodeTitle ?? `节点 ${row.nodeId}`}</span>
+                        </button>
+                      </TooltipTrigger>
+                      <TooltipContent className="max-w-80" side="top">
+                        <div className="font-medium text-slate-800">{nodeTitle ?? '未知节点'}</div>
+                        <div className="mt-0.5 break-all font-mono text-[10px] text-slate-500">{row.nodeId}</div>
+                      </TooltipContent>
+                    </Tooltip>
                   ) : (
                     <span className="text-[10px] text-slate-500">未绑定节点</span>
                   )}
                 </TableCell>
-                <TableCell className="w-14 py-1 pr-2">
+                <TableCell className="w-8 py-1 pr-2">
                   <div className="flex items-center justify-end">
                     <CopyButton text={fullText} />
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <Button
-                          className="h-6 w-6 px-0"
-                          disabled={!canJump}
-                          onClick={() => { if (canJump) onJumpToNode(row.nodeId as string); }}
-                          variant="ghost"
-                        >
-                          <ExternalLink className="h-3.5 w-3.5" strokeWidth={1.5} />
-                        </Button>
-                      </TooltipTrigger>
-                      <TooltipContent side="top">定位到节点</TooltipContent>
-                    </Tooltip>
                   </div>
                 </TableCell>
               </TableRow>
