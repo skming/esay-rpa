@@ -1,4 +1,4 @@
-import { Maximize2, Minimize2, PanelRightClose, Sparkles } from 'lucide-react';
+import { PictureInPicture2, PictureInPicture, Sparkles, BotOff } from 'lucide-react';
 import type { ReactElement } from 'react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
@@ -207,15 +207,15 @@ export function AiPanel({
       <span className="mx-0.5 h-4 w-px shrink-0 bg-slate-200" />
       {mode === 'sidebar' ? (
         <IconButton label="弹出浮窗" onClick={() => switchMode('float')}>
-          <Maximize2 className="h-3.5 w-3.5" />
+          <PictureInPicture2 className="h-3.5 w-3.5" />
         </IconButton>
       ) : (
-        <IconButton label="收起到侧边栏" onClick={() => switchMode('sidebar')}>
-          <Minimize2 className="h-3.5 w-3.5" />
+        <IconButton label="关闭浮窗" onClick={() => switchMode('sidebar')}>
+          <PictureInPicture className="h-3.5 w-3.5" />
         </IconButton>
       )}
       <IconButton label="关闭 AI 面板" onClick={onClose}>
-        <PanelRightClose className="h-3.5 w-3.5" />
+        <BotOff className="h-3.5 w-3.5" />
       </IconButton>
     </div>
   );

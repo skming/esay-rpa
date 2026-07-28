@@ -1,4 +1,4 @@
-import { CirclePlay, Grid3X3, Map, Maximize2, Minimize2, PanelBottom, PanelBottomOpen, Sparkles } from 'lucide-react';
+import { CirclePlay, Grid3X3, Map, Maximize2, Minimize2, PanelBottom, PanelBottomOpen, BotMessageSquare } from 'lucide-react';
 import { type ReactElement, useEffect, useRef, useState } from 'react';
 
 import type { CanvasToolMode, CanvasToolbarStats, RuntimeProgress } from '../../../types/rpa';
@@ -153,7 +153,7 @@ export function CanvasToolbar({
           label={aiPanelOpen ? '关闭 RPA 助手' : '打开 RPA 助手'}
           onClick={onToggleAiPanel}
         >
-          <Sparkles className="h-3.5 w-3.5" strokeWidth={1.5} />
+          <BotMessageSquare className="h-3.5 w-3.5" strokeWidth={1.5} />
         </IconButton>
         <IconButton
           active={focusMode}
