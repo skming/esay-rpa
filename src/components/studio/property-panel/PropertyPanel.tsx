@@ -1,7 +1,7 @@
 import { Check, CheckCircle2, Copy, Loader2, PanelRightClose, PanelRightOpen, RotateCcw, Save, TriangleAlert } from 'lucide-react';
 import type { Node } from '@xyflow/react';
 import type { ReactElement } from 'react';
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 import type { ElectronBridgeState } from '../../../hooks/useElectronBridge';
 import { applyNodeConfigDraft, createNodeConfigDraft } from '../../../lib/nodeConfigDraft';
@@ -41,6 +41,19 @@ export function PropertyPanel({
   const savedDraft = useMemo(() => (selectedNode === undefined ? null : createNodeConfigDraft(selectedNode.data)), [selectedNode?.data]);
   const dirty = savedDraft !== null && JSON.stringify(draft) !== JSON.stringify(savedDraft);
   const [copied, setCopied] = useState(false);
+  const setPendingDraft = usePropertyPanelStore((state) => state.setPendingDraft);
+
+  // 运行走的是画布节点，面板里没保存的草稿它看不见——把草稿交给 store，运行前替运行方落盘。
+  // 只有 dirty 时发布：否则每次选中节点都写一次 store，运行方要多判一次「和已存的一样吗」。
+  useEffect(() => {
+    if (selectedNode === undefined || !dirty) {
+      setPendingDraft(null);
+      return;
+    }
+    setPendingDraft({ nodeId: selectedNode.id, draft });
+  }, [dirty, draft, selectedNode?.id, setPendingDraft]);
+
+  useEffect(() => () => setPendingDraft(null), [setPendingDraft]);
 
   // 放渲染期而非 effect：effect 会先用上个节点的草稿绘一帧，切节点时面板闪一下旧值
   const [syncedNode, setSyncedNode] = useState({ data: selectedNode?.data, id: selectedNode?.id });

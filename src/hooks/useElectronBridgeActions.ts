@@ -9,6 +9,8 @@ import { cloneFlowTemplate, type FlowTemplate } from '../lib/flowTemplates';
 import { isSafeVariableName } from '../lib/variableNaming';
 import { getBlockingRunIssue, validateRunConfiguration } from '../lib/runValidation';
 import { useBottomPanelStore } from '../stores/useBottomPanelStore';
+import { usePropertyPanelStore } from '../stores/usePropertyPanelStore';
+import { applyPendingDraftToNodes } from '../lib/pendingNodeDraft';
 import { buildInitialFlowPayload, buildUpdatePayload, hasDefinitionChanged } from '../lib/flowVersioning';
 import type {
   ArtifactContent,
@@ -568,11 +570,12 @@ export function useElectronBridgeActions({
           return;
         }
 
-        const executableNode = findExecutableFetchNode(flowCanvas);
-        const flowDefinition = buildFlowDefinition(flowCanvas.nodes, flowCanvas.edges, inputVariables, currentFlow?.name);
+        const canvas = commitPendingNodeDraft(flowCanvas, setFlowNodes);
+        const executableNode = findExecutableFetchNode(canvas);
+        const flowDefinition = buildFlowDefinition(canvas.nodes, canvas.edges, inputVariables, currentFlow?.name);
         const runVariables = mergeRunVariables(inputVariables, runOptions.overrideVariables ?? []);
         const scope = runOptions.scope ?? 'full';
-        const validation = validateRunConfiguration(flowCanvas.nodes, flowCanvas.edges, {
+        const validation = validateRunConfiguration(canvas.nodes, canvas.edges, {
           availableVariableNames: runVariables.map((variable) => variable.name),
           scope,
           startNodeId: runOptions.startNodeId
@@ -1032,6 +1035,26 @@ function createLocalDraftFlow(name: string): FlowSnapshot {
     updatedAt: now,
     version: 'draft'
   };
+}
+
+/** 把属性面板里未点保存的草稿落到画布，返回落盘后的快照。
+ *
+ * 运行读的是画布节点，草稿只活在面板本地 state：改完直接点运行，跑的是改之前的值，
+ * 结果还是 success，唯一提示是面板标题旁 1.5px 的小圆点。
+ * 就地返回新快照而不是等 setFlowNodes 生效：状态更新要下一帧才可见，本次运行仍会拿到旧节点。
+ */
+function commitPendingNodeDraft(
+  flowCanvas: FlowCanvasSnapshot,
+  setFlowNodes: Dispatch<SetStateAction<Node<RpaNodeData>[]>>
+): FlowCanvasSnapshot {
+  const { pendingDraft, setPendingDraft } = usePropertyPanelStore.getState();
+  const nodes = applyPendingDraftToNodes(flowCanvas.nodes, pendingDraft);
+  if (nodes === flowCanvas.nodes) {
+    return flowCanvas;
+  }
+  setFlowNodes((current) => applyPendingDraftToNodes(current, pendingDraft));
+  setPendingDraft(null);
+  return { ...flowCanvas, nodes };
 }
 
 function findExecutableFetchNode(flowCanvas: FlowCanvasSnapshot): { selector?: string; targetUrl?: string; timeoutMs?: number } {
