@@ -779,11 +779,13 @@ _LITERAL_PROSE_PATTERN = re.compile(
 )
 _CJK_SENTENCE_PUNCTUATION = ("。", "，", "！", "？", "；", "：")
 # 报错/日志文案不是交付内容：它只在数据为空或异常时出现，写死是对的。
-# 不豁免 print——script 节点靠 stdout 交付，那里的固定长文本正是这条规则要抓的。
+# 三种脚本通道各自的写法都要覆盖：只认 Python 写法，同一段逻辑换成 JS 就又开始误报。
+# 不豁免 print/echo——script 节点靠 stdout 交付，那里的固定长文本正是这条规则要抓的。
 _ERROR_MESSAGE_CALL = re.compile(
-    r"(?:raise\s+\w+\s*\(|SystemExit\s*\(|assert\s|sys\.stderr\.write\s*\(|"
-    r"\.(?:error|warning|warn|exception|critical)\s*\()[^\n]*$"
+    r"(?:raise\s+\w+\s*\(|SystemExit\s*\(|assert\s|throw\s+new\s+\w*Error\s*\(|"
+    r"sys\.stderr\.write\s*\(|\.(?:error|warning|warn|exception|critical)\s*\()[^\n]*$"
 )
+_STDERR_REDIRECT = re.compile(r">&\s*2|>>?\s*/dev/stderr")
 
 
 # 「按条件保留子集」的脚本特征：既做比较，又把命中的行收进一个新集合
@@ -933,6 +935,16 @@ _SEMANTIC_CLAIM_PATTERN = re.compile(
 # 已经说清楚是规则产物的说法，不算冒充
 _SEMANTIC_HONEST_MARKERS = ("原文摘录", "摘录", "要点提取", "节选", "excerpt")
 
+# 只读/取数/控制流节点上出现「总结」是在描述读到的东西（「提取页面总结区域」「读取总结文档」），
+# 不是声称自己做了语义加工；除这些之外的业务节点都会产出内容，都要判。
+# 反过来白名单几种脚本类型是不够的：同一个冒充换成 data.string.transform、excel.write、
+# variable.set 一样交付给用户，模型选哪种节点做拼装是随机的。
+_SEMANTIC_CLAIM_EXEMPT_PREFIXES = ("browser.", "ui.", "control.")
+_SEMANTIC_CLAIM_EXEMPT_TYPES = frozenset({
+    "file.read", "file.list", "file.watch", "excel.read", "http.request",
+    "data.json.parse", "variable.get", "variable.input", "variable.log",
+})
+
 
 def _lint_claimed_semantic_capability(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """没有会调模型的节点时，不许把规则处理命名成「总结」——这条必须是 error。
@@ -948,11 +960,14 @@ def _lint_claimed_semantic_capability(nodes: list[dict[str, Any]]) -> list[dict[
         return []
     findings: list[dict[str, Any]] = []
     for node in nodes:
-        if node.get("type") not in _SCRIPT_CHANNEL_NODE_TYPES and node.get("type") != "file.write":
+        node_type = str(node.get("type") or "")
+        if node_type.startswith(_SEMANTIC_CLAIM_EXEMPT_PREFIXES) or node_type in _SEMANTIC_CLAIM_EXEMPT_TYPES:
             continue
         claims = " ".join(
             str(node.get(field) or "")
-            for field in ("title", "description", "outputVariable", "path")
+            # 各节点类型给产物起名的字段不同：脚本/转换用 outputVariable，variable.set 用
+            # variableName，写文件用 path，excel 用 sheetName——少收一个就少拦一类节点。
+            for field in ("title", "description", "outputVariable", "variableName", "path", "sheetName")
         )
         if not _SEMANTIC_CLAIM_PATTERN.search(claims):
             continue
@@ -1010,7 +1025,13 @@ def _lint_script_hardcoded_content(nodes: list[dict[str, Any]]) -> list[dict[str
             literal = match.group(2)
             if not any(mark in literal for mark in _CJK_SENTENCE_PUNCTUATION):
                 continue
-            if _ERROR_MESSAGE_CALL.search(code[: match.start()].rsplit("\n", 1)[-1]):
+            line_start = code.rfind("\n", 0, match.start()) + 1
+            line_end = code.find("\n", match.end())
+            line = code[line_start : line_end if line_end != -1 else len(code)]
+            if _ERROR_MESSAGE_CALL.search(code[line_start : match.start()]):
+                continue
+            # shell 没有 raise：定向到 stderr 就是报错路径，而这个标记写在字面量之后
+            if _STDERR_REDIRECT.search(line):
                 continue
             findings.append({
                 "severity": "warn",

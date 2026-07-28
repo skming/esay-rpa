@@ -2968,6 +2968,35 @@ def test_honest_rule_based_wording_is_left_alone() -> None:
     assert _lint_claimed_semantic_capability([unrelated]) == []
 
 
+def test_the_same_claim_is_caught_whichever_node_type_assembles_it() -> None:
+    """闸门不能只认脚本节点：模型用哪种节点拼装产物是随机的，用户拿到的东西一样。
+
+    只白名单 script.* + file.write 的话，同一句「生成总结」换成 data.string.transform
+    或 excel.write 就直接放行——闸门强弱取决于模型的节点偏好，正是要抹平的差异。
+    """
+    disguises = [
+        {"id": "a", "type": "data.string.transform", "title": "生成总结", "outputVariable": "digest"},
+        {"id": "b", "type": "excel.write", "title": "写入报表", "sheetName": "内容摘要"},
+        {"id": "c", "type": "variable.set", "title": "汇总", "variableName": "summary_text"},
+        {"id": "d", "type": "file.write", "title": "输出", "path": "out/总结.md"},
+    ]
+
+    for node in disguises:
+        findings = _lint_claimed_semantic_capability([node])
+        assert [f["issue"] for f in findings] == ["claimed_semantic_capability_unavailable"], node["type"]
+
+
+def test_reading_something_that_is_already_a_summary_is_not_a_claim() -> None:
+    """browser/ui/只读节点上的「总结」在描述读到的东西，不是声称自己加工出来的。"""
+    readers = [
+        {"id": "a", "type": "browser.extract", "title": "提取页面总结区域", "outputVariable": "summary_block"},
+        {"id": "b", "type": "file.read", "title": "读取上季度总结文档", "outputVariable": "last_summary"},
+        {"id": "c", "type": "control.foreach", "title": "遍历每篇摘要"},
+    ]
+
+    assert _lint_claimed_semantic_capability(readers) == []
+
+
 def test_semantic_node_types_stay_in_sync_with_the_catalog() -> None:
     """catalog 里出现了会调模型的节点，能力声明必须同时更新。
 
@@ -3033,6 +3062,28 @@ def test_error_message_literals_are_not_read_as_hardcoded_deliverable_content() 
     assert [f["issue"] for f in _lint_script_hardcoded_content([hardcoded])] == [
         "script_hardcoded_prose_literal"
     ], "stdout 是 script 节点的交付通道，那里的固定长文本仍必须报"
+
+
+def test_error_literal_exemption_holds_across_script_channels() -> None:
+    """这条规则跑在三种脚本通道上，豁免却只写了 Python 写法。
+
+    结果是同一段逻辑用 script.javascript 写就误报——闸门的宽严取决于模型选了哪种语言。
+    """
+    javascript = {
+        "id": "n4",
+        "title": "生成报表",
+        "type": "script.javascript",
+        "code": "if (!rows.length) {\n  throw new Error('未提取到帖子内容，无法生成报表。');\n}\n",
+    }
+    shell = {
+        "id": "n5",
+        "title": "生成报表",
+        "type": "script.shell",
+        "code": 'test -s "$IN" || { echo "输入文件为空，无法生成报表。" >&2; exit 1; }\n',
+    }
+
+    assert _lint_script_hardcoded_content([javascript]) == []
+    assert _lint_script_hardcoded_content([shell]) == []
 
 
 def test_incomplete_sweep_is_detected_when_paginate_output_equals_upstream_extract() -> None:
