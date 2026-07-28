@@ -1,8 +1,8 @@
-import type { RpaNodeConfigDraft, RpaNodeData } from '../types/rpa';
+import { DEFAULT_ACTION_TYPE_BY_KIND, type RpaNodeConfigDraft, type RpaNodeData } from '../types/rpa';
 
 /** 把节点的 action（按类型才有的字段）展平成配置面板统一的草稿表单；新增 action 字段需同时更新 applyNodeConfigDraft 做反向写回。 */
 export function createNodeConfigDraft(data: RpaNodeData): RpaNodeConfigDraft {
-  const actionType = data.action?.type ?? `${data.kind}.step`;
+  const actionType = data.action?.type ?? DEFAULT_ACTION_TYPE_BY_KIND[data.kind];
   return {
     attribute: data.action?.attribute ?? 'href',
     autoSave: data.action?.autoSave ?? true,
@@ -134,9 +134,9 @@ export function applyNodeConfigDraft(data: RpaNodeData, draft: RpaNodeConfigDraf
       channel: data.action?.type === 'variable.notify' ? (draft.channel === '' ? undefined : draft.channel) : data.action?.channel,
       defaultValue: data.action?.type === 'variable.input' ? draft.defaultValue : data.action?.defaultValue,
       logLevel: data.action?.type === 'variable.log' ? draft.logLevel : data.action?.logLevel,
-      scope: data.action?.type === 'variable.set' || data.action?.type === 'variable.assign' || data.action?.type === 'variable.input' ? draft.variableScope : data.action?.scope,
+      scope: data.action?.type === 'variable.set' || data.action?.type === 'variable.input' ? draft.variableScope : data.action?.scope,
       variableName: data.action?.type?.startsWith('variable.') ? (draft.variableName === '' ? undefined : draft.variableName) : data.action?.variableName,
-      value: data.action?.type === 'variable.set' || data.action?.type === 'variable.assign' || data.action?.type === 'variable.step' ? draft.defaultValue : data.action?.value,
+      value: data.action?.type === 'variable.set' ? draft.defaultValue : data.action?.value,
       column: actionType?.startsWith('excel.') === true ? (draft.column === '' ? undefined : draft.column) : data.action?.column,
       content: data.action?.type === 'variable.clipboard' ? (draft.content === '' ? undefined : draft.content) : draft.content === '' ? undefined : draft.content,
       requestBody: actionType === 'http.request' ? (draft.requestBody === '' ? undefined : draft.requestBody) : data.action?.requestBody,

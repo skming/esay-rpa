@@ -6,6 +6,7 @@ import pytest
 
 from app.models.schemas import FlowRunRequest, FlowSnapshot, RunTaskRequest, RuntimeProgress, ScrapeResult, TaskSnapshot
 from app.services.flow_control import evaluate_condition
+from app.services.ai_tools.catalog import NODE_TYPE_CATALOG
 from app.services.flow_definition import FlowDefinitionSelector, is_executable_node
 from app.services.flow_runner import FlowRunService
 from app.services.log_broker import LogBroker
@@ -92,6 +93,25 @@ def test_flow_template_action_types_are_backend_executable() -> None:
     assert unsupported == []
 
 
+def test_every_node_type_offered_to_the_model_is_actually_runnable() -> None:
+    """告诉模型「有这个节点」却跑不了，是最难查的一类故障。
+
+    落不进 executable_nodes 的节点不会报错，只会在运行时被静默跳过——流程照常 success，
+    只是那一步没发生。所以判据取模型看到的整份目录，而不是抽样几个类型。
+    """
+    catalog_types = {
+        node_type.strip()
+        # 目录里有几行把同族节点并成一条（"ui.click / ui.fill / ..."），逐个拆开判
+        for entry in NODE_TYPE_CATALOG
+        for node_type in entry["type"].split("/")
+    }
+
+    # 条件节点没有表达式就不算条件节点（会退回顺序执行），补一个才能验类型本身
+    unsupported = sorted(t for t in catalog_types if not is_executable_node({"type": t, "condition": "ready"}))
+
+    assert unsupported == []
+
+
 async def test_flow_run_service_starts_task_from_browser_fetch_node() -> None:
     task_manager = TaskManager(runner=FakeRunner(), broker=LogBroker())
     service = FlowRunService(task_manager=task_manager)
@@ -157,7 +177,7 @@ async def test_flow_run_service_uses_edge_order_for_fetch_node() -> None:
                 "selector": ".detached::text",
             },
             {"id": "start", "type": "start"},
-            {"id": "guard", "type": "control.step"},
+            {"id": "guard", "type": "control.condition"},
             {
                 "id": "reachable",
                 "type": "browser.fetch",
@@ -189,7 +209,7 @@ async def test_flow_run_service_selects_fetch_node_from_scope_and_skips_disabled
                 "selector": ".disabled::text",
                 "disabled": True,
             },
-            {"id": "middle", "type": "control.step"},
+            {"id": "middle", "type": "control.condition"},
             {
                 "id": "second",
                 "type": "browser.fetch",
@@ -214,7 +234,7 @@ async def test_flow_run_service_selected_only_requires_selected_fetch_node() -> 
     definition = {
         "nodes": [
             {"id": "start", "type": "start"},
-            {"id": "middle", "type": "control.step"},
+            {"id": "middle", "type": "control.condition"},
             {
                 "id": "fetch",
                 "type": "browser.fetch",
@@ -336,7 +356,7 @@ async def test_flow_definition_selector_returns_ordered_fetch_nodes_and_skips_de
                 "targetUrl": "https://example.com/first",
                 "selector": ".first::text",
             },
-            {"id": "disabled", "type": "control.step", "disabled": True},
+            {"id": "disabled", "type": "control.condition", "disabled": True},
             {
                 "id": "second",
                 "type": "browser.fetch",
@@ -360,7 +380,7 @@ async def test_flow_definition_selector_includes_condition_nodes_in_execution_pl
     definition = {
         "nodes": [
             {"id": "start", "type": "start"},
-            {"id": "guard", "type": "control.step", "description": "row_count > 0"},
+            {"id": "guard", "type": "control.condition", "description": "row_count > 0"},
             {
                 "id": "fetch",
                 "type": "browser.fetch",

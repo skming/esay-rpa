@@ -1,7 +1,7 @@
 import { MarkerType, type Edge, type Node } from '@xyflow/react';
 
 import { initialEdges, initialNodes, kindStyles } from '../data/studioData';
-import type { NodeKind, NodeStatus, RpaNodeAction, RpaNodeData, RunLogLevel, RuntimeVariable, VariableCategory, VariableScope } from '../types/rpa';
+import { DEFAULT_ACTION_TYPE_BY_KIND, type NodeKind, type NodeStatus, type RpaNodeAction, type RpaNodeData, type RunLogLevel, type RuntimeVariable, type VariableCategory, type VariableScope } from '../types/rpa';
 
 /** 当前流程定义文件格式版本，用于向后兼容校验。 */
 export const FLOW_DEFINITION_VERSION = '1.0.0';
@@ -97,7 +97,7 @@ function inferActionFromNode(node: Node<RpaNodeData>): { type: string } {
   if (node.id === 'start' || node.id === 'end') {
     return { type: node.id };
   }
-  return { type: `${node.data.kind}.step` };
+  return { type: DEFAULT_ACTION_TYPE_BY_KIND[node.data.kind] };
 }
 
 function restoreNode(rawNode: unknown, index: number): Node<RpaNodeData> | null {
@@ -363,7 +363,7 @@ function getDefaultTitle(type: string, id: string): string {
   if (type === 'control.delay') return '等待延时';
   if (type === 'control.break') return '中断循环';
   if (type === 'control.noop') return '流程控制';
-  if (type === 'variable.set' || type === 'variable.assign' || type === 'variable.step') return '赋值变量';
+  if (type === 'variable.set') return '赋值变量';
   if (type === 'variable.get') return '获取变量';
   if (type === 'variable.input') return '输入弹窗';
   if (type === 'variable.log') return '输出日志';

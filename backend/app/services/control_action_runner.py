@@ -10,6 +10,9 @@ type FlowNode = dict[str, object]
 
 _CONTROL_ACTION_NODE_TYPES = {"control.delay", "control.break", "control.noop", "control.retry", "control.try"}
 _SUBPROCESS_NODE_TYPES = {"control.subprocess"}
+# 本 runner 不执行它（暂停等人的逻辑要拿 TaskRecord 上的 Event，只能留在 task_manager），
+# 但类型判断放这里跟其他 control.* 一处，省得类型名散在多个文件里各写一份字面量。
+HUMAN_TAKEOVER_NODE_TYPE = "control.human_takeover"
 _MAX_DELAY_MS = 300_000  # 单次延时上限 5 分钟，防止误配置的巨大延时把任务挂死
 
 
@@ -68,6 +71,10 @@ def is_control_action_node(node: FlowNode) -> bool:
 
 def is_subprocess_node(node: FlowNode) -> bool:
     return node.get("type") in _SUBPROCESS_NODE_TYPES
+
+
+def is_human_takeover_node(node: FlowNode) -> bool:
+    return node.get("type") == HUMAN_TAKEOVER_NODE_TYPE
 
 
 def apply_control_result_variables(node: FlowNode, result: ControlActionResult, variables: RuntimeVariableStore) -> list[str]:

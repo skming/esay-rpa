@@ -8,9 +8,7 @@ from app.services.runtime_variables import RuntimeVariableStore, normalize_varia
 type FlowNode = dict[str, object]
 
 _VARIABLE_ACTION_TYPES = {
-    "variable.step",
     "variable.set",
-    "variable.assign",
     "variable.get",
     "variable.input",
     "variable.log",
@@ -40,7 +38,7 @@ class VariableActionRunner:
     async def run(self, node: FlowNode, variables: RuntimeVariableStore, *, timeout_ms: int) -> VariableActionResult:
         action_type = _read_action_type(node)
 
-        if action_type in {"variable.step", "variable.set", "variable.assign"}:
+        if action_type == "variable.set":
             name = read_variable_name(node)
             value = _read_template_value(node, variables, keys=("value", "inputValue", "defaultValue", "content"))
             variables.set(name, value, scope=read_variable_scope(node, default="全局"))
@@ -80,7 +78,7 @@ def is_variable_action_node(node: FlowNode) -> bool:
 def apply_variable_result_variables(node: FlowNode, result: VariableActionResult, variables: RuntimeVariableStore) -> list[str]:
     saved_names: list[str] = []
 
-    if result.action_type in {"variable.step", "variable.set", "variable.assign"}:
+    if result.action_type == "variable.set":
         _append_saved_name(saved_names, read_variable_name(node))
 
     if result.action_type == "variable.input":

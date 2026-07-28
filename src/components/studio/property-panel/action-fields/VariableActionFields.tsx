@@ -1,6 +1,6 @@
 import type { ReactElement } from 'react';
 
-import type { RunLogLevel, VariableScope } from '../../../../types/rpa';
+import { DEFAULT_ACTION_TYPE_BY_KIND, type RunLogLevel, type VariableScope } from '../../../../types/rpa';
 import { Field } from '../../../ui/FormControls';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../../../ui/select';
 import { VariableNameField } from '../VariableNameField';
@@ -12,7 +12,7 @@ const variableScopes: VariableScope[] = ['全局', '循环', '局部'];
 const logLevels: RunLogLevel[] = ['info', 'success', 'running', 'warn', 'error'];
 
 export function VariableActionFields({ draft, electron, node, onDraftPatch }: ActionFieldsProps): ReactElement {
-  const actionType = node.data.action?.type ?? `${node.data.kind}.step`;
+  const actionType = node.data.action?.type ?? DEFAULT_ACTION_TYPE_BY_KIND[node.data.kind];
   const availableVariables = electron.variableViews;
 
   if (actionType === 'variable.get') {

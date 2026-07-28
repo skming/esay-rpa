@@ -1,6 +1,6 @@
 import { MarkerType, type Edge, type Node, type XYPosition } from '@xyflow/react';
 
-import type { NodeKind, RpaNodeData } from '../types/rpa';
+import { DEFAULT_ACTION_TYPE_BY_KIND, type NodeKind, type RpaNodeData } from '../types/rpa';
 
 export type ComponentDragPayload = {
   nodeType: NodeKind;
@@ -534,7 +534,7 @@ function getDefaultAction(payload: ComponentDragPayload): RpaNodeData['action'] 
   if (payload.nodeType === 'variable') {
     return getDefaultVariableAction(payload.label);
   }
-  return { type: `${payload.nodeType}.step`, timeoutMs: 30_000 };
+  return { type: DEFAULT_ACTION_TYPE_BY_KIND[payload.nodeType], timeoutMs: 30_000 };
 }
 
 function isNodeKind(value: unknown): value is NodeKind {

@@ -9,7 +9,7 @@ from app.services.runtime_variables import RuntimeVariableStore, normalize_varia
 type FlowEdge = dict[str, object]
 type FlowNode = dict[str, object]
 
-_LOOP_NODE_TYPES = {"control.loop", "control.foreach", "control.for-each", "loop", "foreach"}
+_LOOP_NODE_TYPES = {"control.foreach"}
 _BODY_EDGE_LABELS = {"body", "loop", "loop-body", "foreach-body", "each", "iterate", "true", "yes", "是", "循环", "循环体", "每项", "迭代"}
 _EXIT_EDGE_LABELS = {"exit", "done", "complete", "loop-exit", "foreach-exit", "false", "no", "否", "完成", "结束", "退出", "跳出"}
 # 节点自身可配置 maxIterations，但无论如何都会被硬顶到 10000——防止 AI/用户配置失误
@@ -18,7 +18,7 @@ _DEFAULT_MAX_ITERATIONS = 1000
 _HARD_MAX_ITERATIONS = 10_000
 
 
-_REPEAT_UNTIL_NODE_TYPES = {"control.repeat_until", "control.repeatUntil", "control.while", "repeat_until"}
+_REPEAT_UNTIL_NODE_TYPES = {"control.repeat_until"}
 # 循环次数由运行时决定的场景（翻到目标月份、点到没有「加载更多」为止）此前无法表达，
 # 只能展开成写死次数的节点链——那个次数是生成当天算出来的，之后每次运行都是错的。
 _DEFAULT_REPEAT_MAX_ITERATIONS = 50

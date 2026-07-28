@@ -138,7 +138,7 @@ class ScraplingCodeGenerator:
             lines.append(f"    time.sleep({max(delay_ms, 0) / 1000:.3f})")
             return lines
 
-        if node_type in {"variable.set", "variable.assign", "variable.step"}:
+        if node_type == "variable.set":
             name = node.get("variableName") or node.get("outputVariable") or node.get("responseVariable")
             value = node.get("value") if node.get("value") is not None else node.get("defaultValue")
             if name:

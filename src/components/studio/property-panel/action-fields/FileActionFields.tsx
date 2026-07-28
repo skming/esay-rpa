@@ -10,9 +10,10 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import { LabelLike } from './FieldLayout';
 import { ExcelPreviewDialog } from '../ExcelPreviewDialog';
 import type { ActionFieldsProps } from './types';
+import { DEFAULT_ACTION_TYPE_BY_KIND } from '../../../../types/rpa';
 
 export function FileActionFields({ draft, electron, node, onDraftPatch }: Pick<ActionFieldsProps, 'draft' | 'electron' | 'node' | 'onDraftPatch'>): ReactElement {
-  const actionType = node.data.action?.type ?? `${node.data.kind}.step`;
+  const actionType = node.data.action?.type ?? DEFAULT_ACTION_TYPE_BY_KIND[node.data.kind];
   const availableVariables = electron.variableViews;
   const [previewOpen, setPreviewOpen] = useState(false);
 

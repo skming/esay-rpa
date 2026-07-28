@@ -13,7 +13,7 @@ from app.models.schemas import ArtifactContent, ArtifactSnapshot, DebugControlCo
 from app.services.artifact_store import ArtifactStore, LocalArtifactStore
 from app.services.browser_action_runner import BrowserActionContext, BrowserActionRunner, OverlayInfo, apply_browser_result_variables, detect_blocking_overlay, is_browser_action_node, try_auto_dismiss_overlay
 from app.services.browser_executor import BrowserExecutor
-from app.services.control_action_runner import BreakLoopSignal, ControlActionRunner, apply_control_result_variables, is_control_action_node, is_subprocess_node
+from app.services.control_action_runner import BreakLoopSignal, ControlActionRunner, apply_control_result_variables, is_control_action_node, is_human_takeover_node, is_subprocess_node
 from app.services.extension_bridge_service import ExtensionBridgeService
 from app.services.extension_executor import ExtensionExecutor
 from app.services.data_action_runner import DataActionRunner, apply_data_result_variables, is_data_action_node
@@ -806,7 +806,7 @@ class TaskManager:
             state.executable_steps += 1
             await self._update_step_progress(record, state.started, current_step=state.executable_steps, total_steps=state.total_steps)
             await self._run_variable_action_node(record, node, node_id=record.active_node_id, node_title=node_title)
-        elif is_condition_node(node, outgoing_edges):
+        elif is_condition_node(node):
             node_title = _read_node_title(node, fallback="条件节点")
             await self._pause_for_debug_if_needed(record, node_id=record.active_node_id, node_title=node_title)
             state.executable_steps += 1
@@ -860,10 +860,7 @@ class TaskManager:
             state.executable_steps += 1
             await self._update_step_progress(record, state.started, current_step=state.executable_steps, total_steps=state.total_steps)
             if state.browser_context is None:
-                needs_headed = any(
-                    str(n.get("type", "")) == "control.human_takeover"
-                    for n in record.executable_nodes
-                )
+                needs_headed = any(is_human_takeover_node(n) for n in record.executable_nodes)
                 state.browser_context = await self._resolve_browser_executor(record).create_context(headless=not needs_headed)
             browser_result = await self._run_browser_action_node(record, node, state.browser_context, node_id=record.active_node_id, node_title=node_title)
             if browser_result is not None and _is_collectable_result_node(node):
@@ -874,7 +871,7 @@ class TaskManager:
             state.executable_steps += 1
             await self._update_step_progress(record, state.started, current_step=state.executable_steps, total_steps=state.total_steps)
             await self._run_subprocess_node(record, state, node, node_id=record.active_node_id, node_title=node_title)
-        elif node_type == "control.human_takeover":
+        elif is_human_takeover_node(node):
             node_title = _read_node_title(node, fallback=f"人工接管 {state.executable_steps + 1}")
             await self._pause_for_debug_if_needed(record, node_id=record.active_node_id, node_title=node_title)
             state.executable_steps += 1
@@ -2082,9 +2079,7 @@ def _read_variable_detail(node: dict[str, object]) -> str | None:
 
 def _build_variable_result_message(action_type: str, node_title: str) -> str:
     labels = {
-        "variable.step": "变量已更新",
         "variable.set": "变量已更新",
-        "variable.assign": "变量已更新",
         "variable.get": "变量已读取",
         "variable.input": "输入弹窗已记录",
         "variable.log": "流程日志",

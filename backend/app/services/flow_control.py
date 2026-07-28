@@ -16,23 +16,14 @@ _NUMERIC_PATTERN = re.compile(r"^-?(?:\d+\.?\d*|\.\d+)$")
 _COMPARISON_OPERATORS = ("==", "!=", ">=", "<=", ">", "<")
 _TRUE_BRANCH_LABELS = {"1", "true", "yes", "y", "是", "真", "成功", "then", "if-true", "true-branch"}
 _FALSE_BRANCH_LABELS = {"0", "false", "no", "n", "否", "假", "失败", "else", "if-false", "false-branch"}
-_CONTROL_NODE_TYPES = {"control.step", "control.condition", "condition.step", "condition"}
+CONDITION_NODE_TYPE = "control.condition"
 _MAX_EXPRESSION_LENGTH = 500
 
 
-def is_condition_node(node: FlowNode, outgoing_edges: list[FlowEdge] | None = None) -> bool:
-    node_type = node.get("type")
-    if node_type not in _CONTROL_NODE_TYPES:
-        return False
-
-    if read_condition_expression(node) is None:
-        return False
-
-    if node_type in {"control.condition", "condition.step", "condition"}:
-        return True
-
-    edges = outgoing_edges or []
-    return len(edges) > 1 or any(_read_branch(edge) is not None for edge in edges)
+def is_condition_node(node: FlowNode) -> bool:
+    # 没有表达式的条件节点不当条件走：分支路由会拿不到判据而必然走同一边，
+    # 悄悄跑完比报错更难查。这里返回 False 让它退回顺序执行。
+    return node.get("type") == CONDITION_NODE_TYPE and read_condition_expression(node) is not None
 
 
 def read_condition_expression(node: FlowNode) -> str | None:

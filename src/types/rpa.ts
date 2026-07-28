@@ -3,6 +3,23 @@ import type { LucideIcon } from 'lucide-react';
 
 export type NodeStatus = 'done' | 'running' | 'pending' | 'error' | 'skipped';
 export type NodeKind = 'browser' | 'excel' | 'ui' | 'file' | 'data' | 'script' | 'control' | 'variable';
+/**
+ * 每个 kind 在识别不出具体动作时退到哪个真实类型。
+ *
+ * 必须是后端执行器认得的类型：拼一个 `<kind>.step` 之类的占位类型不会报错，节点照样能存进
+ * 流程文件，但运行时既进不了 executable_nodes 也匹配不到任何 runner，表现是这一步被静默跳过。
+ */
+export const DEFAULT_ACTION_TYPE_BY_KIND: Record<NodeKind, string> = {
+  browser: 'browser.click',
+  ui: 'ui.click',
+  excel: 'excel.read',
+  file: 'file.read',
+  data: 'data.json.parse',
+  script: 'script.python',
+  control: 'control.noop',
+  variable: 'variable.set'
+};
+
 export type PanelTab = 'config' | 'io' | 'advanced';
 export type BottomTab = 'logs' | 'variables' | 'breakpoints' | 'errors' | 'artifacts';
 export type CanvasToolMode = 'select' | 'pan';

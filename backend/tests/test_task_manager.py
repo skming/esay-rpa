@@ -713,7 +713,7 @@ async def test_task_manager_runs_flow_definition_fetch_nodes_in_order(tmp_path) 
                         "fetcher": "static",
                         "extractMode": "text",
                     },
-                    {"id": "disabled", "type": "control.step", "disabled": True},
+                    {"id": "disabled", "type": "control.condition", "disabled": True},
                     {
                         "id": "second",
                         "title": "采集作者",
@@ -1048,7 +1048,7 @@ async def test_task_manager_selects_true_condition_branch(tmp_path) -> None:
             flowDefinition={
                 "nodes": [
                     {"id": "start", "type": "start"},
-                    {"id": "guard", "title": "判断是否有数据", "type": "control.step", "description": "row_count > 0"},
+                    {"id": "guard", "title": "判断是否有数据", "type": "control.condition", "description": "row_count > 0"},
                     {
                         "id": "yes",
                         "type": "browser.fetch",

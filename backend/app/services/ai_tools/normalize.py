@@ -107,7 +107,7 @@ _NAME_ONLY_FIELDS = (
     "listVariable", "errorVariable", "responseVariable", "resultVariable",
 )
 # 只有条件类节点的 inputValue 是表达式；browser.fill 的 inputValue 是要填的值，模板必须保留。
-_CONDITION_NODE_TYPES = frozenset({"control.condition", "control.repeat_until", "control.while"})
+_CONDITION_NODE_TYPES = frozenset({"control.condition", "control.repeat_until"})
 # 与 lint 的 _ROW_SELECTOR_FIELD_BY_TYPE 同一批节点：会产出行集合、因而「行数」有意义。
 _COUNTABLE_EXTRACT_TYPES = frozenset({
     "browser.extract", "ui.extract", "browser.paginateNext", "browser.clickLoadMore",

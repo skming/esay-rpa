@@ -19,7 +19,6 @@ _DATA_ACTION_TYPES = {
     "data.regex.match",
     "data.list.map",
     "data.math.compute",
-    "data.step",
     "data.convert",
     "data.encrypt",
 }
@@ -49,9 +48,6 @@ class DataActionRunner:
     async def run(self, node: FlowNode, variables: RuntimeVariableStore, *, timeout_ms: int) -> DataActionResult:
         del timeout_ms
         action_type = _read_action_type(node)
-        if action_type == "data.step":
-            action_type = "data.json.parse"
-
         if action_type == "data.json.parse":
             return _run_json_parse(node, variables)
         if action_type == "data.string.transform":

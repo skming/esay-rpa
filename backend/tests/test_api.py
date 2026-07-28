@@ -179,7 +179,7 @@ async def test_task_endpoint_accepts_request_and_exposes_logs() -> None:
                 "flowDefinition": {
                     "nodes": [
                         {"id": "start", "type": "start"},
-                        {"id": "n2", "type": "control.step"},
+                        {"id": "n2", "type": "control.condition"},
                         {
                             "id": "n3",
                             "type": "browser.fetch",

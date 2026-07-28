@@ -17,7 +17,7 @@ from app.services.runtime_variables import RuntimeVariableStore
 
 type FlowNode = dict[str, object]
 
-_SCRIPT_ACTION_TYPES = {"script.python", "script.javascript", "script.step", "script.shell", "script.websocket"}
+_SCRIPT_ACTION_TYPES = {"script.python", "script.javascript", "script.shell", "script.websocket"}
 _MAX_STDIO_BYTES = 512_000  # 单路输出上限，防止失控脚本把日志/内存打爆
 _MAX_ENV_BYTES = 64_000  # 多数系统 env 总量上限留出安全余量，超出则改用紧凑/省略副本
 _MAX_ENV_VALUE_BYTES = 8_000  # 单个变量塞进紧凑 JSON 副本前的上限，超出的改走 RPA_VARIABLES_FILE
@@ -97,7 +97,7 @@ class ScriptActionRunner:
         stdout = _decode_limited(stdout_bytes, "stdout")
         stderr = _decode_limited(stderr_bytes, "stderr")
         return ScriptActionResult(
-            action_type=action_type if action_type != "script.step" else "script.python",
+            action_type=action_type,
             command=command,
             cwd=str(self._workspace_root),
             exit_code=process.returncode or 0,
@@ -233,8 +233,6 @@ def apply_script_result_variables(node: FlowNode, result: ScriptActionResult, va
 
 
 def _build_command(action_type: str, script_path: Path) -> list[str]:
-    if action_type == "script.step":
-        action_type = "script.python"
     if action_type == "script.python":
         if script_path.suffix.lower() != ".py":
             raise ValueError("Python 脚本节点仅允许执行 .py 文件")

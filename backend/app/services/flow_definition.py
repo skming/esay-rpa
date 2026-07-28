@@ -1,56 +1,18 @@
 from __future__ import annotations
 
 from app.models.schemas import RunScope, RunTaskRequest
+from app.services.browser_action_runner import is_browser_action_node
+from app.services.control_action_runner import is_control_action_node, is_human_takeover_node, is_subprocess_node
+from app.services.data_action_runner import is_data_action_node
+from app.services.file_action_runner import is_file_action_node
+from app.services.flow_control import is_condition_node
+from app.services.flow_loop import is_loop_node, is_repeat_until_node
+from app.services.http_action_runner import is_http_action_node
+from app.services.script_action_runner import is_script_action_node
+from app.services.variable_action_runner import is_variable_action_node
 
 type FlowNode = dict[str, object]
 type FlowEdge = dict[str, object]
-
-_VARIABLE_NODE_TYPES = {
-    "variable.step",
-    "variable.set",
-    "variable.assign",
-    "variable.get",
-    "variable.input",
-    "variable.log",
-    "variable.notify",
-    "variable.clipboard",
-}
-_CONDITION_NODE_TYPES = {"control.step", "control.condition", "condition.step", "condition"}
-_LOOP_NODE_TYPES = {"control.loop", "control.foreach", "control.for-each", "loop", "foreach"}
-_REPEAT_UNTIL_NODE_TYPES = {"control.repeat_until", "control.repeatUntil", "control.while", "repeat_until"}
-_HTTP_NODE_TYPES = {"http.request", "script.http", "api.request"}
-_SCRIPT_NODE_TYPES = {"script.python", "script.javascript", "script.step"}
-_DATA_ACTION_NODE_TYPES = {"data.json.parse", "data.string.transform", "data.regex.match", "data.list.map", "data.math.compute", "data.step"}
-_BROWSER_ACTION_NODE_TYPES = {
-    "browser.open",
-    "browser.click",
-    "browser.fill",
-    "browser.press",
-    "browser.wait",
-    "browser.extract",
-    "browser.dismiss",
-    "browser.clickLoadMore",
-    "browser.paginateNext",
-    "browser.screenshot",
-    "browser.scroll",
-    "browser.select",
-    "browser.check",
-    "browser.drag",
-    "browser.tab.open",
-    "browser.tab.close",
-    "browser.tab.switch",
-    "ui.click",
-    "ui.fill",
-    "ui.wait",
-    "ui.extract",
-    "ui.screenshot",
-    "ui.select",
-    "ui.check",
-    "ui.drag",
-}
-_CONTROL_ACTION_NODE_TYPES = {"control.delay", "control.break", "control.noop"}
-_FILE_ACTION_NODE_TYPES = {"file.read", "file.write", "file.copy", "file.move", "file.delete", "file.list", "file.step", "excel.read", "excel.write", "excel.step"}
-_CONDITION_KEYS = ("condition", "expression", "inputValue", "description")
 
 
 class FlowDefinitionSelector:
@@ -244,27 +206,27 @@ class FlowDefinitionSelector:
         return first_id if isinstance(first_id, str) else None
 
 
+# 判据一律转发给各执行器自己的谓词，不在这里另抄一份类型清单：抄漏一个类型不会报错，
+# 只会让该节点悄悄从 executable_nodes 里消失——进度条少算一步，且 headed 浏览器的
+# 判定（扫描 executable_nodes 找 control.human_takeover）会永远扫不到，人工接管无从操作。
+_NODE_PREDICATES = (
+    is_variable_action_node,
+    is_http_action_node,
+    is_script_action_node,
+    is_data_action_node,
+    is_browser_action_node,
+    is_control_action_node,
+    is_subprocess_node,
+    is_human_takeover_node,
+    is_file_action_node,
+    is_loop_node,
+    is_repeat_until_node,
+    is_condition_node,
+)
+
+
 def is_executable_node(node: FlowNode) -> bool:
-    node_type = node.get("type")
-    return (
-        node_type == "browser.fetch"
-        or node_type in _VARIABLE_NODE_TYPES
-        or node_type in _HTTP_NODE_TYPES
-        or node_type in _SCRIPT_NODE_TYPES
-        or node_type in _DATA_ACTION_NODE_TYPES
-        or node_type in _BROWSER_ACTION_NODE_TYPES
-        or node_type in _CONTROL_ACTION_NODE_TYPES
-        or node_type in _FILE_ACTION_NODE_TYPES
-        or node_type in _LOOP_NODE_TYPES
-        or node_type in _REPEAT_UNTIL_NODE_TYPES
-        or _has_condition_expression(node)
-    )
-
-
-def _has_condition_expression(node: FlowNode) -> bool:
-    if node.get("type") not in _CONDITION_NODE_TYPES:
-        return False
-    return any(isinstance(node.get(key), str) and node[key].strip() for key in _CONDITION_KEYS)
+    return node.get("type") == "browser.fetch" or any(predicate(node) for predicate in _NODE_PREDICATES)
 
 
 def _read_edge_target(edge: FlowEdge) -> str | None:

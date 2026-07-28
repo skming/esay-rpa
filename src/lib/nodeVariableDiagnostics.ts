@@ -216,7 +216,7 @@ function collectProducedVariables(action: RpaNodeAction): Array<{ fieldName: str
   if (action.type === 'control.repeat_until') {
     add('indexVariable', action.indexVariable);
   }
-  if (action.type === 'variable.set' || action.type === 'variable.assign' || action.type === 'variable.input') {
+  if (action.type === 'variable.set' || action.type === 'variable.input') {
     add('variableName', action.variableName);
   }
 

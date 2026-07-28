@@ -123,7 +123,7 @@ export function buildNodeExecutionSummary(node: Node<RpaNodeData>): NodeExecutio
     addRow('humanTakeoverResumeMode', '恢复方式', action.humanTakeoverResumeMode === 'current_node' ? '重试当前节点' : '继续下一节点');
   }
 
-  if (actionType === 'variable.set' || actionType === 'variable.assign' || actionType === 'variable.step') {
+  if (actionType === 'variable.set') {
     addRow('variableName', '变量名', action.variableName);
     addRow('value', '变量值', action.value ?? action.defaultValue);
     addRow('scope', '变量作用域', action.scope);

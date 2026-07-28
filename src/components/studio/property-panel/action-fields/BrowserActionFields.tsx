@@ -11,6 +11,7 @@ import { VariablePickerField } from '../VariablePickerField';
 import { CheckedStateField, ExtractModeField, InlineHint, SelectorField, SiteAnalysisSummary } from './BrowserFieldParts';
 import { readBrowserHintText, readBrowserHintTone } from './browserHints';
 import type { ActionFieldsProps } from './types';
+import { DEFAULT_ACTION_TYPE_BY_KIND } from '../../../../types/rpa';
 
 // 需要选择器输入框的动作；不在表里的（如 browser.scroll、browser.tab.*）不显示拾取器区块
 const SELECTOR_ACTION_TYPES = new Set([
@@ -23,7 +24,7 @@ const SELECTOR_ACTION_TYPES = new Set([
 const RESILIENCE_EXCLUDED_TYPES = new Set(['browser.dismiss', 'browser.screenshot', 'browser.drag', 'browser.fetch', 'ui.drag']);
 
 export function BrowserActionFields({ draft, electron, flowTargetUrl, node, onDraftPatch }: ActionFieldsProps): ReactElement {
-  const actionType = node.data.action?.type ?? `${node.data.kind}.step`;
+  const actionType = node.data.action?.type ?? DEFAULT_ACTION_TYPE_BY_KIND[node.data.kind];
   const resolvedTargetUrl = draft.targetUrl?.trim() || flowTargetUrl;
   const availableVariables = electron.variableViews;
   if (actionType === 'browser.clickLoadMore' || actionType === 'browser.paginateNext') {

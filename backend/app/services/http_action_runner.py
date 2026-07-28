@@ -16,7 +16,7 @@ type FlowNode = dict[str, object]
 
 HttpMethod = Literal["GET", "POST", "PUT", "PATCH", "DELETE"]
 
-_HTTP_NODE_TYPES = {"http.request", "script.http", "api.request"}
+_HTTP_NODE_TYPES = {"http.request"}
 _HTTP_URL_ADAPTER = TypeAdapter(HttpUrl)
 _ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE"}
 # 禁止流程节点设置这些 Header：防止凭据/身份伪造类请求被当作普通 HTTP 节点悄悄发出。

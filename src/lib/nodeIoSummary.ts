@@ -151,7 +151,7 @@ export function buildNodeIoSummary(node: Node<RpaNodeData>): NodeIoSummary {
 
   if (actionType.startsWith('variable.')) {
     addOutput(action.outputVariable ?? action.responseVariable, 'String', '变量动作输出');
-    if ((actionType === 'variable.set' || actionType === 'variable.assign' || actionType === 'variable.input') && typeof action.variableName === 'string') {
+    if ((actionType === 'variable.set' || actionType === 'variable.input') && typeof action.variableName === 'string') {
       addOutput(action.variableName, '变量', '写入变量');
     }
   }

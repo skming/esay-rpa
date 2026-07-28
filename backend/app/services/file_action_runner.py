@@ -18,8 +18,8 @@ from app.services.runtime_variables import RuntimeVariableStore, stringify_varia
 
 type FlowNode = dict[str, object]
 
-_FILE_ACTION_TYPES = {"file.read", "file.write", "file.copy", "file.move", "file.delete", "file.list", "file.step", "file.compress", "file.rename", "file.watch"}
-_EXCEL_ACTION_TYPES = {"excel.read", "excel.write", "excel.step", "excel.addrow", "excel.save", "excel.deleterow", "excel.filter"}
+_FILE_ACTION_TYPES = {"file.read", "file.write", "file.copy", "file.move", "file.delete", "file.list", "file.compress", "file.rename", "file.watch"}
+_EXCEL_ACTION_TYPES = {"excel.read", "excel.write", "excel.addrow", "excel.save", "excel.deleterow", "excel.filter"}
 # 单文件读取/CSV 解析上限：防止大文件把结果塞进变量/日志导致内存或前端渲染卡死。
 _MAX_TEXT_BYTES = 512_000
 _MAX_CSV_ROWS = 10_000
@@ -57,8 +57,6 @@ class FileActionRunner:
         raise ValueError(f"不支持的文件/Excel 节点类型: {action_type}")
 
     def _run_file_action(self, action_type: str, node: FlowNode, variables: RuntimeVariableStore) -> FileActionResult:
-        if action_type == "file.step":
-            action_type = "file.read"
         path = self._resolve_path(node, variables)
         if action_type == "file.read":
             if not path.exists() or not path.is_file():
@@ -140,8 +138,6 @@ class FileActionRunner:
         raise ValueError(f"不支持的文件节点类型: {action_type}")
 
     def _run_excel_action(self, action_type: str, node: FlowNode, variables: RuntimeVariableStore) -> FileActionResult:
-        if action_type == "excel.step":
-            action_type = "excel.read"
         path = self._resolve_path(node, variables)
 
         if action_type == "excel.read":

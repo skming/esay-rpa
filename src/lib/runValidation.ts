@@ -375,7 +375,7 @@ function validateNodeAction(node: Node<RpaNodeData>, action: RpaNodeAction): Run
     issues.push({ nodeId: node.id, severity: 'error', message: `节点“${title}”缺少有效的延时毫秒数` });
   }
 
-  if (type === 'variable.set' || type === 'variable.assign' || type === 'variable.get' || type === 'variable.input') {
+  if (type === 'variable.set' || type === 'variable.get' || type === 'variable.input') {
     requireField(action.variableName, '变量名');
   }
 
@@ -738,7 +738,7 @@ function collectProducedVariableNames(action: RpaNodeAction): string[] {
     add(action.indexVariable);
   }
 
-  if (action.type === 'variable.set' || action.type === 'variable.assign' || action.type === 'variable.input') {
+  if (action.type === 'variable.set' || action.type === 'variable.input') {
     add(action.variableName);
   }
 

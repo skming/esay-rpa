@@ -66,7 +66,7 @@ if TYPE_CHECKING:
 _LOGIN_URL_TOKENS = ("login", "signin", "sign-in", "auth", "sso", "passport")
 
 
-_CONDITION_NODE_TYPES = ("control.condition", "condition.step", "condition", "control.step")
+_CONDITION_NODE_TYPES = ("control.condition",)
 
 # run_flow 的调用参数名。塞进 variables 既不报错也不生效，是最难自查的一类静默失效
 _RUN_CALL_PARAM_NAMES = frozenset({"browser_executor", "flow_id", "task_id"})

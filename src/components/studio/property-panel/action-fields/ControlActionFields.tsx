@@ -6,9 +6,10 @@ import { VariableNameField } from '../VariableNameField';
 import { VariablePickerField } from '../VariablePickerField';
 import { LabelLike } from './FieldLayout';
 import type { ActionFieldsProps } from './types';
+import { DEFAULT_ACTION_TYPE_BY_KIND } from '../../../../types/rpa';
 
 export function ControlActionFields({ draft, electron, node, onDraftPatch }: Pick<ActionFieldsProps, 'draft' | 'electron' | 'node' | 'onDraftPatch'>): ReactElement {
-  const actionType = node.data.action?.type ?? `${node.data.kind}.step`;
+  const actionType = node.data.action?.type ?? DEFAULT_ACTION_TYPE_BY_KIND[node.data.kind];
   const availableVariables = electron.variableViews;
   if (actionType === 'control.condition') {
     return <VariablePickerField label="条件表达式" onChange={(value) => onDraftPatch('inputValue', value)} value={draft.inputValue} variables={availableVariables} />;

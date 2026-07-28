@@ -3,7 +3,7 @@ import type { ReactElement } from 'react';
 import { useEffect } from 'react';
 
 import type { ElectronBridgeState } from '../../../hooks/useElectronBridge';
-import type { RpaNodeConfigDraft, RpaNodeData } from '../../../types/rpa';
+import { DEFAULT_ACTION_TYPE_BY_KIND, type RpaNodeConfigDraft, type RpaNodeData } from '../../../types/rpa';
 import { Field } from '../../ui/FormControls';
 import { ActionFields } from './ActionFields';
 import { ExecutionStrategySection } from './ExecutionStrategySection';
@@ -26,7 +26,7 @@ export function ConfigTab({
     onDraftChange({ ...draft, [key]: value });
   };
 
-  const actionType = node.data.action?.type ?? `${node.data.kind}.step`;
+  const actionType = node.data.action?.type ?? DEFAULT_ACTION_TYPE_BY_KIND[node.data.kind];
   const isNoExec = actionType === 'control.noop' || actionType === 'control.break';
 
   // 故意不依赖 draft/onDraftChange：加进去会在拾取结果没变时因 draft 变化重复写回
