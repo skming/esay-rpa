@@ -118,4 +118,42 @@ describe('nodeConfigDraft', () => {
       })
     );
   });
+
+  it('URL 式翻页保留页号参数，切回点击式则一并清掉', () => {
+    const data: RpaNodeData = {
+      title: '翻页抓取',
+      description: '',
+      kind: 'browser',
+      status: 'pending',
+      action: {
+        type: 'browser.paginateNext',
+        selector: 'a.next',
+        targetSelector: '.row::text',
+        timeoutMs: 30_000
+      }
+    };
+
+    const draft = createNodeConfigDraft(data);
+    const byUrl = applyNodeConfigDraft(data, {
+      ...draft,
+      urlTemplate: 'https://example.com/list?p=${page}',
+      startPage: 0,
+      pageStep: 20
+    });
+
+    expect(byUrl.action).toEqual(
+      expect.objectContaining({
+        urlTemplate: 'https://example.com/list?p=${page}',
+        startPage: 0,
+        pageStep: 20
+      })
+    );
+
+    // 留着页号参数会让点击式节点带上永远不生效的字段，用户改了却看不出任何变化
+    const backToClick = applyNodeConfigDraft(byUrl, { ...createNodeConfigDraft(byUrl), urlTemplate: '' });
+
+    expect(backToClick.action?.urlTemplate).toBeUndefined();
+    expect(backToClick.action?.startPage).toBeUndefined();
+    expect(backToClick.action?.pageStep).toBeUndefined();
+  });
 });

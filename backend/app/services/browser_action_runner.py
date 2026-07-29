@@ -7,6 +7,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from app.models.schemas import ScrapeResult
+from app.services import browser_profile_lock
+from app.services.pagination_probe import (
+    FIRST_PAGE_STOP_REASONS,
+    SINGLE_PAGE_VERDICT,
+    build_first_page_stop_error,
+    probe_pagination_evidence_playwright,
+)
 from app.services.runtime_variables import RuntimeVariableStore, append_variable_values, normalize_variable_name
 
 type FlowNode = dict[str, object]
@@ -60,6 +67,9 @@ class BrowserActionContext:
     persistent: bool = field(default=False)
     # 无头模式下窗口不可见，无法人工接管。
     headless: bool = field(default=True)
+    # 持久化 profile 的目录与登记的占用方；关闭上下文时按这两个字段销号
+    profile_dir: str | None = field(default=None)
+    profile_owner: str | None = field(default=None)
 
 
 @dataclass(frozen=True)
@@ -80,10 +90,13 @@ class SweepOutcome:
     trigger_matches: int | None
 
     unit: str = "轮"
+    # 只翻到第 1 页时，页面证据给出的裁决（如 single_page_confirmed）；没做过裁决为 None
+    verdict: str | None = None
 
     @property
     def note(self) -> str:
-        return f"{self.rounds}{self.unit} · {self.progress_counts} · stop={self.stop_reason}"
+        base = f"{self.rounds}{self.unit} · {self.progress_counts} · stop={self.stop_reason}"
+        return f"{base} · verdict={self.verdict}" if self.verdict else base
 
 
 @dataclass(frozen=True)
@@ -127,30 +140,67 @@ async def _goto_with_retry(page: object, url: str, *, timeout: int) -> None:
     await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
 
 
+# Playwright 找不到指定 channel 的系统浏览器时的报错特征
+_CHROME_CHANNEL_MISSING = re.compile(r"chromium distribution|channel|executable doesn't exist", re.IGNORECASE)
+
+
+async def launch_persistent_chrome(playwright: object, profile_dir: str, *, headless: bool, **options: object) -> object:
+    """优先用系统安装的正版 Chrome，装不到才回落到 Playwright 自带的 Chromium。
+
+    差别不只是版本：自带 Chromium 的 UA 里带 Chromium 标识、缺 Chrome 专有组件，是反爬
+    判定最容易命中的一条。同一份 profile 换 channel 可以直接复用，cookies/登录态不受影响。
+
+    也不再传 --disable-cache：它和持久化 profile 自相矛盾（留了 cookie 却每次冷启动），
+    既拖慢每一次运行，又让请求特征偏离真实浏览。要新鲜内容的节点自己 reload 即可。
+    """
+    try:
+        return await playwright.chromium.launch_persistent_context(profile_dir, headless=headless, channel="chrome", **options)
+    except Exception as exc:
+        if not _CHROME_CHANNEL_MISSING.search(str(exc)):
+            raise
+    return await playwright.chromium.launch_persistent_context(profile_dir, headless=headless, **options)
+
+
 class BrowserActionRunner:
     def __init__(self, session_dir: str | None = None) -> None:
         self._session_dir = session_dir
 
-    async def create_context(self, *, headless: bool = True) -> BrowserActionContext:
+    async def create_context(self, *, headless: bool = True, owner: str | None = None) -> BrowserActionContext:
         try:
             from playwright.async_api import async_playwright
         except ModuleNotFoundError as exc:
             raise RuntimeError("未安装 Playwright，请执行 uv pip install playwright") from exc
 
-        playwright = await async_playwright().start()
-
         if self._session_dir is not None:
             profile_path = Path(self._session_dir)
             profile_path.mkdir(parents=True, exist_ok=True)
-            # launch_persistent_context 保留跨运行的 cookies/localStorage；
-            # --disable-cache 禁用 HTTP 磁盘缓存，确保每次都取到最新页面内容。
-            browser_context = await playwright.chromium.launch_persistent_context(
-                str(profile_path),
+            # 登记放在 playwright 启动之前：占用冲突要在拉起进程前就判掉，
+            # 否则多出一个僵尸 playwright 进程要善后
+            owner_label = owner or "另一个运行"
+            browser_profile_lock.acquire(str(profile_path), owner_label)
+            playwright = await async_playwright().start()
+            try:
+                # launch_persistent_context 保留跨运行的 cookies/localStorage
+                browser_context = await launch_persistent_chrome(playwright, str(profile_path), headless=headless)
+                page = await browser_context.new_page()
+            except Exception as exc:
+                browser_profile_lock.release(str(profile_path), owner_label)
+                await playwright.stop()
+                translated = browser_profile_lock.translate_launch_error(str(profile_path), exc)
+                if translated is None:
+                    raise
+                raise RuntimeError(translated) from exc
+            return BrowserActionContext(
+                playwright=playwright,
+                browser=browser_context,
+                page=page,
+                persistent=True,
                 headless=headless,
-                args=['--disable-cache'],
+                profile_dir=str(profile_path),
+                profile_owner=owner_label,
             )
-            page = await browser_context.new_page()
-            return BrowserActionContext(playwright=playwright, browser=browser_context, page=page, persistent=True, headless=headless)
+
+        playwright = await async_playwright().start()
 
         browser = await playwright.chromium.launch(headless=headless)
         page = await browser.new_page()
@@ -161,10 +211,15 @@ class BrowserActionRunner:
             return
         close = getattr(context.browser, "close", None)
         stop = getattr(context.playwright, "stop", None)
-        if callable(close):
-            await close()
-        if callable(stop):
-            await stop()
+        try:
+            if callable(close):
+                await close()
+            if callable(stop):
+                await stop()
+        finally:
+            # 关闭失败也要销号：否则一次异常退出会让 profile 在本进程里永久"被占用"
+            if context.profile_dir is not None and context.profile_owner is not None:
+                browser_profile_lock.release(context.profile_dir, context.profile_owner)
 
     async def screenshot(self, context: BrowserActionContext) -> bytes:
         return await context.page.screenshot(full_page=True, type="png")
@@ -257,6 +312,21 @@ class BrowserActionRunner:
 
         if action_type == "browser.screenshot":
             return BrowserActionResult(action_type=action_type, detail=page.url, values=[page.url])
+
+        # URL 翻页不点任何元素，selector 在这条路径上没有意义，必须抢在必填校验之前分流
+        if action_type == "browser.paginateNext":
+            url_template = _read_optional_string(node, "urlTemplate")
+            if url_template is not None:
+                resolved_template = variables.resolve_text(url_template)
+                if "${page}" not in resolved_template:
+                    raise ValueError("urlTemplate 必须包含 ${page} 占位符，否则每一页请求的都是同一个地址")
+                target_selector_config = _read_target_selector_config(node, variables)
+                outcome = await self._paginate_by_url_and_extract(
+                    page, resolved_template, target_selector_config, variables, node, timeout=timeout
+                )
+                rows, schema_note = _apply_output_schema(outcome.rows, node)
+                detail = f"{resolved_template} -> {target_selector_config.selector} · {outcome.note}"
+                return _build_extract_result(action_type, _with_schema_note(detail, schema_note), rows)
 
         selector_config = _read_selector_config(node, variables)
         selector = selector_config.selector
@@ -560,14 +630,21 @@ class BrowserActionRunner:
         if pages_variable is not None:
             variables.set(pages_variable, pages_visited, scope="局部")
 
-        if pages_visited <= 1 and stop_reason == "next_selector_not_found":
+        verdict: str | None = None
+        if pages_visited <= 1 and stop_reason in FIRST_PAGE_STOP_REASONS:
             # 配 paginateNext 就是断言「这里有下一页」；断言不成立还当成功，交出去的数据
-            # 只有第 1 页且看不出残缺。clickLoadMore 不这样判：内容加载完时按钮本就不存在。
-            raise ValueError(
-                f"分页未生效：下一页 selector `{next_selector}` 在页面上没有匹配到任何元素，"
-                f"只采集到第 1 页共 {len(all_values)} 条。请用 inspect_page 确认真实的分页控件"
-                "——若该站是数字页码而非「下一页」按钮，改用按 URL 翻页（?p=N）而不是点击翻页。"
-            )
+            # 只有第 1 页且看不出残缺。但「按钮隐藏/禁用」在真·单页站点上是正常的末页形态，
+            # 不能一律判失败，改由页面自身的分页证据裁决。
+            # clickLoadMore 不做这一步：内容加载完时按钮本就该消失。
+            evidence = await probe_pagination_evidence_playwright(page)
+            if stop_reason == "next_selector_not_found" or evidence.has_more_pages:
+                raise ValueError(build_first_page_stop_error(
+                    next_selector=next_selector,
+                    stop_reason=stop_reason,
+                    row_count=len(all_values),
+                    evidence=evidence,
+                ))
+            verdict = SINGLE_PAGE_VERDICT
 
         return SweepOutcome(
             rows=all_values,
@@ -575,6 +652,78 @@ class BrowserActionRunner:
             progress_counts=per_page_counts,
             stop_reason=stop_reason,
             trigger_matches=trigger_matches,
+            unit=" 页",
+            verdict=verdict,
+        )
+
+    async def _paginate_by_url_and_extract(
+        self,
+        page: object,
+        url_template: str,
+        target_selector_config: "SelectorConfig",
+        variables: RuntimeVariableStore,
+        node: FlowNode,
+        *,
+        timeout: int,
+    ) -> SweepOutcome:
+        """按 URL 逐页抓取：数字页码站点点不动「下一页」，只能自己拼地址。
+
+        点击式翻页翻到第 2 页后，页码控件的位置和文字都变了，selector 往往当场失效；
+        这条路径每页都从 URL 重新进入，与页面上有没有下一页按钮无关。
+        """
+        max_iterations = max(1, _read_int(node, "maxIterations", default=20))
+        start_page = _read_int(node, "startPage", default=1)
+        # offset 型分页（?start=0/20/40）靠步长表达，页号本身就是偏移量
+        page_step = max(1, _read_int(node, "pageStep", default=1))
+        delay_ms = max(0, _read_int(node, "delayMs", default=500))
+
+        all_values: list[object] = []
+        per_page_counts: list[int] = []
+        previous_fingerprint = ""
+        pages_visited = 0
+        stop_reason = "max_iterations_reached"
+
+        for index in range(max_iterations):
+            page_number = start_page + index * page_step
+            await _goto_with_retry(page, url_template.replace("${page}", str(page_number)), timeout=timeout)
+            if delay_ms > 0:
+                await page.wait_for_timeout(delay_ms)
+            try:
+                current_values = await _extract_locator_values(page, target_selector_config, timeout=timeout)
+            except Exception:
+                # 翻过头是这条路径的正常收尾方式：末页之后行选择器等不到元素，
+                # 这属于「没有下一页了」，不是流程失败。第 1 页就等不到会走下面的 pages_visited==0 分支
+                current_values = []
+            if not current_values:
+                stop_reason = "empty_page"
+                break
+            # 指纹不含 URL：越界页号常被站点重定向回首页/末页，此时地址不同而内容逐字相同
+            fingerprint = _build_page_fingerprint("", current_values)
+            if fingerprint == previous_fingerprint:
+                stop_reason = "duplicate_content"
+                break
+            all_values.extend(current_values)
+            per_page_counts.append(len(current_values))
+            pages_visited += 1
+            previous_fingerprint = fingerprint
+
+        pages_variable = _read_optional_string(node, "pageCountVariable")
+        if pages_variable is not None:
+            variables.set(pages_variable, pages_visited, scope="局部")
+
+        if pages_visited == 0:
+            raise ValueError(
+                f"按 URL 翻页第 1 页（{url_template.replace('${page}', str(start_page))}）就没抽到任何内容："
+                f"targetSelector `{target_selector_config.selector}` 没命中，或 startPage 起点不对。"
+                "请用 inspect_page 核对行选择器与真实页号起点（有的站从 0 开始，offset 型分页要配 pageStep）。"
+            )
+
+        return SweepOutcome(
+            rows=all_values,
+            rounds=pages_visited,
+            progress_counts=per_page_counts,
+            stop_reason=stop_reason,
+            trigger_matches=None,
             unit=" 页",
         )
 
@@ -1229,6 +1378,54 @@ def _classify_overlay(vendor: str | None, text: str, interactive: list[dict[str,
     return "未知弹层"
 
 
+# 拦截页（interstitial）识别
+# 与浮层检测是两件事：Cloudflare / DataDome 这类拦截页不是盖在内容上的浮层，
+# 而是整页替换——没有 position:fixed 的高层容器，findBlocker 一个都命中不了，
+# 于是「页面明明写着请完成人机验证」却被当成 selector 不匹配，助手一路去改选择器。
+_INTERSTITIAL_PROBE_SCRIPT = """
+() => {
+  // 厂商特征只作高置信度快速命中；判据主体是下面的通用信号，换个厂商同样要拦得住
+  const WIDGET_SELECTORS = [
+    'iframe[src*="challenges.cloudflare.com"]',
+    'iframe[src*="hcaptcha.com"]',
+    'iframe[src*="recaptcha"]',
+    '#challenge-form', '#challenge-running', '#cf-chl-widget', '.cf-turnstile',
+    '[id^="cf-chl"]', '#px-captcha', '#datadome',
+  ];
+  let widget = null;
+  for (const sel of WIDGET_SELECTORS) {
+    try { widget = document.querySelector(sel); } catch (e) { widget = null; }
+    if (widget) break;
+  }
+
+  const bodyText = (document.body && document.body.innerText || '').trim();
+  const title = (document.title || '').trim();
+  const haystack = (title + ' ' + bodyText).toLowerCase();
+  const VERIFY_WORDING = [
+    'just a moment', 'checking your browser', 'verify you are human', 'verifying you are human',
+    'needs to review the security', 'enable javascript and cookies', 'attention required',
+    'ddos protection', 'access denied', 'unusual traffic',
+    '请稍候', '正在验证', '安全检查', '人机验证', '完成验证', '访问被拒绝', '异常流量',
+  ];
+  const wording = VERIFY_WORDING.find((w) => haystack.includes(w)) || null;
+
+  // 通用信号：整页几乎没有正文。拦截页只放一句提示和一个控件，正常内容页不会这么空。
+  // 光靠字数会误判空列表页，所以必须同时命中验证措辞或验证控件。
+  const sparse = bodyText.length < 600;
+  if (!widget && !(sparse && wording)) return null;
+
+  return {
+    widget: widget ? (widget.id || widget.className || widget.tagName || '').toString().slice(0, 120) : null,
+    wording,
+    title: title.slice(0, 120),
+    text: bodyText.slice(0, 800),
+    textLength: bodyText.length,
+    url: (location.href || '').slice(0, 300),
+  };
+}
+"""
+
+
 @dataclass(frozen=True)
 class OverlayInfo:
     """检测到的阻断型浮层：label 用于日志/横幅展示，summary 供 AI 弹层分析使用。"""
@@ -1236,16 +1433,42 @@ class OverlayInfo:
     label: str
     reason: str
     summary: dict[str, object]
+    # 无头运行时给出的补救方向。拦截页和普通验证码的出路不同：前者要换有头/插件执行器
+    # 让人过一次，加 human_takeover 节点在无头下依然过不去。
+    headless_advice: str = "请在流程中加入 control.human_takeover 节点后重跑"
 
 
-async def detect_blocking_overlay(page: object, target_selector: str | None = None) -> OverlayInfo | None:
-    """检测是否有阻断型浮层遮挡目标操作，或覆盖大部分视口。"""
+async def detect_blocking_interstitial(page: object) -> OverlayInfo | None:
+    """检测整页替换式的人机验证/拦截页（Cloudflare、DataDome、hCaptcha 等）。"""
     try:
-        result = await page.evaluate(_OVERLAY_PROBE_SCRIPT, target_selector)
+        result = await page.evaluate(_INTERSTITIAL_PROBE_SCRIPT)
     except Exception:
         return None
     if not isinstance(result, dict):
         return None
+    return OverlayInfo(
+        label="人机验证拦截页",
+        reason="challenge_interstitial",
+        summary=result,
+        headless_advice=(
+            "请改用有头模式或插件执行器运行，人工完成一次验证；"
+            "登录态与验证 cookie 会留在持久化 profile 里，后续运行通常无需再验"
+        ),
+    )
+
+
+async def detect_blocking_overlay(page: object, target_selector: str | None = None) -> OverlayInfo | None:
+    """检测是否有阻断型浮层遮挡目标操作，或覆盖大部分视口。
+
+    浮层没命中时再查拦截页：整页替换的验证页不满足「高层浮动容器」的形状，
+    两种形态必须分别识别，否则拦截页会一路漏到「selector 不匹配」。
+    """
+    try:
+        result = await page.evaluate(_OVERLAY_PROBE_SCRIPT, target_selector)
+    except Exception:
+        return await detect_blocking_interstitial(page)
+    if not isinstance(result, dict):
+        return await detect_blocking_interstitial(page)
     reason = str(result.get("reason") or "")
     label = _classify_overlay(
         result.get("vendor") if isinstance(result.get("vendor"), str) else None,
@@ -1255,7 +1478,7 @@ async def detect_blocking_overlay(page: object, target_selector: str | None = No
     if reason == "fullscreen_overlay" and label == "未知弹层":
         # 兜底扫描命中大面积容器但无厂商特征/关键词匹配，很可能是页面自身布局容器
         # 而非真阻断浮层，置信度不足以转人工。
-        return None
+        return await detect_blocking_interstitial(page)
     return OverlayInfo(label=label, reason=reason, summary=result)
 
 

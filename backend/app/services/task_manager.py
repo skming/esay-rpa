@@ -63,6 +63,12 @@ def _append_exc_context(exc: Exception, context_note: str) -> None:
         pass
 
 
+def _profile_owner_label(record: "TaskRecord") -> str:
+    """占用方登记名要能让用户在界面上认出是哪一次运行，所以带流程名而不只是 task_id。"""
+    name = (record.request.flow_name or "").strip() or "未命名流程"
+    return f"{name} · 运行 {record.snapshot.task_id}"
+
+
 def _resolve_output_slug(request: RunTaskRequest) -> str:
     """已保存流程用 flow_id 作产物目录键，避免重命名后产物拆到多个目录；
     未保存流程回退到流程名。"""
@@ -829,7 +835,7 @@ class TaskManager:
             await self._append_log(record, "running", f"执行节点 · {node_title}", step_request.selector, node_id=record.active_node_id)
             if record.request.browser_executor == "extension":
                 if state.browser_context is None:
-                    state.browser_context = await self._resolve_browser_executor(record).create_context(headless=True)
+                    state.browser_context = await self._resolve_browser_executor(record).create_context(headless=True, owner=_profile_owner_label(record))
                 result = await self._run_fetch_node(
                     record,
                     step_request,
@@ -861,7 +867,7 @@ class TaskManager:
             await self._update_step_progress(record, state.started, current_step=state.executable_steps, total_steps=state.total_steps)
             if state.browser_context is None:
                 needs_headed = any(is_human_takeover_node(n) for n in record.executable_nodes)
-                state.browser_context = await self._resolve_browser_executor(record).create_context(headless=not needs_headed)
+                state.browser_context = await self._resolve_browser_executor(record).create_context(headless=not needs_headed, owner=_profile_owner_label(record))
             browser_result = await self._run_browser_action_node(record, node, state.browser_context, node_id=record.active_node_id, node_title=node_title)
             if browser_result is not None and _is_collectable_result_node(node):
                 state.results.append(browser_result)
@@ -1164,7 +1170,7 @@ class TaskManager:
         owns_context = context is None
         active_context = context
         if active_context is None:
-            active_context = await executor.create_context(headless=True)
+            active_context = await executor.create_context(headless=True, owner=_profile_owner_label(record))
         try:
             if request.target_url is not None:
                 await self._append_log(record, "running", f"扩展打开网页 · {node_title}", str(request.target_url), node_id=node_id)
@@ -1399,7 +1405,7 @@ class TaskManager:
                 return True
             if context.headless:
                 # 无头模式用户看不到浏览器，无法人工处理——补充错误上下文后按失败处理。
-                _append_exc_context(exc, f"[检测到{overlay.label}，但当前为无头运行无法人工处理。请在流程中加入 control.human_takeover 节点后重跑]")
+                _append_exc_context(exc, f"[检测到{overlay.label}，但当前为无头运行无法人工处理。{overlay.headless_advice}]")
             else:
                 if await self._pause_for_runtime_overlay(record, context, overlay, node_id=node_id, node_title=node_title):
                     return True

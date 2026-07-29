@@ -471,7 +471,8 @@ def _find_incomplete_sweeps(nodes: list[Any], variables: dict[str, Any]) -> list
                     ),
                     "fix": (
                         f"用 inspect_page 确认真实的分页控件，再修 selector `{node.get('selector')}`；"
-                        "若该站是数字页码而非「下一页」按钮，改用按 URL 翻页（?p=N）而不是点击翻页。"
+                        "若该站是数字页码而非「下一页」按钮，把该节点改成 URL 翻页模式："
+                        "填 urlTemplate（含 `${page}` 占位，必要时配 startPage/pageStep）并删掉 selector。"
                     ),
                 })
                 break

@@ -111,7 +111,7 @@ class FakeBrowserActionRunner:
         self.actions: list[dict[str, object]] = []
         self._extract_values_by_selector = extract_values_by_selector or {}
 
-    async def create_context(self, *, headless: bool = True) -> object:
+    async def create_context(self, *, headless: bool = True, owner: str | None = None) -> object:
         return object()
 
     async def close_context(self, context: object | None) -> None:
@@ -226,7 +226,7 @@ class OverlayBrowserActionRunner(FakeBrowserActionRunner):
         self._fail_node_id = fail_node_id
         self._call_counts: dict[str, int] = {}
 
-    async def create_context(self, *, headless: bool = True) -> object:
+    async def create_context(self, *, headless: bool = True, owner: str | None = None) -> object:
         return FakeOverlayContext(self.page, headless=self._headless)
 
     async def run(self, node: dict[str, object], variables, context: object, *, timeout_ms: int):

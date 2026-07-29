@@ -6,6 +6,9 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+from app.services import browser_profile_lock
+from app.services.browser_action_runner import launch_persistent_chrome
+
 
 # 注入的 JS 依赖 window.__rpaPickerCapture__ / __rpaPickerCancel__，
 # 需在 add_init_script 前由 page.expose_function 先暴露。
@@ -552,6 +555,10 @@ _PICKER_OVERLAY_JS = r"""
 """
 
 
+# 拾取器全局只有一个会话，占用登记名固定
+_PICKER_OWNER = "元素拾取器"
+
+
 class PickerService:
     def __init__(self, session_dir: str) -> None:
         self._session_dir = session_dir
@@ -572,16 +579,22 @@ class PickerService:
         self._result_queue = asyncio.Queue()
 
         from playwright.async_api import async_playwright
-        self._playwright = await async_playwright().start()
         profile_path = Path(self._session_dir)
         profile_path.mkdir(parents=True, exist_ok=True)
+        # 登记在启动之前：正在运行/等人工接管的任务开着同一个 profile 时，
+        # 拾取器要给出「谁占着、去哪操作」，而不是 Chrome 让位后的那句天书
+        browser_profile_lock.acquire(str(profile_path), _PICKER_OWNER)
 
-        self._context = await self._playwright.chromium.launch_persistent_context(
-            str(profile_path),
-            headless=False,
-            args=["--disable-cache"],
-        )
-        self._page = await self._context.new_page()
+        self._playwright = await async_playwright().start()
+        try:
+            self._context = await launch_persistent_chrome(self._playwright, str(profile_path), headless=False)
+            self._page = await self._context.new_page()
+        except Exception as exc:
+            await self._cleanup()
+            translated = browser_profile_lock.translate_launch_error(str(profile_path), exc)
+            if translated is None:
+                raise
+            raise RuntimeError(translated) from exc
         self._active = True
 
         if mode == "pick":
@@ -629,3 +642,5 @@ class PickerService:
         self._context = None
         self._page = None
         self._playwright = None
+        if self._session_dir:
+            browser_profile_lock.release(self._session_dir, _PICKER_OWNER)

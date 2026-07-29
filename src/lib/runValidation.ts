@@ -269,7 +269,15 @@ function validateNodeAction(node: Node<RpaNodeData>, action: RpaNodeAction): Run
   }
 
   if (type === 'browser.clickLoadMore' || type === 'browser.paginateNext') {
-    requireField(action.selector, type === 'browser.paginateNext' ? '下一页按钮选择器' : '加载按钮选择器');
+    // URL 翻页模式不点任何元素，此时要求填按钮选择器只会逼用户填一个永远用不上的值
+    const paginatesByUrl = type === 'browser.paginateNext' && (action.urlTemplate ?? '').trim() !== '';
+    if (paginatesByUrl) {
+      if (!action.urlTemplate?.includes('${page}')) {
+        issues.push({ nodeId: node.id, severity: 'error', message: `节点“${title}”的翻页地址模板缺少 \${page} 占位符，每页请求的会是同一个地址` });
+      }
+    } else {
+      requireField(action.selector, type === 'browser.paginateNext' ? '下一页按钮选择器' : '加载按钮选择器');
+    }
     requireField(action.targetSelector, '列表项选择器');
   }
 

@@ -686,6 +686,30 @@ async def test_run_flow_reports_waiting_for_user_input_instead_of_timeout(monkey
     assert result["waiting_for_user_input"] is True
 
 
+async def test_run_flow_blocks_when_another_run_holds_the_browser_profile() -> None:
+    """浏览器被占用时若照常起跑，失败现场是一屏 Chrome 启动参数，模型会当成 selector 问题去改流程。"""
+    from app.core import storage
+    from app.services import browser_profile_lock
+
+    profile = str(storage.resolve_browser_profile_dir())
+    browser_profile_lock.acquire(profile, "抓取 NodeSeek 帖子内容 · 运行 t_1")
+    try:
+        task_manager = FakeTaskManager(with_failing_tasks=False, extension_connected=True)
+        executor = RpaToolExecutor(flow_service=FakeFlowService(), task_manager=task_manager)  # type: ignore[arg-type]
+
+        result = await executor._run_flow("flow-1")
+
+        assert result["status"] == "blocked_browser_profile_busy"
+        assert result["holder"] == "抓取 NodeSeek 帖子内容 · 运行 t_1"
+        assert "不要改流程" in result["message"]
+
+        # 插件执行器借用用户自己的浏览器，不受应用 profile 占用影响，不能顺手拦掉
+        extension_result = await executor._run_flow("flow-1", browser_executor="extension")
+        assert extension_result.get("status") != "blocked_browser_profile_busy"
+    finally:
+        browser_profile_lock.release(profile, "抓取 NodeSeek 帖子内容 · 运行 t_1")
+
+
 async def test_get_run_error_returns_root_cause_hints_for_login_detection_failure() -> None:
     task_manager = FakeTaskManager()
     executor = RpaToolExecutor(flow_service=FakeFlowService(), task_manager=task_manager)  # type: ignore[arg-type]

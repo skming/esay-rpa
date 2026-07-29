@@ -89,6 +89,9 @@ export type RpaNodeAction = {
   countVariable?: string;
   loadedCountVariable?: string;
   pageCountVariable?: string;
+  urlTemplate?: string;
+  startPage?: number;
+  pageStep?: number;
   dismissedCountVariable?: string;
   firstValueVariable?: string;
   stderrVariable?: string;
@@ -191,6 +194,9 @@ export type RpaNodeConfigDraft = {
   anchorText: string;
   outputSchema: string;
   waitCondition: 'visible' | 'hidden' | 'textContains';
+  urlTemplate: string;
+  startPage: number;
+  pageStep: number;
 };
 
 export type FlowCanvasSnapshot = {

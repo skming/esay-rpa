@@ -142,9 +142,18 @@ NODE_TYPE_CATALOG: list[dict[str, str]] = [
     },
     {
         "type": "browser.paginateNext",
-        "key_fields": "selector, targetSelector",
-        "output_var_field": "outputVariable（翻页后提取到的内容列表，可选）",
-        "description": "点击翻页按钮（selector）并等待加载，再用 targetSelector 提取本页内容；结果列表存入 outputVariable。支持 outputSchema（同 browser.extract）",
+        "key_fields": "selector, targetSelector（点击式）／urlTemplate, targetSelector（URL 式）",
+        "output_var_field": "outputVariable（逐页累计提取到的内容列表，可选）",
+        "description": (
+            "逐页抓取，两种模式二选一。"
+            "**点击式**：selector 指向「下一页」按钮，翻一页抽一页；按钮消失/禁用即停。"
+            "**URL 式**：填 urlTemplate（含 `${page}` 占位，如 `https://x.com/list?p=${page}`）并**不要填 selector**，"
+            "逐页直接换地址进入，本页抽不到内容或与上一页逐字相同即停；可选 startPage（默认 1，有的站从 0 开始）、"
+            "pageStep（默认 1；offset 型分页如 `?start=${page}` 配 startPage=0 + pageStep=20）。"
+            "**数字页码站点（1 2 3 … 下一页）必须用 URL 式**：点到第 2 页后页码控件位置就变了，点击式会当场失效。"
+            "两种模式都用 targetSelector 提取本页内容，结果累计存入 outputVariable，页数存入 pageCountVariable；"
+            "支持 outputSchema（同 browser.extract）"
+        ),
     },
     {
         "type": "browser.clickLoadMore",

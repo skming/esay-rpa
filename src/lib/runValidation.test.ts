@@ -392,4 +392,38 @@ describe('runValidation', () => {
     expect((batch.get('fetch') ?? []).length).toBeGreaterThan(0);
     expect((batch.get('fill') ?? []).length).toBeGreaterThan(0);
   });
+
+  it('URL 式翻页节点不再要求下一页按钮选择器', () => {
+    const node = createNode('paginate', {
+      title: '翻页抓取',
+      action: {
+        type: 'browser.paginateNext',
+        urlTemplate: 'https://example.com/list?p=${page}',
+        targetSelector: '.row::text',
+        responseVariable: 'rows'
+      }
+    });
+
+    const issues = validateNodeConfigurationInFlow(node, [node], [], []).filter((issue) => issue.severity === 'error');
+
+    expect(issues).toEqual([]);
+  });
+
+  it('翻页地址模板缺少 ${page} 时拦截：每页请求的会是同一个地址', () => {
+    const node = createNode('paginate', {
+      title: '翻页抓取',
+      action: {
+        type: 'browser.paginateNext',
+        urlTemplate: 'https://example.com/list',
+        targetSelector: '.row::text',
+        responseVariable: 'rows'
+      }
+    });
+
+    const issues = validateNodeConfigurationInFlow(node, [node], [], []).filter((issue) => issue.severity === 'error');
+
+    expect(issues).toHaveLength(1);
+    expect(issues[0]?.severity).toBe('error');
+    expect(issues[0]?.message).toContain('${page}');
+  });
 });

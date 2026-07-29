@@ -191,6 +191,8 @@ _SEC['step1_login_challenges'] = """**登录挑战处理规范（验证码 / 2FA
 
 **运行时兜底**：即使流程中没有 human_takeover 节点，运行器在浏览器节点失败时也会自动检测页面上的验证码/滑块组件（极验、顶象、数美、腾讯防水墙、阿里、字节等），检测到且浏览器可见时会自动暂停等待人工完成后重试。因此若 `get_run_error` 的错误信息中出现「检测到XX验证」字样，**修复方向是登录态复用或加 human_takeover 节点，绝不是改 selector**。
 
+**「检测到人机验证拦截页」是另一回事**：Cloudflare / DataDome 这类整页拦截不是流程缺陷，加 human_takeover 节点也过不去（无头模式下没人能操作）。此时**不要改流程**，如实告诉用户：改用有头模式或插件执行器跑一次、人工完成验证即可，验证 cookie 会留在持久化 profile 里，后续运行通常无需再验。
+
 各类型操作：
 - 图形验证码（需用户输入字符）：在填写密码后、点击登录前，加 `variable.input`（message:"请查看浏览器中的图形验证码并输入", variableName:"captcha_code"），再加 `browser.fill` 填入验证码框
 - 短信验证码（运行时才能收到）：只有页面真实存在"获取/发送验证码"按钮时才点击发送；短信码用 `variable.input` 等待用户手动输入
@@ -324,7 +326,8 @@ _SEC['node_patterns'] = """## 常用节点组合模式
 | API 数据采集→文件 | `http.request` → `data.json.parse` → `file.write`（整份结果一次写出，`file.write` 无追加模式，别套 `foreach`） |
 | 无条件登录（仅当站点每次都强制重新登录时才用，否则用下一行） | `browser.open`(登录页) → `browser.wait`(`input[type='password']`,超时10s) → `browser.fill`(账号,`${var.username}`) → `browser.fill`(密码,`${var.password}`) → [`variable.input`(验证码,可选)] → `browser.click`(登录) → `browser.wait`(目标页) → `browser.extract` |
 | 带登录的网页抓取（默认，会话可持久） | `browser.ensureLogin`(targetUrl, selector=已登录特征, targetSelector=`input[type='password']`, firstValueVariable=login_status) → `control.condition`(`login_status == 'login_required'`) → **true分支**：填账号→填密码→[验证码/human_takeover]→点击登录→`browser.wait`(应用壳) → **false分支**：直连 → 合流后 `browser.open`(目标数据页) → `browser.wait` → `browser.extract` |
-| 分页按钮翻页抓取 | `browser.open` → `browser.paginateNext`(翻页按钮 selector + 内容 targetSelector) 累计提取 |
+| 分页按钮翻页抓取（有「下一页」按钮） | `browser.open` → `browser.paginateNext`(翻页按钮 selector + 内容 targetSelector) 累计提取 |
+| 数字页码翻页抓取（1 2 3 … 无稳定「下一页」） | `browser.paginateNext`(urlTemplate=`…?p=${page}` + 内容 targetSelector，不填 selector) 逐页换地址累计提取 |
 | 无限滚动/加载更多 | `browser.open` → `browser.clickLoadMore`(加载更多按钮 selector + 内容 targetSelector) 累计提取 |
 | 可搜索候选弹层筛选 | `browser.click`(输入框) → `browser.fill`(同一输入框, 目标文本) → `browser.click`(可见候选项精确文本) → `browser.click`(查询按钮) |
 | 页码列表循环抓取 | 外层 `foreach`（页码列表）→ `browser.open`(每页 URL) → 内层 `browser.extract` |
@@ -367,9 +370,11 @@ _SEC['scraping_practices'] = """## 抓取与表格数据最佳实践（构建通
 
 2. **分页累加要整行去重**。`browser.paginateNext` 单节点内部已按页面指纹检测末页并停止；若用 `foreach` + 手动累加翻页，仍要按整行内容去重，并优先用"下一页按钮禁用/不存在"作为停止条件，不要硬编码页数。
 
-3. **非 `<table>` 结构**（div 网格、卡片列表）用 text/attribute 模式按字段分别提取，再用 `foreach` 组装；table 模式仅适用于真正的 `<table>`。
+3. **点击式翻页只在真有「下一页」按钮时用**。页面是 `1 2 3 … ›` 这类数字页码时改用 `urlTemplate` 模式（见节点说明）：点击式翻到第 2 页后页码控件就换位置了。翻页节点若只翻到第 1 页就停，运行器会拿页面证据判断是真单页还是 selector 找错——判定为找错会直接让运行失败并给出候选控件，别绕过它。
 
-4. **运行成功后必须做通用质量审计**。只要流程涉及抓取、筛选或导出，就必须用 `assert_run_output(task_id, requirement_text=用户原始需求)` 审计输出是否可信。若审计发现表格扁平化、筛选控件高风险、需求约束不可验证、输出变量缺失等问题，说明流程业务可信度不足，即使 `run_flow` 返回 success 也必须继续修复。
+4. **非 `<table>` 结构**（div 网格、卡片列表）用 text/attribute 模式按字段分别提取，再用 `foreach` 组装；table 模式仅适用于真正的 `<table>`。
+
+5. **运行成功后必须做通用质量审计**。只要流程涉及抓取、筛选或导出，就必须用 `assert_run_output(task_id, requirement_text=用户原始需求)` 审计输出是否可信。若审计发现表格扁平化、筛选控件高风险、需求约束不可验证、输出变量缺失等问题，说明流程业务可信度不足，即使 `run_flow` 返回 success 也必须继续修复。
 
 ---
 

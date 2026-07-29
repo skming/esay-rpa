@@ -32,6 +32,13 @@ from app.services.browser_action_runner import (
     _split_selector_candidates,
 )
 from app.services.extension_bridge_service import ExtensionBridgeService
+from app.services.pagination_probe import (
+    EXTENSION_EVIDENCE_SELECTORS,
+    FIRST_PAGE_STOP_REASONS,
+    SINGLE_PAGE_VERDICT,
+    PaginationEvidence,
+    build_first_page_stop_error,
+)
 from app.services.runtime_variables import RuntimeVariableStore
 
 _SUPPORTED_ACTION_TYPES = {
@@ -85,7 +92,8 @@ class ExtensionExecutor:
     def is_connected(self) -> bool:
         return self._bridge.is_connected
 
-    async def create_context(self, *, headless: bool = True) -> ExtensionExecutionContext:
+    # owner 只为满足 BrowserExecutor 协议：插件执行器借用用户自己的浏览器，不占用应用的 profile
+    async def create_context(self, *, headless: bool = True, owner: str | None = None) -> ExtensionExecutionContext:
         if not self._bridge.is_connected:
             raise ConnectionError("没有已连接的浏览器扩展，无法使用插件执行器——请确认扩展已加载并打开了一个标签页")
         self._step_count = 0
@@ -360,6 +368,17 @@ class ExtensionExecutor:
             return _build_extract_result(action_type, detail, outcome.rows)
 
         if action_type == "browser.paginateNext":
+            url_template = _read_optional_string(node, "urlTemplate")
+            if url_template is not None:
+                resolved_template = variables.resolve_text(url_template)
+                if "${page}" not in resolved_template:
+                    raise ValueError("urlTemplate 必须包含 ${page} 占位符，否则每一页请求的都是同一个地址")
+                target_selector_config = _read_target_selector_config(node, variables)
+                outcome = await self._paginate_by_url_and_extract(
+                    resolved_template, target_selector_config, variables, node, timeout_seconds=timeout_seconds
+                )
+                detail = f"{resolved_template} -> {target_selector_config.selector} · {outcome.note}"
+                return _build_extract_result(action_type, detail, outcome.rows)
             next_selector = variables.resolve_text(_read_required_string(node, "selector"))
             target_selector_config = _read_target_selector_config(node, variables)
             outcome = await self._paginate_next_and_extract(next_selector, target_selector_config, variables, node, timeout_seconds=timeout_seconds)
@@ -567,13 +586,18 @@ class ExtensionExecutor:
         if pages_variable is not None:
             variables.set(pages_variable, pages_visited, scope="局部")
 
-        if pages_visited <= 1 and stop_reason == "next_selector_not_found":
+        verdict: str | None = None
+        if pages_visited <= 1 and stop_reason in FIRST_PAGE_STOP_REASONS:
             # 判据与 Playwright 执行器一致，见 browser_action_runner._paginate_next_and_extract
-            raise ValueError(
-                f"分页未生效：下一页 selector `{next_selector}` 在页面上不存在，"
-                f"只采集到第 1 页共 {len(all_values)} 条。请用 inspect_page 确认真实的分页控件"
-                "——若该站是数字页码而非「下一页」按钮，改用按 URL 翻页（?p=N）而不是点击翻页。"
-            )
+            evidence = await self._probe_pagination_evidence(timeout_seconds=timeout_seconds)
+            if stop_reason == "next_selector_not_found" or evidence.has_more_pages:
+                raise ValueError(build_first_page_stop_error(
+                    next_selector=next_selector,
+                    stop_reason=stop_reason,
+                    row_count=len(all_values),
+                    evidence=evidence,
+                ))
+            verdict = SINGLE_PAGE_VERDICT
 
         return SweepOutcome(
             rows=all_values,
@@ -581,6 +605,90 @@ class ExtensionExecutor:
             progress_counts=per_page_counts,
             stop_reason=stop_reason,
             trigger_matches=1 if exists else 0,
+            unit=" 页",
+            verdict=verdict,
+        )
+
+    async def _probe_pagination_evidence(self, *, timeout_seconds: float) -> PaginationEvidence:
+        """插件没有 evaluate 通道，只能拿固定 CSS 逐个问 elementState 换取证据。
+
+        拿不到 href，因此只能证明「还有分页控件」，给不出 urlTemplate 建议；
+        这条路径只在翻页已经停在第 1 页时才走，多这几次往返不影响正常运行。
+        """
+        candidates: list[dict[str, object]] = []
+        for selector in EXTENSION_EVIDENCE_SELECTORS:
+            try:
+                state = await self._element_state(selector, timeout_seconds=min(timeout_seconds, 3.0))
+            except Exception:
+                continue
+            if not state.get("exists", False) or state.get("hidden", True):
+                continue
+            kind = "page_number" if "=2" in selector else "next_control"
+            candidates.append({"kind": kind, "text": "", "href": selector, "selector": selector})
+        return PaginationEvidence(candidates=candidates)
+
+    async def _paginate_by_url_and_extract(
+        self,
+        url_template: str,
+        target_selector_config: SelectorConfig,
+        variables: RuntimeVariableStore,
+        node: FlowNode,
+        *,
+        timeout_seconds: float,
+    ) -> SweepOutcome:
+        """按 URL 逐页抓取，判据与 browser_action_runner._paginate_by_url_and_extract 一致。"""
+        max_iterations = max(1, _read_int(node, "maxIterations", default=20))
+        start_page = _read_int(node, "startPage", default=1)
+        page_step = max(1, _read_int(node, "pageStep", default=1))
+        delay_ms = max(0, _read_int(node, "delayMs", default=500))
+
+        all_values: list[object] = []
+        per_page_counts: list[int] = []
+        previous_fingerprint = ""
+        pages_visited = 0
+        stop_reason = "max_iterations_reached"
+
+        for index in range(max_iterations):
+            page_number = start_page + index * page_step
+            target_url = url_template.replace("${page}", str(page_number))
+            await self._bridge.execute({"type": "browser.open", "targetUrl": target_url}, timeout=timeout_seconds)
+            if delay_ms > 0:
+                await asyncio.sleep(delay_ms / 1000)
+            try:
+                current_values = await self._extract_selector_values(target_selector_config, timeout_seconds=timeout_seconds)
+            except RuntimeError:
+                # 翻过头是这条路径的正常收尾方式：末页之后行选择器在插件端报「没找到元素」，
+                # 这属于「没有下一页了」，不是流程失败。第 1 页就失败会走下面的 pages_visited==0 分支
+                current_values = []
+            if not current_values:
+                stop_reason = "empty_page"
+                break
+            fingerprint = _fingerprint_rows(current_values)
+            if fingerprint == previous_fingerprint:
+                stop_reason = "duplicate_content"
+                break
+            all_values.extend(current_values)
+            per_page_counts.append(len(current_values))
+            pages_visited += 1
+            previous_fingerprint = fingerprint
+
+        pages_variable = _read_optional_string(node, "pageCountVariable")
+        if pages_variable is not None:
+            variables.set(pages_variable, pages_visited, scope="局部")
+
+        if pages_visited == 0:
+            raise ValueError(
+                f"按 URL 翻页第 1 页（{url_template.replace('${page}', str(start_page))}）就没抽到任何内容："
+                f"targetSelector `{target_selector_config.selector}` 没命中，或 startPage 起点不对。"
+                "请用 inspect_page 核对行选择器与真实页号起点（有的站从 0 开始，offset 型分页要配 pageStep）。"
+            )
+
+        return SweepOutcome(
+            rows=all_values,
+            rounds=pages_visited,
+            progress_counts=per_page_counts,
+            stop_reason=stop_reason,
+            trigger_matches=None,
             unit=" 页",
         )
 

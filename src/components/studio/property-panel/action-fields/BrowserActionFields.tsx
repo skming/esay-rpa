@@ -29,20 +29,44 @@ export function BrowserActionFields({ draft, electron, flowTargetUrl, node, onDr
   const availableVariables = electron.variableViews;
   if (actionType === 'browser.clickLoadMore' || actionType === 'browser.paginateNext') {
     const isNextPagination = actionType === 'browser.paginateNext';
+    // 翻页方式由 urlTemplate 是否有值决定，而不是另存一个 mode 字段：执行器就是这么分派的，
+    // 多一个字段就多一种「UI 显示 URL 式、后端却在点按钮」的错位
+    const paginatesByUrl = isNextPagination && draft.urlTemplate.trim() !== '';
     return (
       <>
-        <SelectorField
-          electron={electron}
-          label={isNextPagination ? '下一页按钮 (CSS)' : '加载按钮 (CSS)'}
-          onChange={(value) => onDraftPatch('selector', value)}
-          targetUrl={resolvedTargetUrl}
-          value={draft.selector}
-        />
+        {isNextPagination && (
+          <Segmented
+            label="翻页方式"
+            onChange={(value) => onDraftPatch('urlTemplate', value === 'url' ? (draft.urlTemplate.trim() || `${resolvedTargetUrl?.trim() || 'https://example.com/list'}?page=\${page}`) : '')}
+            options={[
+              { label: '点「下一页」', value: 'click' },
+              { label: '按地址翻页', value: 'url' }
+            ]}
+            value={paginatesByUrl ? 'url' : 'click'}
+          />
+        )}
+        {paginatesByUrl ? (
+          <>
+            <Field label="翻页地址模板" mono onChange={(event) => onDraftPatch('urlTemplate', event.target.value)} placeholder="https://example.com/list?page=${page}" value={draft.urlTemplate} />
+            {!draft.urlTemplate.includes('${page}') && <InlineHint text="模板缺少 ${page} 占位符，每页请求的会是同一个地址" tone="warn" />}
+            <Field label="起始页号" onChange={(event) => onDraftPatch('startPage', Math.max(0, Number.parseInt(event.target.value, 10) || 0))} type="number" value={String(draft.startPage)} />
+            <Field label="页号步长" onChange={(event) => onDraftPatch('pageStep', Math.max(1, Number.parseInt(event.target.value, 10) || 1))} type="number" value={String(draft.pageStep)} />
+            <InlineHint text="按 offset 分页的站点（如 start=0/20/40）把起始页号设为 0、步长设为每页条数。" />
+          </>
+        ) : (
+          <SelectorField
+            electron={electron}
+            label={isNextPagination ? '下一页按钮 (CSS)' : '加载按钮 (CSS)'}
+            onChange={(value) => onDraftPatch('selector', value)}
+            targetUrl={resolvedTargetUrl}
+            value={draft.selector}
+          />
+        )}
         <Field label="列表项选择器" mono onChange={(event) => onDraftPatch('targetSelector', event.target.value)} placeholder=".item::text" value={draft.targetSelector} />
         <ExtractModeField onChange={(value) => onDraftPatch('extractMode', value)} value={draft.extractMode} />
         {draft.extractMode === 'attribute' &&<Field label="属性名" mono onChange={(event) => onDraftPatch('attribute', event.target.value)} placeholder="href" value={draft.attribute} />}
         <Field label={isNextPagination ? '最大页数' : '最大点击次数'} onChange={(event) => onDraftPatch('maxIterations', Math.max(1, Number.parseInt(event.target.value, 10) || 1))} type="number" value={String(draft.maxIterations)} />
-        <Field label="点击后等待(ms)" onChange={(event) => onDraftPatch('delayMs', Math.max(0, Number.parseInt(event.target.value, 10) || 0))} type="number" value={String(draft.delayMs)} />
+        <Field label={paginatesByUrl ? '每页等待(ms)' : '点击后等待(ms)'} onChange={(event) => onDraftPatch('delayMs', Math.max(0, Number.parseInt(event.target.value, 10) || 0))} type="number" value={String(draft.delayMs)} />
         <VariableNameField label="输出变量" mode="target" onChange={(value) => onDraftPatch('responseVariable', value)} placeholder={isNextPagination ? 'paged_items' : 'loaded_items'} value={draft.responseVariable} variables={availableVariables} />
       </>
     );

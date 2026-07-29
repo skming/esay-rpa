@@ -619,7 +619,9 @@ def _lint_scrape_flow_without_table_output(nodes: list[dict[str, Any]]) -> list[
         ),
         "fix": (
             "把抽取节点改为 extractMode='table'（selector 指向数据行）；"
-            "确实无法从 DOM 直接出表时，补一个 script.python 把文本整理成 [{列: 值}] 并写入 outputVariable。"
+            "确实无法从 DOM 直接出表时，补一个 script.python 把每条记录**拆成多个字段**再写入 outputVariable。"
+            "注意：把整段文本原样塞进单列（如 [{序号, 内容}]）只是给文本数组换个外壳，"
+            "该拆出来的用户/时间/金额等字段仍然没有，别用它来过这道门。"
         ),
     }]
 

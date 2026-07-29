@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.services.browser_action_runner import BrowserActionContext, BrowserActionResult, BrowserActionRunner, _normalize_table_rows, _goto_with_retry, _raise_if_table_scope_error, apply_browser_result_variables, detect_blocking_overlay
+from app.services.browser_action_runner import BrowserActionContext, BrowserActionResult, BrowserActionRunner, _INTERSTITIAL_PROBE_SCRIPT, launch_persistent_chrome, _normalize_table_rows, _goto_with_retry, _raise_if_table_scope_error, apply_browser_result_variables, detect_blocking_overlay
 from app.services.runtime_variables import RuntimeVariableStore
 
 
@@ -380,6 +380,69 @@ async def test_browser_paginate_next_fails_loudly_when_next_selector_matches_not
         )
 
 
+async def test_browser_paginate_next_fails_when_dom_still_reports_more_pages() -> None:
+    """按钮「隐藏/禁用」不等于「已经是最后一页」——DOM 里还挂着可见的页码链接就说明 selector 找错了。
+
+    这里不失败的代价是 success + 只有第 1 页，用户只能靠肉眼发现少了后面所有页。
+    """
+    variables = RuntimeVariableStore.from_initial({})
+    page = FakeEvidencePaginatePage()
+    context = BrowserActionContext(playwright=object(), browser=object(), page=page)
+
+    with pytest.raises(ValueError, match="数字页码分页"):
+        await BrowserActionRunner().run(
+            {"type": "browser.paginateNext", "selector": "a.next", "targetSelector": ".row::text"},
+            variables,
+            context,
+            timeout_ms=1000,
+        )
+
+
+async def test_browser_paginate_next_by_url_walks_pages_until_duplicate() -> None:
+    variables = RuntimeVariableStore.from_initial({})
+    page = FakeUrlPaginatePage()
+    context = BrowserActionContext(playwright=object(), browser=object(), page=page)
+
+    result = await BrowserActionRunner().run(
+        {
+            "type": "browser.paginateNext",
+            "urlTemplate": "https://example.com/list?p=${page}",
+            "targetSelector": ".row::text",
+            "delayMs": 0,
+            "pageCountVariable": "visited_pages",
+        },
+        variables,
+        context,
+        timeout_ms=1000,
+    )
+
+    assert page.visited == [
+        "https://example.com/list?p=1",
+        "https://example.com/list?p=2",
+        "https://example.com/list?p=3",
+        "https://example.com/list?p=4",
+    ]
+    assert result.values == ["A1", "A2", "B1", "B2", "C1"]
+    assert variables.get("visited_pages") == 3
+
+
+async def test_browser_paginate_next_by_url_rejects_template_without_placeholder() -> None:
+    variables = RuntimeVariableStore.from_initial({})
+    context = BrowserActionContext(playwright=object(), browser=object(), page=FakeUrlPaginatePage())
+
+    with pytest.raises(ValueError, match=r"必须包含 \$\{page\}"):
+        await BrowserActionRunner().run(
+            {
+                "type": "browser.paginateNext",
+                "urlTemplate": "https://example.com/list",
+                "targetSelector": ".row::text",
+            },
+            variables,
+            context,
+            timeout_ms=1000,
+        )
+
+
 async def test_browser_paginate_next_picks_union_selector_candidates_in_written_order() -> None:
     """逗号组按书写顺序取第一组有命中的，不按 DOM 顺序。
 
@@ -449,10 +512,16 @@ async def test_browser_dismiss_clicks_visible_candidates_and_waits_target() -> N
 
 
 class FakeOverlayEvaluatePage:
-    def __init__(self, result: object) -> None:
+    """按脚本分派：浮层探针和拦截页探针查的是页面的两种不同形态，
+    一个 fake 同时回同一份数据会让「浮层没命中就查拦截页」这条链路测不出来。"""
+
+    def __init__(self, result: object, interstitial: object = None) -> None:
         self._result = result
+        self._interstitial = interstitial
 
     async def evaluate(self, script: str, arg: object = None) -> object:
+        if script is _INTERSTITIAL_PROBE_SCRIPT:
+            return self._interstitial
         return self._result
 
 
@@ -517,6 +586,88 @@ async def test_detect_blocking_overlay_keeps_low_confidence_target_obscured() ->
 
     assert overlay is not None
     assert overlay.label == "未知弹层"
+
+
+async def test_detect_blocking_overlay_falls_through_to_the_challenge_interstitial() -> None:
+    """Cloudflare 这类拦截页是整页替换，没有高层浮动容器，浮层探针一个都命中不了。
+    漏掉它的代价是助手把「请完成人机验证」当成 selector 不匹配，一路去改选择器。"""
+    page = FakeOverlayEvaluatePage(
+        None,
+        interstitial={
+            "widget": "cf-chl-widget-abc",
+            "wording": "just a moment",
+            "title": "Just a moment...",
+            "text": "Verifying you are human. This may take a few seconds.",
+            "textLength": 52,
+            "url": "https://www.nodeseek.com/post-845913-1",
+        },
+    )
+
+    overlay = await detect_blocking_overlay(page, "#post-content")
+
+    assert overlay is not None
+    assert overlay.reason == "challenge_interstitial"
+    assert overlay.label == "人机验证拦截页"
+    # 无头下加 human_takeover 节点依然过不去，出路是换有头/插件执行器
+    assert "插件执行器" in overlay.headless_advice
+
+
+async def test_detect_blocking_overlay_reports_nothing_when_neither_probe_hits() -> None:
+    page = FakeOverlayEvaluatePage(None, interstitial=None)
+
+    assert await detect_blocking_overlay(page, "#post-content") is None
+
+
+class FakeChromeLauncher:
+    """记录每次 launch_persistent_context 的 channel，用来验证回落顺序。"""
+
+    def __init__(self, *, chrome_installed: bool) -> None:
+        self._chrome_installed = chrome_installed
+        self.channels: list[object] = []
+
+    @property
+    def chromium(self) -> "FakeChromeLauncher":
+        return self
+
+    async def launch_persistent_context(self, profile_dir: str, *, headless: bool = True, channel: str | None = None) -> str:
+        self.channels.append(channel)
+        if channel == "chrome" and not self._chrome_installed:
+            raise RuntimeError("Chromium distribution 'chrome' is not found at /Applications/Google Chrome.app")
+        return f"context:{channel}"
+
+
+async def test_launch_prefers_real_chrome(tmp_path) -> None:
+    launcher = FakeChromeLauncher(chrome_installed=True)
+
+    context = await launch_persistent_chrome(launcher, str(tmp_path), headless=False)
+
+    assert context == "context:chrome"
+    assert launcher.channels == ["chrome"]
+
+
+async def test_launch_falls_back_to_bundled_chromium_when_chrome_is_missing(tmp_path) -> None:
+    launcher = FakeChromeLauncher(chrome_installed=False)
+
+    context = await launch_persistent_chrome(launcher, str(tmp_path), headless=False)
+
+    assert context == "context:None"
+    assert launcher.channels == ["chrome", None]
+
+
+async def test_launch_does_not_swallow_unrelated_failures(tmp_path) -> None:
+    """profile 被占用之类的失败必须原样抛出：当成「没装 Chrome」重试一次，
+    只会再撞一次同样的墙，还把真实原因换成了误导性的第二次报错。"""
+    class BusyLauncher(FakeChromeLauncher):
+        async def launch_persistent_context(self, profile_dir: str, *, headless: bool = True, channel: str | None = None) -> str:
+            self.channels.append(channel)
+            raise RuntimeError("Target page, context or browser has been closed")
+
+    launcher = BusyLauncher(chrome_installed=True)
+
+    with pytest.raises(RuntimeError, match="has been closed"):
+        await launch_persistent_chrome(launcher, str(tmp_path), headless=False)
+
+    assert launcher.channels == ["chrome"]
 
 
 class FakePage:
@@ -671,6 +822,67 @@ class FakePaginateLocator:
         if self._selector == ".row":
             return self._page.pages[self._page.page_index]
         return []
+
+    async def evaluate_all(self, script: str, attribute: str | None = None) -> list[str | None]:
+        return await self.all_text_contents()
+
+
+class FakeEvidencePaginatePage(FakePaginatePage):
+    """只有一页可点，但 DOM 里还留着指向第 2 页的页码链接。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pages = [["A1"]]
+
+    async def evaluate(self, script: str, arg: object = None) -> object:
+        return [
+            {"kind": "page_number", "selector": 'a[href*="?p=2"]', "text": "2", "href": "https://example.com/list?p=2"}
+        ]
+
+
+class FakeUrlPaginatePage:
+    """按 URL 逐页导航；第 4 页重复第 3 页的内容，用来验证重复即收工。"""
+
+    def __init__(self) -> None:
+        self.visited: list[str] = []
+        self.pages = {
+            "https://example.com/list?p=1": ["A1", "A2"],
+            "https://example.com/list?p=2": ["B1", "B2"],
+            "https://example.com/list?p=3": ["C1"],
+            "https://example.com/list?p=4": ["C1"],
+        }
+
+    @property
+    def url(self) -> str:
+        return self.visited[-1] if self.visited else "about:blank"
+
+    async def goto(self, url: str, *, wait_until: str, timeout: int) -> None:
+        self.visited.append(url)
+
+    async def wait_for_timeout(self, delay_ms: int) -> None:
+        return None
+
+    async def wait_for_selector(self, selector: str, *, timeout: int) -> None:
+        return None
+
+    def locator(self, selector: str) -> "FakeUrlPaginateLocator":
+        return FakeUrlPaginateLocator(self, selector)
+
+
+class FakeUrlPaginateLocator:
+    def __init__(self, page: FakeUrlPaginatePage, selector: str) -> None:
+        self._page = page
+        self._selector = selector
+
+    def first(self) -> "FakeUrlPaginateLocator":
+        return self
+
+    async def wait_for(self, *, state: str, timeout: int) -> None:
+        if not self._page.pages.get(self._page.url):
+            raise TimeoutError(f"等待元素超时: {self._selector}")
+
+    async def all_text_contents(self) -> list[str | None]:
+        return self._page.pages.get(self._page.url, []) if self._selector == ".row" else []
 
     async def evaluate_all(self, script: str, attribute: str | None = None) -> list[str | None]:
         return await self.all_text_contents()

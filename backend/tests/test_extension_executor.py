@@ -267,6 +267,91 @@ async def test_browser_paginate_next_stops_on_repeated_fingerprint() -> None:
     assert click_calls == [{"type": "browser.click", "selector": ".next-page"}]
 
 
+async def test_browser_paginate_next_fails_when_page_still_shows_pagination() -> None:
+    """只翻到第 1 页时不能默认「就这一页」：页面上还挂着可见的页码控件就说明 selector 找错了，
+    静默成功等于让用户自己去发现少抓了后面所有页。"""
+    bridge = FakeBridge(
+        responses={
+            "browser.extract": [{"values": ["row1"]}],
+            # 第一次是「下一页」按钮本身（隐藏），其余是证据探测逐个问的候选控件
+            "browser.elementState": [{"exists": True, "hidden": True, "disabled": False}],
+        }
+    )
+    # 队列耗尽后 FakeBridge 返回 {}，这里让所有候选都「存在且可见」以模拟页面仍有分页条
+    bridge._responses["browser.elementState"].extend(  # noqa: SLF001
+        [{"exists": True, "hidden": False, "disabled": False}] * 20
+    )
+    executor, context = await make_context(bridge)
+    variables = RuntimeVariableStore.from_initial({})
+
+    with pytest.raises(ValueError, match="页面上存在可见的下一页控件"):
+        await executor.run(
+            {
+                "type": "browser.paginateNext",
+                "selector": ".next-page",
+                "targetSelector": ".contract-row",
+                "delayMs": 0,
+            },
+            variables,
+            context,
+            timeout_ms=1000,
+        )
+
+
+async def test_browser_paginate_next_by_url_walks_pages_until_empty() -> None:
+    bridge = FakeBridge(
+        responses={
+            "browser.extract": [
+                {"values": ["a1", "a2"]},
+                {"values": ["b1"]},
+                {"values": []},
+            ],
+        }
+    )
+    executor, context = await make_context(bridge)
+    variables = RuntimeVariableStore.from_initial({})
+
+    result = await executor.run(
+        {
+            "type": "browser.paginateNext",
+            "urlTemplate": "https://example.com/list?p=${page}",
+            "targetSelector": ".contract-row",
+            "delayMs": 0,
+            "pageCountVariable": "page_count",
+        },
+        variables,
+        context,
+        timeout_ms=1000,
+    )
+
+    open_calls = [call["targetUrl"] for call in bridge.calls if call["type"] == "browser.open"]
+    assert open_calls == [
+        "https://example.com/list?p=1",
+        "https://example.com/list?p=2",
+        "https://example.com/list?p=3",
+    ]
+    assert result.values == ["a1", "a2", "b1"]
+    assert variables.get("page_count") == 2
+
+
+async def test_browser_paginate_next_by_url_rejects_template_without_placeholder() -> None:
+    bridge = FakeBridge()
+    executor, context = await make_context(bridge)
+    variables = RuntimeVariableStore.from_initial({})
+
+    with pytest.raises(ValueError, match=r"必须包含 \$\{page\}"):
+        await executor.run(
+            {
+                "type": "browser.paginateNext",
+                "urlTemplate": "https://example.com/list",
+                "targetSelector": ".contract-row",
+            },
+            variables,
+            context,
+            timeout_ms=1000,
+        )
+
+
 async def test_browser_paginate_next_preserves_table_rows() -> None:
     rows = [{"序号": "1", "合约编号": "Y001"}, {"序号": "2", "合约编号": "Y002"}]
     bridge = FakeBridge(
@@ -296,7 +381,8 @@ async def test_browser_paginate_next_preserves_table_rows() -> None:
         timeout_ms=1000,
     )
 
-    assert bridge.calls[-2] == {"type": "browser.extract", "selector": ".contract-row", "extractMode": "table"}
+    extract_calls = [call for call in bridge.calls if call["type"] == "browser.extract"]
+    assert extract_calls == [{"type": "browser.extract", "selector": ".contract-row", "extractMode": "table"}]
     assert result.structured == rows
     assert result.values == ['{"序号": "1", "合约编号": "Y001"}', '{"序号": "2", "合约编号": "Y002"}']
     assert variables.get("page_count") == 1

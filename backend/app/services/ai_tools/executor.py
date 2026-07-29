@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from app.core import storage
+from app.services import browser_profile_lock
+from app.services.browser_action_runner import detect_blocking_interstitial, launch_persistent_chrome
 from app.services.ai_tools.catalog import NODE_TYPE_CATALOG
 from app.services.ai_tools.diagnostics import (
     SELECTOR_MATCH_HIDDEN_OR_NOT_VISIBLE,
@@ -143,6 +145,27 @@ def _splice_branch_placeholder_noops(
         if not (isinstance(node, dict) and str(node.get("id")) in set(spliced))
     ]
     return remaining_nodes, kept, spliced
+
+
+def _profile_busy_block(tool_name: str) -> dict[str, Any] | None:
+    """浏览器 profile 被别的运行占着时，返回一份「别修流程、去找用户」的阻断结果。
+
+    按任务状态自查（原来只看 status == "running"）会漏掉 paused_for_human：等人工接管的运行
+    照样开着浏览器窗口，此时 inspect_page 会拿到一屏 Chrome 启动参数当报错，模型接着去改
+    selector——错的方向。占用登记表是唯一知道「谁开着浏览器」的地方。
+    """
+    held = browser_profile_lock.holder(str(storage.resolve_browser_profile_dir()))
+    if held is None:
+        return None
+    return {
+        "status": "blocked_browser_profile_busy",
+        "holder": held,
+        "error": f"{tool_name} 需要打开浏览器，但{browser_profile_lock.busy_message(held)}",
+        "message": (
+            "这是浏览器被占用，不是流程配置有问题：不要改流程、不要重试其他工具，"
+            "把上面这句话转告用户，等他处理完再继续。"
+        ),
+    }
 
 
 def _annotate_login_redirect(result: dict[str, Any], requested_url: str) -> None:
@@ -1183,6 +1206,13 @@ class RpaToolExecutor:
                 ),
             }
 
+        # 起跑前判：profile 被占时浏览器根本起不来，失败现场是一屏 Chrome 启动参数，
+        # 模型会当成 selector 问题一路改流程。插件执行器借用用户自己的浏览器，不受此限。
+        if browser_executor != "extension":
+            busy = _profile_busy_block("run_flow")
+            if busy is not None:
+                return busy
+
         failure_gate = await self._recent_failure_gate(flow_id)
         if failure_gate is not None:
             return failure_gate
@@ -2157,15 +2187,9 @@ class RpaToolExecutor:
         scope_selector: str | None = None,
     ) -> dict[str, Any]:
         """Navigate to a URL with the persistent browser profile and return structured DOM info."""
-        running = [
-            record for record in self._task_manager._tasks.values()
-            if record.snapshot.status == "running"
-        ]
-        if running:
-            return {
-                "error": "浏览器正被运行中的任务占用，请等待任务完成后再调用 inspect_page。",
-                "running_task_ids": [r.snapshot.task_id for r in running],
-            }
+        busy = _profile_busy_block("inspect_page")
+        if busy is not None:
+            return busy
 
         try:
             from playwright.async_api import async_playwright as _async_playwright
@@ -2173,14 +2197,16 @@ class RpaToolExecutor:
             return {"error": "未安装 Playwright，请执行 uv pip install playwright"}
 
         browser_profile = str(storage.resolve_browser_profile_dir())
+        # 自己也要登记：检查页面期间用户点了运行，那次运行才能拿到「被 inspect_page 占用」而不是天书
+        owner = "AI 助手 · inspect_page"
+        try:
+            browser_profile_lock.acquire(browser_profile, owner)
+        except browser_profile_lock.BrowserProfileBusyError:
+            return _profile_busy_block("inspect_page") or {"error": "浏览器被占用"}
 
         try:
             async with _async_playwright() as pw:
-                ctx = await pw.chromium.launch_persistent_context(
-                    browser_profile,
-                    headless=True,
-                    args=["--disable-cache"],
-                )
+                ctx = await launch_persistent_chrome(pw, browser_profile, headless=True)
                 try:
                     page = ctx.pages[0] if ctx.pages else await ctx.new_page()
                     await page.goto(url, wait_until="load", timeout=30_000)
@@ -2196,6 +2222,23 @@ class RpaToolExecutor:
                             pass  # best-effort; still extract what's there
                     else:
                         await page.wait_for_timeout(3_000)
+
+                    # 拦截页要在探测结果之前判掉：它的元素数量通常是 0，落到下面就会被当成
+                    # 「SPA 没渲染完」，模型于是带着 wait_selector 一遍遍重试同一堵墙——
+                    # 用户看到的「第一次助手被 cloudflare 拦截、什么也没生成」就是这么来的。
+                    challenge = await detect_blocking_interstitial(page)
+                    if challenge is not None:
+                        return {
+                            "status": "blocked_challenge_page",
+                            "requested_url": url,
+                            "challenge": challenge.summary,
+                            "error": f"目标站点返回了{challenge.label}，无头浏览器拿不到真实页面内容。",
+                            "message": (
+                                "这不是流程或 selector 的问题，也不要重试 inspect_page（同一堵墙）。"
+                                "请把下面这段告诉用户：该站点启用了人机验证，需要先用有头模式或插件执行器"
+                                "打开一次并人工完成验证，验证 cookie 会留在持久化 profile 里，之后再继续。"
+                            ),
+                        }
 
                     result = await page.evaluate(PAGE_PROBE_JS, scope_selector)
                     result["scope_selector"] = scope_selector
@@ -2321,7 +2364,10 @@ class RpaToolExecutor:
                 finally:
                     await ctx.close()
         except Exception as exc:
-            return {"error": f"页面检查失败：{exc}"}
+            translated = browser_profile_lock.translate_launch_error(browser_profile, exc)
+            return {"error": translated or f"页面检查失败：{exc}"}
+        finally:
+            browser_profile_lock.release(browser_profile, owner)
 
     async def _inspect_screenshot(
         self,
@@ -2335,15 +2381,9 @@ class RpaToolExecutor:
         re-injects it as a vision content block, so the model actually *sees*
         the page instead of reading base64 noise.
         """
-        running = [
-            record for record in self._task_manager._tasks.values()
-            if record.snapshot.status == "running"
-        ]
-        if running:
-            return {
-                "error": "浏览器正被运行中的任务占用，请等待任务完成后再调用 inspect_screenshot。",
-                "running_task_ids": [r.snapshot.task_id for r in running],
-            }
+        busy = _profile_busy_block("inspect_screenshot")
+        if busy is not None:
+            return busy
 
         try:
             from playwright.async_api import async_playwright as _async_playwright
@@ -2353,13 +2393,16 @@ class RpaToolExecutor:
         import base64
 
         browser_profile = str(storage.resolve_browser_profile_dir())
+        owner = "AI 助手 · inspect_screenshot"
+        try:
+            browser_profile_lock.acquire(browser_profile, owner)
+        except browser_profile_lock.BrowserProfileBusyError:
+            return _profile_busy_block("inspect_screenshot") or {"error": "浏览器被占用"}
+
         try:
             async with _async_playwright() as pw:
-                ctx = await pw.chromium.launch_persistent_context(
-                    browser_profile,
-                    headless=True,
-                    viewport={"width": 1280, "height": 800},
-                    args=["--disable-cache"],
+                ctx = await launch_persistent_chrome(
+                    pw, browser_profile, headless=True, viewport={"width": 1280, "height": 800}
                 )
                 try:
                     page = ctx.pages[0] if ctx.pages else await ctx.new_page()
@@ -2406,4 +2449,7 @@ class RpaToolExecutor:
                 finally:
                     await ctx.close()
         except Exception as exc:
-            return {"error": f"页面截图失败：{exc}"}
+            translated = browser_profile_lock.translate_launch_error(browser_profile, exc)
+            return {"error": translated or f"页面截图失败：{exc}"}
+        finally:
+            browser_profile_lock.release(browser_profile, owner)

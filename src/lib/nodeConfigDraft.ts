@@ -58,6 +58,9 @@ export function createNodeConfigDraft(data: RpaNodeData): RpaNodeConfigDraft {
     fallbackSelectors: data.action?.fallbackSelectors ?? '',
     anchorText: data.action?.anchorText ?? '',
     outputSchema: data.action?.outputSchema ?? '',
+    urlTemplate: data.action?.urlTemplate ?? '',
+    startPage: data.action?.startPage ?? 1,
+    pageStep: data.action?.pageStep ?? 1,
     waitCondition: data.action?.waitCondition ?? 'visible'
   };
 }
@@ -147,6 +150,11 @@ export function applyNodeConfigDraft(data: RpaNodeData, draft: RpaNodeConfigDraf
       itemVariable: data.action?.type === 'control.foreach' ? (draft.itemVariable === '' ? undefined : draft.itemVariable) : data.action?.itemVariable,
       indexVariable: data.action?.type === 'control.foreach' || data.action?.type === 'control.repeat_until' ? (draft.indexVariable === '' ? undefined : draft.indexVariable) : data.action?.indexVariable,
       maxIterations: data.action?.type === 'control.foreach' || data.action?.type === 'control.repeat_until' || data.action?.type === 'browser.clickLoadMore' || data.action?.type === 'browser.paginateNext' || data.action?.type === 'browser.dismiss' ? draft.maxIterations : data.action?.maxIterations,
+      // startPage/pageStep 只在 URL 式翻页下有意义：留着它们会让点击式节点带上永远不生效的字段，
+      // 用户和 AI 都会以为改了页号却毫无效果
+      urlTemplate: data.action?.type === 'browser.paginateNext' ? (draft.urlTemplate.trim() === '' ? undefined : draft.urlTemplate.trim()) : data.action?.urlTemplate,
+      startPage: data.action?.type === 'browser.paginateNext' && draft.urlTemplate.trim() !== '' ? draft.startPage : data.action?.type === 'browser.paginateNext' ? undefined : data.action?.startPage,
+      pageStep: data.action?.type === 'browser.paginateNext' && draft.urlTemplate.trim() !== '' ? draft.pageStep : data.action?.type === 'browser.paginateNext' ? undefined : data.action?.pageStep,
       retryCount: data.action?.type === 'control.retry' ? draft.retryCount : data.action?.retryCount,
       errorVariable: data.action?.type === 'control.try' ? (draft.errorVariable === '' ? undefined : draft.errorVariable) : data.action?.errorVariable,
       flowId: data.action?.type === 'control.subprocess' ? (draft.flowId === '' ? undefined : draft.flowId) : data.action?.flowId,
