@@ -1,0 +1,150 @@
+{
+  "model": "gpt-5.5",
+  "prompt_version": "v2",
+  "scenario": "gen_paginated_scrape",
+  "reply": "",
+  "calls": [
+    {
+      "name": "inspect_page",
+      "args": {
+        "url": "https://example.com/list",
+        "wait_selector": "table, [role=grid], main, nav"
+      }
+    },
+    {
+      "name": "inspect_page",
+      "args": {
+        "url": "https://example.com/list",
+        "wait_selector": "table, .data-table, .pagination, .el-pagination, button"
+      }
+    },
+    {
+      "name": "list_node_types",
+      "args": {}
+    },
+    {
+      "name": "create_flow",
+      "args": {
+        "name": "分页表格抓取-JSON",
+        "description": "打开列表页，逐页抓取表格数据并保存为 JSON。",
+        "input_variables": [],
+        "nodes": [
+          {
+            "id": "start",
+            "type": "start",
+            "title": "开始",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 100
+            },
+            "description": "开始流程"
+          },
+          {
+            "id": "n1_open",
+            "type": "browser.open",
+            "title": "打开列表页",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 220
+            },
+            "targetUrl": "https://example.com/list",
+            "delayMs": 2000,
+            "description": "打开目标列表页"
+          },
+          {
+            "id": "n2_wait_table",
+            "type": "browser.wait",
+            "title": "等待表格",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 340
+            },
+            "selector": ".data-table tbody tr",
+            "timeoutMs": 15000,
+            "description": "等待表格数据行出现"
+          },
+          {
+            "id": "n3_paginate_extract",
+            "type": "browser.paginateNext",
+            "title": "分页抓取表格",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 460
+            },
+            "urlTemplate": "https://example.com/list?page=${page}",
+            "startPage": 1,
+            "pageStep": 1,
+            "targetSelector": ".data-table tbody tr",
+            "extractMode": "table",
+            "outputVariable": "table_rows",
+            "pageCountVariable": "page_count",
+            "countVariable": "row_count",
+            "description": "按页码 URL 逐页进入并累计提取表格行"
+          },
+          {
+            "id": "n4_write_json",
+            "type": "file.write",
+            "title": "保存 JSON",
+            "kind": "file",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 580
+            },
+            "path": "${var.output_prefix}.json",
+            "content": "${var.table_rows}",
+            "description": "将全部表格数据保存为本次运行 JSON 文件"
+          },
+          {
+            "id": "end",
+            "type": "end",
+            "title": "结束",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 700
+            },
+            "description": "结束流程"
+          }
+        ],
+        "edges": [
+          {
+            "id": "e_start_n1_open",
+            "source": "start",
+            "target": "n1_open"
+          },
+          {
+            "id": "e_n1_open_n2_wait_table",
+            "source": "n1_open",
+            "target": "n2_wait_table"
+          },
+          {
+            "id": "e_n2_wait_table_n3_paginate_extract",
+            "source": "n2_wait_table",
+            "target": "n3_paginate_extract"
+          },
+          {
+            "id": "e_n3_paginate_extract_n4_write_json",
+            "source": "n3_paginate_extract",
+            "target": "n4_write_json"
+          },
+          {
+            "id": "e_n4_write_json_end",
+            "source": "n4_write_json",
+            "target": "end"
+          }
+        ]
+      }
+    }
+  ],
+  "guard_hits": []
+}

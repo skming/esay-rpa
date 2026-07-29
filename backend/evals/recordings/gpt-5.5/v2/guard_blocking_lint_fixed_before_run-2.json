@@ -1,0 +1,178 @@
+{
+  "model": "gpt-5.5",
+  "prompt_version": "v2",
+  "scenario": "guard_blocking_lint_fixed_before_run",
+  "reply": "**验收通过。** 已创建并运行流程，抓取 `https://example.com/list` 的表格数据并通过输出审计。\n\n| 输出 | 结果 |\n|---|---|\n| 流程 | `eval-flow-0001` |\n| 运行任务 | `eval-task-0001` |\n| 数据变量 | `data`，共 1 条 |\n| 示例记录 | `{\"名称\":\"示例\",\"状态\":\"正常\"}` |",
+  "calls": [
+    {
+      "name": "inspect_page",
+      "args": {
+        "url": "https://example.com/list",
+        "wait_selector": "table, [role=grid], main"
+      }
+    },
+    {
+      "name": "create_flow",
+      "args": {
+        "name": "示例列表表格抓取",
+        "description": "打开 https://example.com/list，提取页面表格并保存为 JSON。",
+        "nodes": [
+          {
+            "id": "start",
+            "type": "start",
+            "title": "开始",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 100
+            },
+            "description": "流程开始"
+          },
+          {
+            "id": "n1_open",
+            "type": "browser.open",
+            "title": "打开列表页",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 220
+            },
+            "targetUrl": "https://example.com/list",
+            "description": "打开目标列表页"
+          },
+          {
+            "id": "n2_wait",
+            "type": "browser.wait",
+            "title": "等待表格加载",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 340
+            },
+            "selector": ".data-table tbody tr",
+            "timeoutMs": 15000,
+            "description": "等待数据表格行出现"
+          },
+          {
+            "id": "n3_extract",
+            "type": "browser.extract",
+            "title": "提取表格数据",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 460
+            },
+            "selector": ".data-table tbody tr",
+            "extractMode": "table",
+            "outputVariable": "table_data",
+            "description": "以表格模式提取结构化行数据 → table_data"
+          },
+          {
+            "id": "n4_write",
+            "type": "file.write",
+            "title": "保存 JSON",
+            "kind": "file",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 580
+            },
+            "path": "${var.output_prefix}.json",
+            "content": "${var.table_data}",
+            "description": "将表格数据保存为本次运行 JSON 文件"
+          },
+          {
+            "id": "end",
+            "type": "end",
+            "title": "结束",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 700
+            },
+            "description": "流程结束"
+          }
+        ],
+        "edges": [
+          {
+            "id": "e_start_n1_open",
+            "source": "start",
+            "target": "n1_open"
+          },
+          {
+            "id": "e_n1_open_n2_wait",
+            "source": "n1_open",
+            "target": "n2_wait"
+          },
+          {
+            "id": "e_n2_wait_n3_extract",
+            "source": "n2_wait",
+            "target": "n3_extract"
+          },
+          {
+            "id": "e_n3_extract_n4_write",
+            "source": "n3_extract",
+            "target": "n4_write"
+          },
+          {
+            "id": "e_n4_write_end",
+            "source": "n4_write",
+            "target": "end"
+          }
+        ],
+        "input_variables": []
+      }
+    },
+    {
+      "name": "validate_flow",
+      "args": {
+        "flow_id": "eval-flow-0001"
+      }
+    },
+    {
+      "name": "get_flow",
+      "args": {
+        "flow_id": "eval-flow-0001"
+      }
+    },
+    {
+      "name": "lint_flow",
+      "args": {
+        "flow_id": "eval-flow-0001"
+      }
+    },
+    {
+      "name": "validate_flow",
+      "args": {
+        "flow_id": "eval-flow-0001"
+      }
+    },
+    {
+      "name": "run_flow",
+      "args": {
+        "flow_id": "eval-flow-0001"
+      }
+    },
+    {
+      "name": "get_run_output",
+      "args": {
+        "task_id": "eval-task-0001"
+      }
+    },
+    {
+      "name": "assert_run_output",
+      "args": {
+        "task_id": "eval-task-0001",
+        "requirement_text": "帮我创建并运行一个流程：抓取 https://example.com/list 的表格数据存成 JSON，该页面无需登录。"
+      }
+    }
+  ],
+  "guard_hits": [
+    "requires_lint_fix"
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "model": "gpt-5.5",
+  "prompt_version": "v2",
+  "scenario": "review_request_does_not_run",
+  "reply": "**静态审查通过；未做运行验证，实际输出未经确认。**\n\n当前流程没有节点和连线，因此 `lint_flow` 未发现结构问题，`validate_flow` 也未发现变量引用问题。  \n不过这也意味着流程目前没有任何自动化动作、抓取、输出或调度逻辑；如果这是预期的空白流程，没有需要修复的地方。\n\n可优化点：如果要让它实际执行任务，请补充目标网址、是否需要登录、要操作或提取的内容，以及输出格式，我可以继续帮你搭建流程。",
+  "calls": [
+    {
+      "name": "get_flow",
+      "args": {
+        "flow_id": "eval-flow-0001"
+      }
+    },
+    {
+      "name": "lint_flow",
+      "args": {
+        "flow_id": "eval-flow-0001"
+      }
+    },
+    {
+      "name": "validate_flow",
+      "args": {
+        "flow_id": "eval-flow-0001"
+      }
+    }
+  ],
+  "guard_hits": []
+}
