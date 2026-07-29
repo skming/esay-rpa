@@ -12,6 +12,7 @@ type AiChatStore = {
   getMessages: (key: string) => AiMessage[];
   setMessages: (key: string, messages: AiMessage[]) => void;
   clearMessages: (key: string) => void;
+  migrateSession: (fromKey: string, toKey: string) => void;
   setModel: (model: string) => void;
 };
 
@@ -27,6 +28,15 @@ export const useAiChatStore = create<AiChatStore>()(
         set((s) => {
           const { [key]: _removed, ...rest } = s.sessions;
           return { sessions: rest };
+        }),
+      // 草稿存成流程后会话 key 会变，不搬的话这段对话在界面上直接消失
+      migrateSession: (fromKey, toKey) =>
+        set((s) => {
+          const source = s.sessions[fromKey];
+          // 目标已有对话就不动：那是这个流程自己的历史，覆盖等于拿草稿把正文冲掉
+          if (source === undefined || source.length === 0 || (s.sessions[toKey]?.length ?? 0) > 0) return s;
+          const { [fromKey]: _moved, ...rest } = s.sessions;
+          return { sessions: { ...rest, [toKey]: source } };
         }),
       setModel: (model) => set({ model }),
     }),

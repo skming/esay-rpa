@@ -861,6 +861,15 @@ async def save_chat_session(session_key: str, payload: dict) -> dict:
     return {"session_key": session_key, "message_count": len(messages), "status": "saved"}
 
 
+@app.post("/api/ai/chats/{session_key}/rename")
+async def rename_chat_session(session_key: str, payload: dict) -> dict:
+    to_key = str(payload.get("toKey", "")).strip()
+    if not to_key:
+        raise HTTPException(status_code=422, detail="toKey 不能为空")
+    moved = ai_chat_store.rename(session_key, to_key)
+    return {"session_key": session_key, "to_key": to_key, "moved": moved}
+
+
 @app.delete("/api/ai/chats/{session_key}")
 async def delete_chat_session(session_key: str) -> dict:
     deleted = ai_chat_store.delete(session_key)

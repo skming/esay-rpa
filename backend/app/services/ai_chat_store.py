@@ -117,6 +117,24 @@ class AiChatStore:
         return removed
 
 
+    def rename(self, from_key: str, to_key: str) -> bool:
+        """把草稿会话改挂到流程保存后拿到的真实 id 上，成功搬迁返回 True。
+
+        目标已存在时一律不搬：那说明该流程已经有自己的对话（例如 AI 自己建流程时就写在真实
+        id 下），搬过去等于用草稿覆盖掉正文。源不存在同理直接返回，让调用方无需先探测。
+        """
+        source = self._path(from_key)
+        target = self._path(to_key)
+        if source == target or not source.exists() or target.exists():
+            return False
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            source.replace(target)
+        except OSError:
+            return False
+        return True
+
+
     def delete(self, session_key: str) -> bool:
         path = self._path(session_key)
         if path.exists():

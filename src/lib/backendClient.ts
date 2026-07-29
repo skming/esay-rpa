@@ -379,6 +379,18 @@ export class BackendClient {
     await this.request(`/api/ai/chats/${encodeURIComponent(key)}`, { body: { messages }, method: 'PUT', timeoutMs: 5000 });
   }
 
+  /** 草稿保存成流程后把对话搬到新 key；目标已有对话时后端不搬，返回 moved=false。 */
+  async renameAiChat(fromKey: string, toKey: string): Promise<boolean> {
+    assertId(fromKey, 'chatKey');
+    assertId(toKey, 'chatKey');
+    const result = await this.request<{ moved: boolean }>(`/api/ai/chats/${encodeURIComponent(fromKey)}/rename`, {
+      body: { toKey },
+      method: 'POST',
+      timeoutMs: 5000
+    });
+    return result.moved;
+  }
+
   async deleteAiChat(key: string): Promise<void> {
     assertId(key, 'chatKey');
     await this.request(`/api/ai/chats/${encodeURIComponent(key)}`, { method: 'DELETE', timeoutMs: 3000 });

@@ -11,6 +11,7 @@ import { getBlockingRunIssue, validateRunConfiguration } from '../lib/runValidat
 import { useBottomPanelStore } from '../stores/useBottomPanelStore';
 import { useFlowDraftStore } from '../stores/useFlowDraftStore';
 import { usePropertyPanelStore } from '../stores/usePropertyPanelStore';
+import { useAiChatStore } from '../stores/useAiChatStore';
 import { useWorkspaceStore } from '../stores/useWorkspaceStore';
 import { applyPendingDraftToNodes } from '../lib/pendingNodeDraft';
 import { buildInitialFlowPayload, buildUpdatePayload, hasDefinitionChanged } from '../lib/flowVersioning';
@@ -34,7 +35,7 @@ import type {
 import type { FlowCanvasSnapshot, RpaNodeData, RunLogEntry, RuntimeStatus, RuntimeVariable } from '../types/rpa';
 import { normalizeRunConcurrency } from '../lib/runConfigPresentation';
 import { clearDraftStorage } from './useFlowDraftAutosave';
-import { fetchFlowSnapshot } from '../lib/backendClient';
+import { backend, fetchFlowSnapshot } from '../lib/backendClient';
 import { toSafeFilename } from '../lib/filenames';
 type UseElectronBridgeActionsParams = {
   activeFlowNameRef: import('react').MutableRefObject<string>;
@@ -959,6 +960,22 @@ function forgetDeletedFlow(flowId: string): void {
   useFlowDraftStore.getState().detachFlowId(flowId);
 }
 
+/**
+ * 草稿拿到真实 flowId 时把 AI 对话一起搬过去。会话 key 由 flowId 派生（见 useAiChat 的
+ * sessionKey），保存动作换了 id 就等于换了会话，用户会看到刚才那轮对话凭空消失——第一轮被
+ * 站点拦截、还没生成节点时尤其致命：那轮记录的正是"为什么没做成"。
+ * 搬迁只在这里做，不放在 AI 面板里按 key 变化猜：从草稿切到另一个已存在的流程同样会换 key，
+ * 靠猜就会把草稿对话挂到别人的流程上。
+ */
+async function carryOverAiChat(fromFlowId: string | null, toFlowId: string): Promise<void> {
+  const fromKey = fromFlowId === null ? 'local' : `flow_${fromFlowId}`;
+  const toKey = `flow_${toFlowId}`;
+  useAiChatStore.getState().migrateSession(fromKey, toKey);
+  try {
+    await backend.renameAiChat(fromKey, toKey);
+  } catch { /* 落盘搬迁失败不影响保存本身：内存里的会话已经挂到新 key 上了 */ }
+}
+
 async function persistCurrentFlow({
   callBridge,
   currentFlow,
@@ -974,10 +991,14 @@ async function persistCurrentFlow({
 }): Promise<FlowSnapshot | null> {
   const definition = buildFlowDefinition(flowCanvas.nodes, flowCanvas.edges, inputVariables, currentFlow?.name);
   if (currentFlow === null) {
-    return await callBridge((api) => api.createFlow(buildInitialFlowPayload(definition, inputVariables)));
+    const created = await callBridge((api) => api.createFlow(buildInitialFlowPayload(definition, inputVariables)));
+    if (created !== null) await carryOverAiChat(null, created.flowId);
+    return created;
   }
   if (currentFlow.flowId.startsWith('local-')) {
-    return await callBridge((api) => api.createFlow(buildInitialFlowPayload(definition, inputVariables, currentFlow.name)));
+    const created = await callBridge((api) => api.createFlow(buildInitialFlowPayload(definition, inputVariables, currentFlow.name)));
+    if (created !== null) await carryOverAiChat(currentFlow.flowId, created.flowId);
+    return created;
   }
   const savedFlow = flows.find((flow) => flow.flowId === currentFlow.flowId);
   const nameChanged = savedFlow !== undefined && savedFlow.name !== currentFlow.name;
