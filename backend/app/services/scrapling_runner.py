@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,7 +10,12 @@ from typing import Any, Protocol
 
 from app.models.schemas import RunTaskRequest, ScrapeResult
 
+logger = logging.getLogger(__name__)
+
 LogCallback = Callable[[str, str, str | None], Awaitable[None]]
+
+# 结尾的 ::text / ::attr(x) 是伪元素，css() 返回字符串而非元素。
+_PSEUDO_SUFFIX_RE = re.compile(r"::(?:text|attr\(\s*[^)\s]+\s*\))\s*$")
 
 
 class RunnerProtocol(Protocol):
@@ -30,16 +37,23 @@ class ScraplingRunner:
     @staticmethod
     def _configure_storage(storage_dir: str) -> None:
         try:
-            from scrapling.fetchers import DynamicFetcher, Fetcher, StealthyFetcher
+            from scrapling.fetchers import AsyncFetcher, DynamicFetcher, Fetcher, StealthyFetcher
 
-            db_path = str(Path(storage_dir) / "scrapling_storage.db")
             Path(storage_dir).mkdir(parents=True, exist_ok=True)
-            args = {"db_path": db_path}
-            Fetcher.configure(storage_args=args)
-            DynamicFetcher.configure(storage_args=args)
-            StealthyFetcher.configure(storage_args=args)
+            # 键名必须是 storage_file（SQLiteStorageSystem 的形参名）。传错键在这里不报错，
+            # 要等第一次真去开库时才抛 TypeError，而那时已经在抓取途中了。
+            args = {"storage_file": str(Path(storage_dir) / "scrapling_storage.db")}
+            # adaptive 必须在 Selector 初始化时打开：css(adaptive=True) 只是单次调用的开关，
+            # 初始化时没开就整段跳过，只在 scrapling 自己的 logger 里留一行 warning——
+            # 这正是元素指纹一直没生效的原因，节点上的开关全程是个摆设。
+            # AsyncFetcher 是独立的类，configure 写的是各自的类属性，漏了它
+            # static 档（build_request_for_fetch_node 的默认值）就永远拿不到指纹。
+            for fetcher in (Fetcher, AsyncFetcher, DynamicFetcher, StealthyFetcher):
+                fetcher.configure(adaptive=True, storage_args=args)
         except Exception:
-            pass  # 未安装 scrapling 或配置失败时静默降级，不阻断启动
+            # 配置失败只降级为「没有自动重定位」，不阻断启动；但必须留痕，
+            # 上一版在这里静默 pass，于是这个功能死了多久都没人知道。
+            logger.warning("Scrapling 元素指纹存储配置失败，页面改版后的自动重定位将不可用", exc_info=True)
 
     async def run(self, task_id: str, request: RunTaskRequest, on_log: LogCallback) -> ScrapeResult:
         await on_log("running", "开始调用 Scrapling 采集引擎", f"{request.fetcher} · {request.target_url}")
@@ -111,20 +125,32 @@ class ScraplingRunner:
 
         if mode == "attribute":
             attribute = request.attribute or "href"
-            return self._coerce_to_strings(
-                page.css(f"{selector}::attr({attribute})").getall()
-            )
+            values = (el.attrib.get(attribute) for el in self._select(page, selector, request))
+            return [str(v) for v in values if v is not None]
 
         if mode == "html":
-            elements = page.css(selector, adaptive=request.adaptive, auto_save=request.auto_save)
-            return [str(getattr(el, "html_content", el)) for el in elements]
+            return [str(getattr(el, "html_content", el)) for el in self._select(page, selector, request)]
 
-        if "::text" in selector:
-            return self._coerce_to_strings(
-                page.css(selector, adaptive=request.adaptive, auto_save=request.auto_save).getall()
-            )
-        elements = page.css(selector, adaptive=request.adaptive, auto_save=request.auto_save)
+        elements = self._select(page, selector, request)
+        if _PSEUDO_SUFFIX_RE.search(selector):
+            # 页面级 "sel::text" 取的是直接文本子节点、不含后代，./text() 与之逐字等价；
+            # 元素级 el.css("::text") 会把后代文本也捞进来，换掉会改变既有流程的输出。
+            return [str(t) for el in elements for t in el.xpath("./text()").getall()]
         return [str(getattr(el, "text", el)) for el in elements]
+
+    @staticmethod
+    def _select(page: Any, selector: str, request: RunTaskRequest) -> Any:
+        """按裸选择器选出元素，伪元素的取值由调用方自己完成。
+
+        伪元素不能交给 css()：平时它返回字符串没问题，可一旦命中重定位，relocate 交还的是
+        元素本身，getall() 于是吐出整段 HTML 而不是文本——错得非常安静，抓下来的表格会突然
+        变成一列标签。指纹也只有落在真实元素上才谈得上「改版后还能找回同一个元素」。
+
+        identifier 固定用原始 selector：同一批元素在不同 extractMode 下写法不同（裸写、
+        ::text、配 attribute），共用一份指纹正是想要的，否则每种写法各存一份互不相认。
+        """
+        base = _PSEUDO_SUFFIX_RE.sub("", selector).strip() or selector
+        return page.css(base, identifier=selector, adaptive=request.adaptive, auto_save=request.auto_save)
 
     def _extract_by_text(self, page: Any, request: RunTaskRequest) -> list[str]:
         text_query = getattr(request, "text_query", None) or ""
@@ -157,10 +183,3 @@ class ScraplingRunner:
                 results.append(text)
         return results
 
-    @staticmethod
-    def _coerce_to_strings(values: object) -> list[str]:
-        if values is None:
-            return []
-        if isinstance(values, str):
-            return [values]
-        return [str(v) for v in values]
