@@ -52,7 +52,7 @@ from app.services.ai_tools.diagnostics import (
     _parse_runtime_value,
 )
 from app.services.ai_tools.graph import _unreachable_node_ids
-from app.services.ai_tools.lint import _lint_flow
+from app.services.ai_tools.lint import _lint_flow, annotate_lint_findings
 from app.services.ai_tools.normalize import (
     _choose_layout_lane,
     _next_layout_lane,
@@ -297,17 +297,15 @@ class RpaToolExecutor:
         findings = _lint_flow(nodes, edges, input_variable_names=input_var_names)
         errors = [f for f in findings if f["severity"] == "error"]
         warns = [f for f in findings if f["severity"] == "warn"]
+        marked, summary = annotate_lint_findings(findings)
         return {
             "flow_id": flow_id,
             "flow_name": flow.name,
-            "findings": findings,
+            "findings": marked,
             "error_count": len(errors),
             "warn_count": len(warns),
             "is_clean": len(findings) == 0,
-            "summary": (
-                f"发现 {len(errors)} 个错误、{len(warns)} 个警告，请逐项修复后再运行。"
-                if findings else "未发现任何问题。"
-            ),
+            "summary": summary if findings else "未发现任何问题。",
         }
 
     async def _list_node_types(self) -> dict[str, Any]:
@@ -677,12 +675,7 @@ class RpaToolExecutor:
                 "请调用 validate_flow 查看详情，再用 apply_node_fix 或 update_flow 修复后运行。"
             )
         if lint_findings:
-            result["lint_findings"] = lint_findings
-            result["lint_warning"] = (
-                f"静态检查发现 {sum(1 for f in lint_findings if f['severity']=='error')} 个错误、"
-                f"{sum(1 for f in lint_findings if f['severity']=='warn')} 个警告（见 lint_findings），"
-                "请逐项修复后再运行。"
-            )
+            result["lint_findings"], result["lint_warning"] = annotate_lint_findings(lint_findings)
         else:
             # 干净时不给信号，模型分不清「查过没问题」和「压根没查」，只能再补一次 lint_flow
             result["lint_clean"] = True
@@ -1020,12 +1013,7 @@ class RpaToolExecutor:
             result["validation_warning"] = "变更已应用，但仍存在未定义变量引用，建议继续修复。"
 
         if lint_findings:
-            result["lint_findings"] = lint_findings
-            result["lint_warning"] = (
-                f"静态检查发现 {sum(1 for f in lint_findings if f['severity']=='error')} 个错误、"
-                f"{sum(1 for f in lint_findings if f['severity']=='warn')} 个警告（见 lint_findings），"
-                "请逐项修复后再运行。"
-            )
+            result["lint_findings"], result["lint_warning"] = annotate_lint_findings(lint_findings)
         else:
             # 干净时不给信号，模型分不清「查过没问题」和「压根没查」，只能再补一次 lint_flow
             result["lint_clean"] = True
@@ -1797,11 +1785,7 @@ class RpaToolExecutor:
             result["node_type"] = patched_node_ref["type"]
             result["node_label"] = patched_node_ref["label"]
         if lint_findings:
-            result["lint_findings"] = lint_findings
-            result["lint_warning"] = (
-                f"修复后静态检查：{sum(1 for f in lint_findings if f['severity']=='error')} 个错误、"
-                f"{sum(1 for f in lint_findings if f['severity']=='warn')} 个警告（见 lint_findings）。"
-            )
+            result["lint_findings"], result["lint_warning"] = annotate_lint_findings(lint_findings)
         return result
 
     async def _publish_flow(self, flow_id: str) -> dict[str, Any]:

@@ -44,7 +44,7 @@ from app.services.ai_config_service import AiConfigService, AI_MODEL_CATALOG  # 
 from app.services.ai_prompts import PROMPT_VERSIONS, active_prompt_version  # noqa: E402
 from app.services.ai_guards import FLOW_WRITE_TOOLS  # noqa: E402
 from app.services.ai_tools.catalog import NODE_TYPE_CATALOG  # noqa: E402
-from app.services.ai_tools.lint import _lint_flow  # noqa: E402
+from app.services.ai_tools.lint import _lint_flow, annotate_lint_findings  # noqa: E402
 from app.services.ai_tools.normalize import (  # noqa: E402
     _normalize_generated_edges,
     _normalize_generated_nodes,
@@ -320,12 +320,18 @@ SCENARIOS: list[Scenario] = [
         tool_overrides={
             "create_flow": {
                 "flow_id": "eval-flow-0001", "name": "评测流程", "status": "draft",
-                "lint_findings": [{
-                    "issue": "table_extract_selector_targets_container",
-                    "severity": "warning",
-                    "node_id": "n2",
-                    "detail": "extractMode=table 的 selector 指向了表格容器而不是数据行，会只抽到一行。",
-                }],
+                # blocks_run / lint_warning 用真函数现算：模型能不能提前避开护栏，取决于
+                # 返回值里有没有「这条会挡住运行」这个信号，手写 fixture 会把这个信号写死
+                **dict(zip(
+                    ("lint_findings", "lint_warning"),
+                    annotate_lint_findings([{
+                        "issue": "table_extract_selector_targets_container",
+                        "severity": "warn",
+                        "node_id": "n2",
+                        "detail": "extractMode=table 的 selector 指向了表格容器而不是数据行，会只抽到一行。",
+                    }]),
+                    strict=True,
+                )),
             },
         },
         expect_tool_order=[("apply_node_fix", "run_flow")],

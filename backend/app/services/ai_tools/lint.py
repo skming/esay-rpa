@@ -44,6 +44,54 @@ _CREDENTIAL_KEYWORDS = frozenset({
     "login", "secret", "token", "apikey", "api_key",
 })
 
+# warn 级但照样会挡住运行的 issue：它们不会让流程报错，只会让它安静地跑出错数据
+# （只抽到一行、筛选没生效、登录后停在登录页），跑完才发现等于白跑一趟真实站点。
+BLOCKING_LINT_ISSUES = frozenset({
+    "critical_action_continue_on_error",
+    "script_uses_browser_dom",
+    "single_navigation_node",
+    "clear_storage_breaks_login_persistence",
+    "table_extract_selector_targets_container",
+    "table_extract_selector_not_table_like",
+    "extract_selector_union_used_as_fallback",
+    "table_extract_selector_too_broad",
+    "client_side_filter_masks_page_filter",
+    "date_filter_missing_verification",
+    "submit_key_on_body",
+    "date_trigger_selector_too_broad",
+    "unrolled_repeat_click_chain",
+    "login_without_navigation_to_data_page",
+    "probe_extract_without_continue_on_error",
+})
+
+
+def is_blocking_finding(finding: Any) -> bool:
+    if not isinstance(finding, dict):
+        return False
+    return finding.get("severity") == "error" or finding.get("issue") in BLOCKING_LINT_ISSUES
+
+
+def annotate_lint_findings(findings: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str]:
+    """给每条 finding 标上会不会挡住运行，并给出对应的措辞。
+
+    阻断名单只存在于编排层，模型看不见：它读到的是「warn」，据此判断可以先跑一次看看，
+    然后被 requires_lint_fix 拦在 run_flow 上。这一轮既没跑成也没修成，而模型手上
+    没有任何字段能让它提前避开——所以要修的是这里的返回值，不是提示词。
+    """
+    marked = [{**f, "blocks_run": is_blocking_finding(f)} for f in findings]
+    blocking = sum(1 for f in marked if f["blocks_run"])
+    errors = sum(1 for f in findings if f.get("severity") == "error")
+    warns = sum(1 for f in findings if f.get("severity") == "warn")
+    text = f"静态检查发现 {errors} 个错误、{warns} 个警告（见 lint_findings）。"
+    if blocking:
+        text += (
+            f"其中 {blocking} 条标了 blocks_run=true，未修完就调 run_flow 会被直接阻断，"
+            "请先逐项修复再运行。"
+        )
+    else:
+        text += "没有会阻断运行的项。"
+    return marked, text
+
 
 def _lint_flow(
     nodes: list[Any],

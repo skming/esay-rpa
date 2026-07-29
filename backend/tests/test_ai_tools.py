@@ -3250,3 +3250,30 @@ def test_incomplete_sweep_is_not_reported_when_pagination_actually_collected_mor
     })
 
     assert findings == []
+
+
+def test_findings_that_will_block_a_run_say_so_in_the_tool_result() -> None:
+    """阻断名单在编排层，模型只看得到 severity——warn 级的阻断项必须自报家门。
+
+    否则它读到「1 个警告」，合理地判断可以先跑一次看看，然后被 requires_lint_fix 拦在
+    run_flow 上：这一轮既没跑成也没修成，而它手上没有任何字段能让它提前避开。
+    """
+    from app.services.ai_tools.lint import annotate_lint_findings
+
+    marked, text = annotate_lint_findings([
+        {"issue": "table_extract_selector_targets_container", "severity": "warn", "node_id": "n2"},
+        {"issue": "long_wait_timeout", "severity": "warn", "node_id": "n3"},
+    ])
+
+    assert [f["blocks_run"] for f in marked] == [True, False]
+    assert "blocks_run=true" in text
+
+
+def test_advisory_only_findings_do_not_read_as_a_blocked_run() -> None:
+    """全是建议项时不能说「会被阻断」，不然模型会去修一堆压根不挡路的东西。"""
+    from app.services.ai_tools.lint import annotate_lint_findings
+
+    marked, text = annotate_lint_findings([{"issue": "long_wait_timeout", "severity": "warn"}])
+
+    assert marked[0]["blocks_run"] is False
+    assert "blocks_run=true" not in text

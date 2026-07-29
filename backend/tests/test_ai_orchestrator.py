@@ -823,3 +823,49 @@ def test_clean_lint_still_lets_a_repair_skip_inspect_page() -> None:
     _orchestrator_guard_after_tool("lint_flow", {"findings": []}, state)
 
     assert state["pending_repair_gate"]["inspect_done"] is True
+
+
+def test_a_lint_flow_that_finds_nothing_new_does_not_unlock_a_pending_lint_fix() -> None:
+    """阻断标记只能被真实修复解除，不能被"再 lint 一次"解除。
+
+    编排层读 lint_flow 的 lint_findings 键（实际叫 findings）时恒得空列表，于是每次
+    lint_flow 都在清锁：模型被 requires_lint_fix 拦下后，随手复检一次、一个字没改，
+    run_flow 就放行了——护栏在评测里正是这样被绕过去的。
+    """
+    from app.services.ai_orchestrator import _orchestrator_guard_after_tool
+
+    issue = "table_extract_selector_targets_container"
+    state: dict[str, Any] = {}
+
+    _orchestrator_guard_after_tool(
+        "create_flow",
+        {"lint_findings": [{"issue": issue, "severity": "warn", "node_id": "n2"}]},
+        state,
+    )
+    assert state["requires_lint_fix"]
+
+    _orchestrator_guard_after_tool(
+        "lint_flow",
+        {"findings": [{"issue": issue, "severity": "warn", "node_id": "n2"}], "is_clean": False},
+        state,
+    )
+    assert state["requires_lint_fix"]
+
+    _orchestrator_guard_after_tool("apply_node_fix", {"lint_findings": []}, state)
+    assert state["requires_lint_fix"] is None
+
+
+def test_a_failed_lint_call_is_not_read_as_a_clean_flow() -> None:
+    """lint_flow 报错时没有 findings 字段，当成"零阻断"就是把工具故障读成流程干净。"""
+    from app.services.ai_orchestrator import _orchestrator_guard_after_tool
+
+    state: dict[str, Any] = {}
+    _orchestrator_guard_after_tool(
+        "create_flow",
+        {"lint_findings": [{"issue": "single_navigation_node", "severity": "warn", "node_id": "n1"}]},
+        state,
+    )
+
+    _orchestrator_guard_after_tool("lint_flow", {"error": "流程 x 不存在"}, state)
+
+    assert state["requires_lint_fix"]

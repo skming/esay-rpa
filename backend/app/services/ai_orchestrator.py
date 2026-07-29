@@ -25,6 +25,7 @@ from app.services.ai_guards import (
 from app.services.ai_prompts import get_system_prompt
 from app.services.ai_tools import TOOL_SCHEMAS, RpaToolExecutor
 from app.services.ai_tools.diagnostics import CONTENT_MISMATCH_ISSUES, SELECTOR_DIAGNOSTIC_KINDS
+from app.services.ai_tools.lint import is_blocking_finding
 
 logger = logging.getLogger(__name__)
 
@@ -1878,24 +1879,6 @@ class AiOrchestrator:
         yield {"type": "done"}
 
 
-_BLOCKING_LINT_ISSUES = {
-    "critical_action_continue_on_error",
-    "script_uses_browser_dom",
-    "single_navigation_node",
-    "clear_storage_breaks_login_persistence",
-    "table_extract_selector_targets_container",
-    "table_extract_selector_not_table_like",
-    "extract_selector_union_used_as_fallback",
-    "table_extract_selector_too_broad",
-    "client_side_filter_masks_page_filter",
-    "date_filter_missing_verification",
-    "submit_key_on_body",
-    "date_trigger_selector_too_broad",
-    "unrolled_repeat_click_chain",
-    "login_without_navigation_to_data_page",
-    "probe_extract_without_continue_on_error",
-}
-
 _NON_EXECUTED_STATUSES = {"blocked_by_orchestrator_guard", "skipped", "error"}
 
 def _tool_call_succeeded(result: Any) -> bool:
@@ -2321,8 +2304,13 @@ def _orchestrator_guard_after_tool(tool_name: str, result: Any, state: dict[str,
             state["quality_issue_counts"] = {}
             state["quality_budget_lock"] = None
 
-    if tool_name in {"apply_node_fix", "update_flow", "create_flow", "lint_flow"}:
-        blocking = _blocking_lint_findings(result.get("lint_findings", []))
+    if tool_name in {"apply_node_fix", "update_flow", "create_flow", "lint_flow"} and not result.get("error"):
+        # lint_flow 交回的键是 findings，写工具（create/update/apply）才叫 lint_findings。
+        # 取错键读到的恒是空列表，于是下面这行把阻断标记清成 None：模型被拦下后随手
+        # 调一次 lint_flow，什么都没修，锁就没了。失败的调用同样不能清——上面的 error
+        # 判断挡的就是「lint 报错 = 流程干净」这个更荒谬的推论。
+        raw = result.get("findings") if tool_name == "lint_flow" else result.get("lint_findings")
+        blocking = _blocking_lint_findings(raw or [])
         # 运行期逃逸 finding（如 undefined_variable_ref_runtime_escape）存在的前提
         # 就是静态扫描漏网——一次通过的 lint_flow 不能把它冲掉，
         # 只有真实的结构性修复（update_flow / apply_node_fix 成功）才允许清除。
@@ -2333,14 +2321,14 @@ def _orchestrator_guard_after_tool(tool_name: str, result: Any, state: dict[str,
             ]
             blocking = blocking + [f for f in escaped if f not in blocking]
         state["requires_lint_fix"] = blocking or None
-        if tool_name in {"apply_node_fix", "update_flow"} and not result.get("error"):
+        if tool_name in {"apply_node_fix", "update_flow"}:
             # 只有真实结构修复才能解除质量审计失败标记，下次运行会重新审计
             state["requires_quality_fix"] = None
             state["quality_issue_counts"] = {}
             state["quality_budget_lock"] = None
             state["navigation_failure_counts"] = {}
             state["navigation_budget_lock"] = None
-        if tool_name == "apply_node_fix" and not result.get("error"):
+        if tool_name == "apply_node_fix":
             state["failure_budget_lock"] = None
 
     if state.get("pending_repair_gate") is not None:
@@ -2370,10 +2358,4 @@ def _orchestrator_guard_after_tool(tool_name: str, result: Any, state: dict[str,
 def _blocking_lint_findings(findings: Any) -> list[dict[str, Any]]:
     if not isinstance(findings, list):
         return []
-    blocking: list[dict[str, Any]] = []
-    for finding in findings:
-        if not isinstance(finding, dict):
-            continue
-        if finding.get("severity") == "error" or finding.get("issue") in _BLOCKING_LINT_ISSUES:
-            blocking.append(finding)
-    return blocking
+    return [f for f in findings if is_blocking_finding(f)]

@@ -102,3 +102,13 @@ python -m evals.run_evals --compare-prompts v1,v2 --reps 3  # 并排对比，第
 
 判据写错和模型做错在结果上同形（都是红的），区别只在**失败原因读起来是否荒谬**。
 调用序列里模型的动作明明合理却被判失败时，先改判据。
+
+### 模型踩护栏，先看它手上有没有躲开的字段
+
+`guard_blocking_lint_fixed_before_run` 长期 0/3，模型每次都在修复前先 `run_flow` 撞一次
+`requires_lint_fix`。这不是提示词说得不够重：阻断名单只存在于编排层，`create_flow` 交回给模型的
+finding 只有 `severity: warn`，它据此判断可以先跑一次看看，完全合理。
+
+`expect_guards_not_triggered` 断言的是「提示词能让模型自己避开」，而模型**根本没有可依据的字段**
+时，这条断言测的是猜谜。出路是把判断依据放进工具返回值（`annotate_lint_findings()` 给每条 finding
+标 `blocks_run`），不是加提示词——加完 3/3。fixture 也改成调真函数现算，手写的那份会把这个信号写死。
