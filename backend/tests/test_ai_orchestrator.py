@@ -791,3 +791,35 @@ async def test_usage_events_report_rounds_tokens_and_blocked_calls(monkeypatch) 
     assert final["max_rounds"] > 0
     assert events[-1] == {"type": "done"}
     assert events[-2]["type"] == "usage", "终值必须在 done 之前发出，否则最后一次计数丢失"
+
+
+def test_lint_findings_are_read_from_the_key_lint_flow_actually_returns() -> None:
+    """_lint_flow_tool 交回的键是 findings，只有写工具才叫 lint_findings。
+
+    取错键不会报错，也不会少一个字段——它让「lint 发现 selector 问题就还得 inspect_page」
+    这半条判据恒为假，模型据此改出来的 selector 从头到尾没见过真实 DOM。
+    """
+    from app.services.ai_orchestrator import _BROWSER_SELECTOR_ISSUES, _orchestrator_guard_after_tool
+
+    issue = next(iter(_BROWSER_SELECTOR_ISSUES))
+    state: dict[str, Any] = {"pending_repair_gate": {"lint_done": False, "inspect_done": False}}
+
+    _orchestrator_guard_after_tool(
+        "lint_flow",
+        {"findings": [{"issue": issue, "severity": "error", "node_id": "n2"}]},
+        state,
+    )
+
+    assert state["pending_repair_gate"]["lint_done"] is True
+    assert state["pending_repair_gate"]["inspect_done"] is False
+
+
+def test_clean_lint_still_lets_a_repair_skip_inspect_page() -> None:
+    """没有 selector 问题时仍要放行，否则每个纯变量修复都被硬塞一次 inspect_page。"""
+    from app.services.ai_orchestrator import _orchestrator_guard_after_tool
+
+    state: dict[str, Any] = {"pending_repair_gate": {"lint_done": False, "inspect_done": False}}
+
+    _orchestrator_guard_after_tool("lint_flow", {"findings": []}, state)
+
+    assert state["pending_repair_gate"]["inspect_done"] is True

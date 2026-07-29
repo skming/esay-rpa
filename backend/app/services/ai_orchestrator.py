@@ -1472,6 +1472,7 @@ class AiOrchestrator:
             "quality_issue_counts": {},
             "quality_budget_lock": None,
             "pending_repair_gate": None,   # {lint_done, inspect_done} — set on repair intent
+            "repair_autorun_lock": None,
             "pre_create_inspect_gate": None,  # {inspect_done, suggested_url} — set on create intent
             "read_only_tools": read_only,     # 自愈诊断模式：阻断所有写入类工具
             "model_no_vision": not _model_caps(model).supports_vision,  # 阻断 inspect_screenshot
@@ -1492,6 +1493,9 @@ class AiOrchestrator:
 
         if intents.repair:
             guard_state["pending_repair_gate"] = {"lint_done": False, "inspect_done": False}
+            # 刻意不进 _PERSISTED_KEYS：只锁本轮。用户下一句往往就是「跑一下看看」，
+            # 那时 repair 关键词不再出现，锁自然不会重新挂上。
+            guard_state["repair_autorun_lock"] = True
             full_messages.append({"role": "system", "content": _GUIDANCE_BEFORE_REPAIR})
         if intents.preserve_execution_channel:
             guard_state["repair_intent"] = "preserve_execution_channel"
@@ -2346,7 +2350,9 @@ def _orchestrator_guard_after_tool(tool_name: str, result: Any, state: dict[str,
             gate["runtime_selector_error"] = True
         if tool_name == "lint_flow" and not result.get("error"):
             gate["lint_done"] = True
-            findings = result.get("lint_findings", [])
+            # lint_flow 交回来的键是 findings；写工具（create/update/apply）才叫 lint_findings。
+            # 取错键不会报错，只会让下面这段恒为「没发现问题」，inspect_page 于是无条件被跳过。
+            findings = result.get("findings", [])
             has_browser_issue = any(
                 f.get("issue") in _BROWSER_SELECTOR_ISSUES
                 for f in findings if isinstance(f, dict)
