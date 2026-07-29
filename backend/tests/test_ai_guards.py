@@ -121,6 +121,17 @@ def test_quality_budget_lock_blocks_retry_of_the_same_failed_direction() -> None
     assert apply_pre_tool_guards("apply_node_fix", {}, state) is None
 
 
+def test_challenge_page_lock_stops_edits_and_reruns_against_the_same_wall() -> None:
+    state = {"challenge_page_lock": {"url": "https://site.example/post-1", "label": "人机验证拦截页"}}
+    for tool in ("create_flow", "update_flow", "apply_node_fix", "run_flow"):
+        assert _blocked_by(tool, {}, state)["guard_id"] == "challenge_page_lock"
+    # 重探同一个 URL 就是撞同一堵墙，第一轮丢节点正是这么循环出来的
+    blocked = _blocked_by("inspect_page", {"url": "https://site.example/post-1"}, state)
+    assert blocked["required_action"] == "needs_human_verification"
+    # 换个地址去看仍是正当动作，挡掉等于没收了模型唯一还能用的眼睛
+    assert apply_pre_tool_guards("inspect_page", {"url": "https://other.example/"}, state) is None
+
+
 def test_navigation_budget_lock_asks_the_user_for_a_target_url() -> None:
     state = {"navigation_budget_lock": {"node_id": "n_menu", "count": 2}}
     blocked = _blocked_by("run_flow", {}, state)

@@ -1468,6 +1468,7 @@ class AiOrchestrator:
             "requires_lint_fix": None,
             "navigation_failure_counts": {},
             "navigation_budget_lock": None,
+            "challenge_page_lock": None,
             "quality_issue_counts": {},
             "quality_budget_lock": None,
             "pending_repair_gate": None,   # {lint_done, inspect_done} — set on repair intent
@@ -2214,6 +2215,15 @@ def _orchestrator_guard_after_tool(tool_name: str, result: Any, state: dict[str,
             }
             existing = state.get("requires_lint_fix") or []
             state["requires_lint_fix"] = existing + [escape_finding]
+
+    if result.get("status") == "blocked_challenge_page":
+        # 刻意不进 _PERSISTED_KEYS：这道锁只在本轮有效。用户下一句往往正是
+        # 「我过完验证了，再跑一次」，跨轮留着会把唯一的出路也锁死。
+        state["challenge_page_lock"] = {
+            "url": result.get("requested_url"),
+            "label": result.get("challenge_label"),
+        }
+        return
 
     if result.get("status") == "blocked_by_failure_budget":
         state["failure_budget_lock"] = {

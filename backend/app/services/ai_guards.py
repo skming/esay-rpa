@@ -431,6 +431,28 @@ def _check_quality_budget_lock(tool_name: str, args: dict[str, Any], state: dict
     )
 
 
+def _check_challenge_page_lock(tool_name: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
+    locked = state["challenge_page_lock"]
+    locked_url = str(locked.get("url") or "")
+    # 探测类工具只挡同一个 URL：拦截页是这个站点这一刻的状态，不是模型的能力问题，
+    # 换个地址去看仍然是正当动作，一律挡掉等于没收了它唯一还能用的眼睛。
+    if tool_name in {"inspect_page", "inspect_screenshot"}:
+        if not locked_url or str((args or {}).get("url") or "") != locked_url:
+            return None
+    return _blocked(
+        tool_name,
+        required_action="needs_human_verification",
+        message=(
+            f"{locked.get('label') or '人机验证拦截页'}：{locked_url or '目标站点'} 返回的是验证墙，不是真实页面。"
+            "这不是流程或 selector 的缺陷，改流程、换 selector、重试探测都会撞上同一堵墙；"
+            "加 control.human_takeover 节点在无头模式下同样过不去，因为那时没有人在场操作。"
+            "请如实告诉用户：需要用有头模式或插件执行器打开一次并人工完成验证，"
+            "验证 cookie 会留在持久化 profile 里，之后再继续。"
+        ),
+        challenge_page_lock=locked,
+    )
+
+
 def _check_navigation_budget_lock(tool_name: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
     locked = state["navigation_budget_lock"]
     return _blocked(
@@ -628,6 +650,17 @@ GUARDS: tuple[Guard, ...] = (
         requires_state=("pre_create_inspect_gate",),
         check=_check_pre_create_inspect_gate,
         contract="用户给了 URL 时，create_flow/update_flow 之前必须先 inspect_page，selector 只能来自检查结果。",
+    ),
+    Guard(
+        id="challenge_page_lock",
+        summary="探测到人机验证拦截页后，禁止改流程或重跑，只能转为向用户说明",
+        scope=ToolScope(include=FLOW_WRITE_TOOLS | {"run_flow", "inspect_page", "inspect_screenshot"}),
+        requires_state=("challenge_page_lock",),
+        check=_check_challenge_page_lock,
+        contract=(
+            "探测到 Cloudflare / DataDome 这类整页人机验证时，改流程和重试都不会有任何效果，"
+            "唯一出路是让用户用有头模式或插件执行器人工过一次验证。"
+        ),
     ),
     Guard(
         id="consecutive_inspect_limit",
