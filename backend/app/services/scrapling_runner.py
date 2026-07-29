@@ -44,15 +44,15 @@ class ScraplingRunner:
             # 要等第一次真去开库时才抛 TypeError，而那时已经在抓取途中了。
             args = {"storage_file": str(Path(storage_dir) / "scrapling_storage.db")}
             # adaptive 必须在 Selector 初始化时打开：css(adaptive=True) 只是单次调用的开关，
-            # 初始化时没开就整段跳过，只在 scrapling 自己的 logger 里留一行 warning——
-            # 这正是元素指纹一直没生效的原因，节点上的开关全程是个摆设。
+            # 初始化时没开就整段跳过，节点上的开关随之全程失效，而报错只有 scrapling
+            # 自己 logger 里的一行 warning。
             # AsyncFetcher 是独立的类，configure 写的是各自的类属性，漏了它
             # static 档（build_request_for_fetch_node 的默认值）就永远拿不到指纹。
             for fetcher in (Fetcher, AsyncFetcher, DynamicFetcher, StealthyFetcher):
                 fetcher.configure(adaptive=True, storage_args=args)
         except Exception:
             # 配置失败只降级为「没有自动重定位」，不阻断启动；但必须留痕，
-            # 上一版在这里静默 pass，于是这个功能死了多久都没人知道。
+            # 静默 pass 的话这个功能死掉也没有任何迹象。
             logger.warning("Scrapling 元素指纹存储配置失败，页面改版后的自动重定位将不可用", exc_info=True)
 
     async def run(self, task_id: str, request: RunTaskRequest, on_log: LogCallback) -> ScrapeResult:

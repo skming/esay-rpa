@@ -2225,8 +2225,8 @@ class RpaToolExecutor:
                 # 用户看到的「第一次助手被 cloudflare 拦截、什么也没生成」就是这么来的。
                 challenge = await detect_blocking_interstitial(page)
                 if challenge is not None:
-                    # 只陈述事实，「不要改流程/不要重试」由 challenge_page_lock 护栏说——
-                    # 规则写两遍必然漂移，护栏那份还能真拦住。
+                    # 这里只陈述事实：「不要改流程、不要重试」交给 challenge_page_lock 护栏，
+                    # 同一条规则写两处必然漂移，而只有护栏那份真拦得住。
                     return {
                         "status": "blocked_challenge_page",
                         "requested_url": url,
@@ -2393,8 +2393,8 @@ class RpaToolExecutor:
         try:
             async with persistent_browser_context(browser_profile, headless=True) as ctx:
                 page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-                # 视口只影响这一次截图，设在页面上；隐身会话不接受上下文级 viewport，
-                # 传进去会被忽略，截出来的是默认尺寸——错得很安静
+                # 视口设在页面上而不是上下文上：隐身会话不接受上下文级 viewport，
+                # 传进去会被静默忽略，截出来的是默认尺寸
                 await page.set_viewport_size({"width": 1280, "height": 800})
                 await page.goto(url, wait_until="load", timeout=30_000)
                 try:

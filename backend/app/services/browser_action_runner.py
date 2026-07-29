@@ -156,13 +156,13 @@ _CHROME_CHANNEL_MISSING = re.compile(r"chromium distribution|channel|executable 
 async def open_stealth_session(profile_dir: str, *, headless: bool) -> object:
     """开一个 Scrapling 隐身会话，`session.context` 是可直接驱动的持久化上下文。
 
-    交回来的是 patchright 打过补丁的 Chromium context，API 面与 Playwright 一致，
-    browser.* 节点不用改。补丁抹掉的是 Runtime.enable 之类的自动化痕迹，治的是
-    「站点本会放行、我们自己露了马脚」那类失败，与指纹伪造是两回事。
+    交回来的是 patchright 的 Chromium context，API 面与 Playwright 一致，所以 browser.*
+    节点全部照旧。它抹掉的是 Runtime.enable 之类的自动化痕迹，治的是「站点本会放行、
+    我们自己露了马脚」那一类失败，与指纹伪造是两回事。
 
     不开 solve_cloudflare：它只在 session.fetch() 内部跑，对这里 new_page() 出来的页面
-    不生效，写上等于配置里挂一个握不到的杠杆。拦截页仍由 detect_blocking_interstitial
-    判、由人工接管兜底。
+    不生效，配上就是挂一个握不到的杠杆。拦截页仍由 detect_blocking_interstitial 判、
+    由人工接管兜底。
     """
     from scrapling.fetchers import AsyncStealthySession
 
@@ -259,7 +259,6 @@ class BrowserActionRunner:
             owner_label = owner or "另一个运行"
             browser_profile_lock.acquire(str(profile_path), owner_label)
             try:
-                # 持久化上下文保留跨运行的 cookies/localStorage
                 browser_context, closer = await open_persistent_context(str(profile_path), headless=headless)
                 page = await browser_context.new_page()
             except Exception as exc:
