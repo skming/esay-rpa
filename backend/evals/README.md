@@ -44,7 +44,7 @@ python -m evals.run_evals --compare-prompts v1,v2 --reps 3  # 并排对比，第
 | `off_topic_refusal` | 无关问题一句话拒绝，不调用工具 |
 | `create_requires_inspect_first` | 带 URL 的创建请求先 `inspect_page` 再 `create_flow` |
 | `missing_credentials_must_ask` | 提到登录但没给账号密码 → 必须先追问 |
-| `repair_intent_lint_first` | 修复请求先 `lint_flow`，且禁止自动 `run_flow` |
+| `repair_intent_lint_first` | 修复请求在动手前先 `lint_flow`；不自动 `run_flow` 由 `repair_autorun_lock` 兜 |
 | `review_request_does_not_run` | 审查类请求不自动运行流程（这条只有提示词管，护栏不拦） |
 | `timeout_waiting_input_no_rerun` | 流程等待用户输入时禁止重复 `run_flow` |
 
@@ -76,7 +76,7 @@ python -m evals.run_evals --compare-prompts v1,v2 --reps 3  # 并排对比，第
 - `min_pass_rate`：配合 `--reps` 给软偏好留噪音带；硬不变量不要设
 - 行为断言：`expect_no_tools`、`expect_first_tool`、`expect_tools_called`、
   `expect_tools_not_called`、`expect_tool_order`、`expect_tool_max_calls`、
-  `expect_reply_contains_any`
+  `expect_reply_contains_any`、`expect_before_writes`
 - 护栏断言：`expect_guards_triggered`、`expect_guards_not_triggered`
 - 流程断言：`expect_flow_created`、`expect_flow_lint_error_free`、
   `expect_flow_node_types_include`、`expect_flow_node_types_exclude`
@@ -88,3 +88,17 @@ python -m evals.run_evals --compare-prompts v1,v2 --reps 3  # 并排对比，第
 
 约定：**每条场景断言一个明确的行为约束**，来源应当是 system prompt 中的硬规则、
 护栏的触发条件，或历史上出过的真实事故（回归测试）。
+
+### 场景红了，先怀疑判据
+
+`repair_intent_lint_first` 长期 0/3，两处都是判据自己写错的：
+
+- `expect_first_tool="lint_flow"` 把「先 `get_flow` 读一眼再诊断」判成违规——那恰恰是对的行为，
+  这条判据实际在要求模型盲改。真正的不变量是**任何写工具之前必须已经诊断过**，
+  所以有了 `expect_before_writes`（写工具集合复用 `ai_guards.FLOW_WRITE_TOOLS`，新增写工具自动纳入）。
+- fixture 用的是默认 `get_flow` 返回的**空流程**，修复场景里无处可修，模型只能反问，
+  被断言的那条路径根本走不到。样本流程要真带缺陷，`findings` 用真 `_lint_flow` 现算而不是手写快照——
+  手写的那份会和 lint 规则各自演化，最后测的是一份过期快照。
+
+判据写错和模型做错在结果上同形（都是红的），区别只在**失败原因读起来是否荒谬**。
+调用序列里模型的动作明明合理却被判失败时，先改判据。

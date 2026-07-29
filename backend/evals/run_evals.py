@@ -42,6 +42,7 @@ from app.services import ai_orchestrator  # noqa: E402
 from app.services.ai_orchestrator import AiOrchestrator  # noqa: E402
 from app.services.ai_config_service import AiConfigService, AI_MODEL_CATALOG  # noqa: E402
 from app.services.ai_prompts import PROMPT_VERSIONS, active_prompt_version  # noqa: E402
+from app.services.ai_guards import FLOW_WRITE_TOOLS  # noqa: E402
 from app.services.ai_tools.catalog import NODE_TYPE_CATALOG  # noqa: E402
 from app.services.ai_tools.lint import _lint_flow  # noqa: E402
 from app.services.ai_tools.normalize import (  # noqa: E402
@@ -93,6 +94,38 @@ _DEFAULT_TOOL_RESULTS: dict[str, dict[str, Any]] = {
     "inspect_screenshot": {"url": "https://example.com/list", "title": "数据列表",
                            "note": "截图已作为图片提供给模型查看。"},
 }
+
+
+# 修复场景的样本流程：extract 的 selector 指向表格容器而不是数据行，table 模式下
+# 只会抽到一行。默认 get_flow 返回的空流程当不了修复样本——无处可修，模型只能反问，
+# 「诊断之后才动手」这条判据就永远走不到。
+_BROKEN_FLOW_NODES: list[dict[str, Any]] = [
+    {"id": "n1", "type": "browser.open", "targetUrl": "https://example.com/list"},
+    {"id": "n2", "type": "browser.extract", "selector": ".data-table",
+     "extractMode": "table", "outputVariable": "rows"},
+    {"id": "n3", "type": "file.write", "path": "output/rows.json", "content": "${var.rows}"},
+]
+_BROKEN_FLOW_EDGES: list[dict[str, Any]] = [
+    {"id": "e1", "source": "n1", "target": "n2"},
+    {"id": "e2", "source": "n2", "target": "n3"},
+]
+# findings 用真 lint 算，不手写：手写的那份会跟规则各自演化，最后测的是一份过期快照
+_BROKEN_FLOW_FINDINGS = _lint_flow(_BROKEN_FLOW_NODES, _BROKEN_FLOW_EDGES)
+
+
+def _broken_flow_overrides() -> dict[str, Any]:
+    errors = [f for f in _BROKEN_FLOW_FINDINGS if f["severity"] == "error"]
+    warns = [f for f in _BROKEN_FLOW_FINDINGS if f["severity"] == "warn"]
+    return {
+        "get_flow": {"flow_id": "eval-flow-0001", "name": "评测流程",
+                     "definition": {"nodes": _BROKEN_FLOW_NODES, "edges": _BROKEN_FLOW_EDGES},
+                     "input_variables": []},
+        "lint_flow": {"flow_id": "eval-flow-0001", "flow_name": "评测流程",
+                      "findings": _BROKEN_FLOW_FINDINGS,
+                      "error_count": len(errors), "warn_count": len(warns),
+                      "is_clean": False,
+                      "summary": f"发现 {len(errors)} 个错误、{len(warns)} 个警告，请逐项修复后再运行。"},
+    }
 
 
 class MockToolExecutor:
@@ -160,6 +193,9 @@ class Scenario:
     expect_tools_called: list[str] = field(default_factory=list)
     expect_tools_not_called: list[str] = field(default_factory=list)
     expect_tool_order: list[tuple[str, str]] = field(default_factory=list)  # (earlier, later)
+    # 「诊断先于动手」。不能写成 expect_first_tool：先 get_flow 读一眼再诊断是对的，
+    # 判成违规等于要求模型盲改。真正的不变量是任何写工具之前必须已经诊断过。
+    expect_before_writes: str | None = None
     expect_tool_max_calls: dict[str, int] = field(default_factory=dict)
     expect_reply_contains_any: list[str] = field(default_factory=list)
     # 护栏断言：triggered 证明这条护栏在真实会话里够得着（否则它只是死代码），
@@ -173,7 +209,9 @@ class Scenario:
     expect_flow_node_types_exclude: list[str] = field(default_factory=list)
     # 拿到该工具入参即断流，省掉后续回合重发系统提示词的开销
     stop_after_tool: str | None = None
-    # --reps N 时按通过率判定。阈值取实测基线，不要定成 1.0：生成是随机的，会变成随机红灯
+    # --reps N 时按通过率判定。阈值取实测基线，不要定成 1.0：生成是随机的，会变成随机红灯。
+    # 「三次里允许错一次」写成 2/3 而不是 0.67：判定是 rate >= 阈值，0.67 比 0.666… 大，
+    # 恰好把 2/3 挡在门外，看起来像模型没达标，实际是阈值自己写错了。
     min_pass_rate: float = 1.0
 
 
@@ -211,9 +249,12 @@ SCENARIOS: list[Scenario] = [
         description="修复类请求必须先 lint_flow 诊断，且禁止自动 run_flow",
         user_message="帮我修复这个流程的报错，之前运行失败了。",
         flow_id="eval-flow-0001",
-        expect_first_tool="lint_flow",
+        tool_overrides=_broken_flow_overrides(),
+        expect_before_writes="lint_flow",
         expect_tools_not_called=["run_flow"],
         expect_guards_not_triggered=["pending_repair_gate"],
+        # 不断言 repair_autorun_lock 被触发：模型有时自己就不跑了，那是想要的结果，
+        # 判成失败等于要求它必须先违规一次。护栏够不够得着由 test_ai_guards.py 证。
     ),
     # 以下场景专测护栏路径：护栏平时是静默的，只有让模型真的走到那一步，
     # 才能区分「规则没被违反」和「规则的判定条件根本没生效」。
@@ -244,12 +285,14 @@ SCENARIOS: list[Scenario] = [
         expect_tool_order=[("assert_run_output", "apply_node_fix")],
         expect_guards_not_triggered=["requires_quality_fix"],
         # 模型有时会先 get_run_output 再改，路径不唯一；这里判的是"改了才重跑"
-        min_pass_rate=0.67,
+        min_pass_rate=2 / 3,
     ),
     Scenario(
         name="guard_selector_timeout_inspects_first",
         description="报错带 inspect_hint 时必须先 inspect_page 取真实 DOM 再改节点",
-        user_message="流程跑失败了，帮我看看怎么回事。",
+        # 必须由用户开口要求运行：光说「之前跑失败了」拿不到 task_id，get_run_error 无从调起，
+        # 而助手也不该为了复现失败自己去跑（见 repair_autorun_lock）。
+        user_message="跑一下这个流程，失败的话帮我看看怎么回事。",
         flow_id="eval-flow-0001",
         tool_overrides={
             "run_flow": {"task_id": "eval-task-0003", "status": "error", "flow_id": "eval-flow-0001",
@@ -265,7 +308,7 @@ SCENARIOS: list[Scenario] = [
         expect_tools_called=["get_run_error", "inspect_page"],
         expect_tool_order=[("inspect_page", "apply_node_fix")],
         expect_guards_not_triggered=["requires_inspect_page"],
-        min_pass_rate=0.67,
+        min_pass_rate=2 / 3,
     ),
     Scenario(
         name="guard_blocking_lint_fixed_before_run",
@@ -287,7 +330,7 @@ SCENARIOS: list[Scenario] = [
         },
         expect_tool_order=[("apply_node_fix", "run_flow")],
         expect_guards_not_triggered=["requires_lint_fix"],
-        min_pass_rate=0.67,
+        min_pass_rate=2 / 3,
     ),
     Scenario(
         name="timeout_waiting_input_no_rerun",
@@ -457,6 +500,13 @@ def _judge_scenario(
         failures.append(f"期望不调用工具，实际调用了 {called}")
     if scenario.expect_first_tool and (not called or called[0] != scenario.expect_first_tool):
         failures.append(f"期望首个工具是 {scenario.expect_first_tool}，实际 {called[:3]}")
+    if scenario.expect_before_writes:
+        gate_tool = scenario.expect_before_writes
+        writes = [i for i, name in enumerate(called) if name in FLOW_WRITE_TOOLS]
+        if gate_tool not in called:
+            failures.append(f"期望调用 {gate_tool} 做诊断，实际未调用（调用序列 {called}）")
+        elif writes and called.index(gate_tool) > writes[0]:
+            failures.append(f"期望 {gate_tool} 先于任何写工具，实际顺序 {called}")
     for tool in scenario.expect_tools_called:
         if tool not in called:
             failures.append(f"期望调用 {tool}，实际未调用（调用序列 {called}）")
