@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from app.services import browser_action_runner
 from app.services.browser_action_runner import BrowserActionContext, BrowserActionResult, BrowserActionRunner, _INTERSTITIAL_PROBE_SCRIPT, launch_persistent_chrome, _normalize_table_rows, _goto_with_retry, _raise_if_table_scope_error, apply_browser_result_variables, detect_blocking_overlay
 from app.services.runtime_variables import RuntimeVariableStore
 
@@ -668,6 +669,78 @@ async def test_launch_does_not_swallow_unrelated_failures(tmp_path) -> None:
         await launch_persistent_chrome(launcher, str(tmp_path), headless=False)
 
     assert launcher.channels == ["chrome"]
+
+
+async def test_persistent_context_prefers_the_stealth_session_and_closes_it(tmp_path, monkeypatch) -> None:
+    """会话自己持有浏览器进程，关闭只能整个走 session.close()——
+    交出的关闭函数要是漏了这一步，每跑一次流程就漏一个 Chrome 进程。"""
+    closed: list[str] = []
+
+    class FakeSession:
+        context = "stealth-context"
+
+        async def close(self) -> None:
+            closed.append("session")
+
+    async def _open(profile_dir: str, *, headless: bool) -> object:
+        return FakeSession()
+
+    monkeypatch.setattr(browser_action_runner, "open_stealth_session", _open)
+
+    context, close = await browser_action_runner.open_persistent_context(str(tmp_path), headless=True)
+    await close()
+
+    assert context == "stealth-context"
+    assert closed == ["session"]
+
+
+async def test_persistent_context_falls_back_when_stealth_is_unavailable(tmp_path, monkeypatch) -> None:
+    """没装 scrapling / 没有正版 Chrome 只是少一层反检测，节点能力一个不缺，
+    不该让整条流程跑不起来。"""
+    events: list[str] = []
+
+    class FakeContext:
+        async def close(self) -> None:
+            events.append("context")
+
+    class Launcher(FakeChromeLauncher):
+        async def launch_persistent_context(self, profile_dir: str, *, headless: bool = True, channel: str | None = None) -> FakeContext:
+            self.channels.append(channel)
+            return FakeContext()
+
+        async def stop(self) -> None:
+            events.append("playwright")
+
+    class FakePlaywright:
+        async def start(self) -> Launcher:
+            return launcher
+
+    async def _boom(profile_dir: str, *, headless: bool) -> object:
+        raise ModuleNotFoundError("No module named 'scrapling'")
+
+    launcher = Launcher(chrome_installed=True)
+    monkeypatch.setattr(browser_action_runner, "open_stealth_session", _boom)
+    monkeypatch.setattr("playwright.async_api.async_playwright", FakePlaywright)
+
+    context, close = await browser_action_runner.open_persistent_context(str(tmp_path), headless=True)
+    await close()
+
+    assert isinstance(context, FakeContext)
+    assert launcher.channels == ["chrome"]
+    # 顺序不能反：stop() 之后再 close() 是往断掉的连接上发命令
+    assert events == ["context", "playwright"]
+
+
+async def test_persistent_context_does_not_fall_back_when_the_profile_is_busy(tmp_path, monkeypatch) -> None:
+    """回落只是让第二个进程去开同一份 profile，两边登录态互相覆盖；
+    而 Chrome 让位报的是「browser has been closed」，从报错里看不出这一层。"""
+    async def _busy(profile_dir: str, *, headless: bool) -> object:
+        raise RuntimeError("Target page, context or browser has been closed")
+
+    monkeypatch.setattr(browser_action_runner, "open_stealth_session", _busy)
+
+    with pytest.raises(RuntimeError, match="has been closed"):
+        await browser_action_runner.open_persistent_context(str(tmp_path), headless=True)
 
 
 class FakePage:

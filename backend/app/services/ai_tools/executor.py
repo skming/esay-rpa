@@ -10,12 +10,13 @@ import hashlib
 import json
 import re
 from datetime import UTC, datetime
+from importlib.util import find_spec
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from app.core import storage
 from app.services import browser_profile_lock
-from app.services.browser_action_runner import detect_blocking_interstitial, launch_persistent_chrome
+from app.services.browser_action_runner import detect_blocking_interstitial, persistent_browser_context
 from app.services.ai_tools.catalog import NODE_TYPE_CATALOG
 from app.services.ai_tools.diagnostics import (
     SELECTOR_MATCH_HIDDEN_OR_NOT_VISIBLE,
@@ -2191,9 +2192,7 @@ class RpaToolExecutor:
         if busy is not None:
             return busy
 
-        try:
-            from playwright.async_api import async_playwright as _async_playwright
-        except ModuleNotFoundError:
+        if find_spec("playwright") is None:
             return {"error": "未安装 Playwright，请执行 uv pip install playwright"}
 
         browser_profile = str(storage.resolve_browser_profile_dir())
@@ -2205,164 +2204,158 @@ class RpaToolExecutor:
             return _profile_busy_block("inspect_page") or {"error": "浏览器被占用"}
 
         try:
-            async with _async_playwright() as pw:
-                ctx = await launch_persistent_chrome(pw, browser_profile, headless=True)
+            async with persistent_browser_context(browser_profile, headless=True) as ctx:
+                page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+                await page.goto(url, wait_until="load", timeout=30_000)
                 try:
-                    page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-                    await page.goto(url, wait_until="load", timeout=30_000)
+                    await page.wait_for_load_state("networkidle", timeout=6_000)
+                except Exception:
+                    pass
+
+                if wait_selector:
                     try:
-                        await page.wait_for_load_state("networkidle", timeout=6_000)
+                        await page.wait_for_selector(wait_selector, timeout=12_000)
                     except Exception:
-                        pass
+                        pass  # best-effort; still extract what's there
+                else:
+                    await page.wait_for_timeout(3_000)
 
-                    if wait_selector:
-                        try:
-                            await page.wait_for_selector(wait_selector, timeout=12_000)
-                        except Exception:
-                            pass  # best-effort; still extract what's there
-                    else:
-                        await page.wait_for_timeout(3_000)
+                # 拦截页要在探测结果之前判掉：它的元素数量通常是 0，落到下面就会被当成
+                # 「SPA 没渲染完」，模型于是带着 wait_selector 一遍遍重试同一堵墙——
+                # 用户看到的「第一次助手被 cloudflare 拦截、什么也没生成」就是这么来的。
+                challenge = await detect_blocking_interstitial(page)
+                if challenge is not None:
+                    # 只陈述事实，「不要改流程/不要重试」由 challenge_page_lock 护栏说——
+                    # 规则写两遍必然漂移，护栏那份还能真拦住。
+                    return {
+                        "status": "blocked_challenge_page",
+                        "requested_url": url,
+                        "challenge_label": challenge.label,
+                        "challenge": challenge.summary,
+                        "error": f"目标站点返回了{challenge.label}，无头浏览器拿不到真实页面内容。",
+                    }
 
-                    # 拦截页要在探测结果之前判掉：它的元素数量通常是 0，落到下面就会被当成
-                    # 「SPA 没渲染完」，模型于是带着 wait_selector 一遍遍重试同一堵墙——
-                    # 用户看到的「第一次助手被 cloudflare 拦截、什么也没生成」就是这么来的。
-                    challenge = await detect_blocking_interstitial(page)
-                    if challenge is not None:
-                        return {
-                            "status": "blocked_challenge_page",
-                            "requested_url": url,
-                            "challenge": challenge.summary,
-                            "error": f"目标站点返回了{challenge.label}，无头浏览器拿不到真实页面内容。",
-                            "message": (
-                                "这不是流程或 selector 的问题，也不要重试 inspect_page（同一堵墙）。"
-                                "请把下面这段告诉用户：该站点启用了人机验证，需要先用有头模式或插件执行器"
-                                "打开一次并人工完成验证，验证 cookie 会留在持久化 profile 里，之后再继续。"
-                            ),
+                result = await page.evaluate(PAGE_PROBE_JS, scope_selector)
+                result["scope_selector"] = scope_selector
+                result["requested_url"] = url
+                result["note"] = (
+                    "selector 字段为推荐选择器，可直接用于 browser.click / browser.fill 等节点。"
+                    ":has-text() 为 Playwright 伪选择器，合法可用。"
+                    "若 date_controls 字段存在，按 interaction_recipe.steps 构建节点（selector 直接用，"
+                    "日期文本/目标年月/节点数量按本次任务改写）；主路线走不通时才看 fallback_steps，"
+                    "notes 里是该框架与执行器的已知限制。"
+                )
+
+                # 必须在 total_elements 判空之前检测加载态类名，否则只有 logo 的页面
+                # （total_elements=1）会漏报 SPA 仍在渲染中
+                # page_classes 是给模型看的前 120 个；all_classes 是未截断的全量集合。
+                # 加载态指示类名一般挂在靠前的容器上，模糊匹配（loading/skeleton 子串）
+                # 在全量集合上误报率高，所以只有精确指示类名和组件识别用全量。
+                page_classes: list[str] = result.get("page_classes", [])
+                all_classes: list[str] = result.pop("all_classes", None) or page_classes
+                spa_loading = (
+                    "nprogress-busy" in all_classes
+                    or any(
+                        cls in all_classes
+                        for cls in ("v-loading", "el-loading-mask", "ant-spin-spinning", "arco-spin")
+                    )
+                    or any(
+                        "loading" in cls or "skeleton" in cls
+                        for cls in page_classes
+                        if cls not in ("el-loading-fade-enter", "el-loading-fade-leave")
+                    )
+                )
+                # 识别已知组件库控件并注入 interaction_recipe，模型无需猜 selector
+                try:
+                    from app.services.skills.registry import match_skills as _match_skills
+                    from app.services.skills.registry import build_skill_recipe as _build_skill_recipe
+                    _matched = _match_skills(all_classes)
+                    _controls = [
+                        {
+                            "type": f"{s.library}/{s.component}",
+                            "library": s.library,
+                            "component": s.component,
+                            "description": s.description,
+                            "interaction_recipe": _build_skill_recipe(s, result.get("inputs", [])),
                         }
+                        for s in _matched
+                    ]
+                    # 页面用的是没写过配方的组件库（Arco/Vant/iView/自研）时，指纹匹配一无所获，
+                    # 模型就只能凭空猜交互方式。退回到与组件库无关的日期特征识别，
+                    # 至少保证任何框架下都拿得到真实 selector + 通用交互路线。
+                    if not any("date" in c["component"] for c in _controls):
+                        from app.services.skills.generic import build_generic_date_recipe
+                        _generic = build_generic_date_recipe(result.get("inputs", []))
+                        if _generic:
+                            _controls.append(_generic)
+                    if _controls:
+                        result["date_controls"] = _controls
+                except Exception:
+                    pass  # skill matching is best-effort; never break inspect_page
 
-                    result = await page.evaluate(PAGE_PROBE_JS, scope_selector)
-                    result["scope_selector"] = scope_selector
-                    result["requested_url"] = url
-                    result["note"] = (
-                        "selector 字段为推荐选择器，可直接用于 browser.click / browser.fill 等节点。"
-                        ":has-text() 为 Playwright 伪选择器，合法可用。"
-                        "若 date_controls 字段存在，按 interaction_recipe.steps 构建节点（selector 直接用，"
-                        "日期文本/目标年月/节点数量按本次任务改写）；主路线走不通时才看 fallback_steps，"
-                        "notes 里是该框架与执行器的已知限制。"
+                if spa_loading:
+                    result["spa_loading"] = True
+                    result["warning"] = (
+                        "⚠️ SPA 页面正在加载（检测到 nprogress-busy 或加载指示器类名）。"
+                        "页面内容尚未渲染，当前返回的元素列表不可靠。\n"
+                        "必须执行以下诊断（按顺序，不可跳过）：\n"
+                        "1. 检查流程拓扑：列出所有 browser.open 节点的 URL，确认是否有导航节点跳转到目标页面\n"
+                        "2. 若只有一个 browser.open（登录页），先添加第二个 browser.open（目标页，delayMs:3000）再重试\n"
+                        "3. 若导航节点存在，增加其 delayMs 到 3000-5000ms 等待 SPA 渲染\n"
+                        "4. 修复前置节点后，再重新调用 inspect_page 获取真实 DOM\n"
+                        "禁止在 spa_loading:true 时对 browser.wait/browser.extract 节点写 selector。"
+                    )
+                else:
+                    result["spa_loading"] = False
+
+                total_elements = (
+                    len(result.get("inputs", []))
+                    + len(result.get("buttons", []))
+                    + len(result.get("links", []))
+                    + len(result.get("tables", []))
+                )
+                if total_elements == 0 and not spa_loading:
+                    result["warning"] = (
+                        "⚠️ 页面元素为空——SPA 可能未渲染完毕。"
+                        "请重新调用 inspect_page，并指定 wait_selector 参数等待页面核心元素出现，"
+                        "例如 wait_selector='nav, table, [role=grid], [role=navigation], main'。"
+                        "如果多次重试仍为空，请检查 url 是否正确、是否需要重新登录。"
                     )
 
-                    # 必须在 total_elements 判空之前检测加载态类名，否则只有 logo 的页面
-                    # （total_elements=1）会漏报 SPA 仍在渲染中
-                    # page_classes 是给模型看的前 120 个；all_classes 是未截断的全量集合。
-                    # 加载态指示类名一般挂在靠前的容器上，模糊匹配（loading/skeleton 子串）
-                    # 在全量集合上误报率高，所以只有精确指示类名和组件识别用全量。
-                    page_classes: list[str] = result.get("page_classes", [])
-                    all_classes: list[str] = result.pop("all_classes", None) or page_classes
-                    spa_loading = (
-                        "nprogress-busy" in all_classes
-                        or any(
-                            cls in all_classes
-                            for cls in ("v-loading", "el-loading-mask", "ant-spin-spinning", "arco-spin")
+                # 子 frame 对主文档抽取不可见，需单独统计并告知 AI
+                try:
+                    child_frames = [
+                        fr for fr in page.frames
+                        if fr is not page.main_frame
+                        and fr.url and fr.url != "about:blank"
+                    ][:3]
+                    if child_frames:
+                        frames_info: list[dict[str, Any]] = []
+                        for fr in child_frames:
+                            try:
+                                census = await fr.evaluate(
+                                    "() => ({"
+                                    " inputs: document.querySelectorAll('input:not([type=hidden]), textarea').length,"
+                                    " buttons: document.querySelectorAll('button, [role=button]').length,"
+                                    " tables: document.querySelectorAll('table, [role=grid], [role=table]').length,"
+                                    " title: document.title })"
+                                )
+                            except Exception:
+                                census = {}
+                            frames_info.append({"url": fr.url, "name": fr.name or None, **(census or {})})
+                        result["frames"] = frames_info
+                        result["frames_note"] = (
+                            "⚠️ 页面包含 iframe。主文档提取结果不含 iframe 内部元素；"
+                            "若目标元素（表单/表格）在 iframe 内，selector 使用穿透语法："
+                            "`iframe选择器 >>> 内部选择器`（如 `iframe[name=\"main\"] >>> tbody tr`，"
+                            "iframe 选择器按 frames[].name/url 构造，可多层链式）。"
                         )
-                        or any(
-                            "loading" in cls or "skeleton" in cls
-                            for cls in page_classes
-                            if cls not in ("el-loading-fade-enter", "el-loading-fade-leave")
-                        )
-                    )
-                    # 识别已知组件库控件并注入 interaction_recipe，模型无需猜 selector
-                    try:
-                        from app.services.skills.registry import match_skills as _match_skills
-                        from app.services.skills.registry import build_skill_recipe as _build_skill_recipe
-                        _matched = _match_skills(all_classes)
-                        _controls = [
-                            {
-                                "type": f"{s.library}/{s.component}",
-                                "library": s.library,
-                                "component": s.component,
-                                "description": s.description,
-                                "interaction_recipe": _build_skill_recipe(s, result.get("inputs", [])),
-                            }
-                            for s in _matched
-                        ]
-                        # 页面用的是没写过配方的组件库（Arco/Vant/iView/自研）时，指纹匹配一无所获，
-                        # 模型就只能凭空猜交互方式。退回到与组件库无关的日期特征识别，
-                        # 至少保证任何框架下都拿得到真实 selector + 通用交互路线。
-                        if not any("date" in c["component"] for c in _controls):
-                            from app.services.skills.generic import build_generic_date_recipe
-                            _generic = build_generic_date_recipe(result.get("inputs", []))
-                            if _generic:
-                                _controls.append(_generic)
-                        if _controls:
-                            result["date_controls"] = _controls
-                    except Exception:
-                        pass  # skill matching is best-effort; never break inspect_page
+                except Exception:
+                    pass  # frame census is best-effort
 
-                    if spa_loading:
-                        result["spa_loading"] = True
-                        result["warning"] = (
-                            "⚠️ SPA 页面正在加载（检测到 nprogress-busy 或加载指示器类名）。"
-                            "页面内容尚未渲染，当前返回的元素列表不可靠。\n"
-                            "必须执行以下诊断（按顺序，不可跳过）：\n"
-                            "1. 检查流程拓扑：列出所有 browser.open 节点的 URL，确认是否有导航节点跳转到目标页面\n"
-                            "2. 若只有一个 browser.open（登录页），先添加第二个 browser.open（目标页，delayMs:3000）再重试\n"
-                            "3. 若导航节点存在，增加其 delayMs 到 3000-5000ms 等待 SPA 渲染\n"
-                            "4. 修复前置节点后，再重新调用 inspect_page 获取真实 DOM\n"
-                            "禁止在 spa_loading:true 时对 browser.wait/browser.extract 节点写 selector。"
-                        )
-                    else:
-                        result["spa_loading"] = False
-
-                    total_elements = (
-                        len(result.get("inputs", []))
-                        + len(result.get("buttons", []))
-                        + len(result.get("links", []))
-                        + len(result.get("tables", []))
-                    )
-                    if total_elements == 0 and not spa_loading:
-                        result["warning"] = (
-                            "⚠️ 页面元素为空——SPA 可能未渲染完毕。"
-                            "请重新调用 inspect_page，并指定 wait_selector 参数等待页面核心元素出现，"
-                            "例如 wait_selector='nav, table, [role=grid], [role=navigation], main'。"
-                            "如果多次重试仍为空，请检查 url 是否正确、是否需要重新登录。"
-                        )
-
-                    # 子 frame 对主文档抽取不可见，需单独统计并告知 AI
-                    try:
-                        child_frames = [
-                            fr for fr in page.frames
-                            if fr is not page.main_frame
-                            and fr.url and fr.url != "about:blank"
-                        ][:3]
-                        if child_frames:
-                            frames_info: list[dict[str, Any]] = []
-                            for fr in child_frames:
-                                try:
-                                    census = await fr.evaluate(
-                                        "() => ({"
-                                        " inputs: document.querySelectorAll('input:not([type=hidden]), textarea').length,"
-                                        " buttons: document.querySelectorAll('button, [role=button]').length,"
-                                        " tables: document.querySelectorAll('table, [role=grid], [role=table]').length,"
-                                        " title: document.title })"
-                                    )
-                                except Exception:
-                                    census = {}
-                                frames_info.append({"url": fr.url, "name": fr.name or None, **(census or {})})
-                            result["frames"] = frames_info
-                            result["frames_note"] = (
-                                "⚠️ 页面包含 iframe。主文档提取结果不含 iframe 内部元素；"
-                                "若目标元素（表单/表格）在 iframe 内，selector 使用穿透语法："
-                                "`iframe选择器 >>> 内部选择器`（如 `iframe[name=\"main\"] >>> tbody tr`，"
-                                "iframe 选择器按 frames[].name/url 构造，可多层链式）。"
-                            )
-                    except Exception:
-                        pass  # frame census is best-effort
-
-                    # 放在最后：登录重定向比 spa_loading / 空元素更能解释异常，warning 以它为准
-                    _annotate_login_redirect(result, url)
-                    return result
-                finally:
-                    await ctx.close()
+                # 放在最后：登录重定向比 spa_loading / 空元素更能解释异常，warning 以它为准
+                _annotate_login_redirect(result, url)
+                return result
         except Exception as exc:
             translated = browser_profile_lock.translate_launch_error(browser_profile, exc)
             return {"error": translated or f"页面检查失败：{exc}"}
@@ -2385,9 +2378,7 @@ class RpaToolExecutor:
         if busy is not None:
             return busy
 
-        try:
-            from playwright.async_api import async_playwright as _async_playwright
-        except ModuleNotFoundError:
+        if find_spec("playwright") is None:
             return {"error": "未安装 Playwright，请执行 uv pip install playwright"}
 
         import base64
@@ -2400,54 +2391,51 @@ class RpaToolExecutor:
             return _profile_busy_block("inspect_screenshot") or {"error": "浏览器被占用"}
 
         try:
-            async with _async_playwright() as pw:
-                ctx = await launch_persistent_chrome(
-                    pw, browser_profile, headless=True, viewport={"width": 1280, "height": 800}
-                )
+            async with persistent_browser_context(browser_profile, headless=True) as ctx:
+                page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+                # 视口只影响这一次截图，设在页面上；隐身会话不接受上下文级 viewport，
+                # 传进去会被忽略，截出来的是默认尺寸——错得很安静
+                await page.set_viewport_size({"width": 1280, "height": 800})
+                await page.goto(url, wait_until="load", timeout=30_000)
                 try:
-                    page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-                    await page.goto(url, wait_until="load", timeout=30_000)
+                    await page.wait_for_load_state("networkidle", timeout=6_000)
+                except Exception:
+                    pass
+                if wait_selector:
                     try:
-                        await page.wait_for_load_state("networkidle", timeout=6_000)
+                        await page.wait_for_selector(wait_selector, timeout=12_000)
                     except Exception:
                         pass
-                    if wait_selector:
-                        try:
-                            await page.wait_for_selector(wait_selector, timeout=12_000)
-                        except Exception:
-                            pass
-                    else:
-                        await page.wait_for_timeout(2_000)
+                else:
+                    await page.wait_for_timeout(2_000)
 
-                    raw = await page.screenshot(
-                        type="jpeg", quality=60, full_page=bool(full_page)
-                    )
-                    # Keep a copy on disk for the user / debugging.
-                    saved_path: str | None = None
-                    try:
-                        shots_dir = storage.resolve_cache_dir() / "inspect_shots"
-                        shots_dir.mkdir(parents=True, exist_ok=True)
-                        from datetime import datetime as _dt
-                        fname = f"shot_{_dt.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-                        (shots_dir / fname).write_bytes(raw)
-                        saved_path = str(shots_dir / fname)
-                        # Retain only the most recent 20 screenshots.
-                        shots = sorted(shots_dir.glob("shot_*.jpg"))
-                        for old in shots[:-20]:
-                            old.unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                raw = await page.screenshot(
+                    type="jpeg", quality=60, full_page=bool(full_page)
+                )
+                # Keep a copy on disk for the user / debugging.
+                saved_path: str | None = None
+                try:
+                    shots_dir = storage.resolve_cache_dir() / "inspect_shots"
+                    shots_dir.mkdir(parents=True, exist_ok=True)
+                    from datetime import datetime as _dt
+                    fname = f"shot_{_dt.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+                    (shots_dir / fname).write_bytes(raw)
+                    saved_path = str(shots_dir / fname)
+                    # Retain only the most recent 20 screenshots.
+                    shots = sorted(shots_dir.glob("shot_*.jpg"))
+                    for old in shots[:-20]:
+                        old.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
-                    return {
-                        "url": page.url,
-                        "title": await page.title(),
-                        "image_base64": base64.b64encode(raw).decode("ascii"),
-                        "image_media_type": "image/jpeg",
-                        "image_saved_to": saved_path,
-                        "note": "截图已作为图片提供给模型查看。",
-                    }
-                finally:
-                    await ctx.close()
+                return {
+                    "url": page.url,
+                    "title": await page.title(),
+                    "image_base64": base64.b64encode(raw).decode("ascii"),
+                    "image_media_type": "image/jpeg",
+                    "image_saved_to": saved_path,
+                    "note": "截图已作为图片提供给模型查看。",
+                }
         except Exception as exc:
             translated = browser_profile_lock.translate_launch_error(browser_profile, exc)
             return {"error": translated or f"页面截图失败：{exc}"}

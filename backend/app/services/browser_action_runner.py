@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -15,6 +18,8 @@ from app.services.pagination_probe import (
     probe_pagination_evidence_playwright,
 )
 from app.services.runtime_variables import RuntimeVariableStore, append_variable_values, normalize_variable_name
+
+logger = logging.getLogger(__name__)
 
 type FlowNode = dict[str, object]
 
@@ -60,7 +65,8 @@ _SELECTOR_ATTRIBUTE_PATTERN = re.compile(r"^(?P<selector>.+?)::attr\((?P<attribu
 
 @dataclass
 class BrowserActionContext:
-    playwright: object
+    # 走隐身会话时为 None：playwright 实例归 session 所有，不由这里 stop()
+    playwright: object | None
     browser: object
     page: object
     # browser 是否为 launch_persistent_context 创建的持久化 BrowserContext。
@@ -70,6 +76,9 @@ class BrowserActionContext:
     # 持久化 profile 的目录与登记的占用方；关闭上下文时按这两个字段销号
     profile_dir: str | None = field(default=None)
     profile_owner: str | None = field(default=None)
+    # 持久化上下文的关闭方式跟着创建方式走（见 open_persistent_context），
+    # 由创建方交出来；close_context 猜错就会把浏览器进程漏在那儿。
+    closer: object | None = field(default=None)
 
 
 @dataclass(frozen=True)
@@ -144,13 +153,84 @@ async def _goto_with_retry(page: object, url: str, *, timeout: int) -> None:
 _CHROME_CHANNEL_MISSING = re.compile(r"chromium distribution|channel|executable doesn't exist", re.IGNORECASE)
 
 
+async def open_stealth_session(profile_dir: str, *, headless: bool) -> object:
+    """开一个 Scrapling 隐身会话，`session.context` 是可直接驱动的持久化上下文。
+
+    交回来的是 patchright 打过补丁的 Chromium context，API 面与 Playwright 一致，
+    browser.* 节点不用改。补丁抹掉的是 Runtime.enable 之类的自动化痕迹，治的是
+    「站点本会放行、我们自己露了马脚」那类失败，与指纹伪造是两回事。
+
+    不开 solve_cloudflare：它只在 session.fetch() 内部跑，对这里 new_page() 出来的页面
+    不生效，写上等于配置里挂一个握不到的杠杆。拦截页仍由 detect_blocking_interstitial
+    判、由人工接管兜底。
+    """
+    from scrapling.fetchers import AsyncStealthySession
+
+    session = AsyncStealthySession(
+        headless=headless,
+        # 自带 Chromium 的 UA 标识与缺失的专有组件是反爬最容易命中的一条
+        real_chrome=True,
+        user_data_dir=profile_dir,
+        # 页面由节点自己开关，不走它的池子；留 1 只是别让池子先替我们占掉一个
+        max_pages=1,
+    )
+    await session.start()
+    return session
+
+
+async def open_persistent_context(profile_dir: str, *, headless: bool) -> tuple[object, object]:
+    """开持久化上下文，返回 (context, 关闭它的协程函数)。
+
+    关闭方式必须跟着创建方式走，所以由这里一并交出：会话自己持有 playwright 与浏览器进程，
+    只能整个 close()；裸 Playwright 那条则要先关 context 再 stop()，顺序反过来会让 stop()
+    落在已经断掉的连接上。
+
+    隐身会话开不起来时（没装 scrapling、系统没有正版 Chrome）回落到裸 Playwright，丢的只是
+    反检测那一层，节点能力一个不缺。但 profile 占用冲突不在此列：回落只是让第二个进程去开
+    同一份 profile，两边登录态互相覆盖，而报错里看不出这一层，所以原样抛出交给上层翻译。
+    """
+    try:
+        session = await open_stealth_session(profile_dir, headless=headless)
+    except Exception as exc:
+        if browser_profile_lock.translate_launch_error(profile_dir, exc) is not None:
+            raise
+        logger.warning("隐身会话启动失败，回落到普通 Playwright", exc_info=True)
+    else:
+        return session.context, session.close
+
+    from playwright.async_api import async_playwright
+
+    playwright = await async_playwright().start()
+    try:
+        context = await launch_persistent_chrome(playwright, profile_dir, headless=headless)
+    except Exception:
+        await playwright.stop()
+        raise
+
+    async def close() -> None:
+        await context.close()
+        await playwright.stop()
+
+    return context, close
+
+
+@asynccontextmanager
+async def persistent_browser_context(profile_dir: str, *, headless: bool) -> AsyncIterator[object]:
+    """给用完即走的一次性探测用：关闭函数由创建方交出，忘记调用就是漏一个浏览器进程。"""
+    context, close = await open_persistent_context(profile_dir, headless=headless)
+    try:
+        yield context
+    finally:
+        await close()
+
+
 async def launch_persistent_chrome(playwright: object, profile_dir: str, *, headless: bool, **options: object) -> object:
     """优先用系统安装的正版 Chrome，装不到才回落到 Playwright 自带的 Chromium。
 
     差别不只是版本：自带 Chromium 的 UA 里带 Chromium 标识、缺 Chrome 专有组件，是反爬
     判定最容易命中的一条。同一份 profile 换 channel 可以直接复用，cookies/登录态不受影响。
 
-    也不再传 --disable-cache：它和持久化 profile 自相矛盾（留了 cookie 却每次冷启动），
+    不传 --disable-cache：它与持久化 profile 自相矛盾（留着 cookie 却每次冷启动），
     既拖慢每一次运行，又让请求特征偏离真实浏览。要新鲜内容的节点自己 reload 即可。
     """
     try:
@@ -174,26 +254,25 @@ class BrowserActionRunner:
         if self._session_dir is not None:
             profile_path = Path(self._session_dir)
             profile_path.mkdir(parents=True, exist_ok=True)
-            # 登记放在 playwright 启动之前：占用冲突要在拉起进程前就判掉，
-            # 否则多出一个僵尸 playwright 进程要善后
+            # 登记放在拉起浏览器之前：占用冲突要在起进程前就判掉，
+            # 否则多出一个僵尸进程要善后
             owner_label = owner or "另一个运行"
             browser_profile_lock.acquire(str(profile_path), owner_label)
-            playwright = await async_playwright().start()
             try:
-                # launch_persistent_context 保留跨运行的 cookies/localStorage
-                browser_context = await launch_persistent_chrome(playwright, str(profile_path), headless=headless)
+                # 持久化上下文保留跨运行的 cookies/localStorage
+                browser_context, closer = await open_persistent_context(str(profile_path), headless=headless)
                 page = await browser_context.new_page()
             except Exception as exc:
                 browser_profile_lock.release(str(profile_path), owner_label)
-                await playwright.stop()
                 translated = browser_profile_lock.translate_launch_error(str(profile_path), exc)
                 if translated is None:
                     raise
                 raise RuntimeError(translated) from exc
             return BrowserActionContext(
-                playwright=playwright,
+                playwright=None,
                 browser=browser_context,
                 page=page,
+                closer=closer,
                 persistent=True,
                 headless=headless,
                 profile_dir=str(profile_path),
@@ -209,13 +288,17 @@ class BrowserActionRunner:
     async def close_context(self, context: BrowserActionContext | None) -> None:
         if context is None:
             return
+        closer = context.closer
         close = getattr(context.browser, "close", None)
         stop = getattr(context.playwright, "stop", None)
         try:
-            if callable(close):
-                await close()
-            if callable(stop):
-                await stop()
+            if callable(closer):
+                await closer()
+            else:
+                if callable(close):
+                    await close()
+                if callable(stop):
+                    await stop()
         finally:
             # 关闭失败也要销号：否则一次异常退出会让 profile 在本进程里永久"被占用"
             if context.profile_dir is not None and context.profile_owner is not None:
