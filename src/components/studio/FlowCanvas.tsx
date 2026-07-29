@@ -28,7 +28,6 @@ import { ContextMenu } from './ContextMenu';
 import { nodeTypes } from './FlowNodes';
 
 export function FlowCanvas({
-  aiPanelOpen,
   bottomPanelOpen,
   canvasFitVersion,
   focusMode,
@@ -47,13 +46,11 @@ export function FlowCanvas({
   onNodesChange,
   onRestoreStartEnd,
   progress,
-  onToggleAiPanel,
   onToggleBottomPanel,
   onToggleFocusMode,
   selectedNodeId,
   onSelectedNodeChange
 }: {
-  aiPanelOpen: boolean;
   bottomPanelOpen: boolean;
   canvasFitVersion: number;
   focusMode: boolean;
@@ -72,7 +69,6 @@ export function FlowCanvas({
   onNodesChange: OnNodesChange<Node<RpaNodeData>>;
   onRestoreStartEnd: () => void;
   progress: RuntimeProgress;
-  onToggleAiPanel: () => void;
   onToggleBottomPanel: () => void;
   onToggleFocusMode: () => void;
   selectedNodeId: string;
@@ -81,7 +77,6 @@ export function FlowCanvas({
   return (
     <ReactFlowProvider>
       <FlowCanvasInner
-        aiPanelOpen={aiPanelOpen}
         bottomPanelOpen={bottomPanelOpen}
         canvasFitVersion={canvasFitVersion}
         focusMode={focusMode}
@@ -101,7 +96,6 @@ export function FlowCanvas({
         onRestoreStartEnd={onRestoreStartEnd}
         progress={progress}
         onSelectedNodeChange={onSelectedNodeChange}
-        onToggleAiPanel={onToggleAiPanel}
         onToggleBottomPanel={onToggleBottomPanel}
         onToggleFocusMode={onToggleFocusMode}
         selectedNodeId={selectedNodeId}
@@ -111,7 +105,6 @@ export function FlowCanvas({
 }
 
 function FlowCanvasInner({
-  aiPanelOpen,
   bottomPanelOpen,
   canvasFitVersion,
   focusMode,
@@ -130,13 +123,11 @@ function FlowCanvasInner({
   onNodesChange,
   onRestoreStartEnd,
   progress,
-  onToggleAiPanel,
   onToggleBottomPanel,
   onToggleFocusMode,
   selectedNodeId,
   onSelectedNodeChange
 }: {
-  aiPanelOpen: boolean;
   bottomPanelOpen: boolean;
   canvasFitVersion: number;
   focusMode: boolean;
@@ -155,7 +146,6 @@ function FlowCanvasInner({
   onNodesChange: OnNodesChange<Node<RpaNodeData>>;
   onRestoreStartEnd: () => void;
   progress: RuntimeProgress;
-  onToggleAiPanel: () => void;
   onToggleBottomPanel: () => void;
   onToggleFocusMode: () => void;
   selectedNodeId: string;
@@ -477,7 +467,6 @@ function FlowCanvasInner({
   return (
     <main className="flex min-w-0 flex-1 flex-col bg-canvas">
       <CanvasToolbar
-        aiPanelOpen={aiPanelOpen}
         bottomPanelOpen={bottomPanelOpen}
         focusMode={focusMode}
         gridVisible={gridVisible}
@@ -488,7 +477,6 @@ function FlowCanvasInner({
         onModeChange={setMode}
         onResetZoom={handleResetZoom}
         onRestoreStartEnd={onRestoreStartEnd}
-        onToggleAiPanel={onToggleAiPanel}
         onToggleBottomPanel={onToggleBottomPanel}
         onToggleFocusMode={onToggleFocusMode}
         onToggleGrid={() => setGridVisible((visible) => !visible)}

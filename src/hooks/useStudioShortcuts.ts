@@ -17,6 +17,7 @@ export function useStudioShortcuts({
   onSave,
   onRedo,
   onSelectNode,
+  onToggleAiPanel,
   onUndo,
   selectedEdgeId,
   selectedNodeId
@@ -25,6 +26,7 @@ export function useStudioShortcuts({
   onDeleteEdge: (edgeId: string) => void;
   onFocusProperties?: () => void;
   onSave: () => void;
+  onToggleAiPanel: () => void;
   onRedo: () => void;
   onSelectNode: (nodeId: string) => void;
   onUndo: () => void;
@@ -39,6 +41,13 @@ export function useStudioShortcuts({
           event.target.blur();
         }
         onSelectNode('start');
+        return;
+      }
+
+      // 助手开关放在可编辑元素判断之前：正在助手输入框里打字时也要能一键收起面板
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'j') {
+        event.preventDefault();
+        onToggleAiPanel();
         return;
       }
 
@@ -100,5 +109,5 @@ export function useStudioShortcuts({
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onContextAction, onDeleteEdge, onRedo, onSave, onSelectNode, onUndo, selectedEdgeId, selectedNodeId]);
+  }, [onContextAction, onDeleteEdge, onRedo, onSave, onSelectNode, onToggleAiPanel, onUndo, selectedEdgeId, selectedNodeId]);
 }

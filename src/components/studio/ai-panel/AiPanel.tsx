@@ -8,6 +8,7 @@ import { ChatInput } from './ChatInput';
 import { ChatMessages } from './ChatMessages';
 import { ClearChatButton } from './ClearChatButton';
 import { useAiChat } from './useAiChat';
+import { useAiPanelStore } from '../../../stores/useAiPanelStore';
 import type { NodeLookupItem } from './aiPanelTypes';
 
 type PanelMode = 'sidebar' | 'float';
@@ -164,6 +165,12 @@ export function AiPanel({
     setMode(next);
     onModeChange?.(next);
   };
+
+  // 关掉面板不会中断这一轮对话，把生成状态抬到 store，画布上的悬浮球才有得可显示
+  const setBusy = useAiPanelStore((s) => s.setBusy);
+  useEffect(() => {
+    setBusy(pending);
+  }, [pending, setBusy]);
 
   // 触发式消息（如"AI 分析错误"）若在 pending 时到达，先停止当前生成再排队
   const queuedMsgRef = useRef<string | null>(null);

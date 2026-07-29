@@ -421,6 +421,36 @@ select {
   }
 }
 
+/* 助手悬浮球「正在处理」：同一套 live 蓝，但环从按钮自身边缘往外扩。
+   直接复用 .live-dot 不行——它的 0.55 起始缩放是给 6px 圆点调的，套在 44px 按钮上
+   会先在按钮内部画一圈蓝线；而且它带 position:relative，会顶掉按钮的 absolute 定位。 */
+.fab-live-ring::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 9999px;
+  border: 1.5px solid var(--color-live);
+  opacity: 0;
+  animation: fab-live-ping 2s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+  pointer-events: none;
+}
+
+@keyframes fab-live-ping {
+  0% {
+    transform: scale(1);
+    opacity: 0.65;
+  }
+
+  70% {
+    transform: scale(1.45);
+    opacity: 0;
+  }
+
+  100% {
+    opacity: 0;
+  }
+}
+
 @keyframes thinking-dot {
 
   0%,

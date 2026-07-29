@@ -125,6 +125,7 @@ export default function App(): ReactElement {
     onSave: () => void electron.saveFlow(),
     onRedo: canvas.redoAction,
     onSelectNode: canvas.setSelectedNodeId,
+    onToggleAiPanel: () => ai.setAiPanelOpen(!ai.aiPanelOpen),
     onUndo: canvas.undoAction,
     selectedEdgeId: canvas.selectedEdgeId,
     selectedNodeId: canvas.selectedNodeId,

@@ -10,6 +10,7 @@ import { useStudioLayoutStore } from '../../stores/useStudioLayoutStore';
 import { AiPanel } from './ai-panel/AiPanel';
 import { BottomPanel } from './bottom-panel/BottomPanel';
 import { ComponentLibrary } from './ComponentLibrary';
+import { AiAssistantFab } from './AiAssistantFab';
 import { FlowCanvas } from './FlowCanvas';
 import { PropertyPanel } from './property-panel/PropertyPanel';
 
@@ -81,7 +82,6 @@ export function StudioWorkspace({
       <ComponentLibrary onQuickAdd={canvas.addNodeAfterSelection} />
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <FlowCanvas
-          aiPanelOpen={ai.aiPanelOpen}
           onAddNode={canvas.addNodeAtPosition}
           onBeginNodeDrag={canvas.beginNodeDrag}
           onEndNodeDrag={canvas.endNodeDrag}
@@ -98,7 +98,6 @@ export function StudioWorkspace({
           onEdgesChange={canvas.onEdgesChange}
           onNodesChange={canvas.onNodesChange}
           onSelectedNodeChange={canvas.setSelectedNodeId}
-          onToggleAiPanel={() => ai.setAiPanelOpen(!ai.aiPanelOpen)}
           onToggleBottomPanel={() => setBottomPanelOpen(!bottomPanelOpen)}
           progress={electron.progress}
           selectedNodeId={canvas.selectedNodeId}
@@ -139,6 +138,13 @@ export function StudioWorkspace({
         inputVariables={inputVariables}
         onUpdateNodeData={canvas.updateNodeData}
         selectedNode={canvas.selectedNode}
+      />
+      {/* 悬浮球脱开画布单独挂在工作区上：它是助手的常驻入口，不该跟着画布的滚动、
+          缩放或面板收合走，也不该被画布容器裁掉 */}
+      <AiAssistantFab
+        busy={ai.aiBusy}
+        hidden={ai.aiPanelOpen}
+        onClick={() => ai.setAiPanelOpen(!ai.aiPanelOpen)}
       />
       {/* AiPanel: 始终挂载以保留对话历史，通过 open prop 控制动画显隐 */}
       <AiPanel
