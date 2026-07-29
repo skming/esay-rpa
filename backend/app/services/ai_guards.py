@@ -587,6 +587,21 @@ def _check_node_selector_fix_budget(tool_name: str, args: dict[str, Any], state:
     )
 
 
+def _check_repair_autorun_lock(tool_name: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
+    # 同一条规则提示词里也写着，但模型该跑还是跑——这里不是重复保险，是唯一拦得住的那道。
+    # 两边判错的代价差得很远：拦错了，用户补一句「跑一下」；放行错了，就是在用户没点运行的
+    # 情况下拉起浏览器去操作真实站点。所以宁可偏向拦。
+    return _blocked(
+        tool_name,
+        required_action="ask_user",
+        message=(
+            "本轮用户只要求修复，没有要求运行。改完请说明改了什么、为什么，"
+            "然后问用户要不要重新运行——运行会真的打开浏览器操作目标站点，这个决定归用户。"
+            "用户下一句表示要跑时，本限制自动解除。"
+        ),
+    )
+
+
 def _check_pending_repair_gate(tool_name: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
     gate = state["pending_repair_gate"]
     missing = []
@@ -749,6 +764,14 @@ GUARDS: tuple[Guard, ...] = (
             f"同一节点的 selector 累计改过 {NODE_SELECTOR_FIX_BUDGET} 次（含历史会话）后，"
             "必须先 inspect_page/inspect_screenshot 取得新证据才能再改。"
         ),
+    ),
+    Guard(
+        id="repair_autorun_lock",
+        summary="用户只要求修复时，改完不许顺手 run_flow",
+        scope=ToolScope(include=frozenset({"run_flow"})),
+        requires_state=("repair_autorun_lock",),
+        check=_check_repair_autorun_lock,
+        contract="用户只说「修一下 / 报错了」时，改完交回用户，不要顺手 run_flow；要不要重跑由用户决定。",
     ),
     Guard(
         id="pending_repair_gate",

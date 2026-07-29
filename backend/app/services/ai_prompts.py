@@ -493,7 +493,7 @@ _SEC['error_diagnosis'] = """## 错误诊断
 3. 重新 `run_flow`
 > 严禁先调 `get_run_error`（无 task_id 会报错）
 
-### 运行时错误（run_flow 返回 status=error）
+### 运行时错误（**本轮** `run_flow` 返回 status=error，手上有 task_id）
 1. `get_run_error(task_id)` → 获取失败节点 ID、错误日志、`failed_node_config`
 2. 按错误类型修复：
 
@@ -505,7 +505,9 @@ _SEC['error_diagnosis'] = """## 错误诊断
    | 变量未定义 | 上游节点字段名写错 | `validate_flow` 确认后 `apply_node_fix` 补填 |
    | `File name too long` | `print` 了大段文本被当成文件路径 | 脚本改为写文件后只 `print` 相对路径 |
 
-3. 修复后重新 `run_flow`
+3. 修复后重新 `run_flow`——**仅限本轮自己跑出来的错**：那次运行是用户点的，跑完才算交付。
+   用户只是转述历史失败（「之前运行失败了」、拿不到 task_id）时不适用，那属于上面的
+   「错误分析/审查场景」第 3 条：改完交回用户，由他决定要不要再跑。
 
 selector 失效时，**先看 `selector_diagnostic.kind`，不同类型处理方式完全不同**：
 

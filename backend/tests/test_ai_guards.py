@@ -211,6 +211,21 @@ def test_repair_intent_requires_diagnosis_before_touching_nodes() -> None:
     assert apply_pre_tool_guards("update_flow", {}, state) is None
 
 
+def test_repair_intent_does_not_get_to_run_the_flow_on_its_own() -> None:
+    """提示词里也写着同一条，但模型该跑还是跑——这道闸是唯一拦得住的。"""
+    state = {"repair_autorun_lock": True}
+    blocked = _blocked_by("run_flow", {}, state)
+    assert blocked["guard_id"] == "repair_autorun_lock"
+    assert blocked["required_action"] == "ask_user"
+
+    # 只挡运行：诊断和修复本身是用户要的，挡掉就什么也交付不了
+    assert apply_pre_tool_guards("lint_flow", {}, state) is None
+    assert apply_pre_tool_guards("apply_node_fix", {}, state) is None
+
+    # 锁只在本轮挂着，用户下一句说「跑一下」时不该还被拦
+    assert apply_pre_tool_guards("run_flow", {}, {"repair_autorun_lock": None}) is None
+
+
 def test_requirement_text_and_confirmation_bit_are_taken_over_by_the_system() -> None:
     """被审计方自己填需求、自己勾确认位，对齐检查就永远命中不了真实需求。"""
     state = {"user_requirement_text": "抓 2024 年的订单"}
