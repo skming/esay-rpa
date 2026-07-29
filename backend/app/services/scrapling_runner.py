@@ -16,6 +16,9 @@ LogCallback = Callable[[str, str, str | None], Awaitable[None]]
 
 # 结尾的 ::text / ::attr(x) 是伪元素，css() 返回字符串而非元素。
 _PSEUDO_SUFFIX_RE = re.compile(r"::(?:text|attr\(\s*[^)\s]+\s*\))\s*$")
+# 两种伪元素取的是完全不同的东西，剥掉后缀之后必须靠它区分：
+# 都当成 ::text，`a::attr(href)` 会安静地把链接列表变成链接文字列表。
+_ATTR_SUFFIX_RE = re.compile(r"::attr\(\s*([^)\s]+)\s*\)\s*$")
 
 
 class RunnerProtocol(Protocol):
@@ -132,6 +135,12 @@ class ScraplingRunner:
             return [str(getattr(el, "html_content", el)) for el in self._select(page, selector, request)]
 
         elements = self._select(page, selector, request)
+        attr_suffix = _ATTR_SUFFIX_RE.search(selector)
+        if attr_suffix:
+            # `a::attr(href)` 单写、不配 extractMode=attribute 是仓库里认可的写法
+            # （lint 反过来禁止两者同时用），所以默认档也必须认这个后缀。
+            values = (el.attrib.get(attr_suffix.group(1)) for el in elements)
+            return [str(v) for v in values if v is not None]
         if _PSEUDO_SUFFIX_RE.search(selector):
             # 页面级 "sel::text" 取的是直接文本子节点、不含后代，./text() 与之逐字等价；
             # 元素级 el.css("::text") 会把后代文本也捞进来，换掉会改变既有流程的输出。

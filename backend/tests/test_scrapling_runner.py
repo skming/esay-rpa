@@ -138,6 +138,18 @@ def test_attribute_mode_relocates_and_still_returns_the_attribute(tmp_path: Path
     assert runner._extract_values(_page(after, str(tmp_path)), request) == ["/one"]
 
 
+def test_attr_pseudo_element_returns_the_attribute_in_the_default_mode(tmp_path: Path) -> None:
+    """`a::attr(href)` 单写、不配 extractMode=attribute 是仓库里认可的写法（lint 反过来
+    禁止两者同用）。默认档要是把它当 ::text 处理，链接列表会安静地变成链接文字列表。"""
+    runner = ScraplingRunner(storage_dir=str(tmp_path))
+    request = _request("a.link::attr(href)")
+    before = '<html><body><a class="link" href="/one">TXT</a></body></html>'
+    after = '<html><body><nav><a class="l2" href="/one">TXT</a></nav></body></html>'
+
+    assert runner._extract_values(_page(before, str(tmp_path)), request) == ["/one"]
+    assert runner._extract_values(_page(after, str(tmp_path)), request) == ["/one"]
+
+
 def test_configure_storage_warns_instead_of_failing_silently(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

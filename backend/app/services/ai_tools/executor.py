@@ -2412,7 +2412,7 @@ class RpaToolExecutor:
                 raw = await page.screenshot(
                     type="jpeg", quality=60, full_page=bool(full_page)
                 )
-                # Keep a copy on disk for the user / debugging.
+
                 saved_path: str | None = None
                 try:
                     shots_dir = storage.resolve_cache_dir() / "inspect_shots"
@@ -2421,7 +2421,7 @@ class RpaToolExecutor:
                     fname = f"shot_{_dt.now().strftime('%Y%m%d_%H%M%S')}.jpg"
                     (shots_dir / fname).write_bytes(raw)
                     saved_path = str(shots_dir / fname)
-                    # Retain only the most recent 20 screenshots.
+
                     shots = sorted(shots_dir.glob("shot_*.jpg"))
                     for old in shots[:-20]:
                         old.unlink(missing_ok=True)

@@ -174,7 +174,14 @@ async def open_stealth_session(profile_dir: str, *, headless: bool) -> object:
         # 页面由节点自己开关，不走它的池子；留 1 只是别让池子先替我们占掉一个
         max_pages=1,
     )
-    await session.start()
+    try:
+        await session.start()
+    except Exception:
+        # start() 后半段（页面池、CDP 握手）失败时浏览器进程已经起来了，
+        # 把 session 连同异常一起丢掉就等于把进程留在那儿占着 profile，
+        # 而调用方随后的回落会拿裸 Playwright 再开第二个。
+        await session.close()
+        raise
     return session
 
 
@@ -258,10 +265,16 @@ class BrowserActionRunner:
             # 否则多出一个僵尸进程要善后
             owner_label = owner or "另一个运行"
             browser_profile_lock.acquire(str(profile_path), owner_label)
+            closer: object | None = None
             try:
                 browser_context, closer = await open_persistent_context(str(profile_path), headless=headless)
                 page = await browser_context.new_page()
             except Exception as exc:
+                # new_page() 失败时浏览器已经开着。销号却不关它，profile 就成了「记账上空闲、
+                # 实际被占」——下一次运行照常 acquire，撞上 ProcessSingleton，
+                # 报的还是那句看不懂的 browser has been closed。
+                if closer is not None:
+                    await closer()
                 browser_profile_lock.release(str(profile_path), owner_label)
                 translated = browser_profile_lock.translate_launch_error(str(profile_path), exc)
                 if translated is None:

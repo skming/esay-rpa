@@ -731,6 +731,64 @@ async def test_persistent_context_falls_back_when_stealth_is_unavailable(tmp_pat
     assert events == ["context", "playwright"]
 
 
+async def test_stealth_session_is_closed_when_it_fails_half_way_up(tmp_path, monkeypatch) -> None:
+    """start() 后半段失败时浏览器进程已经起来了；把 session 随异常丢掉，
+    调用方的回落就会拿裸 Playwright 再开第二个进程去抢同一份 profile。"""
+    closed: list[str] = []
+
+    class HalfStartedSession:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        async def start(self) -> None:
+            raise RuntimeError("page pool init failed")
+
+        async def close(self) -> None:
+            closed.append("session")
+
+    monkeypatch.setattr("scrapling.fetchers.AsyncStealthySession", HalfStartedSession)
+
+    with pytest.raises(RuntimeError, match="page pool"):
+        await browser_action_runner.open_stealth_session(str(tmp_path), headless=True)
+
+    assert closed == ["session"]
+
+
+async def test_create_context_closes_the_browser_when_the_first_page_fails(tmp_path, monkeypatch) -> None:
+    """销号却不关浏览器，profile 就成了「记账上空闲、实际被占」——
+    下一次运行照常 acquire，撞上 ProcessSingleton。"""
+    closed: list[str] = []
+
+    class FakeContext:
+        async def new_page(self) -> object:
+            raise RuntimeError("renderer crashed")
+
+    async def _open(profile_dir: str, *, headless: bool) -> tuple[object, object]:
+        async def close() -> None:
+            closed.append("browser")
+        return FakeContext(), close
+
+    monkeypatch.setattr(browser_action_runner, "open_persistent_context", _open)
+
+    with pytest.raises(RuntimeError, match="renderer crashed"):
+        await BrowserActionRunner(session_dir=str(tmp_path)).create_context(headless=True, owner="运行 t_1")
+
+    assert closed == ["browser"]
+    # 销号也必须发生，否则一次异常退出会让 profile 在本进程里永久「被占用」
+    assert await _acquires_cleanly(tmp_path)
+
+
+async def _acquires_cleanly(tmp_path) -> bool:
+    from app.services import browser_profile_lock
+
+    try:
+        browser_profile_lock.acquire(str(tmp_path), "运行 t_2")
+    except browser_profile_lock.BrowserProfileBusyError:
+        return False
+    browser_profile_lock.release(str(tmp_path), "运行 t_2")
+    return True
+
+
 async def test_persistent_context_does_not_fall_back_when_the_profile_is_busy(tmp_path, monkeypatch) -> None:
     """回落只是让第二个进程去开同一份 profile，两边登录态互相覆盖；
     而 Chrome 让位报的是「browser has been closed」，从报错里看不出这一层。"""
