@@ -8,7 +8,7 @@ from sqlalchemy import BigInteger, Integer, String, Text, delete, inspect, selec
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.models.schemas import ArtifactSnapshot, RunConfigSnapshot, RunTaskRequest, RuntimeProgress, RuntimeVariableSnapshot, ScrapeResult, TaskLogEntry, TaskSnapshot
+from app.models.schemas import ArtifactSnapshot, FlowAcceptanceContract, NodeExecutionEvidence, RunConfigSnapshot, RunTaskRequest, RuntimeProgress, RuntimeVariableSnapshot, ScrapeResult, TaskLogEntry, TaskSnapshot
 from app.services.schedule_store import Base, UTCDateTime, _json_type
 
 
@@ -93,6 +93,7 @@ class TaskRow(Base):
     result_payload: Mapped[dict | None] = mapped_column(_json_type(), nullable=True)
     artifacts_payload: Mapped[list] = mapped_column(_json_type(), nullable=False)
     variables_payload: Mapped[list] = mapped_column(_json_type(), nullable=False, default=list)
+    execution_evidence_payload: Mapped[list] = mapped_column(_json_type(), nullable=False, default=list)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     input_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
     human_takeover_message: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -244,6 +245,9 @@ class SqlAlchemyTaskStore:
         row.result_payload = task.result.model_dump(mode="json", by_alias=True) if task.result is not None else None
         row.artifacts_payload = [artifact.model_dump(mode="json", by_alias=True) for artifact in task.artifacts]
         row.variables_payload = [variable.model_dump(mode="json", by_alias=True) for variable in task.variables]
+        row.execution_evidence_payload = [
+            evidence.model_dump(mode="json", by_alias=True) for evidence in task.execution_evidence
+        ]
         row.error_message = task.error
         row.input_prompt = task.input_prompt
         row.human_takeover_message = task.human_takeover_message
@@ -270,6 +274,15 @@ class SqlAlchemyTaskStore:
             result=ScrapeResult.model_validate(row.result_payload) if row.result_payload is not None else None,
             artifacts=[ArtifactSnapshot.model_validate(artifact) for artifact in row.artifacts_payload],
             variables=[RuntimeVariableSnapshot.model_validate(variable) for variable in row.variables_payload],
+            flow_revision=_payload_value(row.request_payload, "flowRevision", "flow_revision"),
+            definition_digest=_payload_value(row.request_payload, "definitionDigest", "definition_digest"),
+            acceptance_contract=FlowAcceptanceContract.model_validate(
+                _payload_value(row.request_payload, "acceptanceContract", "acceptance_contract") or {}
+            ),
+            execution_evidence=[
+                NodeExecutionEvidence.model_validate(evidence)
+                for evidence in (getattr(row, "execution_evidence_payload", None) or [])
+            ],
             run_config=_run_config_from_payload(row.request_payload),
             error=row.error_message,
             input_prompt=getattr(row, "input_prompt", None),
@@ -322,6 +335,8 @@ def _ensure_task_columns(connection) -> None:
     task_columns = {column["name"] for column in inspect(connection).get_columns(TaskRow.__tablename__)}
     if "variables_payload" not in task_columns:
         connection.execute(text("ALTER TABLE rpa_tasks ADD COLUMN variables_payload JSON DEFAULT '[]' NOT NULL"))
+    if "execution_evidence_payload" not in task_columns:
+        connection.execute(text("ALTER TABLE rpa_tasks ADD COLUMN execution_evidence_payload JSON DEFAULT '[]' NOT NULL"))
     if "schedule_id" not in task_columns:
         connection.execute(text("ALTER TABLE rpa_tasks ADD COLUMN schedule_id VARCHAR(36)"))
     if "input_prompt" not in task_columns:
@@ -336,6 +351,12 @@ def _normalize_limit(limit: int) -> int:
     if limit < 1:
         return 1
     return min(limit, 200)
+
+
+def _payload_value(payload: dict | None, camel: str, snake: str):
+    if not isinstance(payload, dict):
+        return None
+    return payload.get(camel, payload.get(snake))
 
 
 def _run_config_from_payload(payload: dict | None) -> RunConfigSnapshot:

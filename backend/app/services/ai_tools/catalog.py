@@ -378,7 +378,7 @@ NODE_TYPE_CATALOG: list[dict[str, str]] = [
     # 脚本 (kind: script)
     {
         "type": "script.python",
-        "key_fields": "code（内联代码，默认）或 path+code（本地文件模式，首次运行自动生成）",
+        "key_fields": "code（内联代码，默认）或 path+code（本地文件模式，首次运行自动生成）, inputVariables（必填）",
         "output_var_field": "outputVariable（脚本 stdout 存入该变量，可选）",
         "description": (
             "执行 Python 脚本。默认用 code 字段写内联代码；"
@@ -388,6 +388,7 @@ NODE_TYPE_CATALOG: list[dict[str, str]] = [
             "【关键】脚本是独立子进程，流程变量必须从环境变量读取："
             "import json,os; _v=json.loads(os.environ.get('RPA_VARIABLES_JSON','{}')); val=_v.get('变量名','')"
             "——直接写变量名（如 data=my_var）会报 NameError。"
+            "节点必须用 inputVariables 精确列出读取的业务变量；未声明的流程变量不会注入子进程。"
             "【输出文件】产物写到 _v['output_dir'] 下、文件名带 _v['run_timestamp']（如 "
             "os.path.join(_v['output_dir'], 'data_%s.json' % _v['run_timestamp'])），先 os.makedirs(_v['output_dir'], exist_ok=True)。"
             + describe_script_capabilities()
@@ -395,7 +396,7 @@ NODE_TYPE_CATALOG: list[dict[str, str]] = [
     },
     {
         "type": "script.javascript",
-        "key_fields": "code（内联代码，默认）或 path+code（本地文件模式，首次运行自动生成）",
+        "key_fields": "code（内联代码，默认）或 path+code（本地文件模式，首次运行自动生成）, inputVariables（必填）",
         "output_var_field": "outputVariable（脚本 stdout 存入该变量，可选）",
         "description": (
             "执行 JavaScript 脚本。默认用 code 字段写内联代码；"
@@ -404,7 +405,7 @@ NODE_TYPE_CATALOG: list[dict[str, str]] = [
     },
     {
         "type": "script.shell",
-        "key_fields": "command",
+        "key_fields": "command, inputVariables（必填；不读取业务变量时为空数组）",
         "output_var_field": "outputVariable（命令 stdout 存入该变量，可选）",
         "description": "执行 shell 命令，command 可含 ${var.xxx}",
     },
@@ -506,5 +507,4 @@ NODE_TYPE_CATALOG: list[dict[str, str]] = [
         "description": "按条件过滤 Excel 行",
     },
 ]
-
 

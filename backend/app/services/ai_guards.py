@@ -37,11 +37,11 @@ MAX_REPAIR_CYCLES = 3
 
 # 自愈诊断等只读场景禁用的写入类工具
 WRITE_TOOLS = frozenset({
-    "create_flow", "update_flow", "apply_node_fix", "run_flow", "publish_flow",
+    "create_flow", "update_flow", "apply_node_fix", "set_acceptance_contract", "run_flow", "publish_flow",
     "stop_run", "create_schedule", "toggle_schedule",
 })
 
-FLOW_WRITE_TOOLS = frozenset({"create_flow", "update_flow", "apply_node_fix"})
+FLOW_WRITE_TOOLS = frozenset({"create_flow", "update_flow", "apply_node_fix", "set_acceptance_contract"})
 
 # 可并发起跑的工具：纯读、无副作用、不参与 guard 计数。
 # 不含 inspect_page / inspect_screenshot / get_run_error——它们会改熔断计数与
@@ -65,6 +65,10 @@ _DIAGNOSTIC_TOOLS = frozenset({
     "get_run_error", "get_run_logs", "get_flow", "lint_flow",
     "validate_flow", "inspect_page", "inspect_screenshot", "get_run_output",
 })
+
+_CREDENTIAL_NAME_TOKENS = (
+    "password", "passwd", "pwd", "token", "secret", "api_key", "apikey", "credential",
+)
 
 
 # ── 策略表结构 ────────────────────────────────────────────────────────────────
@@ -171,6 +175,103 @@ def node_field_changes(tool_name: str, args: dict[str, Any]) -> list[tuple[str, 
 
 def _blocked(tool_name: str, **payload: Any) -> dict[str, Any]:
     return {"status": "blocked_by_orchestrator_guard", "blocked_tool": tool_name, **payload}
+
+
+def _check_credential_values_in_flow(
+    tool_name: str,
+    args: dict[str, Any],
+    state: dict[str, Any],
+) -> dict[str, Any] | None:
+    del state
+    exposed: list[str] = []
+    for item in args.get("input_variables") or []:
+        if not isinstance(item, dict) or not str(item.get("value") or "").strip():
+            continue
+        name = str(item.get("name") or "")
+        lowered = name.lower()
+        if (
+            item.get("category") == "credential"
+            or item.get("sensitive") is True
+            or any(token in lowered for token in _CREDENTIAL_NAME_TOKENS)
+        ):
+            exposed.append(name or "<unnamed>")
+    if not exposed:
+        return None
+    return _blocked(
+        tool_name,
+        guard_id="credential_values_must_stay_out_of_ai_tools",
+        required_action="use_empty_credential_variables",
+        exposed_variables=exposed,
+        message=(
+            f"凭据变量 {exposed} 含非空值，已阻止写入。"
+            "请把 value 清空，仅保留 category='credential'/sensitive 标记，"
+            "并让用户在右侧输入变量面板配置秘密值。"
+        ),
+    )
+
+
+def _check_acceptance_contract_change(
+    tool_name: str,
+    args: dict[str, Any],
+    state: dict[str, Any],
+) -> dict[str, Any] | None:
+    quote = str(args.get("requirement_change_quote") or "").strip()
+    latest = str(state.get("latest_user_message") or "")
+    if quote and quote in latest:
+        return None
+    return _blocked(
+        tool_name,
+        required_action="preserve_acceptance_contract",
+        message=(
+            "验收契约只能在用户本轮明确改变交付目标时修改。"
+            "requirement_change_quote 必须是用户最新消息中的连续原文，不能用模型自己的需求复述。"
+        ),
+    )
+
+
+def _check_acceptance_contract_sources(
+    tool_name: str,
+    args: dict[str, Any],
+    state: dict[str, Any],
+) -> dict[str, Any] | None:
+    contract = args.get("acceptance_contract")
+    if contract is None:
+        return None
+    requirements = contract.get("requirements") if isinstance(contract, dict) else None
+    user_text = " ".join(str(
+        state.get("user_requirement_text") or state.get("latest_user_message") or ""
+    ).split())
+    violations: list[str] = []
+    if not isinstance(requirements, list) or not requirements:
+        violations.append("缺少 requirements")
+    else:
+        for requirement in requirements:
+            if not isinstance(requirement, dict):
+                violations.append("requirements 包含无效条目")
+                continue
+            requirement_id = str(requirement.get("id") or "?")
+            try:
+                confidence = float(requirement.get("confidence", 1))
+            except (TypeError, ValueError):
+                confidence = 0
+            if requirement.get("confirmed", True) is not True or confidence < 0.75:
+                violations.append(f"{requirement_id} 尚未可靠确认")
+            source_kind = requirement.get("sourceKind", requirement.get("source_kind", "user"))
+            if source_kind == "product_default" and requirement_id != "default-output-format":
+                violations.append(f"{requirement_id} 不是允许的产品默认条款")
+            if source_kind == "user":
+                quote = " ".join(str(requirement.get("sourceQuote", requirement.get("source_quote", ""))).split())
+                if not quote or quote not in user_text:
+                    violations.append(f"{requirement_id} 的 sourceQuote 不在用户需求原文中")
+    if not violations:
+        return None
+    return _blocked(
+        tool_name,
+        guard_id="acceptance_contract_sources_must_match_user",
+        required_action="clarify_or_trace_requirements",
+        violations=violations,
+        message="验收契约必须逐条绑定用户原文；低置信度或未确认推断必须先向用户澄清。",
+    )
 
 
 # ── 各条 guard 的判定 ─────────────────────────────────────────────────────────
@@ -632,6 +733,27 @@ def _check_pending_repair_gate(tool_name: str, args: dict[str, Any], state: dict
 #    在已经熔断的局面下报出来只会把模型引向一个同样被挡住的动作。
 
 GUARDS: tuple[Guard, ...] = (
+    Guard(
+        id="credential_values_must_stay_out_of_ai_tools",
+        summary="账号、密码和 Token 等秘密值不得进入 AI 工具参数",
+        scope=ToolScope(include=frozenset({"create_flow"})),
+        check=_check_credential_values_in_flow,
+        contract="凭据变量只能声明名称和敏感属性，value 必须为空；秘密值由用户在输入变量面板配置。",
+    ),
+    Guard(
+        id="acceptance_contract_sources_must_match_user",
+        summary="验收契约的用户需求条款必须绑定真实用户原文",
+        scope=ToolScope(include=frozenset({"create_flow", "set_acceptance_contract"})),
+        check=_check_acceptance_contract_sources,
+        contract="验收条款必须引用用户原文；未经确认或低置信度推断不得写入契约。",
+    ),
+    Guard(
+        id="acceptance_contract_change_requires_user_quote",
+        summary="修改验收契约必须引用用户本轮明确变更需求的原话",
+        scope=ToolScope(include=frozenset({"set_acceptance_contract"})),
+        check=_check_acceptance_contract_change,
+        contract="验收契约只能因用户明确改变需求而修改，普通修复不得放宽交付条件。",
+    ),
     Guard(
         id="read_only_mode",
         summary="只读诊断模式下禁止一切写入与运行",

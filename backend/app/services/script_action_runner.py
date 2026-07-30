@@ -21,6 +21,7 @@ _SCRIPT_ACTION_TYPES = {"script.python", "script.javascript", "script.shell", "s
 _MAX_STDIO_BYTES = 512_000  # 单路输出上限，防止失控脚本把日志/内存打爆
 _MAX_ENV_BYTES = 64_000  # 多数系统 env 总量上限留出安全余量，超出则改用紧凑/省略副本
 _MAX_ENV_VALUE_BYTES = 8_000  # 单个变量塞进紧凑 JSON 副本前的上限，超出的改走 RPA_VARIABLES_FILE
+_RUNTIME_BUILTINS = frozenset({"run_timestamp", "flow_slug", "output_dir", "output_prefix"})
 
 # 注入到内联 Python 脚本开头，确保 _vars 读取未截断的文件快照而非可能被截断的
 # env var 副本；sentinel 防止重复注入。
@@ -85,7 +86,7 @@ class ScriptActionRunner:
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=_build_script_env(variables, restrict_path=True),
+            env=_build_script_env(variables, node=node, restrict_path=True),
         )
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
@@ -117,7 +118,7 @@ class ScriptActionRunner:
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=_build_script_env(variables, restrict_path=False),
+            env=_build_script_env(variables, node=node, restrict_path=False),
         )
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
@@ -247,12 +248,31 @@ def _build_command(action_type: str, script_path: Path) -> list[str]:
     raise ValueError(f"不支持的脚本节点类型: {action_type}")
 
 
-def _build_variables_payload(variables: RuntimeVariableStore) -> str:
-    payload = variables.raw_values()
+def _declared_script_variables(node: FlowNode) -> set[str]:
+    declared = node.get("inputVariables")
+    if not isinstance(declared, list):
+        return set(_RUNTIME_BUILTINS)
+    return {
+        str(name).strip()
+        for name in declared
+        if isinstance(name, str) and name.strip()
+    } | set(_RUNTIME_BUILTINS)
+
+
+def _build_variables_payload(variables: RuntimeVariableStore, allowed_names: set[str]) -> str:
+    payload = {
+        name: value for name, value in variables.raw_values().items()
+        if name in allowed_names
+    }
     return _json_dumps(payload)
 
 
-def _build_script_env(variables: RuntimeVariableStore, *, restrict_path: bool) -> dict[str, str]:
+def _build_script_env(
+    variables: RuntimeVariableStore,
+    *,
+    node: FlowNode,
+    restrict_path: bool,
+) -> dict[str, str]:
     """构造脚本子进程环境。
 
     打包态后端会通过 PYTHONPATH 暴露随包 site-packages；脚本节点必须继承它，
@@ -263,7 +283,8 @@ def _build_script_env(variables: RuntimeVariableStore, *, restrict_path: bool) -
     env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin" if restrict_path else os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
     env["HOME"] = str(Path.home())
 
-    full_payload = _build_variables_payload(variables)
+    allowed_names = _declared_script_variables(node)
+    full_payload = _build_variables_payload(variables, allowed_names)
     variables_file = _write_variables_payload_file(full_payload)
     env["RPA_VARIABLES_FILE"] = str(variables_file)
 
@@ -271,7 +292,7 @@ def _build_script_env(variables: RuntimeVariableStore, *, restrict_path: bool) -
     if len(full_payload.encode("utf-8")) <= _MAX_ENV_BYTES:
         env["RPA_VARIABLES_JSON"] = full_payload
     else:
-        env["RPA_VARIABLES_JSON"] = _build_compact_variables_payload(variables)
+        env["RPA_VARIABLES_JSON"] = _build_compact_variables_payload(variables, allowed_names)
     return env
 
 
@@ -284,9 +305,11 @@ def _write_variables_payload_file(payload: str) -> Path:
     return path
 
 
-def _build_compact_variables_payload(variables: RuntimeVariableStore) -> str:
+def _build_compact_variables_payload(variables: RuntimeVariableStore, allowed_names: set[str]) -> str:
     compact: dict[str, object] = {}
     for name, value in variables.raw_values().items():
+        if name not in allowed_names:
+            continue
         rendered = _json_dumps(value)
         if len(rendered.encode("utf-8")) <= _MAX_ENV_VALUE_BYTES:
             compact[name] = value

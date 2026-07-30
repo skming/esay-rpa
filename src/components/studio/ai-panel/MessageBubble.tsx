@@ -1,10 +1,10 @@
-import { CircleAlert, Loader2, Paperclip, RefreshCw } from 'lucide-react';
+import { BadgeCheck, CircleAlert, CircleDashed, Loader2, Paperclip, PlayCircle, RefreshCw } from 'lucide-react';
 import type { ReactElement } from 'react';
 import { memo } from 'react';
 
 import { cn } from '../../../lib/utils';
 import { Marker, MarkerContent, MarkerIcon, ThinkingDots } from '../../ui/marker';
-import type { AiAttachment, AiMessage, FlowDiff, NodeLookupItem } from './aiPanelTypes';
+import type { AiAttachment, AiMessage, FlowDiff, NodeLookupItem, VerificationStatus } from './aiPanelTypes';
 import { FlowDiffPreview } from './FlowDiffPreview';
 import { MarkdownContent } from './MarkdownContent';
 import { ProcessingTimeline } from './ProcessingTimeline';
@@ -60,6 +60,47 @@ function AttachmentStrip({ attachments, isUser }: { attachments: AiAttachment[];
           <span className="min-w-0 truncate">{att.name}</span>
         </div>
       ))}
+    </div>
+  );
+}
+
+const VERIFICATION_META: Record<VerificationStatus, {
+  icon: typeof BadgeCheck;
+  label: string;
+  className: string;
+}> = {
+  modified_unverified: {
+    icon: CircleDashed,
+    label: '定义已更新 · 尚未运行',
+    className: 'border-amber-200 bg-amber-50 text-amber-700',
+  },
+  run_verified: {
+    icon: PlayCircle,
+    label: '运行已通过 · 结果待验收',
+    className: 'border-blue-200 bg-blue-50 text-blue-700',
+  },
+  accepted: {
+    icon: BadgeCheck,
+    label: '实际输出已验收',
+    className: 'border-emerald-200 bg-emerald-50 text-emerald-700',
+  },
+};
+
+function VerificationBadge({ status, revision }: {
+  status: VerificationStatus;
+  revision?: number;
+}): ReactElement {
+  const meta = VERIFICATION_META[status];
+  const Icon = meta.icon;
+  return (
+    <div
+      aria-label={`验证状态：${meta.label}`}
+      className={cn('mt-1 inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[10.5px] font-medium', meta.className)}
+      role="status"
+    >
+      <Icon className="h-3 w-3 shrink-0" strokeWidth={1.8} />
+      <span>{meta.label}</span>
+      {revision !== undefined && <span className="font-mono text-[9.5px] opacity-70">r{revision}</span>}
     </div>
   );
 }
@@ -154,6 +195,13 @@ export const MessageBubble = memo(function MessageBubble({
               usage={message.usage}
             />
           </div>
+        )}
+
+        {!isUser && message.verificationStatus && (
+          <VerificationBadge
+            revision={message.verificationRevision}
+            status={message.verificationStatus}
+          />
         )}
 
         {message.content && (

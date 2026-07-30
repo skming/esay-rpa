@@ -12,6 +12,24 @@ from app.services.task_manager import TaskManager
 from tests.test_task_manager import FakeRunner
 
 
+def acceptance_contract(variable: str) -> dict:
+    return {
+        "requirements": [{
+            "id": "scheduled-output",
+            "description": "调度测试交付",
+            "sourceKind": "product_default",
+            "confidence": 1,
+            "confirmed": True,
+        }],
+        "deliverables": [{
+            "id": "scheduled-result",
+            "variable": variable,
+            "kind": "table",
+            "requirementIds": ["scheduled-output"],
+        }],
+    }
+
+
 def build_task_request() -> RunTaskRequest:
     return RunTaskRequest(
         flowName="调度测试流程",
@@ -75,11 +93,13 @@ async def test_schedule_trigger_runs_bound_flow_definition() -> None:
                             "selector": ".quote .author::text",
                             "fetcher": "static",
                             "extractMode": "text",
+                            "outputVariable": "scheduled_rows",
                             "timeoutMs": 1000,
                         },
                     ],
                     "edges": [{"source": "start", "target": "fetch"}],
                 },
+                acceptanceContract=acceptance_contract("scheduled_rows"),
             )
         )
         schedule = await service.create_schedule(
@@ -132,12 +152,14 @@ async def test_schedule_trigger_preserves_run_config_for_bound_flow() -> None:
                             "type": "browser.fetch",
                             "targetUrl": "https://quotes.toscrape.com/",
                             "selector": ".quote .text::text",
+                            "outputVariable": "scheduled_rows",
                             "timeoutMs": 1000,
                         },
                     ],
                     "edges": [{"source": "start", "target": "fetch"}],
                 },
                 inputVariables=[{"name": "retry_count", "type": "Integer", "scope": "全局", "value": "1"}],
+                acceptanceContract=acceptance_contract("scheduled_rows"),
             )
         )
         schedule = await service.create_schedule(

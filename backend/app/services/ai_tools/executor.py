@@ -15,6 +15,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from app.core import storage
+from app.models.schemas import FlowAcceptanceContract, FlowUpdateRequest
+from app.services.acceptance_audit import audit_acceptance_contract
+from app.services.acceptance_contract import contract_validation_errors
+from app.services.execution_evidence import definition_digest
 from app.services import browser_profile_lock
 from app.services.browser_action_runner import detect_blocking_interstitial, persistent_browser_context
 from app.services.ai_tools.catalog import NODE_TYPE_CATALOG
@@ -42,6 +46,7 @@ from app.services.ai_tools.diagnostics import (
     _MIN_DOCUMENT_CHARS,
     _find_header_variable,
     _find_incomplete_sweeps,
+    _find_ineffective_transforms,
     _find_swallowed_critical_failures,
     _find_table_candidates,
     _requirement_wants_document,
@@ -272,6 +277,8 @@ class RpaToolExecutor:
                 return await self._get_run_error(**args)
             case "apply_node_fix":
                 return await self._apply_node_fix(**args)
+            case "set_acceptance_contract":
+                return await self._set_acceptance_contract(**args)
             case "publish_flow":
                 return await self._publish_flow(**args)
             case "get_run_output":
@@ -350,6 +357,15 @@ class RpaToolExecutor:
         data = flow.model_dump(mode="json")
         # snapshots 可达 60k-120k 字符，剔除以免拖慢 UI 和浪费 token
         data.pop("snapshots", None)
+        dumped_variables = data.get("input_variables")
+        if isinstance(dumped_variables, list):
+            for source, dumped in zip(flow.input_variables, dumped_variables, strict=False):
+                if not isinstance(dumped, dict):
+                    continue
+                if source.category != "credential" and not source.sensitive:
+                    continue
+                dumped["has_value"] = bool((source.value or "").strip())
+                dumped["value"] = ""
         existing_var_names = [iv.name for iv in flow.input_variables]
         if existing_var_names:
             data["existing_variable_names"] = existing_var_names
@@ -576,6 +592,7 @@ class RpaToolExecutor:
         edges: list[dict[str, Any]] | None = None,
         description: str | None = None,
         input_variables: list[dict[str, Any]] | None = None,
+        acceptance_contract: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         from app.models.schemas import FlowCreateRequest
 
@@ -653,11 +670,21 @@ class RpaToolExecutor:
                     ))),
                 })
 
+        contract = FlowAcceptanceContract.model_validate(acceptance_contract or {})
+        defined_variables = _collect_defined_vars(nodes, iv_names)
+        contract_errors = contract_validation_errors(contract, defined_variables=set(defined_variables))
+        if contract_errors:
+            return {
+                "error": "acceptance_contract_invalid",
+                "contract_errors": contract_errors,
+                "message": "验收契约缺少需求来源、交付绑定或引用了未定义变量。",
+            }
         req = FlowCreateRequest(
             name=name,
             description=description,
             definition=definition,
             input_variables=iv_snapshots,
+            acceptance_contract=contract,
         )
         flow = await self._flow_service.create_flow(req)
 
@@ -667,6 +694,13 @@ class RpaToolExecutor:
             "flow_id": flow.flow_id,
             "name": flow.name,
             "status": flow.status,
+            "revision": flow.revision,
+            "acceptance_contract": flow.acceptance_contract.model_dump(mode="json", by_alias=True),
+            "changed_nodes": [
+                {**ref, "change": "added"}
+                for ref in (_node_ref(node) for node in nodes)
+                if ref is not None
+            ],
         }
         if issues:
             result["validation_issues"] = issues
@@ -990,6 +1024,7 @@ class RpaToolExecutor:
             "status": "applied",
             "flow_id": flow_id,
             "flow_name": updated.name,
+            "revision": updated.revision,
             "node_count": len(nodes),
             "edge_count": len(edges),
         }
@@ -1259,7 +1294,8 @@ class RpaToolExecutor:
                 "message": (
                     f"run_flow 缺少必填变量：{[v['name'] for v in missing_vars]}。"
                     "这些 input_variables 无默认值，必须通过 variables 参数传入。"
-                    "示例：variables={\"username\": \"demo_user\", \"password\": \"demo_pass\", \"captcha\": \"8888\"}"
+                    "普通业务输入可按 variables={\"date_start\": \"2026-01-01\"} 传入；"
+                    "凭据不要进入 AI 工具参数，应由用户在输入变量面板配置。"
                 ),
             }
 
@@ -1288,11 +1324,24 @@ class RpaToolExecutor:
                     "请用 validate_flow 或 lint_flow 查看详情，再用 apply_node_fix 或 update_flow 修复后重试。"
                 ),
             }
+        contract_errors = contract_validation_errors(
+            flow.acceptance_contract,
+            defined_variables=set(_collect_defined_vars(nodes, input_var_names)),
+        )
+        if contract_errors:
+            return {
+                "status": "blocking_acceptance_contract",
+                "contract_errors": contract_errors,
+                "message": "流程缺少完整、可追溯的验收契约，已在启动浏览器前阻止运行。",
+            }
 
         req = RunTaskRequest(
             flow_id=flow_id,
             flow_name=flow.name,
             flow_definition=flow.definition,
+            flow_revision=flow.revision,
+            acceptance_contract=flow.acceptance_contract,
+            sensitive_variables=[iv.name for iv in flow.input_variables if iv.sensitive],
             variables={k: str(v) for k, v in merged_variables.items()},
             browser_executor=browser_executor,
         )
@@ -1338,6 +1387,8 @@ class RpaToolExecutor:
             "task_id": task.task_id,
             "status": task.status if task.status in _TERMINAL else "timeout",
             "flow_id": flow_id,
+            "flow_revision": task.flow_revision,
+            "definition_digest": task.definition_digest,
             "progress": task.progress.model_dump(mode="json") if task.progress else {},
         }
         if task.status not in _TERMINAL:
@@ -1779,6 +1830,8 @@ class RpaToolExecutor:
             "remaining_issues": remaining_issues,
             "all_clear": len(remaining_issues) == 0 and not any(f["severity"] == "error" for f in lint_findings),
         }
+        if updated is not None:
+            result["revision"] = updated.revision
         if patched_node_ref:
             result["node_ref"] = patched_node_ref
             result["node_title"] = patched_node_ref["title"]
@@ -1793,6 +1846,43 @@ class RpaToolExecutor:
         if result is None:
             return {"error": f"流程 {flow_id} 不存在"}
         return {"flow_id": flow_id, "status": result.status}
+
+    async def _set_acceptance_contract(
+        self,
+        flow_id: str,
+        acceptance_contract: dict[str, Any],
+        requirement_change_quote: str,
+    ) -> dict[str, Any]:
+        del requirement_change_quote
+        flow = await self._flow_service.get_flow(flow_id)
+        if flow is None:
+            return {"error": f"流程 {flow_id} 不存在"}
+        contract = FlowAcceptanceContract.model_validate(acceptance_contract)
+        defined = _collect_defined_vars(
+            list(flow.definition.get("nodes", [])),
+            [iv.name for iv in flow.input_variables],
+        )
+        missing = sorted({item.variable for item in contract.deliverables if item.variable not in defined})
+        contract_errors = contract_validation_errors(contract, defined_variables=set(defined))
+        if contract_errors:
+            return {
+                "error": "验收契约无效",
+                "missing_variables": missing,
+                "contract_errors": contract_errors,
+                "message": "契约必须可追溯到需求条款，且每个交付变量都由流程定义或输入变量提供。",
+            }
+        updated = await self._flow_service.update_flow(
+            flow_id,
+            FlowUpdateRequest(acceptance_contract=contract),
+        )
+        if updated is None:
+            return {"error": f"流程 {flow_id} 不存在"}
+        return {
+            "status": "applied",
+            "flow_id": flow_id,
+            "revision": updated.revision,
+            "acceptance_contract": updated.acceptance_contract.model_dump(mode="json", by_alias=True),
+        }
 
     async def _get_run_output(self, task_id: str) -> dict[str, Any]:
         task = await self._task_manager.get_task(task_id)
@@ -1859,6 +1949,98 @@ class RpaToolExecutor:
             }
 
         flow = await self._flow_service.get_flow(task.flow_id) if task.flow_id else None
+        if task.flow_id and flow is None:
+            return {
+                "task_id": task_id,
+                "flow_revision": task.flow_revision,
+                "passed": False,
+                "issues": [{
+                    "issue": "orphaned_run_evidence",
+                    "message": "任务关联的流程已不存在，无法证明该产物对应当前可执行定义。",
+                }],
+            }
+        if flow is not None and task.flow_revision is not None and task.flow_revision != flow.revision:
+            return {
+                "task_id": task_id,
+                "flow_revision": task.flow_revision,
+                "current_flow_revision": flow.revision,
+                "passed": False,
+                "issues": [{
+                    "issue": "stale_run_evidence",
+                    "message": (
+                        f"任务运行的是流程 revision {task.flow_revision}，当前流程已是 revision {flow.revision}。"
+                        "旧产物不能验收新定义，请重新运行当前流程。"
+                    ),
+                }],
+                "repair_plan": [{
+                    "action": "rerun_current_revision",
+                    "reason": "流程定义已在本次任务之后发生变化。",
+                    "steps": ["重新运行当前流程，再对新任务调用 assert_run_output。"],
+                }],
+            }
+        live_digest = definition_digest(flow.definition) if flow is not None else None
+        if flow is not None and task.definition_digest != live_digest:
+            return {
+                "task_id": task_id,
+                "flow_revision": task.flow_revision,
+                "passed": False,
+                "issues": [{
+                    "issue": "definition_digest_mismatch",
+                    "message": "流程 revision 未变化但定义摘要不同，拒绝复用可能被旁路修改的运行证据。",
+                }],
+            }
+        variables = {snap.name: _parse_runtime_value(snap.value) for snap in (task.variables or [])}
+        if task.acceptance_contract.deliverables:
+            audit = audit_acceptance_contract(
+                task.acceptance_contract,
+                variables,
+                task.execution_evidence,
+                workspace_root=storage.resolve_workspace_root(),
+            )
+            blocking = audit["issues"]
+            if flow is not None and blocking:
+                self._record_quality_failure(flow.flow_id, task_id, blocking)
+            return {
+                "task_id": task_id,
+                "flow_revision": task.flow_revision,
+                "definition_digest": task.definition_digest,
+                "passed": audit["passed"],
+                "delivery_shape": "contract",
+                "deliverables": audit["deliverables"],
+                "issues": blocking,
+                "warnings": audit["warnings"],
+                "repair_plan": (
+                    _build_quality_repair_plan(blocking)
+                    or ([{
+                        "action": "satisfy_acceptance_contract",
+                        "reason": "运行产物没有满足流程创建时冻结的交付条件。",
+                        "steps": [
+                            "按 issues 定位交付变量、字段或业务约束失败点。",
+                            "只修流程节点，不得放宽验收契约；修复后重新运行当前 revision。",
+                            "对新任务再次调用 assert_run_output。",
+                        ],
+                    }] if blocking else [])
+                ),
+                "message": (
+                    "运行产物满足验收契约。" if audit["passed"]
+                    else "运行产物未满足验收契约，必须按 issues 修复后重跑。"
+                ),
+            }
+        if task.flow_revision is not None:
+            return {
+                "task_id": task_id,
+                "flow_revision": task.flow_revision,
+                "passed": False,
+                "issues": [{
+                    "issue": "acceptance_contract_missing",
+                    "message": "当前流程没有声明交付验收契约，系统无法确定应验收哪个变量和哪些业务条件。",
+                }],
+                "repair_plan": [{
+                    "action": "define_acceptance_contract",
+                    "reason": "不能从变量名和体量猜测用户真正需要的交付物。",
+                    "steps": ["根据用户原始需求声明交付变量、类型、必需字段和业务约束，然后重新运行。"],
+                }],
+            }
         lint_findings: list[dict[str, Any]] = []
         if flow is not None:
             nodes = flow.definition.get("nodes", [])
@@ -1875,7 +2057,6 @@ class RpaToolExecutor:
             inferred_values = inferred.get("allowed_values")
             allowed_values = inferred_values if isinstance(inferred_values, list) else None
 
-        variables = {snap.name: _parse_runtime_value(snap.value) for snap in (task.variables or [])}
         candidates = _find_table_candidates(variables)
         issues: list[dict[str, Any]] = []
         selected = candidates[0] if candidates else None
@@ -1887,6 +2068,8 @@ class RpaToolExecutor:
                 "table_extract_selector_targets_container",
                 "table_extract_selector_not_table_like",
                 "extract_selector_union_used_as_fallback",
+                "extract_scope_is_page_root",
+                "wait_selector_is_page_root",
                 "table_extract_missing_count",
                 "dropdown_escape_bound_to_unstable_input",
                 "critical_action_continue_on_error",
@@ -1903,9 +2086,11 @@ class RpaToolExecutor:
                 "fix": finding.get("fix"),
             })
 
-        # 采集完整性与交付形态无关：文档和表格都可能只装着第一页，所以在分叉之前判
+        # 采集完整性与交付形态无关：文档和表格都可能只装着第一页，所以在分叉之前判。
+        # 加工节点做没做事同理——清洗的对象既可能是表格也可能是一篇文档
         if flow is not None:
             issues.extend(_find_incomplete_sweeps(flow.definition.get("nodes", []), variables))
+            issues.extend(_find_ineffective_transforms(flow.definition.get("nodes", []), variables))
 
         if selected is None:
             # 用户要的是一篇文档时，「没有表格」不是缺陷；按表格审只会逼助手

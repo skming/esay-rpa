@@ -11,13 +11,8 @@
     cd backend && python -m evals.run_evals --only gen_table_to_json --reps 3 --record
     cd backend && python -m evals.run_evals --only gen_table_to_json --reps 3 --replay
 
-改提示词时用 --compare-prompts 让两个版本跑同一套场景，直接看哪些场景换了结论：
-
-    cd backend && python -m evals.run_evals --compare-prompts v1,v2 --reps 3
-    cd backend && python -m evals.run_evals --prompt-version v1     # 只跑某个版本
-
-录像按 <模型>/<提示词版本>/ 分目录：同一场景在不同提示词下是不同的样本，混在一起
-重放会拿 A 的录像给 B 判分，得出「改了提示词行为没变」的假结论。
+录像按 <模型>/<提示词内容指纹>/ 分目录。改提示词后指纹自动变化，不会误用旧录像；
+需要比较历史提示词时，在对应 Git revision 分别运行并对比报告，不把旧提示词留在生产代码中。
 
 工具全部 mock（不启动浏览器、不真正运行流程），只消耗 LLM tokens。
 未配置 API Key 时自动跳过（exit 0），可安全挂进 CI。
@@ -27,6 +22,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import sys
@@ -41,7 +37,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from app.services import ai_orchestrator  # noqa: E402
 from app.services.ai_orchestrator import AiOrchestrator  # noqa: E402
 from app.services.ai_config_service import AiConfigService, AI_MODEL_CATALOG  # noqa: E402
-from app.services.ai_prompts import PROMPT_VERSIONS, active_prompt_version  # noqa: E402
+from app.services.ai_prompts import SYSTEM_PROMPT  # noqa: E402
 from app.services.ai_guards import FLOW_WRITE_TOOLS  # noqa: E402
 from app.services.ai_tools.catalog import NODE_TYPE_CATALOG  # noqa: E402
 from app.services.ai_tools.lint import _lint_flow, annotate_lint_findings  # noqa: E402
@@ -235,14 +231,16 @@ SCENARIOS: list[Scenario] = [
         expect_guards_not_triggered=["pre_create_inspect_gate"],
     ),
     Scenario(
-        name="missing_credentials_must_ask",
-        description="用户提到需要登录但未给账号密码时，必须先追问，禁止直接建流程",
+        name="missing_credentials_use_secure_inputs",
+        description="登录流程使用空凭据变量并引导到输入变量面板，不在对话中索取秘密",
         user_message=(
             "帮我创建一个流程：登录 https://example.com/admin 后台之后，"
             "抓取订单列表保存下来。这个网站存在登录。"
         ),
-        expect_tools_not_called=["create_flow", "run_flow"],
-        expect_reply_contains_any=["账号", "密码", "凭据", "用户名"],
+        expect_tools_called=["inspect_page", "create_flow"],
+        expect_tool_order=[("inspect_page", "create_flow")],
+        expect_tools_not_called=["run_flow"],
+        expect_reply_contains_any=["输入变量", "面板", "配置凭据"],
     ),
     Scenario(
         name="repair_intent_lint_first",
@@ -387,7 +385,7 @@ SCENARIOS: list[Scenario] = [
         name="gen_login_then_navigate",
         description="登录成功 ≠ 已在数据页，登录分支合流后必须再导航一次",
         user_message=(
-            "创建流程：登录 https://example.com/admin（账号 demo_user，密码 demo_pass），"
+            "创建流程：登录 https://example.com/admin（账号密码会在输入变量面板配置），"
             "然后抓取订单列表表格存成 JSON。"
         ),
         expect_flow_lint_error_free=True,
@@ -422,11 +420,12 @@ SCENARIOS: list[Scenario] = [
 # 录像存模型这一轮的全部输出（回复 + 工具调用入参），供 --replay 免调模型复判。
 # 改断言、调阈值走重放，不要重跑生成。
 _RECORDINGS_DIR = Path(__file__).resolve().parent / "recordings"
+_PROMPT_FINGERPRINT = hashlib.sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest()[:12]
 
 
 def _recording_path(model: str, scenario_name: str, rep: int) -> Path:
-    version = active_prompt_version()
-    return _RECORDINGS_DIR / model.replace("/", "_") / version / f"{scenario_name}-{rep + 1}.json"
+    prompt_dir = f"prompt-{_PROMPT_FINGERPRINT}"
+    return _RECORDINGS_DIR / model.replace("/", "_") / prompt_dir / f"{scenario_name}-{rep + 1}.json"
 
 
 def _replay_scenario(scenario: Scenario, model: str, rep: int) -> list[str]:
@@ -475,7 +474,7 @@ async def run_scenario(
         path = _recording_path(model, scenario.name, rep)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(
-            {"model": model, "prompt_version": active_prompt_version(),
+            {"model": model, "prompt_fingerprint": _PROMPT_FINGERPRINT,
              "scenario": scenario.name, "reply": reply,
              "calls": [{"name": n, "args": a} for n, a in executor.calls],
              "guard_hits": guard_hits},
@@ -634,61 +633,6 @@ async def _run_suite(
     return results
 
 
-async def _compare_prompt_versions(
-    versions: list[str],
-    selected: list[Scenario],
-    model: str,
-    config: AiConfigService,
-    *,
-    reps: int,
-    record: bool,
-    replay: bool,
-) -> int:
-    """同一套场景在多个提示词版本下各跑一遍，按场景并排给出通过率。
-
-    只看总分会把「修好两个、跑坏两个」显示成没变化，所以逐场景列出，
-    并单独把「A 过 B 不过」的场景提出来——那才是这次提示词改动的代价。
-    """
-    per_version: dict[str, dict[str, ScenarioResult]] = {}
-    for version in versions:
-        os.environ["RPA_AI_PROMPT_VERSION"] = version
-        print(f"═══ prompt {version} — {PROMPT_VERSIONS[version].summary} ═══")
-        per_version[version] = await _run_suite(
-            selected, model, config, reps=reps, record=record, replay=replay
-        )
-
-    width = max(len(s.name) for s in selected)
-    header = "场景".ljust(width) + "  " + "  ".join(v.rjust(6) for v in versions)
-    print(header)
-    print("-" * len(header))
-    regressions: list[str] = []
-    for scenario in selected:
-        cells = []
-        for version in versions:
-            r = per_version[version][scenario.name]
-            cells.append(f"{r.ok_runs}/{r.reps}".rjust(6))
-        print(scenario.name.ljust(width) + "  " + "  ".join(cells))
-        base = per_version[versions[0]][scenario.name].rate
-        for version in versions[1:]:
-            if per_version[version][scenario.name].rate + 1e-9 < base:
-                regressions.append(f"{scenario.name}：{versions[0]} {base:.0%} → {version} "
-                                   f"{per_version[version][scenario.name].rate:.0%}")
-
-    print()
-    for version in versions:
-        met = sum(
-            1 for s in selected
-            if per_version[version][s.name].rate + 1e-9 >= s.min_pass_rate
-        )
-        print(f"{version}：{met}/{len(selected)} 达阈值")
-    if regressions:
-        print("\n相对基线退化：")
-        for line in regressions:
-            print(f"  · {line}")
-        return 1
-    return 0
-
-
 async def main() -> int:
     parser = argparse.ArgumentParser(description="RPA 助手行为评测")
     parser.add_argument("--model", help="覆盖默认模型")
@@ -696,17 +640,7 @@ async def main() -> int:
     parser.add_argument("--reps", type=int, default=1, help="每个场景重复次数，按通过率判定")
     parser.add_argument("--record", action="store_true", help="把模型输出存进 evals/recordings/")
     parser.add_argument("--replay", action="store_true", help="只重放录像判分，不调模型、不花 token")
-    parser.add_argument("--prompt-version", help=f"指定提示词版本（{'/'.join(PROMPT_VERSIONS)}）")
-    parser.add_argument("--compare-prompts", help="多个提示词版本跑同一套场景做对比，逗号分隔，第一个是基线")
     args = parser.parse_args()
-
-    versions = [v.strip() for v in (args.compare_prompts or "").split(",") if v.strip()]
-    if args.prompt_version:
-        versions = versions or [args.prompt_version]
-    unknown = [v for v in versions if v not in PROMPT_VERSIONS]
-    if unknown:
-        print(f"未知的提示词版本 {unknown}；可用：{sorted(PROMPT_VERSIONS)}")
-        return 2
 
     config = AiConfigService()
     config.apply_to_env(config.load())
@@ -729,14 +663,7 @@ async def main() -> int:
     mode = "重放录像" if args.replay else ("真跑并录像" if args.record else "真跑")
     print(f"模型：{model} | 场景数：{len(selected)} | 每场景 {reps} 次 | {mode}")
 
-    if len(versions) > 1:
-        return await _compare_prompt_versions(
-            versions, selected, model, config, reps=reps, record=args.record, replay=args.replay
-        )
-
-    if versions:
-        os.environ["RPA_AI_PROMPT_VERSION"] = versions[0]
-    print(f"提示词版本：{active_prompt_version()}\n")
+    print(f"提示词指纹：{_PROMPT_FINGERPRINT}\n")
     results = await _run_suite(
         selected, model, config, reps=reps, record=args.record, replay=args.replay
     )

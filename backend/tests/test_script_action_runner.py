@@ -17,6 +17,7 @@ async def test_python_script_runner_writes_output_variables(tmp_path) -> None:
         "outputVariable": "script_stdout",
         "statusVariable": "script_exit_code",
         "stderrVariable": "script_stderr",
+        "inputVariables": ["order_id"],
     }
 
     result = await runner.run(node, variables, timeout_ms=5_000)
@@ -80,7 +81,11 @@ async def test_python_script_runner_writes_large_variables_to_file(tmp_path) -> 
     variables = RuntimeVariableStore.from_initial({"large_payload": "x" * 80_000})
     runner = ScriptActionRunner(tmp_path)
 
-    result = await runner.run({"type": "script.python", "path": "read_large_variables.py"}, variables, timeout_ms=5_000)
+    result = await runner.run(
+        {"type": "script.python", "path": "read_large_variables.py", "inputVariables": ["large_payload"]},
+        variables,
+        timeout_ms=5_000,
+    )
 
     assert result.exit_code == 0
     assert result.stdout == "80000"

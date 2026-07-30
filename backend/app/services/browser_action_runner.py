@@ -1660,8 +1660,20 @@ async def _extract_locator_values(page: object, selector_config: SelectorConfig,
         _raise_if_table_scope_error(raw_rows, selector_config.selector)
         return _normalize_table_rows(raw_rows)
     else:
-        raw_values = await locator.all_text_contents()
+        raw_values = await locator.evaluate_all(_TEXT_EXTRACT_SCRIPT)
     return _clean_text_values(raw_values)
+
+
+# textContent 会把内联样式和隐藏 DOM 一起交给下游；文本抽取的契约是用户可见内容，
+# 因此隐藏匹配项直接跳过，避免用 textContent 回落后把不可见模板重新带回来
+_TEXT_EXTRACT_SCRIPT = (
+    "(elements) => elements.map((element) => {"
+    "  const style = window.getComputedStyle ? window.getComputedStyle(element) : null;"
+    "  const hidden = style && (style.display === 'none' || style.visibility === 'hidden');"
+    "  if (hidden || (element.getClientRects && element.getClientRects().length === 0)) return '';"
+    "  return typeof element.innerText === 'string' ? element.innerText : '';"
+    "});"
+)
 
 
 _TABLE_EXTRACT_SCRIPT = (

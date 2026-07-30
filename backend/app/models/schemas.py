@@ -34,6 +34,9 @@ FlowStatus = Literal["draft", "active", "paused", "disabled", "archived"]
 RuntimeVariableType = Literal["String", "Integer", "Boolean", "List", "Dict"]
 RuntimeVariableScope = Literal["全局", "循环", "局部"]
 RuntimeVariableCategory = Literal["flow", "environment", "credential"]
+DeliverableKind = Literal["table", "document", "file", "scalar"]
+RequirementSourceKind = Literal["user", "product_default"]
+ComparisonOperator = Literal["eq", "ne", "gt", "gte", "lt", "lte"]
 
 
 class HealthResponse(ApiModel):
@@ -133,12 +136,157 @@ class SiteAnalysisResult(ApiModel):
     candidates: list[SelectorCandidate]
 
 
+class DateRangeAssertion(ApiModel):
+    field: str = Field(min_length=1, max_length=120)
+    start: str | None = Field(default=None, max_length=40)
+    end: str | None = Field(default=None, max_length=40)
+
+
+class AllowedValuesAssertion(ApiModel):
+    field: str = Field(min_length=1, max_length=120)
+    values: list[str] = Field(min_length=1, max_length=100)
+
+
+class RequirementClause(ApiModel):
+    id: str = Field(min_length=1, max_length=120)
+    description: str = Field(min_length=1, max_length=500)
+    source_kind: RequirementSourceKind = "user"
+    source_quote: str | None = Field(default=None, max_length=1000)
+    source_turn_id: str | None = Field(default=None, max_length=120)
+    confidence: float = Field(default=1.0, ge=0, le=1)
+    confirmed: bool = True
+
+    @model_validator(mode="after")
+    def validate_source(self) -> "RequirementClause":
+        if self.source_kind == "user" and not (self.source_quote or "").strip():
+            raise ValueError("用户需求条款必须提供 sourceQuote 原文")
+        if not self.confirmed:
+            raise ValueError("未确认的推断不能进入验收契约")
+        return self
+
+
+class NumericRangeAssertion(ApiModel):
+    field: str = Field(min_length=1, max_length=120)
+    minimum: float | None = None
+    maximum: float | None = None
+
+    @model_validator(mode="after")
+    def validate_range(self) -> "NumericRangeAssertion":
+        if self.minimum is None and self.maximum is None:
+            raise ValueError("数值范围至少需要 minimum 或 maximum")
+        if self.minimum is not None and self.maximum is not None and self.minimum > self.maximum:
+            raise ValueError("minimum 不能大于 maximum")
+        return self
+
+
+class FieldFormatAssertion(ApiModel):
+    field: str = Field(min_length=1, max_length=120)
+    format: Literal["integer", "decimal", "email", "url", "date", "datetime", "non_empty"]
+
+
+class CrossFieldAssertion(ApiModel):
+    left_field: str = Field(min_length=1, max_length=120)
+    operator: ComparisonOperator
+    right_field: str = Field(min_length=1, max_length=120)
+
+
+class SortAssertion(ApiModel):
+    field: str = Field(min_length=1, max_length=120)
+    direction: Literal["asc", "desc"]
+
+
+class AggregateAssertion(ApiModel):
+    field: str | None = Field(default=None, max_length=120)
+    operation: Literal["count", "sum", "avg", "min", "max"]
+    operator: ComparisonOperator = "eq"
+    expected: float
+    tolerance: float = Field(default=0, ge=0)
+
+
+class DeliverableContract(ApiModel):
+    id: str = Field(min_length=1, max_length=120)
+    variable: str = Field(min_length=1, max_length=120)
+    kind: DeliverableKind
+    required: bool = True
+    min_rows: int | None = Field(default=None, ge=0)
+    max_rows: int | None = Field(default=None, ge=0)
+    required_fields: list[str] = Field(default_factory=list, max_length=100)
+    date_ranges: list[DateRangeAssertion] = Field(default_factory=list, max_length=20)
+    allowed_values: list[AllowedValuesAssertion] = Field(default_factory=list, max_length=20)
+    unique_by: list[str] = Field(default_factory=list, max_length=20)
+    min_chars: int | None = Field(default=None, ge=0)
+    required_terms: list[str] = Field(default_factory=list, max_length=100)
+    forbidden_terms: list[str] = Field(default_factory=list, max_length=100)
+    source_variables: list[str] = Field(default_factory=list, max_length=100)
+    extensions: list[str] = Field(default_factory=list, max_length=20)
+    min_bytes: int | None = Field(default=None, ge=0)
+    requirement_ids: list[str] = Field(default_factory=list, max_length=100)
+    numeric_ranges: list[NumericRangeAssertion] = Field(default_factory=list, max_length=20)
+    field_formats: list[FieldFormatAssertion] = Field(default_factory=list, max_length=20)
+    cross_field_assertions: list[CrossFieldAssertion] = Field(default_factory=list, max_length=20)
+    sort_assertions: list[SortAssertion] = Field(default_factory=list, max_length=10)
+    aggregate_assertions: list[AggregateAssertion] = Field(default_factory=list, max_length=20)
+    expected_count_variable: str | None = Field(default=None, max_length=120)
+    minimum_coverage_ratio: float = Field(default=1.0, gt=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> "DeliverableContract":
+        if self.min_rows is not None and self.max_rows is not None and self.min_rows > self.max_rows:
+            raise ValueError("minRows 不能大于 maxRows")
+        return self
+
+
+class FlowAcceptanceContract(ApiModel):
+    requirements: list[RequirementClause] = Field(default_factory=list, max_length=100)
+    deliverables: list[DeliverableContract] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def validate_requirement_references(self) -> "FlowAcceptanceContract":
+        requirement_ids = [item.id for item in self.requirements]
+        if len(requirement_ids) != len(set(requirement_ids)):
+            raise ValueError("requirements.id 不能重复")
+        known = set(requirement_ids)
+        unknown = sorted({
+            requirement_id
+            for deliverable in self.deliverables
+            for requirement_id in deliverable.requirement_ids
+            if requirement_id not in known
+        })
+        if unknown:
+            raise ValueError(f"deliverable 引用了不存在的 requirementIds: {unknown}")
+        return self
+
+
+class VariableEvidence(ApiModel):
+    name: str = Field(min_length=1, max_length=120)
+    type: RuntimeVariableType
+    char_count: int = Field(ge=0)
+    item_count: int | None = Field(default=None, ge=0)
+    digest: str | None = Field(default=None, max_length=64)
+    comparable: bool = True
+    producer_node_id: str | None = Field(default=None, max_length=120)
+
+
+class NodeExecutionEvidence(ApiModel):
+    node_id: str = Field(min_length=1, max_length=120)
+    node_type: str = Field(min_length=1, max_length=120)
+    inputs: list[VariableEvidence] = Field(default_factory=list)
+    outputs: list[VariableEvidence] = Field(default_factory=list)
+    unchanged_pairs: list[str] = Field(default_factory=list)
+    status: Literal["success", "error"] = "success"
+    duration_ms: int = Field(default=0, ge=0)
+    browser_url: str | None = Field(default=None, max_length=4000)
+    selector: str | None = Field(default=None, max_length=1000)
+    match_count: int | None = Field(default=None, ge=0)
+
+
 class FlowCreateRequest(ApiModel):
     name: str = Field(min_length=1, max_length=120)
     version: str = Field(default="v1.0.0", min_length=1, max_length=32)
     description: str | None = Field(default=None, max_length=1000)
     definition: dict[str, object] = Field(default_factory=dict)
     input_variables: list["RuntimeVariableSnapshot"] = Field(default_factory=list)
+    acceptance_contract: FlowAcceptanceContract = Field(default_factory=FlowAcceptanceContract)
     status: FlowStatus = "draft"
     folder_path: str = Field(default="默认目录", max_length=500)
     default_browser_executor: BrowserExecutorKind = "playwright"
@@ -150,6 +298,7 @@ class FlowUpdateRequest(ApiModel):
     description: str | None = Field(default=None, max_length=1000)
     definition: dict[str, object] | None = None
     input_variables: list["RuntimeVariableSnapshot"] | None = None
+    acceptance_contract: FlowAcceptanceContract | None = None
     status: FlowStatus | None = None
     folder_path: str | None = Field(default=None, max_length=500)
     default_browser_executor: BrowserExecutorKind | None = None
@@ -164,6 +313,7 @@ class FlowUpdateRequest(ApiModel):
                 self.description,
                 self.definition,
                 self.input_variables,
+                self.acceptance_contract,
                 self.status,
                 self.folder_path,
                 self.default_browser_executor,
@@ -186,6 +336,8 @@ class FlowVersionSnapshot(ApiModel):
     description: str | None = None
     definition: dict[str, object]
     input_variables: list["RuntimeVariableSnapshot"] = Field(default_factory=list)
+    acceptance_contract: FlowAcceptanceContract = Field(default_factory=FlowAcceptanceContract)
+    revision: int = Field(default=1, ge=1)
     saved_at: datetime
 
 
@@ -196,6 +348,8 @@ class FlowSnapshot(ApiModel):
     description: str | None = None
     definition: dict[str, object]
     input_variables: list["RuntimeVariableSnapshot"] = Field(default_factory=list)
+    acceptance_contract: FlowAcceptanceContract = Field(default_factory=FlowAcceptanceContract)
+    revision: int = Field(default=1, ge=1)
     status: FlowStatus
     folder_path: str = "默认目录"
     default_browser_executor: BrowserExecutorKind = "playwright"
@@ -256,6 +410,10 @@ class RunTaskRequest(ApiModel):
     flow_id: str | None = Field(default=None, max_length=36)
     schedule_id: str | None = Field(default=None, max_length=36)
     flow_definition: dict[str, object] | None = None
+    flow_revision: int | None = Field(default=None, ge=1)
+    definition_digest: str | None = Field(default=None, max_length=64)
+    acceptance_contract: FlowAcceptanceContract = Field(default_factory=FlowAcceptanceContract)
+    sensitive_variables: list[str] = Field(default_factory=list, max_length=100)
     variables: dict[str, object] = Field(default_factory=dict)
     timeout_ms: int = Field(default=30_000, ge=1_000, le=300_000)
     scope: RunScope = "full"
@@ -428,6 +586,10 @@ class TaskSnapshot(ApiModel):
     result: ScrapeResult | None = None
     artifacts: list[ArtifactSnapshot] = Field(default_factory=list)
     variables: list[RuntimeVariableSnapshot] = Field(default_factory=list)
+    flow_revision: int | None = Field(default=None, ge=1)
+    definition_digest: str | None = Field(default=None, max_length=64)
+    acceptance_contract: FlowAcceptanceContract = Field(default_factory=FlowAcceptanceContract)
+    execution_evidence: list[NodeExecutionEvidence] = Field(default_factory=list)
     run_config: RunConfigSnapshot = Field(default_factory=RunConfigSnapshot)
     error: str | None = None
     input_prompt: str | None = None

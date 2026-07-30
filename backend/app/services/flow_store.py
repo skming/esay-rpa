@@ -55,6 +55,8 @@ class FlowRow(Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     definition: Mapped[dict] = mapped_column(_json_type(), nullable=False)
     input_variables: Mapped[list] = mapped_column(_json_type(), nullable=False, default=list)
+    acceptance_contract: Mapped[dict] = mapped_column(_json_type(), nullable=False, default=dict)
+    revision: Mapped[int] = mapped_column(nullable=False, default=1)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="draft")
     folder_path: Mapped[str] = mapped_column(String(500), nullable=False, default="默认目录")
     default_browser_executor: Mapped[str] = mapped_column(String(24), nullable=False, default="playwright")
@@ -111,6 +113,8 @@ class SqlAlchemyFlowStore:
         row.description = flow.description
         row.definition = flow.definition
         row.input_variables = [variable.model_dump(mode="json", by_alias=True) for variable in flow.input_variables]
+        row.acceptance_contract = flow.acceptance_contract.model_dump(mode="json", by_alias=True)
+        row.revision = flow.revision
         row.status = flow.status
         row.folder_path = flow.folder_path
         row.default_browser_executor = flow.default_browser_executor
@@ -129,6 +133,8 @@ class SqlAlchemyFlowStore:
             description=row.description,
             definition=row.definition,
             inputVariables=row.input_variables,
+            acceptanceContract=getattr(row, "acceptance_contract", None) or {},
+            revision=getattr(row, "revision", 1) or 1,
             status=row.status,
             folderPath=getattr(row, "folder_path", "默认目录") or "默认目录",
             defaultBrowserExecutor=getattr(row, "default_browser_executor", "playwright") or "playwright",
@@ -145,6 +151,10 @@ def _ensure_flow_columns(connection) -> None:
     columns = {col["name"] for col in inspect(connection).get_columns(FlowRow.__tablename__)}
     if "input_variables" not in columns:
         connection.execute(text("ALTER TABLE rpa_flows ADD COLUMN input_variables TEXT NOT NULL DEFAULT '[]'"))
+    if "acceptance_contract" not in columns:
+        connection.execute(text("ALTER TABLE rpa_flows ADD COLUMN acceptance_contract TEXT NOT NULL DEFAULT '{}'"))
+    if "revision" not in columns:
+        connection.execute(text("ALTER TABLE rpa_flows ADD COLUMN revision INTEGER NOT NULL DEFAULT 1"))
     if "folder_path" not in columns:
         connection.execute(text("ALTER TABLE rpa_flows ADD COLUMN folder_path VARCHAR(500) NOT NULL DEFAULT '默认目录'"))
     if "default_browser_executor" not in columns:

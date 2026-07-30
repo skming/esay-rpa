@@ -76,6 +76,8 @@ def _lint_flow_semantic_quality(nodes: list[Any]) -> list[dict[str, Any]]:
     findings.extend(_lint_table_output_risks(business_nodes))
     findings.extend(_lint_scrape_flow_without_table_output(business_nodes))
     findings.extend(_lint_extract_union_selector(business_nodes))
+    findings.extend(_lint_extract_scope_is_page_root(business_nodes))
+    findings.extend(_lint_wait_selector_is_page_root(business_nodes))
     findings.extend(_lint_script_environment_risks(business_nodes))
     findings.extend(_lint_script_http_flow_drift(business_nodes))
     findings.extend(_lint_script_hardcoded_content(business_nodes))
@@ -530,15 +532,37 @@ def _lint_unrolled_repeat_chain(nodes: list[Any], edges: list[Any]) -> list[dict
 
 # 抽取节点：浏览器与桌面两条通道，凡是判「抽取」的规则都用这一份
 _EXTRACT_NODE_TYPES = frozenset({"browser.extract", "ui.extract"})
-_BARE_CLASS_SELECTOR = re.compile(r"(?:div|span|section|ul|ol)?\.[A-Za-z0-9_-]+$")
+# 无锚点的并集项：单个 class、或单个容器类标签。判据是"这一项自己说不清在页面哪一层"，
+# 不是"它长什么样"——带后代关系（#Main .topic_content）的项作者已经定了层级，不算
+_BARE_CLASS_SELECTOR = re.compile(r"(?:div|span|section|article|main|ul|ol)?\.[A-Za-z0-9_-]+$")
+_CONTAINER_TAG_SELECTOR = re.compile(r"(?:article|main|section|aside|div|ul|ol|table)$")
+# `*=` 可能同时覆盖外层容器与同名前缀的子项；是否真的嵌套只能由运行时 DOM 判定，
+# 所以静态阶段只提示，`~=` 的 token 匹配与 `^=`/`$=` 不按子串风险处理
+_SUBSTRING_ATTR_SELECTOR = re.compile(r"\[[A-Za-z_-]+\*=")
+
+
+def _is_unanchored_union_part(part: str) -> bool:
+    """这一项有没有把自己定位到页面的某一层。"""
+    if re.search(r"[\s>+~]", re.sub(r"\[[^\]]*\]|:has-text\([^)]*\)", "", part)):
+        return False
+    stripped = re.sub(r":has-text\([^)]*\)", "", part).strip()
+    return bool(
+        _BARE_CLASS_SELECTOR.fullmatch(stripped)
+        or _CONTAINER_TAG_SELECTOR.fullmatch(stripped.lower())
+        or _SUBSTRING_ATTR_SELECTOR.search(stripped)
+    )
 
 
 def _lint_extract_union_selector(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """抽取节点把并集当兜底用。
 
     并集在 browser.wait 上是"任一出现即可"，在抽取节点上却是"全都抓"。写成一串
-    由粗到细的纯 class（.x-page, .x-section, .x-grid, .x-card）说明作者没定下哪个是
-    目标，而最粗的那个通常是其余几个的祖先，抽取范围会塌到整片页面。
+    由粗到细、每项都说不清自己在哪一层的选择器（.x-page, .x-grid, .x-card 或
+    article, main, [class*='post']）说明作者没定下哪个是目标，而最粗的那个通常是
+    其余几个的祖先，抽取范围会塌到整片页面，同一段正文还会按嵌套层数重复若干遍。
+
+    子串型属性匹配单独降到两项就报：`[class*='post']` 一项自己就同时命中 post-list
+    和它内部的 post-item，跟并集里有没有第三项无关。
     """
     findings: list[dict[str, Any]] = []
     for node in nodes:
@@ -546,21 +570,119 @@ def _lint_extract_union_selector(nodes: list[dict[str, Any]]) -> list[dict[str, 
             continue
         selector = str(node.get("selector") or "")
         parts = [part.strip() for part in selector.split(",") if part.strip()]
-        if len(parts) < 3 or not all(_BARE_CLASS_SELECTOR.fullmatch(part) for part in parts):
+        if len(parts) < 2:
+            continue
+        substring_parts = [part for part in parts if _SUBSTRING_ATTR_SELECTOR.search(part)]
+        if not substring_parts and not (
+            len(parts) >= 3 and all(map(_is_unanchored_union_part, parts))
+        ):
+            continue
+        reason = (
+            f"其中 {'、'.join(substring_parts)} 是子串型属性匹配，一项就会同时命中外层容器"
+            "和它内部的同名子元素，同一段内容被重复抓下来。"
+            if substring_parts
+            else f"{len(parts)} 项都没有说明自己在页面的哪一层。"
+        )
+        findings.append({
+            "severity": "warn",
+            "node_id": str(node.get("id", "?")),
+            "node_title": str(node.get("title") or node.get("id", "?")),
+            "issue": "extract_selector_union_used_as_fallback",
+            "message": (
+                f"抽取节点的 selector 是 {len(parts)} 项并集：{selector}。{reason}"
+                "抽取节点不会择一命中，而是把每一项匹配到的元素全部抓下来；"
+                "这几项若存在嵌套关系，最外层会吞掉其余项，结果变成整片区域甚至整页。"
+            ),
+            "fix": (
+                "先用 inspect_page 确认目标数据所在的那一层容器，只保留最贴近数据的一项，"
+                "并给它写全层级（如 `#Main .topic_content`）。"
+                "需要兼容多种页面结构时，用 browser.wait 做存在性判断，不要在抽取节点里堆并集。"
+            ),
+        })
+    return findings
+
+
+# 页面根：这几个 token 都命中整篇文档，任何时刻都存在、且包住其余一切
+_PAGE_ROOT_TOKENS = frozenset({"body", "html", ":root", "document", "*"})
+# 等待类节点：selector 命中即视为条件达成，判「等待有没有意义」的规则都用这一份
+_WAIT_NODE_TYPES = frozenset({"browser.wait", "browser.waitFor", "ui.wait"})
+
+
+def _selector_tokens(selector: str) -> list[str]:
+    """并集里的每一项，去掉 Playwright 伪选择器后的小写形式。"""
+    cleaned = re.sub(r":has-text\([^)]*\)", "", str(selector or ""))
+    return [part.strip().lower() for part in cleaned.split(",") if part.strip()]
+
+
+def _lint_extract_scope_is_page_root(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """抽取节点的 selector 落在页面根上，抓的是整页而不是数据。
+
+    `body` 抓回来的是导航栏、页脚、内联 <style> 全在内的一大团文本，且永远"成功"——
+    运行状态、变量非空、产物存在，没有任何一处会红。坏处要等用户打开产物才发现，
+    而那时的补救通常是加一个下游脚本去洗，洗的却是一个整页文本，行级规则一条都命不中。
+    唯一的出路是在抽取这一步就收窄范围，所以定成 error 拦在运行前。
+    """
+    findings: list[dict[str, Any]] = []
+    for node in nodes:
+        if node.get("type") not in _EXTRACT_NODE_TYPES:
+            continue
+        tokens = _selector_tokens(node.get("selector"))
+        hit = [token for token in tokens if token in _PAGE_ROOT_TOKENS]
+        if not hit:
             continue
         findings.append({
             "severity": "error",
             "node_id": str(node.get("id", "?")),
             "node_title": str(node.get("title") or node.get("id", "?")),
-            "issue": "extract_selector_union_used_as_fallback",
+            "issue": "extract_scope_is_page_root",
             "message": (
-                f"抽取节点的 selector 由 {len(parts)} 个纯 class 并集组成：{selector}。"
-                "抽取节点不会择一命中，而是把每一项匹配到的元素全部抓下来；"
-                "这几项若存在嵌套关系，最外层会吞掉其余项，结果变成整片区域甚至整页。"
+                f"抽取节点的 selector 包含页面根 `{'`、`'.join(hit)}`，抓取范围是整个页面："
+                "导航栏、侧栏、页脚、内联样式表都会进变量，正文只占其中一小段。"
+                + ("并集里只要有一项是页面根，它就包住了其余项，收窄其他项没有用。"
+                   if len(tokens) > 1 else "")
             ),
             "fix": (
-                "先用 inspect_page 确认目标数据所在的那一层容器，只保留最贴近数据的一项。"
-                "需要兼容多种页面结构时，用 browser.wait 做存在性判断，不要在抽取节点里堆并集。"
+                "调用 inspect_page 看 page_layout，找到只装着目标内容的那层容器"
+                "（帖子正文、结果列表、详情面板），把 selector 换成它。\n"
+                "不要用「先抓整页、再写脚本清洗」代替这一步：整页文本是一大段连续文字，"
+                "按行做黑名单和去重命不中任何噪声，脚本会跑成功但一个字符都删不掉。"
+            ),
+        })
+    return findings
+
+
+def _lint_wait_selector_is_page_root(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """等待节点的 selector 落在页面根上，等待恒定成立，等于没等。
+
+    这条最常见的写法是把 `body` 当兜底加进并集（`article, main, .post, body`）——
+    并集在等待节点上是「任一出现即可」，而 body 在导航完成的那一刻就已经在了，
+    真正要等的那几项一次都不会被等到。它不会报错，只会让下游节点在页面还没渲染
+    （或还停在验证页）时就开抓。
+    """
+    findings: list[dict[str, Any]] = []
+    for node in nodes:
+        if node.get("type") not in _WAIT_NODE_TYPES:
+            continue
+        tokens = _selector_tokens(node.get("selector"))
+        hit = [token for token in tokens if token in _PAGE_ROOT_TOKENS]
+        if not hit:
+            continue
+        hidden = str(node.get("waitCondition") or "") == "hidden"
+        findings.append({
+            "severity": "error",
+            "node_id": str(node.get("id", "?")),
+            "node_title": str(node.get("title") or node.get("id", "?")),
+            "issue": "wait_selector_is_page_root",
+            "message": (
+                f"等待节点的 selector 包含页面根 `{'`、`'.join(hit)}`。"
+                + ("等它消失永远等不到，这个节点只会耗光 timeoutMs。"
+                   if hidden
+                   else "页面根在导航完成时就已存在，这个等待立即成立、等于没等；"
+                        "并集里其余那几项一次都不会被等到。")
+            ),
+            "fix": (
+                "删掉并集里的页面根项，只留真正标志「内容已就绪」的那个 selector。"
+                "不确定该等谁时先 inspect_page，别用页面根兜底——兜底在这里的效果是让等待失效。"
             ),
         })
     return findings
@@ -740,6 +862,21 @@ def _lint_script_environment_risks(nodes: list[dict[str, Any]]) -> list[dict[str
         code = str(node.get("code") or "")
         if not code:
             continue
+        uses_runtime_snapshot = any(marker in code for marker in (
+            "RPA_VARIABLES_JSON", "RPA_VARIABLES_FILE", "_vars",
+        ))
+        if uses_runtime_snapshot and not isinstance(node.get("inputVariables"), list):
+            findings.append({
+                "severity": "error",
+                "node_id": str(node.get("id", "?")),
+                "node_title": str(node.get("title") or node.get("id", "?")),
+                "issue": "script_inputs_not_declared",
+                "message": (
+                    "脚本读取运行时变量快照，却没有声明 inputVariables。"
+                    "执行器只会向脚本注入显式声明的变量和内置变量，隐式读取会得到空值。"
+                ),
+                "fix": "列出脚本真实读取的变量名到 inputVariables；不读取业务变量时显式填写空数组。",
+            })
         lowered = code.lower()
         if not any(token in lowered for token in browser_globals):
             continue

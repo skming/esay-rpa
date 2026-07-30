@@ -34,6 +34,7 @@ from app.services.ai_tools.diagnostics import (
     _audit_document_provenance,
     _extract_requirement_targets,
     _find_incomplete_sweeps,
+    _find_ineffective_transforms,
     build_navigation_trace,
     build_navigation_verdict,
 )
@@ -50,6 +51,24 @@ from app.services.ai_tools.script_capabilities import (
     semantic_rewrite_node_types,
 )
 from app.services.ai_tools.normalize import _normalize_generated_edges, _normalize_generated_nodes
+
+
+def _valid_contract(variable: str) -> dict[str, Any]:
+    return {
+        "requirements": [{
+            "id": "test-requirement",
+            "description": "测试交付要求",
+            "sourceKind": "product_default",
+            "confidence": 1,
+            "confirmed": True,
+        }],
+        "deliverables": [{
+            "id": "test-deliverable",
+            "variable": variable,
+            "kind": "scalar",
+            "requirementIds": ["test-requirement"],
+        }],
+    }
 
 
 def test_lint_flow_reports_visual_overlap_for_crowded_branch_columns() -> None:
@@ -135,6 +154,33 @@ def test_normalize_layout_keeps_realistic_login_and_navigation_flow_readable() -
     by_id = {node["id"]: node for node in nodes}
     assert by_id["n6"]["position"]["x"] < by_id["n_nav_menu"]["position"]["x"]
     assert by_id["n_nav_sub"]["position"]["y"] > by_id["n_nav_menu"]["position"]["y"]
+
+
+async def test_create_flow_rejects_missing_or_unbound_acceptance_contract_before_persisting() -> None:
+    executor = RpaToolExecutor(  # type: ignore[arg-type]
+        flow_service=SimpleNamespace(),
+        task_manager=SimpleNamespace(),
+    )
+    nodes = [{
+        "id": "extract",
+        "type": "browser.extract",
+        "selector": ".rows",
+        "outputVariable": "rows",
+        "position": {"x": 0, "y": 100},
+    }]
+
+    missing = await executor.execute("create_flow", {"name": "订单", "nodes": nodes})
+    unbound = await executor.execute("create_flow", {
+        "name": "订单",
+        "nodes": nodes,
+        "acceptance_contract": {
+            "deliverables": [{"id": "orders", "variable": "unknown", "kind": "table"}],
+        },
+    })
+
+    assert missing["error"] == "acceptance_contract_invalid"
+    assert unbound["error"] == "acceptance_contract_invalid"
+    assert any("unknown" in issue for issue in unbound["contract_errors"])
 
 
 def test_normalize_layout_ignores_ai_dirty_positions_and_places_join_after_branch() -> None:
@@ -384,6 +430,7 @@ class FakeFlowService:
             version="v1.0.0",
             status="active",
             inputVariables=[],
+            acceptanceContract=_valid_contract("login_count"),
             definition={
                 "nodes": [
                     {"id": "start", "type": "start"},
@@ -515,10 +562,11 @@ class _SimpleFlowService:
             version="v1.0.0",
             status="active",
             inputVariables=[],
+            acceptanceContract=_valid_contract("page_opened"),
             definition={
                 "nodes": [
                     {"id": "start", "type": "start"},
-                    {"id": "n1", "type": "browser.open", "targetUrl": "https://example.com"},
+                    {"id": "n1", "type": "browser.open", "targetUrl": "https://example.com", "outputVariable": "page_opened"},
                 ],
                 "edges": [{"source": "start", "target": "n1"}],
             },
@@ -553,10 +601,11 @@ class _CredentialFlowService:
             version="v1.0.0",
             status="active",
             inputVariables=self._variables,
+            acceptanceContract=_valid_contract("filled"),
             definition={
                 "nodes": [
                     {"id": "start", "type": "start"},
-                    {"id": "n1", "type": "browser.fill", "selector": "#pwd", "inputValue": self._reference or "x"},
+                    {"id": "n1", "type": "browser.fill", "selector": "#pwd", "inputValue": self._reference or "x", "outputVariable": "filled"},
                 ],
                 "edges": [{"source": "start", "target": "n1"}],
             },
@@ -580,6 +629,24 @@ async def test_get_flow_computes_credential_readiness_instead_of_leaving_it_to_t
 
     assert data["run_readiness"]["ready"] is False
     assert data["run_readiness"]["empty_credential_fields"] == ["password"]
+
+
+async def test_get_flow_redacts_credential_values_before_returning_to_the_model() -> None:
+    executor = RpaToolExecutor(  # type: ignore[arg-type]
+        flow_service=_CredentialFlowService([
+            _cred("password", "hunter2"),
+            _cred("date_start", "2026-01-01", category="flow"),
+        ]),
+        task_manager=FakeTaskManager(with_failing_tasks=False),
+    )
+
+    data = await executor._get_flow("flow-1")
+    variables = {item["name"]: item for item in data["input_variables"]}
+
+    assert variables["password"]["value"] == ""
+    assert variables["password"]["has_value"] is True
+    assert variables["date_start"]["value"] == "2026-01-01"
+    assert data["run_readiness"]["ready"] is True
 
 
 async def test_credential_readiness_ignores_filled_and_unreferenced_fields() -> None:
@@ -646,10 +713,11 @@ class _TakeoverFlowService:
             version="v1.0.0",
             status="active",
             inputVariables=[],
+            acceptanceContract=_valid_contract("takeover_result"),
             definition={
                 "nodes": [
                     {"id": "start", "type": "start"},
-                    {"id": "n1", "type": self._node_type, "title": "等用户"},
+                    {"id": "n1", "type": self._node_type, "title": "等用户", "outputVariable": "takeover_result"},
                 ],
                 "edges": [{"source": "start", "target": "n1"}],
             },
@@ -1801,6 +1869,37 @@ def test_check_structured_rows_allows_a_single_summary_row() -> None:
     assert _check_structured_rows(rows, []) is None
 
 
+def test_check_structured_rows_flags_a_text_blob_wearing_a_table_shell() -> None:
+    """真实规避：被判 no_table_like_output 后，模型把整页文本切段塞进「内容」列凑出 list[dict]。"""
+    rows = [
+        {"序号": i + 1, "类型": "回复" if i else "主题正文", "内容": f"第{i}段正文" + "文" * 60}
+        for i in range(20)
+    ]
+
+    issue = _check_structured_rows(rows, [])
+
+    assert issue is not None
+    assert issue["issue"] == "single_column_text_shell"
+    assert issue["payload_column"] == "内容"
+
+
+def test_check_structured_rows_allows_a_real_table_with_one_long_column() -> None:
+    """正文长不是缺陷：只要其余列装着页面上真实存在的字段（作者、时间各不相同）就算数。"""
+    rows = [
+        {"作者": f"user{i}", "时间": f"2026-07-{i + 1:02d}", "正文": "文" * 200}
+        for i in range(20)
+    ]
+
+    assert _check_structured_rows(rows, []) is None
+
+
+def test_check_structured_rows_allows_a_narrow_two_column_table() -> None:
+    """序号 + 短标题的两列表没有「一列吞掉全部信息」的问题，不该按文本壳判。"""
+    rows = [{"序号": i + 1, "标题": f"第 {i} 号议题"} for i in range(20)]
+
+    assert _check_structured_rows(rows, []) is None
+
+
 def test_parse_tool_arguments_reports_duplicate_keys() -> None:
     """模型想一次改多个节点时会重复写 node_id/config_patch，json 只保留最后一份。"""
     args, duplicates = _parse_tool_arguments(
@@ -1912,8 +2011,53 @@ def test_lint_flags_extract_selector_built_as_a_class_union() -> None:
         if f["issue"] == "extract_selector_union_used_as_fallback"
     )
 
-    assert hit["severity"] == "error"
+    assert hit["severity"] == "warn"
     assert hit["node_id"] == "n14"
+
+
+def test_lint_flags_extract_union_of_landmark_tags_and_substring_attributes() -> None:
+    """真实缺陷：修复时把 body 换成这串并集，正文按嵌套层数重复，产物反而从 471KB 涨到 925KB。"""
+    nodes = [
+        {"id": "n3", "type": "browser.extract", "title": "提取正文",
+         "selector": "article, main, .post, .topic, [class*='post'], [class*='topic']",
+         "extractMode": "text", "outputVariable": "raw", "position": {"x": 0, "y": 0}},
+    ]
+
+    hit = next(
+        f for f in _lint_flow(nodes, [])
+        if f["issue"] == "extract_selector_union_used_as_fallback"
+    )
+
+    assert hit["severity"] == "warn"
+    assert "[class*='post']" in hit["message"]
+
+
+def test_lint_flags_a_substring_attribute_paired_with_one_scoped_selector() -> None:
+    """子串匹配自己就覆盖祖先与后代，并集里有没有第三项跟这个缺陷无关。"""
+    nodes = [
+        {"id": "n3", "type": "browser.extract", "title": "提取正文",
+         "selector": "#Main .topic_content, [class*='reply']",
+         "extractMode": "text", "outputVariable": "raw", "position": {"x": 0, "y": 0}},
+    ]
+
+    assert any(
+        f["issue"] == "extract_selector_union_used_as_fallback"
+        for f in _lint_flow(nodes, [])
+    )
+
+
+def test_lint_allows_extract_union_of_exact_attribute_matches() -> None:
+    """`[data-role="row"]` 是全等匹配，划得清一层，不会顺带命中它的父容器。"""
+    nodes = [
+        {"id": "n3", "type": "browser.extract", "title": "提取行",
+         "selector": "#grid [data-role='row'], #grid [role='row']",
+         "extractMode": "text", "outputVariable": "rows", "position": {"x": 0, "y": 0}},
+    ]
+
+    assert not any(
+        f["issue"] == "extract_selector_union_used_as_fallback"
+        for f in _lint_flow(nodes, [])
+    )
 
 
 def test_lint_allows_union_selector_on_wait_nodes() -> None:
@@ -2012,6 +2156,77 @@ class _ScrapedTaskManager:
 
     async def get_task(self, task_id: str):
         return self.task if task_id == self.task.task_id else None
+
+
+async def test_assert_run_output_rejects_evidence_from_an_old_flow_revision() -> None:
+    now = datetime.now(UTC)
+    task = TaskSnapshot(
+        taskId="stale-task",
+        flowId="flow-1",
+        flowName="订单流程",
+        flowRevision=1,
+        mode="run",
+        status="success",
+        progress=RuntimeProgress(currentStep=2, totalSteps=2, percent=100, elapsedMs=1000),
+        createdAt=now,
+        updatedAt=now,
+    )
+    task_manager = SimpleNamespace(get_task=lambda task_id: None)
+
+    async def get_task(task_id: str):
+        return task if task_id == task.task_id else None
+
+    async def get_flow(flow_id: str):
+        return SimpleNamespace(revision=2)
+
+    task_manager.get_task = get_task
+    flow_service = SimpleNamespace(get_flow=get_flow)
+    executor = RpaToolExecutor(flow_service=flow_service, task_manager=task_manager)  # type: ignore[arg-type]
+
+    result = await executor.execute("assert_run_output", {"task_id": "stale-task"})
+
+    assert result["passed"] is False
+    assert result["issues"][0]["issue"] == "stale_run_evidence"
+    assert result["current_flow_revision"] == 2
+
+
+async def test_assert_run_output_rejects_orphaned_or_digest_mismatched_evidence() -> None:
+    now = datetime.now(UTC)
+    task = TaskSnapshot(
+        taskId="evidence-task",
+        flowId="flow-1",
+        flowName="订单流程",
+        flowRevision=1,
+        definitionDigest="old-digest",
+        mode="run",
+        status="success",
+        progress=RuntimeProgress(currentStep=2, totalSteps=2, percent=100, elapsedMs=1000),
+        createdAt=now,
+        updatedAt=now,
+    )
+
+    async def get_task(_task_id: str):
+        return task
+
+    async def missing_flow(_flow_id: str):
+        return None
+
+    orphan_executor = RpaToolExecutor(  # type: ignore[arg-type]
+        flow_service=SimpleNamespace(get_flow=missing_flow),
+        task_manager=SimpleNamespace(get_task=get_task),
+    )
+    orphaned = await orphan_executor.execute("assert_run_output", {"task_id": task.task_id})
+    assert orphaned["issues"][0]["issue"] == "orphaned_run_evidence"
+
+    async def changed_flow(_flow_id: str):
+        return SimpleNamespace(revision=1, definition={"nodes": [], "edges": []})
+
+    digest_executor = RpaToolExecutor(  # type: ignore[arg-type]
+        flow_service=SimpleNamespace(get_flow=changed_flow),
+        task_manager=SimpleNamespace(get_task=get_task),
+    )
+    mismatched = await digest_executor.execute("assert_run_output", {"task_id": task.task_id})
+    assert mismatched["issues"][0]["issue"] == "definition_digest_mismatch"
 
 
 async def test_assert_run_output_no_longer_passes_a_table_unrelated_to_the_requirement() -> None:
@@ -3277,3 +3492,184 @@ def test_advisory_only_findings_do_not_read_as_a_blocked_run() -> None:
 
     assert marked[0]["blocks_run"] is False
     assert "blocks_run=true" not in text
+
+
+def test_extracting_the_whole_page_is_blocked_before_the_run() -> None:
+    """selector=body 抓回来的是整页文本，正文只占其中一小段。
+
+    这条必须拦在运行前：整页抽取永远"成功"，坏处要等用户打开产物才发现，
+    而那时的补救通常是加一个下游脚本去洗一段本来就洗不动的连续文本。
+    """
+    nodes = [
+        {"id": "start", "type": "start"},
+        {"id": "n4", "type": "browser.extract", "selector": "body",
+         "extractMode": "text", "outputVariable": "post_texts"},
+        {"id": "end", "type": "end"},
+    ]
+    edges = [{"source": "start", "target": "n4"}, {"source": "n4", "target": "end"}]
+
+    findings = _lint_flow(nodes, edges)
+    hit = [f for f in findings if f["issue"] == "extract_scope_is_page_root"]
+
+    assert [f["severity"] for f in hit] == ["error"]
+    assert "inspect_page" in hit[0]["fix"]
+
+
+def test_page_root_inside_an_extract_union_is_still_the_whole_page() -> None:
+    """并集里只要有 body，收窄其余项就没有意义——它把其余项全包住了。"""
+    nodes = [
+        {"id": "n4", "type": "ui.extract", "selector": ".post-content, body",
+         "outputVariable": "rows"},
+    ]
+
+    findings = _lint_flow(nodes, [])
+    hit = [f for f in findings if f["issue"] == "extract_scope_is_page_root"]
+
+    assert len(hit) == 1
+    assert "包住了其余项" in hit[0]["message"]
+
+
+def test_narrow_extract_selector_is_left_alone() -> None:
+    """误报会教模型整体忽略 lint 结论，正常的正文 selector 一条都不能碰。"""
+    nodes = [
+        {"id": "n4", "type": "browser.extract", "selector": ".post-content .content",
+         "extractMode": "text", "outputVariable": "post_texts"},
+    ]
+
+    findings = _lint_flow(nodes, [])
+
+    assert not [f for f in findings if f["issue"] == "extract_scope_is_page_root"]
+
+
+def test_wait_with_a_body_fallback_is_reported_as_no_wait() -> None:
+    """`article, main, body` 这种兜底写法让等待恒成立，下游会在页面没就绪时开抓。"""
+    nodes = [
+        {"id": "n3", "type": "browser.wait", "selector": "article, main, .post, body",
+         "timeoutMs": 30000},
+    ]
+
+    findings = _lint_flow(nodes, [])
+    hit = [f for f in findings if f["issue"] == "wait_selector_is_page_root"]
+
+    assert [f["severity"] for f in hit] == ["error"]
+    assert "立即成立" in hit[0]["message"]
+
+
+def test_waiting_for_the_page_root_to_disappear_reads_as_a_dead_wait() -> None:
+    """同一个 selector 在 hidden 条件下是另一种坏法：永远等不到，只会耗光 timeout。"""
+    nodes = [
+        {"id": "n3", "type": "browser.waitFor", "selector": "body", "waitCondition": "hidden"},
+    ]
+
+    hit = [f for f in _lint_flow(nodes, []) if f["issue"] == "wait_selector_is_page_root"]
+
+    assert "永远等不到" in hit[0]["message"]
+
+
+def test_dismiss_and_press_may_still_target_the_page_root() -> None:
+    """Escape 就是要打在 body 上（另一条 lint 的 fix 明说了这么写），别把它一起拦了。"""
+    nodes = [
+        {"id": "n2", "type": "browser.press", "selector": "body", "inputValue": "Escape"},
+        {"id": "n3", "type": "browser.dismiss", "selector": "body"},
+    ]
+
+    findings = _lint_flow(nodes, [])
+
+    assert not [f for f in findings if f["issue"].endswith("is_page_root")]
+
+
+def test_cleanup_script_that_deletes_nothing_fails_the_audit() -> None:
+    """"清洗"跑通了但一个字符没删——运行状态、变量、产物全绿，只有体量对比看得出来。"""
+    raw = "导航 登录 注册\n" + "帖子正文内容。" * 400
+    nodes = [
+        {"id": "n4_extract", "type": "browser.extract", "selector": "body",
+         "outputVariable": "post_texts", "firstValueVariable": "post_text"},
+        {"id": "n6_clean", "type": "script.python", "outputVariable": "cleaned_post_json",
+         "code": "..."},
+    ]
+
+    findings = _find_ineffective_transforms(nodes, {
+        "post_texts": [raw],
+        "post_text": raw,
+        "cleaned_post_json": raw,
+    })
+
+    assert [f["issue"] for f in findings] == ["transform_had_no_effect"]
+    assert findings[0]["input_variable"] in {"post_text", "post_texts"}
+    assert "get_run_output" in findings[0]["fix"]
+
+
+def test_a_transform_that_really_strips_the_noise_passes() -> None:
+    nodes = [
+        {"id": "n4_extract", "type": "browser.extract", "outputVariable": "post_text"},
+        {"id": "n6_clean", "type": "script.python", "outputVariable": "cleaned"},
+    ]
+    raw = "导航 登录 注册 页脚 版权\n" + "帖子正文内容。" * 400
+
+    findings = _find_ineffective_transforms(nodes, {
+        "post_text": raw,
+        "cleaned": "帖子正文内容。" * 200,
+    })
+
+    assert findings == []
+
+
+def test_one_extract_nodes_own_two_variables_are_not_compared_with_each_other() -> None:
+    """outputVariable 与 firstValueVariable 装的是同一份内容，互比必然"无变化"。"""
+    raw = "帖子正文内容。" * 400
+    nodes = [
+        {"id": "n4", "type": "browser.extract", "outputVariable": "texts",
+         "firstValueVariable": "text"},
+    ]
+
+    assert _find_ineffective_transforms(nodes, {"texts": [raw], "text": raw}) == []
+
+
+def test_describing_a_cleanup_as_done_needs_run_evidence():
+    """清洗类需求的失败是静默的，用户只能从这段回复判断做没做成。"""
+    state: dict = {}
+    _orchestrator_guard_after_tool(
+        "update_flow",
+        {"status": "applied", "changed_nodes": [
+            {"id": "n6_clean", "type": "script.python", "change": "added"},
+        ], "events": [{
+            "type": "flow_written",
+            "revision": 2,
+            "affected_nodes": [{"id": "n6_clean", "type": "script.python", "change": "added"}],
+        }]},
+        state,
+    )
+
+    correction = _overstated_result_claim(
+        "已新增清理步骤，会去除导航词、Cloudflare 提示和重复行。", state
+    )
+
+    assert correction is not None
+    assert "get_run_output" in correction
+
+
+def test_the_same_wording_is_fine_when_no_transform_node_was_touched():
+    """只改了 selector 却说「去掉了…」说的是流程不是数据，别把正常表述也撤回。"""
+    state: dict = {}
+    _orchestrator_guard_after_tool(
+        "update_flow",
+        {"status": "applied", "changed_nodes": [
+            {"id": "n3_wait", "type": "browser.wait", "change": "updated"},
+        ]},
+        state,
+    )
+
+    assert _overstated_result_claim("已去掉等待节点里的 body 兜底。", state) is None
+
+
+def test_cleanup_wording_is_allowed_once_the_audit_has_passed():
+    state: dict = {}
+    _orchestrator_guard_after_tool(
+        "update_flow",
+        {"status": "applied", "changed_nodes": [{"id": "n6", "type": "script.python"}]},
+        state,
+    )
+    _orchestrator_guard_after_tool("run_flow", {"status": "success"}, state)
+    _orchestrator_guard_after_tool("assert_run_output", {"passed": True, "issues": []}, state)
+
+    assert _overstated_result_claim("已去除页面导航与样式表噪声，正文从 11.8 万字符降到 4200 字符。", state) is None

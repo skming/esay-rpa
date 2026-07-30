@@ -43,6 +43,8 @@ export interface AiUsage {
   llm_seconds: number;
 }
 
+export type VerificationStatus = 'modified_unverified' | 'run_verified' | 'accepted';
+
 export interface AiMessage {
   id: string;
   role: 'user' | 'assistant';
@@ -57,6 +59,9 @@ export interface AiMessage {
   reasoning?: string;
   processingMs?: number;
   usage?: AiUsage;
+  /** 当前流程 revision 的证据等级，由后端证据账本确定，不能由回复文案推断。 */
+  verificationStatus?: VerificationStatus;
+  verificationRevision?: number;
   createdAt: number;
   finishedAt?: number;
 }

@@ -74,4 +74,16 @@ describe('cleanForStore', () => {
     ]);
     expect(kept.map((m) => m.id)).toEqual(['u', 'tools']);
   });
+
+  it('保留后端给出的流程验证状态，重开面板后仍能识别证据等级', () => {
+    const [cleaned] = cleanForStore([
+      msg({
+        content: '运行完成',
+        verificationStatus: 'run_verified',
+        verificationRevision: 7,
+      }),
+    ]);
+    expect(cleaned.verificationStatus).toBe('run_verified');
+    expect(cleaned.verificationRevision).toBe(7);
+  });
 });

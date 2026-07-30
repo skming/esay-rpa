@@ -22,9 +22,13 @@ from app.services.ai_guards import (
     node_field_changes as _node_field_changes,
     selector_change_node_ids as _selector_change_node_ids,
 )
-from app.services.ai_prompts import get_system_prompt
+from app.services.ai_prompts import SYSTEM_PROMPT
+from app.services.ai_tool_events import attach_tool_events, current_verification_status, reduce_evidence_state
+from app.services.ai_evidence_ledger import load_verification_state, record_events
 from app.services.ai_tools import TOOL_SCHEMAS, RpaToolExecutor
 from app.services.ai_tools.diagnostics import CONTENT_MISMATCH_ISSUES, SELECTOR_DIAGNOSTIC_KINDS
+from app.services.node_semantics import TRANSFORM_NODE_TYPES
+from app.services.execution_evidence import definition_digest
 from app.services.ai_tools.lint import is_blocking_finding
 
 logger = logging.getLogger(__name__)
@@ -163,11 +167,6 @@ def _clean_litellm_error(msg: str) -> str:
     return msg[:300] if len(msg) > 300 else msg
 
 
-# 正文按段存放在 ai_prompts，版本由 RPA_AI_PROMPT_VERSION 选。
-# 这个常量是导入期取的值，只当默认版本的快照用；真正发出去的提示词在
-# _build_system_message 里按版本重取，否则 evals 中途换版本对已导入的编排器不生效。
-SYSTEM_PROMPT = get_system_prompt()
-
 MAX_TOOL_ROUNDS = 30  # strong 模型的轮次上限；weak/standard 模型用下方 tier 分级覆盖更小的值
 
 # 场景化 guidance，按事件注入，避免每轮携带全量指令
@@ -189,7 +188,7 @@ _GUIDANCE_AFTER_FIX = (
 # 运行成功后：get_run_output → 抓取类流程须 assert_run_output
 _GUIDANCE_AFTER_RUN_SUCCESS = (
     "运行成功。调用 get_run_output 查看产物；"
-    "抓取/筛选/导出类流程还须调用 assert_run_output(task_id, requirement_text=用户原始需求)，"
+    "抓取/筛选/导出类流程还须调用 assert_run_output(task_id) 按流程冻结的验收契约审计，"
     "审计通过后才能向用户汇报完成。"
 )
 
@@ -357,6 +356,7 @@ def _build_few_shot_messages() -> list[dict[str, Any]]:
         {"id": "n5",      "type": "control.condition", "title": "判断是否需要登录",   "kind": "control", "status": "pending", "position": {"x": 100, "y": 600},  "inputValue": "login_status == 'login_required'", "description": "login_required → 走登录分支"},
         {"id": "n6",      "type": "browser.fill",      "title": "填写账号",           "kind": "browser", "status": "pending", "position": {"x": 320, "y": 700},  "selector": "input[placeholder='请输入用户名']", "inputValue": "${var.username}", "delayMs": 800, "description": "填入 ${var.username}"},
         {"id": "n7",      "type": "browser.fill",      "title": "填写密码",           "kind": "browser", "status": "pending", "position": {"x": 320, "y": 800},  "selector": "input[placeholder='请输入密码']", "inputValue": "${var.password}", "delayMs": 500, "description": "填入 ${var.password}"},
+        {"id": "n8_input", "type": "variable.input",    "title": "输入验证码",         "kind": "variable", "status": "pending", "position": {"x": 680, "y": 850},  "message": "请查看浏览器中的图形验证码并输入", "variableName": "captcha", "description": "运行时收集当次验证码 → captcha"},
         {"id": "n8_fill", "type": "browser.fill",      "title": "填写验证码",         "kind": "browser", "status": "pending", "position": {"x": 320, "y": 900},  "selector": "input[placeholder='请输入验证码']", "inputValue": "${var.captcha}", "delayMs": 500, "description": "填入 ${var.captcha}"},
         {"id": "n9",      "type": "browser.click",     "title": "点击登录按钮",       "kind": "browser", "status": "pending", "position": {"x": 320, "y": 1000}, "selector": "button:has-text('登录')", "delayMs": 2000, "description": "提交登录表单"},
         {"id": "n10",     "type": "browser.wait",      "title": "等待登录后导航栏",   "kind": "browser", "status": "pending", "position": {"x": 320, "y": 1100}, "selector": ".side-bar-container, nav", "timeoutMs": 15000, "description": "等应用壳出现，确认登录成功"},
@@ -367,7 +367,7 @@ def _build_few_shot_messages() -> list[dict[str, Any]]:
         {"id": "n16",     "type": "browser.press",     "title": "提交日期区间",       "kind": "browser", "status": "pending", "position": {"x": 100, "y": 1600}, "selector": "input[placeholder='结束日期']", "inputValue": "Enter", "delayMs": 800, "description": "回车提交区间；打在输入框上而非 body，组件的按键处理挂在输入框自身"},
         {"id": "n17a",    "type": "browser.extract",   "title": "回读开始日期",       "kind": "browser", "status": "pending", "position": {"x": 100, "y": 1700}, "selector": "input[placeholder='开始日期']", "extractMode": "attribute", "attribute": "value", "firstValueVariable": "selected_start_date", "outputVariable": "selected_start_dates", "timeoutMs": 8000, "includeInResult": False, "description": "回读输入框实际值"},
         {"id": "n17b",    "type": "browser.extract",   "title": "回读结束日期",       "kind": "browser", "status": "pending", "position": {"x": 100, "y": 1800}, "selector": "input[placeholder='结束日期']", "extractMode": "attribute", "attribute": "value", "firstValueVariable": "selected_end_date", "outputVariable": "selected_end_dates", "timeoutMs": 8000, "includeInResult": False, "description": "回读输入框实际值"},
-        {"id": "n17c",    "type": "script.python",     "title": "校验日期筛选生效",   "kind": "script",  "status": "pending", "position": {"x": 100, "y": 1900}, "timeoutMs": 10000, "description": "日期没写进组件时页面会返回全量数据，这里硬失败，不允许 continueOnError", "code": "import json, os\n_vars = json.loads(os.environ.get('RPA_VARIABLES_JSON', '{}'))\nexpected = (_vars.get('date_start', ''), _vars.get('date_end', ''))\nactual = (_vars.get('selected_start_date', ''), _vars.get('selected_end_date', ''))\nif actual != expected:\n    raise SystemExit(f'日期筛选未生效：期望 {expected}，实际 {actual}')\nprint(json.dumps({'date_filter': f'{actual[0]}~{actual[1]}'}, ensure_ascii=False))\n"},
+        {"id": "n17c",    "type": "script.python",     "title": "校验日期筛选生效",   "kind": "script",  "status": "pending", "position": {"x": 100, "y": 1900}, "timeoutMs": 10000, "inputVariables": ["date_start", "date_end", "selected_start_date", "selected_end_date"], "description": "日期没写进组件时页面会返回全量数据，这里硬失败，不允许 continueOnError", "code": "import json, os\n_vars = json.loads(os.environ.get('RPA_VARIABLES_JSON', '{}'))\nexpected = (_vars.get('date_start', ''), _vars.get('date_end', ''))\nactual = (_vars.get('selected_start_date', ''), _vars.get('selected_end_date', ''))\nif actual != expected:\n    raise SystemExit(f'日期筛选未生效：期望 {expected}，实际 {actual}')\nprint(json.dumps({'date_filter': f'{actual[0]}~{actual[1]}'}, ensure_ascii=False))\n"},
         {"id": "n18",     "type": "browser.click",     "title": "打开项目进度下拉",   "kind": "browser", "status": "pending", "position": {"x": 100, "y": 2000}, "selector": ".el-select:has-text('项目进度') .el-select__tags", "description": "展开项目进度多选"},
         {"id": "n18b",    "type": "browser.wait",      "title": "等下拉选项渲染",     "kind": "browser", "status": "pending", "position": {"x": 100, "y": 2100}, "selector": ".el-select-dropdown__item", "timeoutMs": 5000, "description": "等选项出现再点，别用固定延时赌渲染速度"},
         {"id": "n19",     "type": "browser.click",     "title": "选择项目通过",       "kind": "browser", "status": "pending", "position": {"x": 100, "y": 2200}, "selector": ".el-select-dropdown__item:has-text('项目通过')", "delayMs": 500, "description": "勾选「项目通过」"},
@@ -384,7 +384,8 @@ def _build_few_shot_messages() -> list[dict[str, Any]]:
         {"id": "e_n5_n6",     "source": "n5",      "target": "n6",      "label": "true"},
         {"id": "e_n5_n12",    "source": "n5",      "target": "n12",     "label": "false"},
         {"id": "e_n6_n7",     "source": "n6",      "target": "n7"},
-        {"id": "e_n7_n8fill", "source": "n7",      "target": "n8_fill"},
+        {"id": "e_n7_n8input", "source": "n7",      "target": "n8_input"},
+        {"id": "e_n8input_n8fill", "source": "n8_input", "target": "n8_fill"},
         {"id": "e_n8fill_n9", "source": "n8_fill", "target": "n9"},
         {"id": "e_n9_n10",    "source": "n9",      "target": "n10"},
         {"id": "e_n10_n12",   "source": "n10",     "target": "n12"},
@@ -406,9 +407,8 @@ def _build_few_shot_messages() -> list[dict[str, Any]]:
         {"id": "e_n24_end",   "source": "n24",     "target": "end"},
     ]
     _ivs: list[dict[str, Any]] = [
-        {"name": "username", "type": "String", "value": "demo_user", "category": "credential"},
-        {"name": "password", "type": "String", "value": "demo_pass", "category": "credential", "sensitive": True},
-        {"name": "captcha",  "type": "String", "value": "8888",      "category": "credential"},
+        {"name": "username", "type": "String", "value": "", "category": "credential"},
+        {"name": "password", "type": "String", "value": "", "category": "credential", "sensitive": True},
         {"name": "date_start", "type": "String", "value": "2026-06-01", "category": "flow"},
         {"name": "date_end",   "type": "String", "value": "2026-06-24", "category": "flow"},
     ]
@@ -461,14 +461,34 @@ def _build_few_shot_messages() -> list[dict[str, Any]]:
         {"项目名称": "示例项目 E", "创建时间": "2026-06-19", "项目进度": "项目通过", "负责人": "张三"},
         {"项目名称": "示例项目 F", "创建时间": "2026-06-23", "项目进度": "待尽调",   "负责人": "李四"},
     ]
-    _create_result   = json.dumps({"flow_id": _flow_id, "name": "项目列表抓取-筛选", "status": "draft", "lint_findings": []}, ensure_ascii=False)
+    _contract = {
+        "requirements": [{
+            "id": "requested-filters",
+            "description": "按用户指定日期范围和项目进度抓取项目列表",
+            "sourceKind": "user",
+            "sourceQuote": "筛选创建时间 2026-06-01 至 2026-06-24，项目进度为「项目通过/待尽调」",
+            "confidence": 1,
+            "confirmed": True,
+        }],
+        "deliverables": [{
+            "id": "project-list",
+            "variable": "project_data",
+            "kind": "table",
+            "minRows": 1,
+            "requiredFields": ["项目名称", "创建时间", "项目进度", "负责人"],
+            "dateRanges": [{"field": "创建时间", "start": "2026-06-01", "end": "2026-06-24"}],
+            "allowedValues": [{"field": "项目进度", "values": ["项目通过", "待尽调"]}],
+            "requirementIds": ["requested-filters"],
+        }],
+    }
+    _create_result   = json.dumps({"flow_id": _flow_id, "name": "项目列表抓取-筛选", "status": "draft", "revision": 1, "acceptance_contract": _contract, "lint_findings": []}, ensure_ascii=False)
     _validate_result = json.dumps({
         "flow_id": _flow_id, "flow_name": "项目列表抓取-筛选",
-        "input_variables": ["username", "password", "captcha", "date_start", "date_end"],
-        "defined_variables": ["login_status", "selected_start_date", "selected_end_date", "project_data", "project_page_count", "project_table_count"],
+        "input_variables": ["username", "password", "date_start", "date_end"],
+        "defined_variables": ["login_status", "captcha", "selected_start_date", "selected_end_date", "project_data", "project_page_count", "project_table_count"],
         "issues": [], "is_valid": True, "fix_hint": None,
     }, ensure_ascii=False)
-    _run_result    = json.dumps({"task_id": _task_id, "status": "success", "flow_id": _flow_id, "progress": {"current_step": 26, "total_steps": 26, "percent": 100, "elapsed_ms": 41200}}, ensure_ascii=False)
+    _run_result    = json.dumps({"task_id": _task_id, "status": "success", "flow_id": _flow_id, "flow_revision": 1, "progress": {"current_step": 26, "total_steps": 26, "percent": 100, "elapsed_ms": 41200}}, ensure_ascii=False)
     _output_result = json.dumps({
         "task_id": _task_id, "status": "success",
         "summary": "运行成功，共输出 6 个变量、1 个产物文件。",
@@ -477,15 +497,14 @@ def _build_few_shot_messages() -> list[dict[str, Any]]:
     }, ensure_ascii=False)
     _assert_result = json.dumps({
         "task_id": _task_id, "passed": True,
-        "selected_variable": "project_data", "row_count": 6,
-        "headers": ["项目名称", "创建时间", "项目进度", "负责人"],
-        "resolved_constraints": {"date_field": "创建时间", "start_date": "2026-06-01", "end_date": "2026-06-24", "enum_field": "项目进度", "allowed_values": ["项目通过", "待尽调"]},
-        "issues": [], "sample_rows": _rows[:3],
-        "message": "行数、日期范围、枚举约束全部通过，抽取结果为结构化行。",
+        "flow_revision": 1,
+        "deliverables": [{"id": "project-list", "variable": "project_data", "kind": "table"}],
+        "issues": [], "warnings": [],
+        "message": "运行产物满足验收契约。",
     }, ensure_ascii=False)
 
     return [
-        {"role": "user", "content": "帮我抓取 https://erp.demo-rpa.test/ 项目列表。筛选创建时间 2026-06-01 至 2026-06-24，项目进度为「项目通过/待尽调」。需要判断登录态；账号 demo_user，密码 demo_pass，验证码 8888。"},
+        {"role": "user", "content": "帮我抓取 https://erp.demo-rpa.test/ 项目列表。筛选创建时间 2026-06-01 至 2026-06-24，项目进度为「项目通过/待尽调」。需要账号密码登录，运行时还有图形验证码。"},
         # 每个要交互的页面都单独探一次：登录页给出表单 selector，数据页给出 row_selector 与日期控件配方
         {"role": "assistant", "content": None, "tool_calls": [{"id": "fs_t1", "type": "function", "function": {"name": "inspect_page", "arguments": json.dumps({"url": "https://erp.demo-rpa.test/", "wait_selector": "input[type='password'], nav"})}}]},
         {"role": "tool", "tool_call_id": "fs_t1", "content": _inspect_login},
@@ -493,15 +512,17 @@ def _build_few_shot_messages() -> list[dict[str, Any]]:
         {"role": "tool", "tool_call_id": "fs_t2", "content": _inspect_list},
         # 示例站点恰好是 Element UI，下面的 el- selector 全部来自这次 inspect_page 的 page_classes。
         # 不写明出处的话，模型会把它们当成通用模板抄到 Arco/Vant/自研站点上去。
-        {"role": "assistant", "content": "`page_classes` 里是 el- 前缀，说明这个站点用的是 Element UI，所以下面的表格/下拉/翻页 selector 按 Element UI 的类名取。换一个站点这些类名一律不成立，必须重新 `inspect_page` 拿它自己的 `page_classes` 和 `tables[].row_selector`。", "tool_calls": [{"id": "fs_t3", "type": "function", "function": {"name": "create_flow", "arguments": json.dumps({"name": "项目列表抓取-筛选", "description": "登录后筛选日期范围+项目进度，翻页提取项目列表", "input_variables": _ivs, "nodes": _nodes, "edges": _edges}, ensure_ascii=False)}}]},
+        {"role": "assistant", "content": "`page_classes` 里是 el- 前缀，说明这个站点用的是 Element UI，所以下面的表格/下拉/翻页 selector 按 Element UI 的类名取。换一个站点这些类名一律不成立，必须重新 `inspect_page` 拿它自己的 `page_classes` 和 `tables[].row_selector`。", "tool_calls": [{"id": "fs_t3", "type": "function", "function": {"name": "create_flow", "arguments": json.dumps({"name": "项目列表抓取-筛选", "description": "登录后筛选日期范围+项目进度，翻页提取项目列表", "input_variables": _ivs, "nodes": _nodes, "edges": _edges, "acceptance_contract": _contract}, ensure_ascii=False)}}]},
         {"role": "tool", "tool_call_id": "fs_t3", "content": _create_result},
         {"role": "assistant", "content": None, "tool_calls": [{"id": "fs_t4", "type": "function", "function": {"name": "validate_flow", "arguments": json.dumps({"flow_id": _flow_id})}}]},
         {"role": "tool", "tool_call_id": "fs_t4", "content": _validate_result},
-        {"role": "assistant", "content": None, "tool_calls": [{"id": "fs_t5", "type": "function", "function": {"name": "run_flow", "arguments": json.dumps({"flow_id": _flow_id, "variables": {"username": "demo_user", "password": "demo_pass", "captcha": "8888"}})}}]},
+        {"role": "assistant", "content": "流程已创建并通过静态检查。请先在右侧「输入变量」面板配置账号和密码；运行到验证码步骤时会弹出输入框。"},
+        {"role": "user", "content": "我已在输入变量面板配置好账号和密码，请继续运行并验收。"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "fs_t5", "type": "function", "function": {"name": "run_flow", "arguments": json.dumps({"flow_id": _flow_id})}}]},
         {"role": "tool", "tool_call_id": "fs_t5", "content": _run_result},
         {"role": "assistant", "content": None, "tool_calls": [{"id": "fs_t6", "type": "function", "function": {"name": "get_run_output", "arguments": json.dumps({"task_id": _task_id})}}]},
         {"role": "tool", "tool_call_id": "fs_t6", "content": _output_result},
-        {"role": "assistant", "content": None, "tool_calls": [{"id": "fs_t7", "type": "function", "function": {"name": "assert_run_output", "arguments": json.dumps({"task_id": _task_id, "requirement_text": "筛选创建时间 2026-06-01 至今天，项目进度为项目通过/待尽调", "date_field": "创建时间", "start_date": "2026-06-01", "end_date": "2026-06-24", "enum_field": "项目进度", "allowed_values": ["项目通过", "待尽调"]}, ensure_ascii=False)}}]},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "fs_t7", "type": "function", "function": {"name": "assert_run_output", "arguments": json.dumps({"task_id": _task_id}, ensure_ascii=False)}}]},
         {"role": "tool", "tool_call_id": "fs_t7", "content": _assert_result},
         {"role": "assistant", "content": "已创建并验证通过。翻页抓取 2 页共 6 条项目记录，创建时间均落在 2026-06-01 至今天，项目进度全部为「项目通过」或「待尽调」；结果已写入 project-list-20260624-101500.json。"},
     ]
@@ -1026,12 +1047,11 @@ def _build_system_message(model: str, relayed: bool) -> dict[str, Any]:
     把 TOOL_SCHEMAS 一起缓进去，合计 4.4 万字符。OpenAI/DeepSeek 自动缓存，不需要
     标记；中转端点是否透传 cache_control 不可知，按普通字符串发。
     """
-    prompt = get_system_prompt()
     if relayed or not _model_caps(model).supports_cache_control:
-        return {"role": "system", "content": prompt}
+        return {"role": "system", "content": SYSTEM_PROMPT}
     return {
         "role": "system",
-        "content": [{"type": "text", "text": prompt, "cache_control": {"type": "ephemeral"}}],
+        "content": [{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
     }
 
 
@@ -1229,6 +1249,8 @@ class _FlowContext:
     # edge_id -> (source, target)，用于识别"改边绕过"：AI 可能保留受保护节点本身，
     # 却通过 remove_edge_ids/add_edges 切断其所有连接使其静默孤立
     edges_by_id: dict[str, tuple[str, str]] = dc_field(default_factory=dict)
+    revision: int | None = None
+    definition_digest: str | None = None
 
     @property
     def has_browser_chain(self) -> bool:
@@ -1243,7 +1265,10 @@ async def _load_flow_context(executor: RpaToolExecutor, flow_id: str) -> _FlowCo
     ctx = _FlowContext()
     try:
         flow = await executor.execute("get_flow", {"flow_id": flow_id})
+        if isinstance(flow.get("revision"), int):
+            ctx.revision = flow["revision"]
         if isinstance(flow.get("definition"), dict):
+            ctx.definition_digest = definition_digest(flow["definition"])
             raw_nodes = flow["definition"].get("nodes", [])
             raw_edges = flow["definition"].get("edges", [])
             ctx.browser_chain_node_ids = {
@@ -1459,8 +1484,10 @@ class AiOrchestrator:
             full_messages.insert(protect_prefix, {"role": "system", "content": ledger_summary})
             protect_prefix += 1
 
+        evidence_state = load_verification_state(flow_id, flow_ctx.revision, flow_ctx.definition_digest)
         guard_state: dict[str, Any] = {
             "flow_id": flow_id,
+            **evidence_state,
             "repair_sessions": int(ledger.get("sessions") or 0) + 1,
             "node_field_history": dict(ledger.get("node_field_history") or {}),
             "node_selector_fix_counts": dict(ledger.get("node_selector_fix_counts") or {}),
@@ -1519,6 +1546,14 @@ class AiOrchestrator:
         consecutive_empty_rounds = 0
         meter = _SessionMeter()
         repeated_results: dict[tuple[str, str], str] = {}
+        last_verification_status: str | None = None
+        if guard_state.get("current_flow_revision") is not None:
+            last_verification_status = current_verification_status(guard_state)
+            yield {
+                "type": "verification",
+                "status": last_verification_status,
+                "revision": guard_state.get("current_flow_revision"),
+            }
 
         for round_num in range(effective_max_rounds):
             if round_num == 0:
@@ -1809,6 +1844,15 @@ class AiOrchestrator:
                 # 记账与落盘都排在 yield 之前：一旦让出去，用户点停止就会让这个生成器
                 # 停在这里再也不往下走，而这次工具的代价（run_flow 常以分钟计）已经付掉了。
                 last_tool_name = tool_name
+                result = attach_tool_events(tool_name, result)
+                reduce_evidence_state(guard_state, result)
+                if isinstance(result, dict):
+                    event_flow_id = result.get("flow_id") or guard_state.get("flow_id")
+                    if isinstance(event_flow_id, str):
+                        guard_state["flow_id"] = event_flow_id
+                        record_events(event_flow_id, [
+                            event for event in (result.get("events") or []) if isinstance(event, dict)
+                        ])
                 meter.tool_calls += 1
                 if isinstance(result, dict) and str(result.get("status", "")).startswith("blocked_"):
                     meter.blocked_calls += 1
@@ -1816,6 +1860,17 @@ class AiOrchestrator:
                 _session_checkpoint.save(flow_id, guard_state, rounds=meter.rounds)
 
                 yield {"type": "tool_result", "tool": tool_name, "result": result, "call_id": tc["call_id"]}
+                verification_status = current_verification_status(guard_state)
+                if (
+                    guard_state.get("current_flow_revision") is not None
+                    and verification_status != last_verification_status
+                ):
+                    last_verification_status = verification_status
+                    yield {
+                        "type": "verification",
+                        "status": verification_status,
+                        "revision": guard_state.get("current_flow_revision"),
+                    }
 
                 full_messages.append({
                     "role": "tool",
@@ -1914,7 +1969,7 @@ def _parse_tool_arguments(raw_args: str) -> tuple[dict[str, Any], list[str]]:
     return (parsed if isinstance(parsed, dict) else {}), duplicates
 
 
-_FLOW_WRITE_TOOLS = ("create_flow", "update_flow", "apply_node_fix")
+_FLOW_WRITE_TOOLS = ("create_flow", "update_flow", "apply_node_fix", "set_acceptance_contract")
 
 # 承诺「数据质量没问题」——只有 assert_run_output 读过产物才配得上
 _ACCEPTANCE_CLAIM_PHRASES = ("验收通过", "通过验收", "可以验收", "已验收", "验收结论：通过", "验收：通过")
@@ -1922,6 +1977,12 @@ _ACCEPTANCE_CLAIM_PHRASES = ("验收通过", "通过验收", "可以验收", "�
 _VERIFIED_FIX_CLAIM_PHRASES = (
     "已修复", "问题已解决", "已解决", "修好了", "可以正常使用",
     "运行正常", "已恢复正常", "现在可以正常", "能正常跑",
+)
+# 承诺「数据被加工成了什么样」。这批词单看不足以判错——描述新增节点的用途本来就要用它们，
+# 所以只在本轮真的动了加工节点、且没有一次通过的审计时才当成越界断言
+_DATA_EFFECT_CLAIM_PHRASES = (
+    "去除", "去掉", "剔除", "清洗", "清理掉", "过滤掉", "筛掉",
+    "只保留", "去重", "删掉重复", "噪声",
 )
 
 
@@ -1935,7 +1996,15 @@ def _overstated_result_claim(text: str, state: dict[str, Any]) -> str | None:
     if state.get("result_claim_corrected"):
         return None
 
-    if any(phrase in text for phrase in _ACCEPTANCE_CLAIM_PHRASES) and not state.get("audit_passed"):
+    evidence_status = current_verification_status(state)
+    audit_verified = evidence_status == "accepted" or (
+        state.get("current_flow_revision") is None and state.get("audit_passed")
+    )
+    run_verified = evidence_status in {"run_verified", "accepted"} or (
+        state.get("current_flow_revision") is None and state.get("run_succeeded")
+    )
+
+    if any(phrase in text for phrase in _ACCEPTANCE_CLAIM_PHRASES) and not audit_verified:
         state["result_claim_corrected"] = True
         return (
             "你上一条回复已被撤回，用户没有看到，请完整重写整段回复（不要只补一句更正）。\n"
@@ -1947,7 +2016,7 @@ def _overstated_result_claim(text: str, state: dict[str, Any]) -> str | None:
             "不要保留「验收通过」这个说法。"
         )
 
-    if any(phrase in text for phrase in _VERIFIED_FIX_CLAIM_PHRASES) and not state.get("run_succeeded"):
+    if any(phrase in text for phrase in _VERIFIED_FIX_CLAIM_PHRASES) and not run_verified:
         state["result_claim_corrected"] = True
         return (
             "你上一条回复已被撤回，用户没有看到，请完整重写整段回复（不要只补一句更正）。\n"
@@ -1957,6 +2026,27 @@ def _overstated_result_claim(text: str, state: dict[str, Any]) -> str | None:
             "① 现在调用 run_flow 验证，再据实汇报；\n"
             "② 不运行，就把说法改成「已按…修改，尚未运行验证」，并说明需要用户跑一次确认。\n"
             "「已修复」「问题已解决」这类说法在拿到运行结果之前不要用。"
+        )
+
+    # 清洗类需求的失败是静默的：脚本跑通、变量非空、产物照落，而一个字符都没删。
+    # 用户只能从这段回复判断做没做成，所以在没有产物证据时不许把"打算怎么处理"写成"已经处理了"
+    if (
+        state.get("transform_node_touched")
+        and not audit_verified
+        and any(phrase in text for phrase in _DATA_EFFECT_CLAIM_PHRASES)
+    ):
+        state["result_claim_corrected"] = True
+        return (
+            "你上一条回复已被撤回，用户没有看到，请完整重写整段回复（不要只补一句更正）。\n"
+            "撤回原因：你描述了加工节点对数据的实际效果（去除了什么、留下了什么），"
+            "但当前这份定义没有一次通过的 assert_run_output。加工节点是否真的改变了数据，"
+            "只有把输入和输出的实际内容摆在一起才知道——脚本能跑通、变量有值、产物有文件，"
+            "和一个字符都没删完全共存。\n"
+            "二选一，重新给出回复：\n"
+            "① 先 run_flow，再 get_run_output 读输入与输出的实际内容、assert_run_output 审计，"
+            "然后用真实的前后体量说话；\n"
+            "② 不运行，就只写你改了什么节点、按什么规则处理，并明确说明效果未经运行验证。\n"
+            "不要用「已去除」「已清理」这类完成态描述一次没跑过的加工。"
         )
 
     return None
@@ -2103,7 +2193,7 @@ def _orchestrator_guard_after_tool(tool_name: str, result: Any, state: dict[str,
                 state["fresh_page_evidence"] = True
             if tool_name == "inspect_page" and state.get("pre_create_inspect_gate") is not None:
                 state["pre_create_inspect_gate"]["inspect_done"] = True
-    elif tool_name in {"create_flow", "update_flow", "apply_node_fix", "run_flow"}:
+    elif tool_name in {*_FLOW_WRITE_TOOLS, "run_flow"}:
         state["consecutive_inspect_page_count"] = 0
 
     if tool_name == "assert_run_output":
@@ -2143,6 +2233,17 @@ def _orchestrator_guard_after_tool(tool_name: str, result: Any, state: dict[str,
     if tool_name in _FLOW_WRITE_TOOLS and not result.get("error"):
         state["run_succeeded"] = False
         state["audit_passed"] = False
+        # 取 changed_nodes 而不是调用参数：update_nodes 的 patch 里没有 type，
+        # 只按参数判会漏掉「改的是已有加工节点」这一半
+        flow_event = next((
+            event for event in (result.get("events") or [])
+            if isinstance(event, dict) and event.get("type") == "flow_written"
+        ), None)
+        if flow_event and any(
+            isinstance(item, dict) and item.get("type") in TRANSFORM_NODE_TYPES
+            for item in (flow_event.get("affected_nodes") or [])
+        ):
+            state["transform_node_touched"] = True
     elif tool_name == "run_flow":
         # 超时/暂停/扩展未连接也算尝试过：这些是真拦路条件，不该再催模型去跑
         state["run_attempted"] = True

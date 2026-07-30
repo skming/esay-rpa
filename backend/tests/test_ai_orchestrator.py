@@ -519,6 +519,54 @@ class _FakeExecutor:
         return {"status": "ok"}
 
 
+class _RevisionFlowExecutor(_FakeExecutor):
+    async def execute(
+        self, tool_name: str, args: dict[str, Any], progress_sink: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        self.calls.append((tool_name, args))
+        if tool_name == "get_flow":
+            return {
+                "flow_id": "flow-verified",
+                "revision": 7,
+                "definition": {
+                    "nodes": [
+                        {"id": "start", "type": "start", "title": "开始"},
+                        {"id": "end", "type": "end", "title": "结束"},
+                    ],
+                    "edges": [{"id": "e1", "source": "start", "target": "end"}],
+                },
+            }
+        return {"status": "ok"}
+
+
+async def test_stream_exposes_current_revision_verification_status(monkeypatch) -> None:
+    """只读追问没有新工具结果，仍要告诉前端当前流程证据等级。"""
+    import litellm
+
+    async def fake_acompletion(**kwargs: Any) -> Any:
+        return _FakeStream([_chunk(content="当前流程可以继续使用。", finish="stop")])
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(
+        "app.services.ai_orchestrator.load_verification_state",
+        lambda *_args: {
+            "current_flow_revision": 7,
+            "run_verified_revision": 7,
+            "accepted_revision": None,
+        },
+    )
+
+    orchestrator = AiOrchestrator(tool_executor=_RevisionFlowExecutor())  # type: ignore[arg-type]
+    events = [event async for event in orchestrator.stream(
+        messages=[{"role": "user", "content": "这个流程现在是什么状态？"}],
+        model="test-model",
+        flow_id="flow-verified",
+    )]
+
+    verification = [event for event in events if event["type"] == "verification"]
+    assert verification == [{"type": "verification", "status": "run_verified", "revision": 7}]
+
+
 async def test_parallel_tool_calls_after_create_flow_get_placeholder_responses(monkeypatch) -> None:
     """P0 回归：create_flow 成功后 break 跳过的并行调用必须补 tool 应答，
     且流式返回的空 tool_call id 要合成兜底值——否则严格 OpenAI 兼容端点

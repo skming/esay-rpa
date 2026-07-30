@@ -254,11 +254,55 @@ export type GeneratedScriptResult = {
 
 export type FlowStatus = 'draft' | 'active' | 'paused' | 'disabled' | 'archived';
 
+export type DeliverableContract = {
+  id: string;
+  variable: string;
+  kind: 'table' | 'document' | 'file' | 'scalar';
+  required?: boolean;
+  minRows?: number | null;
+  maxRows?: number | null;
+  requiredFields?: string[];
+  dateRanges?: Array<{ field: string; start?: string | null; end?: string | null }>;
+  allowedValues?: Array<{ field: string; values: string[] }>;
+  uniqueBy?: string[];
+  minChars?: number | null;
+  requiredTerms?: string[];
+  forbiddenTerms?: string[];
+  sourceVariables?: string[];
+  extensions?: string[];
+  minBytes?: number | null;
+  requirementIds?: string[];
+  numericRanges?: Array<{ field: string; minimum?: number | null; maximum?: number | null }>;
+  fieldFormats?: Array<{ field: string; format: 'integer' | 'decimal' | 'email' | 'url' | 'date' | 'datetime' | 'non_empty' }>;
+  crossFieldAssertions?: Array<{ leftField: string; operator: 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte'; rightField: string }>;
+  sortAssertions?: Array<{ field: string; direction: 'asc' | 'desc' }>;
+  aggregateAssertions?: Array<{ field?: string | null; operation: 'count' | 'sum' | 'avg' | 'min' | 'max'; operator: 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte'; expected: number; tolerance?: number }>;
+  expectedCountVariable?: string | null;
+  minimumCoverageRatio?: number;
+};
+
+export type RequirementClause = {
+  id: string;
+  description: string;
+  sourceKind: 'user' | 'product_default';
+  sourceQuote?: string | null;
+  sourceTurnId?: string | null;
+  confidence: number;
+  confirmed: boolean;
+};
+
+export type FlowAcceptanceContract = {
+  requirements: RequirementClause[];
+  deliverables: DeliverableContract[];
+};
+
 export type FlowVersionSnapshot = {
   version: string;
   description?: string | null;
   definition: Record<string, unknown>;
   inputVariables: RuntimeVariable[];
+  acceptanceContract?: FlowAcceptanceContract;
+  revision?: number;
   savedAt: string;
 };
 
@@ -269,6 +313,8 @@ export type FlowSnapshot = {
   description?: string | null;
   definition: Record<string, unknown>;
   inputVariables: RuntimeVariable[];
+  acceptanceContract?: FlowAcceptanceContract;
+  revision?: number;
   status: FlowStatus;
   folderPath: string;
   defaultBrowserExecutor?: BrowserExecutorKind;
@@ -286,6 +332,7 @@ export type FlowSavePayload = {
   description?: string;
   definition: Record<string, unknown>;
   inputVariables: RuntimeVariable[];
+  acceptanceContract?: FlowAcceptanceContract;
   status: FlowStatus;
   folderPath?: string;
   defaultBrowserExecutor?: BrowserExecutorKind;
@@ -417,6 +464,21 @@ export type TaskSnapshot = {
     values: string[];
   } | null;
   variables?: RuntimeVariable[];
+  flowRevision?: number | null;
+  definitionDigest?: string | null;
+  acceptanceContract?: FlowAcceptanceContract;
+  executionEvidence?: Array<{
+    nodeId: string;
+    nodeType: string;
+    inputs: Array<Record<string, unknown>>;
+    outputs: Array<Record<string, unknown>>;
+    unchangedPairs: string[];
+    status: 'success' | 'error';
+    durationMs: number;
+    browserUrl?: string | null;
+    selector?: string | null;
+    matchCount?: number | null;
+  }>;
   artifacts?: ArtifactSnapshot[];
   error?: string | null;
   inputPrompt?: string | null;

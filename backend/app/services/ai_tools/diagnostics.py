@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from app.services.ai_tools.variables import _RUNTIME_BUILTINS
+from app.services.node_semantics import TRANSFORM_NODE_TYPES
 
 _NAVIGATION_NODE_TYPES = frozenset({"browser.open", "browser.ensureLogin"})
 
@@ -47,6 +48,10 @@ CONTENT_MISMATCH_ISSUES = frozenset({OUTPUT_CONTENT_MISMATCH, DOCUMENT_CONTENT_M
 # 文档正文与本次抓取数据无交集：与上面两条不同，这条不接受 content_match_confirmed 自证，
 # 因为它比的就是「模型自己写的字」之外的证据。
 DOCUMENT_MISSING_RUN_DATA = "document_missing_run_data"
+
+# 加工节点的输出与输入无实质差别。名字产在这里、消费在 repair_plan 与编排层的汇报纠偏，
+# 一律引常量：抄成字面量不会报错，只会让依赖它的那半条判据永远不命中
+TRANSFORM_HAD_NO_EFFECT = "transform_had_no_effect"
 
 
 def _read_log_url(log: Any) -> str | None:
@@ -370,6 +375,110 @@ def _run_data_fragments(variables: dict[str, Any], document_name: str) -> list[s
     return fragments
 
 
+# 输入进、输出出，中间由模型写的加工节点。三条脚本通道与列变换节点都算，
+# 少收一种类型就是同一个缺陷换个节点写就漏判
+# 加工后仍有这个比例的体量，就当它什么也没做。留 5% 余量是给「去掉几行页眉」这类
+# 真做了事但削减本来就小的加工；再宽就会把「一个字符没删」也算进正常范围
+_TRANSFORM_EFFECT_RATIO = 0.95
+# 短文本上下浮动几十字就能跨过比例线，判不准；这条判据只管大块文本
+_TRANSFORM_MIN_CHARS = 2000
+_TRANSFORM_PROBE_FRAGMENTS = 12
+_TRANSFORM_PROBE_LEN = 24
+
+
+def _as_text(value: Any) -> str:
+    if isinstance(value, list):
+        return "\n".join(str(item) for item in value)
+    return str(value or "")
+
+
+def _text_survived(source: str, result: str) -> bool:
+    """source 的内容是不是原封不动地还在 result 里。
+
+    取等距片段而不是整串比对：加工节点通常会动几处空白或删掉几行，整串相等几乎不会成立，
+    但那样的改动同样等于没清洗。片段全中说明连噪声段落都逐字保留。
+    """
+    haystack = _collapse(result)
+    text = _collapse(source)
+    step = max(len(text) // _TRANSFORM_PROBE_FRAGMENTS, _TRANSFORM_PROBE_LEN)
+    probes = [
+        text[offset : offset + _TRANSFORM_PROBE_LEN]
+        for offset in range(0, len(text) - _TRANSFORM_PROBE_LEN, step)
+    ]
+    if not probes:
+        return False
+    return sum(probe in haystack for probe in probes) >= len(probes) - 1
+
+
+def _find_ineffective_transforms(
+    nodes: list[Any], variables: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """加工节点的输出和它的输入几乎一模一样——跑通了，但什么也没加工。
+
+    这是"清洗/去噪"类需求的主要失败形态：模型没看过真实数据，按想象写一套行级黑名单，
+    而抽取节点交上来的往往是一大段连续文本，逐行规则一条都命不中。节点不报错、变量非空、
+    产物照落，运行状态与结构审计全绿，只有把两个变量的体量摆在一起才看得出来。
+    判据挂在「输出相对输入有没有变化」上而不是节点标题里的"清洗"二字：换个说法命名、
+    换种脚本语言写，同样拦得住。
+    """
+    own_outputs: dict[str, set[str]] = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        outputs = {
+            str(node.get(field))
+            for field in ("outputVariable", "countVariable", "firstValueVariable", "variableName")
+            if node.get(field)
+        }
+        if outputs:
+            own_outputs[str(node.get("id", ""))] = outputs
+
+    findings: list[dict[str, Any]] = []
+    for node in nodes:
+        if not isinstance(node, dict) or node.get("type") not in TRANSFORM_NODE_TYPES:
+            continue
+        target = str(node.get("outputVariable") or "")
+        if target not in variables:
+            continue
+        result = _as_text(variables[target])
+        if len(result) < _TRANSFORM_MIN_CHARS:
+            continue
+        siblings = own_outputs.get(str(node.get("id", "")), set())
+        for name, value in variables.items():
+            # 同一个抽取节点的 outputVariable 与 firstValueVariable 装的是同一份内容，
+            # 拿它俩互比必然"无变化"——只比别的节点交上来的输入
+            if name == target or name in siblings or name in _RUNTIME_BUILTINS:
+                continue
+            source = _as_text(value)
+            if len(source) < _TRANSFORM_MIN_CHARS:
+                continue
+            if len(result) < len(source) * _TRANSFORM_EFFECT_RATIO:
+                continue
+            if not _text_survived(source, result):
+                continue
+            findings.append({
+                "issue": TRANSFORM_HAD_NO_EFFECT,
+                "node_id": str(node.get("id", "?")),
+                "message": (
+                    f"加工节点 `{node.get('id', '?')}`（{node.get('type')}）的输出 `{target}` "
+                    f"有 {len(result)} 字符，它的输入 `{name}` 有 {len(source)} 字符，"
+                    f"体量只差 {max(0.0, (1 - len(result) / len(source))) * 100:.1f}%，"
+                    "且输入的内容逐段原样出现在输出里：这个节点跑通了，但没有真的加工数据。"
+                ),
+                "fix": (
+                    f"先 get_run_output 把 `{name}` 的实际内容读出来看清噪声长什么样，不要凭猜写规则。\n"
+                    "若输入是整页文本（导航、页脚、内联样式混在一起、几乎不换行），"
+                    "行级黑名单和按行去重必然一条都命不中——出路是回到抽取节点收窄 selector"
+                    "（先 inspect_page 找只装目标内容的容器），不是继续加固脚本。\n"
+                    "改完重跑并再次 assert_run_output；在体量真的变化之前，不要向用户汇报已完成清洗。"
+                ),
+                "output_variable": target,
+                "input_variable": name,
+            })
+            break
+    return findings
+
+
 def _audit_document_provenance(
     document: dict[str, Any], body: str, variables: dict[str, Any]
 ) -> dict[str, Any] | None:
@@ -533,6 +642,9 @@ def _check_structured_rows(rows: list[Any], headers: list[str] | None) -> dict[s
         sparse_issue = _detect_sparse_rows(rows)
         if sparse_issue is not None:
             return sparse_issue
+        shell_issue = _detect_single_column_text_shell(rows)
+        if shell_issue is not None:
+            return shell_issue
         return None
     if not all(isinstance(row, list) for row in rows):
         return {"issue": "unstructured_rows", "message": "结果不是 list[dict] 或 list[list]，无法稳定校验字段。"}
@@ -637,6 +749,77 @@ def _detect_sparse_rows(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
             "真实业务行数远少于 row_count，不能据此认为抓取达标。"
         ),
         "sparse_row_indexes": sparse_indexes[:10],
+    }
+
+
+SINGLE_COLUMN_TEXT_SHELL = "single_column_text_shell"
+
+_SHELL_PAYLOAD_CHAR_SHARE = 0.8  # 一列独占的字符占比，超过它其余列就没装下多少页面信息
+_SHELL_PAYLOAD_MIN_AVG_LEN = 40  # 载荷列的平均长度：短到这个数以下更像正常的窄表
+_SHELL_CONSTANT_MAX_DISTINCT = 3  # 取值不超过这么多种，且都很短 → 是作者自己写的标签，不是页面字段
+_SHELL_CONSTANT_MAX_LEN = 12
+_SHELL_MIN_ROWS = 5
+
+
+def _is_enumeration_column(values: list[Any]) -> bool:
+    """整列是 1、2、3…这样的自增序号——脚本生成的，页面上没有这个字段。"""
+    numbers: list[int] = []
+    for value in values:
+        text = str(value).strip()
+        if not re.fullmatch(r"\d{1,6}", text):
+            return False
+        numbers.append(int(text))
+    return len(set(numbers)) == len(numbers) and numbers == sorted(numbers)
+
+
+def _is_authored_label_column(values: list[Any]) -> bool:
+    """整列只在少数几个短标签之间取值，例如「主题标题 / 主题正文 / 回复」。"""
+    distinct = {str(value).strip() for value in values if str(value).strip()}
+    if not distinct or len(distinct) > _SHELL_CONSTANT_MAX_DISTINCT:
+        return False
+    return all(len(value) <= _SHELL_CONSTANT_MAX_LEN for value in distinct)
+
+
+def _detect_single_column_text_shell(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """检测「一列装整段文本、其余列是自己编的」的假表格。
+
+    是 no_table_like_output 被绕开的标准姿势：被要求交结构化数据时，不回抽取节点拆字段，
+    而是把整页文本切成段塞进 `内容` 列，再补一个序号列和一个类型列凑成 list[dict]。
+    行数、字段数、非空率全部达标，只有「页面上真实存在的字段一个都没拆出来」这一点不达标，
+    所以判据只看列本身的信息量：序号是脚本生成的，少数几个短标签是作者写的，两者都不来自页面。
+    """
+    if len(rows) < _SHELL_MIN_ROWS:
+        return None
+    columns = {key for row in rows for key in row}
+    if len(columns) < 2:
+        return None
+    per_column = {key: [row.get(key, "") for row in rows] for key in columns}
+    lengths = {key: sum(len(str(value)) for value in values) for key, values in per_column.items()}
+    total = sum(lengths.values())
+    if total <= 0:
+        return None
+    payload = max(lengths, key=lambda key: lengths[key])
+    if lengths[payload] / total < _SHELL_PAYLOAD_CHAR_SHARE:
+        return None
+    if lengths[payload] / len(rows) < _SHELL_PAYLOAD_MIN_AVG_LEN:
+        return None
+    others = [key for key in columns if key != payload]
+    if not all(
+        _is_enumeration_column(per_column[key]) or _is_authored_label_column(per_column[key])
+        for key in others
+    ):
+        return None
+    return {
+        "issue": SINGLE_COLUMN_TEXT_SHELL,
+        "message": (
+            f"`{payload}` 一列占了全部字符的 {lengths[payload] / total:.0%}，"
+            f"其余 {len(others)} 列（{'、'.join(sorted(map(str, others)))}）不是自增序号就是"
+            "只在少数几个短标签间取值——这两种列都不是从页面上拆出来的字段。"
+            "这不是一张表格，是把整段文本切开后套了个表格壳：行数和字段数都达标，"
+            "但用户拿到的仍然是原来那团文本。"
+        ),
+        "payload_column": str(payload),
+        "payload_char_share": round(lengths[payload] / total, 3),
     }
 
 
@@ -923,6 +1106,20 @@ def _build_quality_repair_plan(issues: list[dict[str, Any]]) -> list[dict[str, A
                 "重新运行后再次调用 assert_run_output。",
             ],
         })
+    if SINGLE_COLUMN_TEXT_SHELL in issue_names:
+        plan.append({
+            "action": "split_real_page_fields",
+            "reason": "输出只是把整段文本切开塞进一列，再补上序号和类型凑成表格，页面上的字段一个都没拆出来。",
+            "steps": [
+                "**禁止继续在脚本里切文本**：换分隔符、换切分粒度都只会得到另一种切法的同一团文本。",
+                "调用 inspect_page 看目标区域的 page_layout，确认页面上一条记录由哪几个元素组成"
+                "（如标题、作者、时间、正文各自的 class）。",
+                "把 browser.extract 改成按记录抽取：一条记录一行，每个字段一列；"
+                "字段各自有 selector 时用多个抽取节点，整块结构规整时用 extractMode='table'。",
+                "字段确实无法从页面拆出来时，如实告诉用户这个站点只能拿到整段文本，让用户决定，不要用序号列凑数。",
+                "重新运行后再次调用 assert_run_output。",
+            ],
+        })
     if any("header_row_length_mismatch" in name for name in issue_names):
         plan.append({
             "action": "fix_header_row_alignment",
@@ -1041,6 +1238,16 @@ def _build_quality_repair_plan(issues: list[dict[str, Any]]) -> list[dict[str, A
                 "直接向用户确认交付形态，不要造 rows 变量来迎合本条检查。",
             ],
         })
+    if TRANSFORM_HAD_NO_EFFECT in issue_names:
+        plan.append({
+            "action": "make_transform_actually_transform",
+            "reason": "加工节点跑通了，但输出与输入几乎逐字相同，用户要的清洗/加工一步都没发生。",
+            "steps": [
+                "先 get_run_output 读输入变量的真实内容，确认噪声的实际形态（是独立成行，还是和正文连在一段里）。",
+                "噪声不成行时，加固脚本无解：回到抽取节点，用 inspect_page 找只装目标内容的容器并收窄 selector。",
+                "重跑后再次 assert_run_output，确认这条不再出现——体量没变就是没做成，不要改口径汇报成功。",
+            ],
+        })
     if DOCUMENT_MISSING_RUN_DATA in issue_names:
         plan.append({
             "action": "wire_document_to_extracted_data",
@@ -1074,5 +1281,4 @@ def _build_quality_repair_plan(issues: list[dict[str, Any]]) -> list[dict[str, A
             ],
         })
     return plan
-
 

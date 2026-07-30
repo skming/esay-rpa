@@ -11,12 +11,12 @@ import {
 import type { AiMessage, FlowDiff, NodeLookupItem } from './aiPanelTypes';
 import { MessageBubble } from './MessageBubble';
 
-const CAPABILITIES: { icon: ReactElement; label: string }[] = [
-  { icon: <Workflow className="h-3 w-3" strokeWidth={1.5} />, label: '创建流程' },
-  { icon: <PencilRuler className="h-3 w-3" strokeWidth={1.5} />, label: '修改与校验' },
-  { icon: <PlayCircle className="h-3 w-3" strokeWidth={1.5} />, label: '运行与汇报' },
-  { icon: <Bug className="h-3 w-3" strokeWidth={1.5} />, label: '失败排查' },
-  { icon: <CalendarClock className="h-3 w-3" strokeWidth={1.5} />, label: '定时任务' },
+const CAPABILITIES: { icon: ReactElement; label: string; prompt: string; needsFlow?: boolean }[] = [
+  { icon: <Workflow className="h-3 w-3" strokeWidth={1.5} />, label: '创建抓取流程', prompt: '帮我根据一个网页创建抓取流程' },
+  { icon: <PencilRuler className="h-3 w-3" strokeWidth={1.5} />, label: '审查当前流程', prompt: '审查当前流程，找出影响可靠性的问题并给出最优修复', needsFlow: true },
+  { icon: <PlayCircle className="h-3 w-3" strokeWidth={1.5} />, label: '运行并验收', prompt: '运行当前流程，并根据实际输出完成验收', needsFlow: true },
+  { icon: <Bug className="h-3 w-3" strokeWidth={1.5} />, label: '分析运行错误', prompt: '分析当前流程最近一次运行错误并定位根因', needsFlow: true },
+  { icon: <CalendarClock className="h-3 w-3" strokeWidth={1.5} />, label: '创建定时任务', prompt: '为当前流程创建定时任务', needsFlow: true },
 ];
 
 export function ChatMessages({
@@ -27,6 +27,8 @@ export function ChatMessages({
   onRetry,
   nodeLookup,
   onFocusNode,
+  hasFlow,
+  onSuggestion,
 }: {
   messages: AiMessage[];
   pending: boolean;
@@ -35,6 +37,8 @@ export function ChatMessages({
   onRetry?: () => void;
   nodeLookup?: Record<string, NodeLookupItem>;
   onFocusNode?: (nodeId: string) => void;
+  hasFlow: boolean;
+  onSuggestion: (prompt: string) => void;
 }): ReactElement {
   if (messages.length === 0) {
     return (
@@ -44,15 +48,20 @@ export function ChatMessages({
             <Bot className="h-5 w-5 text-white" strokeWidth={1.75} />
           </div>
           <p className="mt-3 text-[13px] font-semibold text-slate-700">RPA 助手</p>
-          <div className="mt-4 flex max-w-64 flex-wrap items-center justify-center gap-1.5">
-            {CAPABILITIES.map((c) => (
-              <span
-                className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10.5px] text-slate-500"
+          <p className="mt-1.5 max-w-64 text-[11px] leading-relaxed text-slate-500">
+            描述目标，我会先确认关键条件，再创建、运行并用实际结果验收。
+          </p>
+          <div className="mt-4 flex max-w-72 flex-wrap items-center justify-center gap-1.5">
+            {CAPABILITIES.filter((c) => !c.needsFlow || hasFlow).map((c) => (
+              <button
+                className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[10.5px] text-slate-600 transition-colors hover:border-accent-line hover:bg-accent-soft hover:text-accent-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-soft"
                 key={c.label}
+                onClick={() => onSuggestion(c.prompt)}
+                type="button"
               >
                 {c.icon}
                 {c.label}
-              </span>
+              </button>
             ))}
           </div>
         </div>

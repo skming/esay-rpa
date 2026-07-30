@@ -8,7 +8,7 @@ from app.services.schedule_store import create_schedule_engine
 
 def build_definition() -> dict[str, object]:
     return {
-        "nodes": [{"id": "start", "type": "start"}, {"id": "n1", "type": "browser.fetch"}],
+        "nodes": [{"id": "start", "type": "start"}, {"id": "n1", "type": "browser.fetch", "outputVariable": "orders"}],
         "edges": [{"source": "start", "target": "n1"}],
     }
 
@@ -29,6 +29,22 @@ async def test_flow_service_persists_crud_with_sqlalchemy(tmp_path) -> None:
                 {"category": "flow", "name": "username", "sensitive": False, "type": "String", "scope": "全局", "value": "zhang.san"},
                 {"category": "credential", "name": "erp_password", "sensitive": True, "type": "String", "scope": "全局", "value": "secret-pass"},
             ],
+            acceptanceContract={
+                "requirements": [{
+                    "id": "orders-required",
+                    "description": "测试订单交付",
+                    "sourceKind": "product_default",
+                    "confidence": 1,
+                    "confirmed": True,
+                }],
+                "deliverables": [{
+                    "id": "orders",
+                    "variable": "orders",
+                    "kind": "table",
+                    "minRows": 1,
+                    "requirementIds": ["orders-required"],
+                }],
+            },
             status="draft",
         )
     )
@@ -42,6 +58,8 @@ async def test_flow_service_persists_crud_with_sqlalchemy(tmp_path) -> None:
     assert listed[0].input_variables[1].name == "erp_password"
     assert listed[0].input_variables[1].category == "credential"
     assert listed[0].input_variables[1].sensitive is True
+    assert listed[0].revision == 1
+    assert listed[0].acceptance_contract.deliverables[0].variable == "orders"
 
     updated = await service.update_flow(
         created.flow_id,
@@ -53,10 +71,26 @@ async def test_flow_service_persists_crud_with_sqlalchemy(tmp_path) -> None:
                 {"category": "environment", "name": "run_scope", "sensitive": False, "type": "String", "scope": "全局", "value": "staging"},
                 {"category": "flow", "name": "row_count", "sensitive": False, "type": "Integer", "scope": "全局", "value": "5"},
             ],
+            acceptanceContract={
+                "requirements": [{
+                    "id": "row-count-required",
+                    "description": "测试计数交付",
+                    "sourceKind": "product_default",
+                    "confidence": 1,
+                    "confirmed": True,
+                }],
+                "deliverables": [{
+                    "id": "row-count",
+                    "variable": "row_count",
+                    "kind": "scalar",
+                    "requirementIds": ["row-count-required"],
+                }],
+            },
         ),
     )
     assert updated is not None
     assert updated.version == "v1.1.0"
+    assert updated.revision == 2
     assert updated.status == "active"
     assert updated.input_variables[0].name == "run_scope"
     assert updated.input_variables[0].category == "environment"
@@ -69,6 +103,9 @@ async def test_flow_service_persists_crud_with_sqlalchemy(tmp_path) -> None:
     assert reloaded is not None
     assert [item.category for item in reloaded.input_variables] == ["environment", "flow"]
     assert [item.sensitive for item in reloaded.input_variables] == [False, False]
+    assert reloaded.revision == 2
+    assert reloaded.snapshots[0].revision == 1
+    assert reloaded.acceptance_contract.deliverables[0].id == "row-count"
 
     archived = await service.archive_flow(created.flow_id)
     assert archived is not None

@@ -53,7 +53,6 @@ BLOCKING_LINT_ISSUES = frozenset({
     "clear_storage_breaks_login_persistence",
     "table_extract_selector_targets_container",
     "table_extract_selector_not_table_like",
-    "extract_selector_union_used_as_fallback",
     "table_extract_selector_too_broad",
     "client_side_filter_masks_page_filter",
     "date_filter_missing_verification",
@@ -591,4 +590,3 @@ def _is_critical_business_action(node: dict[str, Any]) -> bool:
         "导航", "跳转", "列表页", "详情页", "结果", "表格", "列表",
     )
     return any(keyword in marker for keyword in critical_markers)
-

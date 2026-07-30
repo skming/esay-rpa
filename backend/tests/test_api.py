@@ -11,6 +11,24 @@ from app.main import app
 from app.services.site_analyzer import SiteAnalyzer
 
 
+def acceptance_contract(variable: str) -> dict:
+    return {
+        "requirements": [{
+            "id": "api-output",
+            "description": "API 测试交付",
+            "sourceKind": "product_default",
+            "confidence": 1,
+            "confirmed": True,
+        }],
+        "deliverables": [{
+            "id": "api-result",
+            "variable": variable,
+            "kind": "table",
+            "requirementIds": ["api-output"],
+        }],
+    }
+
+
 async def restart_global_workers() -> None:
     import app.main as main_module
 
@@ -147,11 +165,13 @@ async def test_flow_run_endpoint_starts_task_from_definition() -> None:
                                 "selector": ".quote .text::text",
                                 "fetcher": "static",
                                 "extractMode": "text",
+                                "outputVariable": "api_rows",
                                 "timeoutMs": 1000,
                             },
                         ],
                         "edges": [{"source": "start", "target": "n1"}],
                     },
+                    "acceptanceContract": acceptance_contract("api_rows"),
                 },
             )
             assert create_response.status_code == 200
@@ -187,11 +207,13 @@ async def test_task_endpoint_accepts_request_and_exposes_logs() -> None:
                             "selector": ".quote .author::text",
                             "fetcher": "static",
                             "extractMode": "text",
+                            "outputVariable": "task_rows",
                             "timeoutMs": 1000,
                         },
                     ],
                     "edges": [{"source": "start", "target": "n2"}, {"source": "n2", "target": "n3"}],
                 },
+                "acceptanceContract": acceptance_contract("task_rows"),
                 "scope": "from-selection",
                 "startNodeId": "n3",
                 "failureStrategy": "continue",
@@ -251,7 +273,7 @@ async def test_task_debug_endpoint_continues_paused_breakpoint() -> None:
                     "targetUrl": "https://quotes.toscrape.com/",
                     "selector": ".quote .text::text",
                     "mode": "debug",
-                    "flowDefinition": {
+                        "flowDefinition": {
                         "nodes": [
                             {"id": "start", "type": "start"},
                             {
@@ -263,8 +285,9 @@ async def test_task_debug_endpoint_continues_paused_breakpoint() -> None:
                                 "breakpoint": True,
                             },
                         ],
-                        "edges": [{"source": "start", "target": "set-name"}],
-                    },
+                            "edges": [{"source": "start", "target": "set-name"}],
+                        },
+                        "acceptanceContract": acceptance_contract("debug_name"),
                     "timeoutMs": 1000,
                 },
             )
@@ -368,11 +391,13 @@ async def test_schedule_trigger_runs_bound_flow_endpoint() -> None:
                                 "selector": ".quote .author::text",
                                 "fetcher": "static",
                                 "extractMode": "text",
+                                "outputVariable": "api_rows",
                                 "timeoutMs": 1000,
                             },
                         ],
                         "edges": [{"source": "start", "target": "fetch"}],
                     },
+                    "acceptanceContract": acceptance_contract("api_rows"),
                 },
             )
             assert flow_response.status_code == 200

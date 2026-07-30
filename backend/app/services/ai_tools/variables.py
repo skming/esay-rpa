@@ -128,6 +128,10 @@ def _collect_refs_in_node(node: dict[str, Any]) -> set[str]:
 
     for val in node.values():
         _walk(val)
+    if node.get("type") in _SCRIPT_CHANNEL_NODE_TYPES:
+        for name in node.get("inputVariables") or []:
+            if isinstance(name, str) and name.strip():
+                refs.add(name.strip())
     return refs
 
 

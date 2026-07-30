@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING
 
 from app.models.schemas import FlowRunRequest, FlowSnapshot, RunMode, RunTaskRequest, TaskSnapshot
 from app.services.flow_definition import FlowDefinitionSelector
+from app.services.execution_evidence import definition_digest
+from app.services.acceptance_contract import contract_validation_errors, definition_variable_names
 
 if TYPE_CHECKING:
     from app.services.task_manager import TaskManager
@@ -26,12 +28,33 @@ class FlowRunService:
         executable_nodes = FlowDefinitionSelector.select_executable_nodes(flow.definition, scope=scope, start_node_id=start_node_id)
         if not executable_nodes:
             raise ValueError("流程定义缺少可执行节点")
+        contract_errors = contract_validation_errors(
+            flow.acceptance_contract,
+            defined_variables=definition_variable_names(
+                flow.definition,
+                [
+                    variable.get("name") if isinstance(variable, dict) else variable.name
+                    for variable in flow.input_variables
+                    if (variable.get("name") if isinstance(variable, dict) else variable.name)
+                ],
+            ),
+        )
+        if contract_errors:
+            raise ValueError(f"流程缺少完整验收契约：{'；'.join(contract_errors)}")
 
         overrides = run_request.variables if run_request is not None else {}
         base_request = RunTaskRequest(
             flowId=flow.flow_id,
             flowName=flow.name,
             flowDefinition=flow.definition,
+            flowRevision=flow.revision,
+            definitionDigest=definition_digest(flow.definition),
+            acceptanceContract=flow.acceptance_contract,
+            sensitiveVariables=[
+                variable.get("name") if isinstance(variable, dict) else variable.name
+                for variable in flow.input_variables
+                if (variable.get("sensitive", False) if isinstance(variable, dict) else variable.sensitive)
+            ],
             mode=run_request.mode if run_request is not None else mode,
             # RunTaskRequest 要求 targetUrl/selector 非空，但非 browser.fetch 流程根本用不到它们；
             # 这里填占位默认值，若存在 browser.fetch 节点会在下方被 build_request_for_fetch_node 覆盖。

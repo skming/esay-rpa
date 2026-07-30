@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { DEFAULT_MODEL, useAiChatStore } from '../../../stores/useAiChatStore';
-import type { AiAttachment, AiMessage, AiUsage, FlowDiff, ToolCallState } from './aiPanelTypes';
+import type { AiAttachment, AiMessage, AiUsage, FlowDiff, ToolCallState, VerificationStatus } from './aiPanelTypes';
 import { backend } from '../../../lib/backendClient';
 
 function nanoid(): string {
@@ -290,6 +290,8 @@ export function useAiChat(flowId: string | null, onFlowChanged?: (flowId: string
               call_id?: string;
               elapsed_s?: number; progress?: { current_step?: number; total_steps?: number; percent?: number } | null;
               usage?: AiUsage;
+              status?: VerificationStatus;
+              revision?: number;
             };
             try { chunk = JSON.parse(raw); } catch { continue; }
 
@@ -307,6 +309,16 @@ export function useAiChat(flowId: string | null, onFlowChanged?: (flowId: string
               const usage = chunk.usage;
               setMessages((prev) =>
                 prev.map((m) => (m.id === assistantId ? { ...m, usage } : m))
+              );
+              continue;
+            }
+            if (chunk.type === 'verification' && chunk.status) {
+              setMessages((prev) =>
+                prev.map((m) => (m.id === assistantId ? {
+                  ...m,
+                  verificationStatus: chunk.status,
+                  verificationRevision: chunk.revision,
+                } : m))
               );
               continue;
             }

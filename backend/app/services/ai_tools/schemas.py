@@ -11,16 +11,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "lint_flow",
             "description": (
-                "对流程进行全面静态质量检查（与 AI 模型无关的程序化扫描），发现以下问题并返回结构化 findings：\n"
-                "  • 孤儿节点（无法从起点到达，运行时被跳过）\n"
-                "  • foreach 节点缺少 body/exit 标签出边（循环逻辑断路）\n"
-                "  • condition 节点缺少 true/false 分支边（分支逻辑断路）\n"
-                "  • browser.extract 缺少 outputVariable 或 extractMode（结果丢失）\n"
-                "  • http.request 缺少 outputVariable（响应无法被引用）\n"
-                "  • variable.input 误用于账号密码等凭据字段（每次运行暂停等手动输入）\n"
-                "  • 输出文件路径无时间戳（覆盖上次结果）\n"
-                "  • browser.*/select 等节点缺少 selector（运行时崩溃）\n"
-                "每条 finding 包含 severity（error/warn）、node_id、issue 类型、message 和 fix 建议。"
+                "对当前流程做程序化静态质量检查，覆盖图拓扑、节点配置、变量契约、选择器、"
+                "筛选、抓取、脚本及交付风险。返回 findings；每项包含 severity、issue、node_id、"
+                "message、fix 和 blocks_run。优先修复 blocks_run=true 的项，不要根据工具描述里的"
+                "示例清单推断检查范围。"
             ),
             "parameters": {
                 "type": "object",
@@ -35,7 +29,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "list_node_types",
-            "description": "列出所有可用的 RPA 节点类型、关键字段及其输出变量字段，在构建或修改流程前调用以了解能力边界。",
+            "description": "返回完整节点目录 node_types。构建流程前调用；节点 type、key_fields、输出字段和能力边界以返回值为准。",
         },
     },
     {
@@ -43,9 +37,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "get_flow",
             "description": (
-                "获取流程完整结构（节点列表、连线、input_variables），修改前必须先调用。\n"
-                "⚠️ 向已有流程添加节点时，必须先读取返回的 input_variables，"
-                "新节点直接引用已有变量名（如 ${var.username}），禁止为同一概念重复声明不同名称的变量。"
+                "获取流程结构、revision、input_variables、验收契约和 run_readiness，修改前调用。"
+                "凭据 value 永不返回，仅用 has_value 表示是否已配置；复用已有变量名，不要重复声明同一概念。"
             ),
             "parameters": {
                 "type": "object",
@@ -87,12 +80,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "create_flow",
             "description": (
-                "创建**全新**的 RPA 流程，返回新流程 ID。\n"
-                "⚠️ 仅在用户明确要求创建新流程时调用。已有流程需修改时用 update_flow，不要重复创建同名流程。\n"
-                "⚠️ 调用前确认已了解目标 URL、是否需要登录、要提取的内容、输出格式。信息不完整时先提问。\n"
-                "节点格式：type 为点分格式（browser.open）；所有配置字段平铺在根层，不嵌套在 config 中；\n"
-                "必填公共字段：id、type、title、kind、status(pending)、position({x,y})、description。\n"
-                "连线 id 格式：e_{source}_{target}。foreach 出边必须加 label：body / exit。"
+                "创建全新流程；已有 flow_id 时改用 update_flow。所有节点字段平铺在节点根层。"
+                "acceptance_contract 必须绑定用户原文与交付变量。返回 flow_id、revision、"
+                "changed_nodes 和带 blocks_run 标记的 lint_findings。凭据变量只声明空值，"
+                "不得把账号、密码或 Token 写入参数。"
             ),
             "parameters": {
                 "type": "object",
@@ -123,7 +114,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                             "流程输入变量声明。每项字段：\n"
                             "  name: 变量名（英文）\n"
                             "  type: 类型，必须是以下之一（区分大小写）：String | Integer | Boolean | List | Dict\n"
-                            "  value: 变量值字符串（可为空字符串；get_flow 读回来的也是这个字段名）\n"
+                            "  value: 普通变量默认值；凭据变量必须为空，秘密值由用户在输入变量面板配置\n"
                             "  category: 可选，flow（默认）| credential（账号/密码用这个）\n"
                             "  sensitive: 可选布尔，密码类变量设为 true\n"
                             "示例：{\"name\":\"username\",\"type\":\"String\",\"value\":\"\",\"category\":\"credential\"}\n"
@@ -131,8 +122,70 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         ),
                         "items": {"type": "object"},
                     },
+                    "acceptance_contract": {
+                        "type": "object",
+                        "description": (
+                            "运行前冻结的交付验收契约。requirements 必须逐条记录用户原文来源；"
+                            "deliverables 每项必须明确 id、variable、kind、requirement_ids；"
+                            "kind 可为 table/document/file/scalar，并按需求填写 required_fields、"
+                            "date_ranges、allowed_values、unique_by、required_terms、forbidden_terms 等后置条件。"
+                            "审计只验这里声明的交付变量，不再根据变量名猜测。"
+                        ),
+                        "properties": {
+                            "requirements": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": {"type": "string"},
+                                        "description": {"type": "string"},
+                                        "source_kind": {"type": "string", "enum": ["user", "product_default"]},
+                                        "source_quote": {"type": "string"},
+                                        "source_turn_id": {"type": "string"},
+                                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                                        "confirmed": {"type": "boolean"},
+                                    },
+                                    "required": ["id", "description", "source_kind", "confidence", "confirmed"],
+                                },
+                            },
+                            "deliverables": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": {"type": "string"},
+                                        "variable": {"type": "string"},
+                                        "kind": {"type": "string", "enum": ["table", "document", "file", "scalar"]},
+                                        "required": {"type": "boolean"},
+                                        "min_rows": {"type": "integer"},
+                                        "max_rows": {"type": "integer"},
+                                        "required_fields": {"type": "array", "items": {"type": "string"}},
+                                        "date_ranges": {"type": "array", "items": {"type": "object"}},
+                                        "allowed_values": {"type": "array", "items": {"type": "object"}},
+                                        "unique_by": {"type": "array", "items": {"type": "string"}},
+                                        "min_chars": {"type": "integer"},
+                                        "required_terms": {"type": "array", "items": {"type": "string"}},
+                                        "forbidden_terms": {"type": "array", "items": {"type": "string"}},
+                                        "source_variables": {"type": "array", "items": {"type": "string"}},
+                                        "extensions": {"type": "array", "items": {"type": "string"}},
+                                        "min_bytes": {"type": "integer"},
+                                        "requirement_ids": {"type": "array", "items": {"type": "string"}},
+                                        "numeric_ranges": {"type": "array", "items": {"type": "object"}},
+                                        "field_formats": {"type": "array", "items": {"type": "object"}},
+                                        "cross_field_assertions": {"type": "array", "items": {"type": "object"}},
+                                        "sort_assertions": {"type": "array", "items": {"type": "object"}},
+                                        "aggregate_assertions": {"type": "array", "items": {"type": "object"}},
+                                        "expected_count_variable": {"type": "string"},
+                                        "minimum_coverage_ratio": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+                                    },
+                                    "required": ["id", "variable", "kind", "requirement_ids"],
+                                },
+                            },
+                        },
+                        "required": ["requirements", "deliverables"],
+                    },
                 },
-                "required": ["name", "nodes"],
+                "required": ["name", "nodes", "acceptance_contract"],
             },
         },
     },
@@ -141,28 +194,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "update_flow",
             "description": (
-                "直接修改现有流程的节点或连线并立即写入，无需用户确认。\n"
-                "适用场景：增删节点、调整连线、批量修改多个节点。\n"
-                "系统会自动检测并清理因插入节点导致的旧边冲突。\n"
-                "调用前先通过 get_flow 了解当前结构（包括 edges）。修改后若涉及变量引用变化，也应调用 validate_flow 验证。\n\n"
-                "【调用后必须核查响应】\n"
-                "  返回体中的 updated_node_snapshots 列出了每个被 update_nodes 修改节点的 patched_fields 实际值。\n"
-                "  ⚠️ 必须逐项确认 patched_fields 与你的修改意图一致，不一致则重新调用修正，绝不能假设修改成功后直接运行。\n"
-                "  修改后若 lint_findings 仍包含同一节点的同一 issue，说明修复未生效，需要重新检查 patch 格式再试。\n\n"
-                "【add_nodes vs update_nodes 区别（必须严格区分）】\n"
-                "  • add_nodes：只用于添加全新节点。若 id 与流程中已有节点冲突，服务器会报错拒绝。\n"
-                "    ⚠️ 'start'、'end' 等已存在的节点绝不能放入 add_nodes——必须用 update_nodes 修改\n"
-                "  • update_nodes：修改已存在节点的字段，每项含 {id, patch}，patch 只写要改的字段\n\n"
-                "【连线管理规则】\n"
-                "  add_edges 的 source/target 只能引用已存在的节点或本次 add_nodes 同时新建的节点 id——"
-                "严禁连到尚未创建的节点。删除某节点的入边时，必须同时补上新的入边，"
-                "否则其下游分支会变成不可达孤儿节点（系统会返回 connectivity_warning，你必须继续补连）。\n"
-                "foreach 节点出边必须加 label：循环体边 label='body'，循环后边 label='exit'。\n\n"
-                "【流程命名】\n"
-                "  若当前流程名仍是占位名（如「新建 RPA 流程」「未命名流程」），"
-                "在把流程内容构建完整后，应顺带传入 name 参数，"
-                "根据用户需求和已搭建的节点内容起一个简洁准确的标题（无需用户确认）；"
-                "流程已有恰当名称时不要覆盖。"
+                "直接修改现有流程并写入。调用前先 get_flow：add_nodes 只放新 ID，update_nodes"
+                "使用 {id, patch} 修改已有节点，结构变化同时维护入边和出边。返回 revision、"
+                "changed_nodes、updated_node_snapshots、connectivity_warning 和 lint_findings；"
+                "必须核对 patched_fields，且先修复 blocks_run=true 的 finding。占位流程名可随本次"
+                "完整构建一起更新，已有准确名称不要覆盖。"
             ),
             "parameters": {
                 "type": "object",
@@ -214,12 +250,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "run_flow",
             "description": (
-                "运行指定流程并等待执行完成（内部自动轮询，最长等待 90 秒），"
-                "直接返回最终 status（success / error / stopped / timeout）和 task_id。"
-                "success → 调用 get_run_output；error → 调用 get_run_error；"
-                "timeout 且含 variable.input → 流程等待用户输入，禁止重新调用 run_flow。"
-                "browser_executor='extension' 时会先检查扩展连接状态：未连接直接返回"
-                "status=extension_not_connected 并阻止运行，不会静默回退到 Playwright。"
+                "启动流程并最多等待 90 秒，返回 task_id、flow_revision、progress 和 status。"
+                "success 后读取并审计输出；error 后诊断；paused_for_human / waiting_for_user_input"
+                "表示原任务仍在等待用户，禁止重新运行；timeout 可查询状态。extension 未连接时"
+                "返回 extension_not_connected，不会回退到 Playwright。"
             ),
             "parameters": {
                 "type": "object",
@@ -406,6 +440,31 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "set_acceptance_contract",
+            "description": (
+                "仅在用户本轮明确改变交付目标或业务约束时，替换流程验收契约。"
+                "普通节点修复不得调用此工具放宽验收条件；调用后流程 revision 递增，旧运行证据全部失效。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "flow_id": {"type": "string"},
+                    "acceptance_contract": {
+                        "type": "object",
+                        "description": "完整替换契约；requirements 的用户条款仍必须携带 source_quote 原文。",
+                    },
+                    "requirement_change_quote": {
+                        "type": "string",
+                        "description": "用户本轮原话中明确改变需求的连续片段，系统会核对。",
+                    },
+                },
+                "required": ["flow_id", "acceptance_contract", "requirement_change_quote"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "publish_flow",
             "description": "将流程发布为 active 状态，使其可被调度执行。",
             "parameters": {
@@ -422,9 +481,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "get_run_output",
             "description": (
-                "获取已完成任务的输出结果：输出变量快照和采集产物列表。\n"
-                "在 get_run_status 返回 status=success 后调用，用于向用户汇报实际运行结果。\n"
-                "返回：variables（变量名→值）、artifacts（产物文件名列表）、summary（简要描述）。"
+                "读取任务的实际输出。返回 variables（变量名到值）、artifacts（含 filename/type 的对象列表）"
+                "和 summary。它只展示产物，不判定是否满足需求；成功运行后仍需 assert_run_output。"
             ),
             "parameters": {
                 "type": "object",
@@ -440,50 +498,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "assert_run_output",
             "description": (
-                "对已成功运行的流程做通用质量审计。注意：run_flow status=success 只代表节点未报错，"
-                "不代表流程结构、筛选链路、抽取形态和输出内容可信。抓取/筛选/导出类流程在 get_run_output 后必须调用本工具。\n\n"
-                "本工具不是针对某个页面的校验器，而是模型无关的质量闸门：\n"
-                "  • 结合流程 lint 发现高风险结构问题（如日期 fill、表格未 table mode、下拉关闭错误）\n"
-                "  • 自动识别输出变量里的表格候选，检查是否按行结构化，而不是整张表拼成一个文本数组\n"
-                "  • 可选使用 requirement_text 辅助推断用户约束；也可传入通用显式约束\n"
-                "  • 比对需求里的业务目标词是否在输出的表头/数据里出现，识别「抓到了一张表但抓错了表」\n"
-                "  • 按需求自动判断交付形态：需求指向总结/报告/Markdown 这类文档时按文档审"
-                "（落盘+篇幅+内容对得上），不要求表格变量\n"
-                "结构校验通过不等于抓对了数据：务必读 sample_rows 并与需求逐条核对后再汇报。\n"
-                "审计失败时必须继续诊断和修复流程，禁止向用户报告“已成功完成”。"
+                "按该次运行携带的冻结验收契约审计实际输出与执行证据。run_flow success 只代表节点"
+                "未报错；本工具的 passed=true 才允许宣称验收通过。passed=false 时按 issues 和"
+                "repair_plan 修流程并重新运行，不得修改契约来消除失败。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "string", "description": "要检查的运行任务 ID"},
-                    "requirement_text": {
-                        "type": "string",
-                        "description": (
-                            "用户原始需求文本，可选。工具会从中辅助推断日期、枚举、数量等约束，但不会绑定具体页面。"
-                            "系统会用本会话用户原话覆盖此字段——需求以用户说的为准，写你自己的任务复述没有意义。"
-                        ),
-                    },
-                    "min_rows": {"type": "integer", "description": "最少结果行数，可选"},
-                    "max_rows": {"type": "integer", "description": "最多结果行数，可选"},
-                    "date_field": {"type": "string", "description": "日期字段名或列名，可选；未知时可不传，由 AI 根据输出/需求继续诊断"},
-                    "start_date": {"type": "string", "description": "起始日期 YYYY-MM-DD，可选"},
-                    "end_date": {"type": "string", "description": "结束日期 YYYY-MM-DD，可选"},
-                    "enum_field": {"type": "string", "description": "枚举字段名或列名，可选；未知时可不传，由 AI 根据输出/需求继续诊断"},
-                    "allowed_values": {
-                        "type": "array",
-                        "description": "枚举字段允许值",
-                        "items": {"type": "string"},
-                    },
-                    "content_match_confirmed": {
-                        "type": "boolean",
-                        "description": (
-                            "声明你已把 sample_rows 与用户需求逐条比对、确认抓到的就是用户要的数据。"
-                            "仅在工具报出 output_content_may_not_match_requirement 或 "
-                            "document_content_may_not_match_requirement、"
-                            "而你核对后确认输出无误时才传 true；不确定就修流程重跑，不要用它消警告。"
-                            "本会话未报出该问题前传 true 会被系统忽略并按 false 处理。"
-                        ),
-                    },
                 },
                 "required": ["task_id"],
             },
@@ -494,24 +516,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "inspect_page",
             "description": (
-                "用 Playwright 访问指定 URL，提取页面上的交互元素（输入框、按钮、菜单项、表格头、下拉框等），"
-                "返回结构化文本，无需图片分析即可获取精确 CSS 选择器。\n\n"
-                "**何时使用**：\n"
-                "• 构建流程前不确定选择器（尤其是 Element UI / Ant Design 等组件库）\n"
-                "• 使用不支持图像分析的模型（如 DeepSeek），无法解读截图时\n"
-                "• 登录后需要检查目标页面的表单/菜单结构\n\n"
-                "**返回字段**：\n"
-                "• inputs / buttons / selects：表单字段和按钮（含精确 selector）\n"
-                "• links：页面所有有文字的链接（text/href/selector/cls）——AI 自行判断哪些是导航/操作入口\n"
-                "• tables：含表头的表格（headers/container_selector/cls/row_selector）；"
-                "**row_selector 已自动收窄到最近业务容器作用域，直接用于 browser.extract 的 selector 字段**\n"
-                "• visible_options：当前已展开下拉弹层中的选项（仅在弹层打开时有值）\n"
-                "• page_classes：页面上所有实际 CSS class（最多120个），用于识别真实框架/命名规律\n"
-                "• page_layout：body 顶层结构元素数组（tag/cls/role/id/aria_label/html），动态反映页面实际布局——"
-                "当 links/tables 为空时必须查看此字段的 html 片段以获取真实类名\n\n"
-                "**注意**：此工具会使用持久化浏览器 Profile（含登录 Cookie），"
-                "因此访问登录后的页面时无需再走登录流程。\n"
-                "如有正在运行的任务占用浏览器，需等任务完成后再调用。"
+                "使用持久化浏览器 Profile 打开 URL 并返回客观 DOM 事实：inputs、buttons、selects、"
+                "links、tables、visible_options、page_classes、page_layout 和 frames。构建或修复"
+                "selector 时优先使用返回值；tables[].row_selector 可直接用于表格抽取。元素为空时"
+                "结合 warning 以 wait_selector 重试，登录重定向时不得把登录页 DOM 当成目标页。"
             ),
             "parameters": {
                 "type": "object",
@@ -596,4 +604,3 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
 ]
-

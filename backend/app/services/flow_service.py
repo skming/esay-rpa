@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 from app.models.schemas import FlowCreateRequest, FlowSnapshot, FlowStatus, FlowUpdateRequest, FlowVersionSnapshot, TaskSnapshot
+from app.services.acceptance_contract import contract_validation_errors, definition_variable_names
 from app.services.flow_store import FlowStore, InMemoryFlowStore
 
 _TRAILING_NUMBER = re.compile(r"(\d+)$")
@@ -26,6 +27,16 @@ class FlowService:
         self._store = store or InMemoryFlowStore()
 
     async def create_flow(self, request: FlowCreateRequest) -> FlowSnapshot:
+        if request.acceptance_contract.deliverables or request.acceptance_contract.requirements:
+            contract_errors = contract_validation_errors(
+                request.acceptance_contract,
+                defined_variables=definition_variable_names(
+                    request.definition,
+                    [variable.name for variable in request.input_variables],
+                ),
+            )
+            if contract_errors:
+                raise ValueError("；".join(contract_errors))
         now = datetime.now(UTC)
         snapshot = FlowSnapshot(
             flowId=str(uuid4()),
@@ -34,6 +45,8 @@ class FlowService:
             description=request.description,
             definition=request.definition,
             inputVariables=request.input_variables,
+            acceptanceContract=request.acceptance_contract,
+            revision=1,
             status=request.status,
             folderPath=request.folder_path,
             defaultBrowserExecutor=request.default_browser_executor,
@@ -54,12 +67,37 @@ class FlowService:
             return None
 
         definition_changed = request.definition is not None and request.definition != current.definition
-        if definition_changed:
+        contract_changed = (
+            request.acceptance_contract is not None
+            and request.acceptance_contract != current.acceptance_contract
+        )
+        input_variables_changed = (
+            request.input_variables is not None
+            and request.input_variables != current.input_variables
+        )
+        revision_changed = definition_changed or contract_changed or input_variables_changed
+        if revision_changed:
+            next_definition = request.definition if request.definition is not None else current.definition
+            next_variables = request.input_variables if request.input_variables is not None else current.input_variables
+            next_contract = request.acceptance_contract or current.acceptance_contract
+            if next_contract.deliverables or next_contract.requirements:
+                contract_errors = contract_validation_errors(
+                    next_contract,
+                    defined_variables=definition_variable_names(
+                        next_definition,
+                        [variable.name for variable in next_variables],
+                    ),
+                )
+                if contract_errors:
+                    raise ValueError("；".join(contract_errors))
+        if revision_changed:
             entry = FlowVersionSnapshot(
                 version=current.version,
                 description=current.description,
                 definition=current.definition,
                 input_variables=current.input_variables,
+                acceptance_contract=current.acceptance_contract,
+                revision=current.revision,
                 saved_at=current.updated_at,
             )
             updated_snapshots = [entry, *current.snapshots[:49]]  # 版本历史最多保留 50 条（含本条），避免无限增长
@@ -71,8 +109,10 @@ class FlowService:
             if value is not None:
                 payload[key] = value
         # 调用方（尤其 AI 工具）几乎不显式传 version，不自动递增会导致版本历史挤在同一版本号上。
-        if definition_changed and request.version is None:
+        if revision_changed and request.version is None:
             payload["version"] = _bump_patch_version(current.version)
+        if revision_changed:
+            payload["revision"] = current.revision + 1
         payload["snapshots"] = updated_snapshots
         payload["updated_at"] = datetime.now(UTC)
         return await self._store.save(FlowSnapshot.model_validate(payload))
@@ -89,6 +129,8 @@ class FlowService:
             description=source.description,
             definition=source.definition,
             inputVariables=source.input_variables,
+            acceptanceContract=source.acceptance_contract,
+            revision=1,
             status="draft",
             folderPath=source.folder_path,
             defaultBrowserExecutor=source.default_browser_executor,

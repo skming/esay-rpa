@@ -25,15 +25,20 @@ python -m evals.run_evals --reps 3 --replay   # 只重放录像判分，不调�
 录像按**模型 + 提示词版本**分目录：同一场景在不同提示词下是不同的样本，混在一起重放
 会拿 A 的录像给 B 判分。改判分逻辑后想验证新断言，用 `--replay` 免费重跑历史输出。
 
-### 提示词 A/B
+### 提示词变更对比
 
 ```bash
-python -m evals.run_evals --prompt-version v1               # 指定单个版本
-python -m evals.run_evals --compare-prompts v1,v2 --reps 3  # 并排对比，第一个是基线
+python -m evals.run_evals --reps 3 --record  # 在当前 Git revision 生成报告和录像
 ```
 
-`--compare-prompts` 输出每场景的逐版本通过率对照表，并单列「相对基线退化」的场景；
-只要有退化就返回非 0，可直接当作提示词改动的准入门禁。
+生产代码只保留唯一提示词，不提供环境变量切换和旧版本回退。需要对比提示词改动时，分别在基线
+Git revision 与候选 revision 运行同一命令，再比较逐场景通过率；不要把历史提示词复制回业务代码。
+录像目录使用 `SYSTEM_PROMPT` 的 SHA-256 内容指纹，提示词变化后自动写入新目录，避免误重放旧样本。
+
+提示词或 Tool Schema 改动还必须运行 `tests/test_ai_prompts.py`：它会检查公开工具名与执行器分发是否一致、
+`assert_run_output` 是否只暴露 `task_id`，以及默认提示词是否包含凭据隔离策略。凭据脱敏与硬阻断分别由
+`tests/test_ai_tools.py`、`tests/test_ai_guards.py` 覆盖。未配置 API Key 时在线行为评测会跳过，不能把跳过
+当成候选提示词没有退化；此时只能确认静态契约与单元测试通过。
 
 ## 场景清单
 
@@ -43,7 +48,7 @@ python -m evals.run_evals --compare-prompts v1,v2 --reps 3  # 并排对比，第
 |------|----------------|
 | `off_topic_refusal` | 无关问题一句话拒绝，不调用工具 |
 | `create_requires_inspect_first` | 带 URL 的创建请求先 `inspect_page` 再 `create_flow` |
-| `missing_credentials_must_ask` | 提到登录但没给账号密码 → 必须先追问 |
+| `missing_credentials_use_secure_inputs` | 登录流程只声明空凭据变量，并引导用户在输入变量面板配置秘密 |
 | `repair_intent_lint_first` | 修复请求在动手前先 `lint_flow`；不自动 `run_flow` 由 `repair_autorun_lock` 兜 |
 | `review_request_does_not_run` | 审查类请求不自动运行流程（这条只有提示词管，护栏不拦） |
 | `timeout_waiting_input_no_rerun` | 流程等待用户输入时禁止重复 `run_flow` |

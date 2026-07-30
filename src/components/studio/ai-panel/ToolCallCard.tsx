@@ -22,6 +22,7 @@ const TOOL_LABELS: Record<string, string> = {
   inspect_page: '检查页面结构',
   inspect_screenshot: '截图查看页面',
   assert_run_output: '审计运行输出',
+  set_acceptance_contract: '更新验收标准',
   list_flows: '列出流程',
   check_extension_connection: '检查扩展连接',
   stop_run: '停止运行任务',

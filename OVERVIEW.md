@@ -216,6 +216,29 @@ RPA 助手（对话面板）通过工具调用（Function Calling）直接操作
 - **审计运行质量**：运行成功后检查输出是否可验证、是否混入 UI 行、是否满足日期/枚举等需求约束（`assert_run_output`）。文档型交付（md/html/pdf…）额外比对本次抓取到的数据是否真的出现在正文里（`document_missing_run_data`）——正文整篇由脚本写出，只比需求关键词等于让模型拿自己写的标题自证，这条不接受自证
 - **发布流程**（`publish_flow`，将状态改为 `active`，使其可被调度和子流程调用）
 
+### 提示词与工具契约
+
+- system prompt 在 `backend/app/services/ai_prompts.py` 分段维护，生产运行只使用唯一的
+  `SYSTEM_PROMPT`，不接受环境变量切换或旧版本回退。历史内容由 Git 追溯，避免旧提示词继续绑定新工具契约。
+- 当前提示词删除了已由 `lint_flow`、工具返回的 `repair_plan` 和节点目录实时提供的重复诊断内容，
+  避免静态说明与代码行为漂移。新增规则前先判断它属于模型决策偏好还是必须执行的不变量；
+  后者应进入 Guard 或执行器校验，而不是继续堆叠提示词。
+- 模型可调用的参数以 `backend/app/services/ai_tools/schemas.py` 的 `TOOL_SCHEMAS` 为唯一公开契约。
+  工具描述必须说明返回值能证明什么、不能证明什么；例如 `get_run_output` 只读取产物，不能替代
+  `assert_run_output` 的业务验收。
+- `assert_run_output` 对模型只公开 `task_id`。日期、枚举、数量范围等验收要求来自创建流程时冻结的
+  acceptance contract（验收契约），不能由模型在验收时临时填写或自我确认。
+
+### 凭据与敏感输入
+
+- 助手不得在对话中索要用户名、密码、Token 或其他秘密；流程只声明空的 credential 输入变量，
+  用户在右侧输入变量面板完成配置。
+- `create_flow` 携带非空 credential/sensitive 值时，`credential_values_must_stay_out_of_ai_tools`
+  Guard 会直接阻断。动态验证码、OTP（一次性密码）使用 `variable.input`，不得持久化为流程默认值。
+- `get_flow` 返回给模型前会清空所有 credential/sensitive 值，只通过 `has_value` 表示是否已配置；
+  普通非敏感默认值仍可读取。凭据就绪检查在脱敏前完成，因此不会破坏运行前校验。
+- 如果用户主动在对话中粘贴秘密，助手不得在回复中复述，也不得复制进工具参数、节点字段或流程定义。
+
 对话面板会实时显示本轮的轮次、token 消耗（含缓存命中比例）、模型耗时与被护栏拦下的次数，
 接近轮次上限时变色提示——多轮自愈是最贵的路径，值不值得再试一次由用户判断。
 
@@ -242,6 +265,7 @@ RPA 助手的关键安全规则不只依赖 system prompt，而是在编排层�
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Selector 失败熔断 | `get_run_error` 返回 `inspect_hint` 后，编排层会阻止继续 `run_flow` 或盲目修节点，直到调用 `inspect_page` 获取真实 DOM                                                    |
 | 质量审计熔断      | `assert_run_output.passed=false` 后，未按 `repair_plan` 修复前会阻止再次 `run_flow`                                                                                       |
+| 凭据写入熔断      | `create_flow` 中 credential/sensitive 变量携带非空默认值时直接阻断，要求清空值并改由输入变量面板配置                                                                    |
 | 阻断级 lint       | `critical_action_continue_on_error`、`script_uses_browser_dom`、`table_extract_selector_targets_container`、`date_filter_missing_verification`、`submit_key_on_body`、`client_side_filter_masks_page_filter`、`login_without_navigation_to_data_page`、`probe_extract_without_continue_on_error`、`unavailable_artifact_format`、`claimed_semantic_capability_unavailable` 等发现会阻止不可信运行。这类 finding 多数只是 `warn` 级（流程不报错，只是安静地跑出错数据），所以 `create_flow` / `update_flow` / `apply_node_fix` / `lint_flow` 的返回值会逐条标出 `blocks_run`，助手据此先修再跑，而不是撞上阻断才知道 |
 | 修复不顺手重跑    | 用户只说「修一下 / 报错了」时，助手改完必须交回用户，不会自己 `run_flow`——运行会真的打开浏览器操作目标站点，这个决定归用户。用户下一句表示要跑时限制自动解除；本轮自己跑出来的错另算，那次运行是用户点的 |
 | 重复修复去重      | 同一对话中重复提交完全相同的节点 patch 会被拒绝，防止弱模型反复无效尝试                                                                                                   |
@@ -250,7 +274,8 @@ RPA 助手的关键安全规则不只依赖 system prompt，而是在编排层�
 | 会话检查点        | 失败预算与未了结的义务（必须先 `inspect_page`、lint 未修完、审计未通过）落盘在 `~/.easy-rpa/ai/checkpoints/flow_<id>.json`。用户点停止、断流、关窗后重开，这些额度不会归零；拿到最终回复即清账，新任务不背旧熔断。2 小时未更新自动作废 |
 | 站点经验档案      | 按域名沉淀在 `~/.easy-rpa/ai/site_knowledge.json`，对话提到同域名时注入。**双向记录**：跑通过的 selector / UI 框架 / 登录探针供直接复用；真实运行中未命中的 selector 列为「已证伪」，避免换个流程抓同一站点时重踩同一个坑。同一 selector 后来跑通即撤销，失败记录 14 天过期 |
 
-`run_flow` 返回 `success` 只代表节点没有抛出运行异常，不代表业务结果可信。抓取、筛选、导出类流程必须继续执行 `get_run_output` 和 `assert_run_output`。
+`run_flow` 返回 `success` 只代表节点没有抛出运行异常，不代表业务结果可信。抓取、筛选、导出类流程必须继续执行
+`get_run_output` 和 `assert_run_output(task_id)`；后者只使用流程冻结的验收契约。
 
 ### 已知行为限制
 

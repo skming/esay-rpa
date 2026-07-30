@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from app.models.schemas import ArtifactSnapshot, RunTaskRequest, RuntimeProgress, RuntimeVariableSnapshot, ScrapeResult, TaskLogEntry, TaskSnapshot
+from app.models.schemas import ArtifactSnapshot, NodeExecutionEvidence, RunTaskRequest, RuntimeProgress, RuntimeVariableSnapshot, ScrapeResult, TaskLogEntry, TaskSnapshot
 from app.services.schedule_store import create_schedule_engine
 from app.services.task_store import SqlAlchemyTaskStore
 
@@ -11,6 +11,11 @@ def build_task_request() -> RunTaskRequest:
     return RunTaskRequest(
         flowName="任务持久化流程",
         flowId="00000000-0000-0000-0000-000000000101",
+        flowRevision=7,
+        definitionDigest="a" * 64,
+        acceptanceContract={
+            "deliverables": [{"id": "result", "variable": "result_count", "kind": "scalar"}],
+        },
         targetUrl="https://quotes.toscrape.com/",
         selector=".quote .text::text",
         scope="from-selection",
@@ -76,6 +81,11 @@ async def test_sqlalchemy_task_store_persists_task_logs_and_result(tmp_path) -> 
             "result": ScrapeResult(url=str(request.target_url), selector=request.selector, count=1, values=["hello"]),
             "artifacts": [artifact],
             "variables": [RuntimeVariableSnapshot(name="result_count", type="Integer", value="1", scope="局部")],
+            "execution_evidence": [NodeExecutionEvidence(
+                nodeId="count",
+                nodeType="script.python",
+                unchangedPairs=[],
+            )],
             "updated_at": datetime.now(UTC),
         }
     )
@@ -95,6 +105,10 @@ async def test_sqlalchemy_task_store_persists_task_logs_and_result(tmp_path) -> 
     assert restored.result.values == ["hello"]
     assert restored.variables[0].name == "result_count"
     assert restored.variables[0].value == "1"
+    assert restored.flow_revision == 7
+    assert restored.definition_digest == "a" * 64
+    assert restored.acceptance_contract.deliverables[0].variable == "result_count"
+    assert restored.execution_evidence[0].node_id == "count"
     assert [item.artifact_id for item in restored.artifacts] == ["artifact-1"]
     assert restored.artifacts[0].metadata["count"] == 1
 

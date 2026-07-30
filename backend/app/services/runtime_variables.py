@@ -15,18 +15,39 @@ class RuntimeVariableStore:
     """In-memory key-value store for runtime variables during a single task execution."""
     _values: dict[str, object] = field(default_factory=dict)
     _scopes: dict[str, str] = field(default_factory=dict)
+    _producers: dict[str, str] = field(default_factory=dict)
+    _sensitive: set[str] = field(default_factory=set)
 
     @classmethod
-    def from_initial(cls, variables: dict[str, object] | None) -> "RuntimeVariableStore":
+    def from_initial(
+        cls,
+        variables: dict[str, object] | None,
+        *,
+        sensitive_names: set[str] | None = None,
+    ) -> "RuntimeVariableStore":
         store = cls()
         for name, value in (variables or {}).items():
-            store.set(name, value, scope="全局")
+            store.set(name, value, scope="全局", sensitive=name in (sensitive_names or set()))
         return store
 
-    def set(self, name: str, value: object, *, scope: str = "局部") -> None:
+    def set(
+        self,
+        name: str,
+        value: object,
+        *,
+        scope: str = "局部",
+        producer_node_id: str | None = None,
+        sensitive: bool | None = None,
+    ) -> None:
         normalized_name = normalize_variable_name(name)
         self._values[normalized_name] = value
         self._scopes[normalized_name] = normalize_scope(scope)
+        if producer_node_id is not None:
+            self._producers[normalized_name] = producer_node_id
+        if sensitive is True:
+            self._sensitive.add(normalized_name)
+        elif sensitive is False:
+            self._sensitive.discard(normalized_name)
 
     def get(self, name: str) -> object:
         normalized_name = normalize_variable_name(name)
@@ -56,12 +77,26 @@ class RuntimeVariableStore:
                 scope=normalize_scope(self._scopes.get(name, "局部")),
                 type=infer_variable_type(value),
                 value=stringify_variable_value(value),
+                sensitive=name in self._sensitive,
+                category="credential" if name in self._sensitive else "flow",
             )
             for name, value in sorted(self._values.items())
         ]
 
     def raw_values(self) -> dict[str, object]:
         return dict(self._values)
+
+    def mark_producer(self, names: list[str], node_id: str) -> None:
+        for name in names:
+            normalized = normalize_variable_name(name)
+            if normalized in self._values:
+                self._producers[normalized] = node_id
+
+    def producer_of(self, name: str) -> str | None:
+        return self._producers.get(normalize_variable_name(name))
+
+    def is_sensitive(self, name: str) -> bool:
+        return normalize_variable_name(name) in self._sensitive
 
 
 def resolve_template_value(value: object, variables: RuntimeVariableStore) -> object:

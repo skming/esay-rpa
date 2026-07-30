@@ -583,6 +583,9 @@ export function createBrowserBridge({ backendClient = new BackendClient() }: Bro
       try {
         const content = JSON.parse(payload.content) as Record<string, unknown>;
         const flowPayload: FlowSavePayload = {
+          acceptanceContract: content.acceptanceContract && typeof content.acceptanceContract === 'object'
+            ? content.acceptanceContract as FlowSavePayload['acceptanceContract']
+            : undefined,
           definition: content,
           description: '从浏览器预览保存的流程定义',
           inputVariables: Array.isArray(content.inputVariables) ? (content.inputVariables as FlowSavePayload['inputVariables']) : [],

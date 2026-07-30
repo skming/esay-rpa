@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -11,11 +12,12 @@ from uuid import uuid4
 from app.core import storage
 from app.models.schemas import ArtifactContent, ArtifactSnapshot, DebugControlCommand, QueueStats, RunConfigSnapshot, RunTaskRequest, RuntimeProgress, RuntimeVariableSnapshot, ScrapeResult, TaskLogEntry, TaskSnapshot, TaskStatus
 from app.services.artifact_store import ArtifactStore, LocalArtifactStore
-from app.services.browser_action_runner import BrowserActionContext, BrowserActionRunner, OverlayInfo, apply_browser_result_variables, detect_blocking_overlay, is_browser_action_node, try_auto_dismiss_overlay
+from app.services.browser_action_runner import BrowserActionContext, BrowserActionResult, BrowserActionRunner, OverlayInfo, apply_browser_result_variables, detect_blocking_overlay, is_browser_action_node, try_auto_dismiss_overlay
 from app.services.browser_executor import BrowserExecutor
 from app.services.control_action_runner import BreakLoopSignal, ControlActionRunner, apply_control_result_variables, is_control_action_node, is_human_takeover_node, is_subprocess_node
 from app.services.extension_bridge_service import ExtensionBridgeService
 from app.services.extension_executor import ExtensionExecutor
+from app.services.execution_evidence import build_node_execution_evidence, definition_digest
 from app.services.data_action_runner import DataActionRunner, apply_data_result_variables, is_data_action_node
 from app.services.log_broker import LogBroker
 from app.services.flow_definition import FlowDefinitionSelector
@@ -205,7 +207,10 @@ class TaskManager:
         # +2 为进度条预留"启动"与"保存结果"两个非节点步骤，与 _run_record/
         # _run_flow_definition 里重复计算的 total_steps 必须保持一致
         total_steps = max(len(executable_nodes), 1) + 2
-        variables = RuntimeVariableStore.from_initial(request.variables)
+        variables = RuntimeVariableStore.from_initial(
+            request.variables,
+            sensitive_names=set(request.sensitive_variables),
+        )
         run_timestamp = now.astimezone().strftime("%Y%m%d_%H%M%S")
         flow_slug = _resolve_output_slug(request)
         variables.set("run_timestamp", run_timestamp, scope="全局")
@@ -223,6 +228,10 @@ class TaskManager:
             mode=request.mode,
             progress=RuntimeProgress(current_step=0, total_steps=total_steps, percent=0, elapsed_ms=0),
             variables=variables.snapshots(),
+            flowRevision=request.flow_revision,
+            definitionDigest=request.definition_digest or definition_digest(request.flow_definition),
+            acceptanceContract=request.acceptance_contract,
+            executionEvidence=[],
             run_config=RunConfigSnapshot.from_request(request),
             created_at=now,
             updated_at=now,
@@ -802,6 +811,9 @@ class TaskManager:
         outgoing_edges: list[dict[str, object]],
         should_follow_edges: bool,
     ) -> list[dict[str, object]]:
+        before_variables = record.variables.raw_values()
+        result_count_before = len(state.results)
+        node_started = time.monotonic()
         node_type = node.get("type")
         record.active_node_id = _read_node_id(node, fallback="node")
         next_edges = outgoing_edges
@@ -912,6 +924,33 @@ class TaskManager:
             if data_result is not None:
                 state.results.append(data_result)
 
+        node_results = state.results[result_count_before:]
+        collectable_result = next((
+            item for item in reversed(node_results)
+            if isinstance(item, ScrapeResult | BrowserActionResult)
+        ), None)
+        evidence = build_node_execution_evidence(
+            node,
+            before_variables,
+            record.variables,
+            duration_ms=max(0, int((time.monotonic() - node_started) * 1000)),
+            browser_url=(
+                collectable_result.url
+                if isinstance(collectable_result, ScrapeResult)
+                else _get_browser_url(state)
+            ),
+            match_count=(
+                collectable_result.count
+                if isinstance(collectable_result, ScrapeResult)
+                else len(collectable_result.values)
+                if isinstance(collectable_result, BrowserActionResult)
+                else None
+            ),
+        )
+        record.snapshot = record.snapshot.model_copy(update={
+            "execution_evidence": [*record.snapshot.execution_evidence, evidence],
+        })
+        await self._update_snapshot(record)
         return next_edges
 
     async def _run_human_takeover_node(

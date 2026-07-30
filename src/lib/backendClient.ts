@@ -553,6 +553,7 @@ function normalizeAnalyzePayload(payload: Partial<AnalyzeSitePayload>): Record<s
 
 function normalizeFlowPayload(payload: FlowSavePayload): FlowSavePayload {
   return {
+    acceptanceContract: payload.acceptanceContract,
     definition: payload.definition && typeof payload.definition === 'object' ? payload.definition : {},
     description: normalizeOptionalString(payload.description),
     inputVariables: Array.isArray(payload.inputVariables) ? payload.inputVariables : [],

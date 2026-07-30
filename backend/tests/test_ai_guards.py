@@ -242,6 +242,68 @@ def test_requirement_text_and_confirmation_bit_are_taken_over_by_the_system() ->
     assert args2["content_match_confirmed"] is True
 
 
+def test_acceptance_contract_change_requires_an_exact_user_quote() -> None:
+    """普通修复不能靠模型自己复述一句需求来降低验收标准。"""
+    state = {"latest_user_message": "请把交付格式改成 Excel，并保留原始日期字段"}
+
+    blocked = _blocked_by(
+        "set_acceptance_contract",
+        {"requirement_change_quote": "用户希望修改交付格式"},
+        state,
+    )
+    assert blocked["guard_id"] == "acceptance_contract_change_requires_user_quote"
+    assert blocked["required_action"] == "preserve_acceptance_contract"
+
+    assert apply_pre_tool_guards(
+        "set_acceptance_contract",
+        {"requirement_change_quote": "把交付格式改成 Excel"},
+        state,
+    ) is None
+
+
+def test_acceptance_contract_sources_must_match_user_requirement_text() -> None:
+    state = {"user_requirement_text": "抓取全部订单并导出 Excel"}
+    invalid = {
+        "acceptance_contract": {
+            "requirements": [{
+                "id": "export",
+                "description": "导出 CSV",
+                "source_kind": "user",
+                "source_quote": "导出 CSV",
+                "confidence": 1,
+                "confirmed": True,
+            }],
+            "deliverables": [],
+        },
+    }
+    blocked = _blocked_by("create_flow", invalid, state)
+    assert blocked["guard_id"] == "acceptance_contract_sources_must_match_user"
+
+    invalid["acceptance_contract"]["requirements"][0].update({
+        "description": "导出 Excel",
+        "source_quote": "导出 Excel",
+    })
+    assert apply_pre_tool_guards("create_flow", invalid, state) is None
+
+
+def test_credential_values_must_stay_out_of_ai_tools() -> None:
+    blocked = _blocked_by("create_flow", {
+        "input_variables": [
+            {"name": "username", "category": "credential", "value": "alice"},
+            {"name": "password", "sensitive": True, "value": "secret"},
+        ],
+    }, {})
+    assert blocked["guard_id"] == "credential_values_must_stay_out_of_ai_tools"
+    assert blocked["exposed_variables"] == ["username", "password"]
+
+    assert apply_pre_tool_guards("create_flow", {
+        "input_variables": [
+            {"name": "username", "category": "credential", "value": ""},
+            {"name": "date_start", "category": "flow", "value": "2026-01-01"},
+        ],
+    }, {}) is None
+
+
 def test_coarse_circuit_breakers_win_over_fine_grained_gates() -> None:
     """顺序即优先级：模型每轮换个节点改，按节点计数的闸一条都触发不了。"""
     state = {

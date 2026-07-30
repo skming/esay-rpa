@@ -253,6 +253,32 @@ async def test_browser_extract_reads_html_values() -> None:
     assert result.values == ["<strong>标题</strong>"]
 
 
+async def test_browser_extract_text_skips_inline_style_source() -> None:
+    """textContent 会把内联 <style> 的 CSS 源码算成"文本"，抓一层容器就能拎回几万字符噪声。"""
+
+    class FakeStyleNoisePage(FakePage):
+        async def all_text_contents(self) -> list[str]:
+            raise AssertionError("text 模式不得走 textContent")
+
+        async def evaluate_all(self, script: str, attribute: str | None = None) -> list[str]:
+            assert "innerText" in script
+            assert "getComputedStyle" in script
+            assert "getClientRects" in script
+            return ["正文标题"]
+
+    page = FakeStyleNoisePage([".xterm-rows { color: red; }正文标题"])
+    context = BrowserActionContext(playwright=object(), browser=object(), page=page)
+
+    result = await BrowserActionRunner().run(
+        {"type": "browser.extract", "selector": "#Main", "extractMode": "text"},
+        RuntimeVariableStore.from_initial({}),
+        context,
+        timeout_ms=1000,
+    )
+
+    assert result.values == ["正文标题"]
+
+
 async def test_browser_extract_count_mode_returns_dom_match_count() -> None:
     variables = RuntimeVariableStore.from_initial({})
     page = FakePage(["", ""])

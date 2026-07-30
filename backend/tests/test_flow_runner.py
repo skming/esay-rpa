@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import re
 from datetime import UTC, datetime
 from pathlib import Path
@@ -48,28 +49,59 @@ class RecordingTaskManager:
 
 def build_flow(definition: dict[str, object] | None = None) -> FlowSnapshot:
     now = datetime.now(UTC)
+    resolved_definition = copy.deepcopy(definition) if definition is not None else {
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {
+                "id": "n1",
+                "type": "browser.fetch",
+                "targetUrl": "https://quotes.toscrape.com/",
+                "selector": ".quote .text::text",
+                "fetcher": "static",
+                "extractMode": "text",
+                "timeoutMs": 1000,
+            },
+        ],
+        "edges": [{"source": "start", "target": "n1"}],
+    }
+    output_variable = "contract_result"
+    nodes = resolved_definition.get("nodes")
+    if isinstance(nodes, list):
+        candidates = [node for node in nodes if isinstance(node, dict) and node.get("type") not in {"start", "end"}]
+        preferred = next((node for node in candidates if node.get("type") in {"browser.fetch", "http.request"}), None)
+        target = preferred or (candidates[0] if candidates else None)
+        if target is not None:
+            existing = next((
+                target.get(field)
+                for field in ("outputVariable", "responseVariable", "countVariable", "variableName")
+                if isinstance(target.get(field), str) and target.get(field)
+            ), None)
+            if existing is None:
+                target["outputVariable"] = output_variable
+            else:
+                output_variable = existing
     return FlowSnapshot(
         flowId="flow-1",
         name="流程运行测试",
         version="v1.0.0",
         status="active",
         inputVariables=[],
-        definition=definition
-        or {
-            "nodes": [
-                {"id": "start", "type": "start"},
-                {
-                    "id": "n1",
-                    "type": "browser.fetch",
-                    "targetUrl": "https://quotes.toscrape.com/",
-                    "selector": ".quote .text::text",
-                    "fetcher": "static",
-                    "extractMode": "text",
-                    "timeoutMs": 1000,
-                },
-            ],
-            "edges": [{"source": "start", "target": "n1"}],
+        acceptanceContract={
+            "requirements": [{
+                "id": "test-requirement",
+                "description": "测试交付要求",
+                "sourceKind": "product_default",
+                "confidence": 1,
+                "confirmed": True,
+            }],
+            "deliverables": [{
+                "id": "test-output",
+                "variable": output_variable,
+                "kind": "scalar",
+                "requirementIds": ["test-requirement"],
+            }],
         },
+        definition=resolved_definition,
         createdAt=now,
         updatedAt=now,
     )
@@ -165,6 +197,21 @@ async def test_flow_run_service_rejects_missing_executable_node() -> None:
         assert "可执行节点" in str(exc)
     else:
         raise AssertionError("缺少可执行节点时应该失败")
+
+
+async def test_flow_run_service_rejects_missing_acceptance_contract_before_start() -> None:
+    task_manager = RecordingTaskManager()
+    service = FlowRunService(task_manager=task_manager)  # type: ignore[arg-type]
+    flow = build_flow()
+    flow.acceptance_contract = flow.acceptance_contract.model_copy(update={
+        "requirements": [],
+        "deliverables": [],
+    })
+
+    with pytest.raises(ValueError, match="验收契约"):
+        await service.run_flow(flow)
+
+    assert task_manager.requests == []
 
 
 async def test_flow_run_service_starts_non_fetch_flow_definition() -> None:

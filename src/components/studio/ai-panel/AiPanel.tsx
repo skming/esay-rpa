@@ -1,4 +1,4 @@
-import { PictureInPicture2, PictureInPicture, Sparkles, BotOff } from 'lucide-react';
+import { PictureInPicture2, PictureInPicture, Bot, BotOff } from 'lucide-react';
 import type { ReactElement } from 'react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
@@ -199,7 +199,7 @@ export function AiPanel({
 
   const header = (
     <div className="flex h-10 shrink-0 items-center gap-2 border-b border-slate-200 px-3">
-      <Sparkles className="h-3.5 w-3.5 shrink-0 text-accent" />
+      <Bot className="h-3.5 w-3.5 shrink-0 text-accent" />
       <span className="shrink-0 text-[12px] font-semibold text-slate-700">RPA 助手</span>
       {/* 浮窗模式下输入框可能被拖出视野，标题栏保留一个生成中的指示 */}
       {pending && (
@@ -230,12 +230,14 @@ export function AiPanel({
   const body = (
     <>
       <ChatMessages
+        hasFlow={Boolean(flowId)}
         messages={messages}
         nodeLookup={nodeLookup}
         onApplyDiff={handleApplyDiff}
         onFocusNode={onFocusNode}
         onRejectDiff={clearDiff}
         onRetry={handleRetry}
+        onSuggestion={(prompt) => void send(prompt)}
         pending={pending}
       />
       <ChatInput
