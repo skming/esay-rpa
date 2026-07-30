@@ -29,7 +29,23 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "list_node_types",
-            "description": "返回完整节点目录 node_types。构建流程前调用；节点 type、key_fields、输出字段和能力边界以返回值为准。",
+            "description": (
+                "按需返回指定节点的 key_fields、输出字段和能力边界。仅在字段不确定时调用，"
+                "不要为确认已知节点或页面访问问题查询目录；单次最多 8 个类型。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "types": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 8,
+                        "description": "需要查询的精确节点类型，例如 browser.extract、file.write",
+                    }
+                },
+                "required": ["types"],
+            },
         },
     },
     {

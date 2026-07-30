@@ -23,8 +23,14 @@ from app.services.ai_orchestrator import (
     _OLD_SCREENSHOT_PLACEHOLDER,
     _orchestrator_guard_after_tool,
     _orchestrator_guard_before_tool,
+    _resolve_resumable_task_state,
     _split_partial_tag_suffix,
+    _system_prompt_for_round,
+    _task_state_message,
+    _terminal_tool_response,
     _ThinkTagFilter,
+    _tool_schemas_for_round,
+    _TurnIntents,
 )
 
 
@@ -90,6 +96,146 @@ def test_terminal_guard_block_forces_a_closing_statement() -> None:
         "required_action": "call_inspect_page_first",
     }) == (None, False)
 
+    guidance, stop = _after_tool_guidance("inspect_page", {
+        "status": "blocked_page_access",
+        "http_status": 403,
+        "required_action": "report_to_user_and_stop",
+    })
+    assert guidance and stop
+
+
+def test_tool_schemas_follow_the_current_phase() -> None:
+    no_url = _TurnIntents(create_requested=True)
+    assert _tool_schemas_for_round({}, no_url) == []
+
+    inspecting = _TurnIntents(create_requested=True, create_url="https://example.com")
+    schemas = _tool_schemas_for_round(
+        {"pre_create_inspect_gate": {"inspect_done": False}}, inspecting
+    )
+    assert [schema["function"]["name"] for schema in schemas] == ["inspect_page"]
+
+    assert _tool_schemas_for_round({"terminal_response_only": True}, inspecting) == []
+    all_schemas = _tool_schemas_for_round(
+        {"pre_create_inspect_gate": {"inspect_done": True}}, inspecting
+    )
+    assert len(all_schemas) > 1
+
+
+def test_page_discovery_uses_a_compact_phase_prompt() -> None:
+    from app.services.ai_prompts import PAGE_DISCOVERY_PROMPT, SYSTEM_PROMPT
+
+    state = {"pre_create_inspect_gate": {"inspect_done": False}}
+    assert _system_prompt_for_round(state) == PAGE_DISCOVERY_PROMPT
+    assert len(PAGE_DISCOVERY_PROMPT) < len(SYSTEM_PROMPT) // 5
+    state["pre_create_inspect_gate"]["inspect_done"] = True
+    assert _system_prompt_for_round(state) == SYSTEM_PROMPT
+
+
+def test_terminal_tool_response_prefers_structured_user_guidance() -> None:
+    text = _terminal_tool_response("inspect_page", {
+        "status": "blocked_page_access",
+        "error": "目标页面返回 HTTP 403。",
+        "required_action": "report_to_user_and_stop",
+        "user_message": "请完成登录后再继续。",
+    })
+    assert text == "**当前无法继续。** 目标页面返回 HTTP 403。\n\n请完成登录后再继续。"
+
+
+async def test_stream_sends_only_phase_relevant_tool_schemas(monkeypatch) -> None:
+    import litellm
+
+    captured: list[dict[str, Any]] = []
+
+    async def fake_acompletion(**kwargs: Any) -> Any:
+        captured.append(kwargs)
+        return _FakeStream([_chunk(content="请提供目标网址。", finish="stop")])
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    orchestrator = AiOrchestrator(tool_executor=_FakeExecutor())  # type: ignore[arg-type]
+
+    async for _ in orchestrator.stream(
+        messages=[{"role": "user", "content": "帮我创建一个网页抓取流程"}],
+        model="test-model",
+    ):
+        pass
+    assert "tools" not in captured[-1]
+    assert "tool_choice" not in captured[-1]
+
+    async for _ in orchestrator.stream(
+        messages=[{"role": "user", "content": "创建流程，抓取 https://example.com 的正文"}],
+        model="test-model",
+    ):
+        pass
+    assert [item["function"]["name"] for item in captured[-1]["tools"]] == ["inspect_page"]
+
+    continuation = [
+        {"role": "user", "content": "https://example.com/post/1，帖子主题及回帖"},
+        {
+            "role": "assistant",
+            "content": "页面返回 403。",
+            "toolCalls": [{
+                "tool": "inspect_page",
+                "args": '{"url":"https://example.com/post/1"}',
+                "result": {
+                    "status": "blocked_page_access",
+                    "requested_url": "https://example.com/post/1",
+                },
+            }],
+        },
+        {"role": "user", "content": "继续创建"},
+    ]
+    async for _ in orchestrator.stream(messages=continuation, model="test-model"):
+        pass
+    assert [item["function"]["name"] for item in captured[-1]["tools"]] == ["inspect_page"]
+    assert any("当前可恢复任务状态" in str(message.get("content")) for message in captured[-1]["messages"])
+
+
+async def test_terminal_page_block_returns_without_a_second_llm_round(monkeypatch) -> None:
+    import litellm
+
+    calls: list[dict[str, Any]] = []
+
+    async def fake_acompletion(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return _FakeStream([
+            _chunk(
+                tool_calls=[_tool_call_chunk(
+                    0,
+                    call_id="inspect-1",
+                    name="inspect_page",
+                    arguments='{"url":"https://blocked.test"}',
+                )],
+                finish="tool_calls",
+            ),
+        ])
+
+    class _BlockedExecutor(_FakeExecutor):
+        async def execute(
+            self, tool_name: str, args: dict[str, Any], progress_sink: dict[str, Any] | None = None
+        ) -> dict[str, Any]:
+            self.calls.append((tool_name, args))
+            return {
+                "status": "blocked_page_access",
+                "http_status": 403,
+                "error": "目标页面返回 HTTP 403。",
+                "required_action": "report_to_user_and_stop",
+                "user_message": "请完成登录后再继续。",
+            }
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    executor = _BlockedExecutor()
+    orchestrator = AiOrchestrator(tool_executor=executor)  # type: ignore[arg-type]
+    events = [event async for event in orchestrator.stream(
+        messages=[{"role": "user", "content": "抓取 https://blocked.test 的正文"}],
+        model="test-model",
+    )]
+
+    assert len(calls) == 1
+    assert len(str(calls[0]["messages"][0]["content"])) < 6_000
+    assert executor.calls == [("inspect_page", {"url": "https://blocked.test"})]
+    assert "HTTP 403" in "".join(event.get("delta", "") for event in events if event["type"] == "text")
+    assert events[-1] == {"type": "done"}
+
 
 def test_waiting_for_the_user_does_not_burn_the_repair_budget() -> None:
     """停下来等人不是一次失败的修复，记进熔断计数等于罚用户操作慢。"""
@@ -154,14 +300,118 @@ def test_passing_audit_clears_the_repair_cycle_counter() -> None:
 def test_create_intent_needs_url_and_is_suppressed_by_repair_intent() -> None:
     blank = _FlowContext(is_blank=True)
     msgs = [{"role": "user", "content": "帮我抓取 https://example.com 的表格"}]
-    assert _detect_turn_intents(msgs, "flow-1", blank).create_url == "https://example.com"
+    detected = _detect_turn_intents(msgs, "flow-1", blank)
+    assert detected.create_requested is True
+    assert detected.create_url == "https://example.com"
     # 没有 URL 就无从 inspect，不激活 gate
-    assert _detect_turn_intents([{"role": "user", "content": "帮我建个流程"}], None, blank).create_url is None
+    missing_url = _detect_turn_intents([{"role": "user", "content": "帮我建个流程"}], None, blank)
+    assert missing_url.create_requested is True
+    assert missing_url.create_url is None
     # "抓不全" 是修复而非新建
     repair = _detect_turn_intents(
         [{"role": "user", "content": "https://example.com 抓不全，帮我修一下"}], "flow-1", blank
     )
     assert repair.repair and repair.create_url is None
+
+
+def test_continuation_recovers_the_active_task_from_real_tool_history() -> None:
+    blank = _FlowContext(is_blank=True)
+    messages = [
+        {"role": "user", "content": "https://example.com/post/1，帖子主题及回帖"},
+        {
+            "role": "assistant",
+            "content": "页面返回 403。",
+            "toolCalls": [{
+                "tool": "inspect_page",
+                "args": '{"url":"https://example.com/post/1"}',
+                "result": {
+                    "status": "blocked_page_access",
+                    "requested_url": "https://example.com/post/1",
+                    "http_status": 403,
+                },
+            }],
+        },
+        {"role": "user", "content": "继续创建"},
+    ]
+
+    state = _resolve_resumable_task_state(messages, "flow-1", blank)
+    assert state.target_url == "https://example.com/post/1"
+    assert state.target_source == "inspection_history"
+    assert state.phase == "page_inspection_blocked"
+    assert state.last_inspection_status == "blocked_page_access"
+    assert "帖子主题及回帖" in state.requirement_text
+    assert "继续创建" not in state.requirement_text
+
+    detected = _detect_turn_intents(messages, "flow-1", blank, state)
+    assert detected.create_requested is True
+    assert detected.create_url == "https://example.com/post/1"
+
+    context = _task_state_message(state)
+    assert context is not None
+    assert "retry_page_inspection" in str(context["content"])
+
+
+def test_new_task_does_not_inherit_the_previous_target() -> None:
+    blank = _FlowContext(is_blank=True)
+    messages = [
+        {"role": "user", "content": "抓取 https://old.example.com/list"},
+        {"role": "assistant", "content": "需要用户处理。"},
+        {"role": "user", "content": "继续创建另一个流程"},
+    ]
+
+    state = _resolve_resumable_task_state(messages, "flow-1", blank)
+    assert state.target_url is None
+    detected = _detect_turn_intents(messages, "flow-1", blank, state)
+    assert detected.create_requested is True
+    assert detected.create_url is None
+
+
+def test_explicit_new_url_overrides_the_previous_task_target() -> None:
+    blank = _FlowContext(is_blank=True)
+    messages = [
+        {"role": "user", "content": "抓取 https://old.example.com/list"},
+        {"role": "assistant", "content": "页面不可访问。"},
+        {"role": "user", "content": "换一个网站，继续抓取 https://new.example.com/list"},
+    ]
+
+    state = _resolve_resumable_task_state(messages, "flow-1", blank)
+    assert state.target_url == "https://new.example.com/list"
+    assert state.target_source == "current_message"
+    detected = _detect_turn_intents(messages, "flow-1", blank, state)
+    assert detected.create_url == "https://new.example.com/list"
+
+
+def test_successful_inspection_resumes_at_build_instead_of_reinspecting() -> None:
+    blank = _FlowContext(is_blank=True)
+    messages = [
+        {"role": "user", "content": "抓取 https://example.com/list 的标题"},
+        {
+            "role": "assistant",
+            "content": "",
+            "toolCalls": [{
+                "tool": "inspect_page",
+                "args": '{"url":"https://example.com/list"}',
+                "result": {
+                    "requested_url": "https://example.com/list",
+                    "title": "列表",
+                    "page_layout": [{"tag": "main"}],
+                },
+            }],
+        },
+        {"role": "user", "content": "继续"},
+    ]
+
+    state = _resolve_resumable_task_state(messages, "flow-1", blank)
+    assert state.phase == "page_inspected"
+    context = _task_state_message(state)
+    assert context is not None and "build_flow" in str(context["content"])
+
+    intents = _detect_turn_intents(messages, "flow-1", blank, state)
+    guard_state = {
+        "pre_create_inspect_gate": {"inspect_done": state.phase == "page_inspected"},
+    }
+    schemas = _tool_schemas_for_round(guard_state, intents)
+    assert len(schemas) > 1
 
 
 def test_existing_browser_chain_is_protected_unless_switch_is_explicit() -> None:
@@ -539,8 +789,8 @@ class _RevisionFlowExecutor(_FakeExecutor):
         return {"status": "ok"}
 
 
-async def test_stream_exposes_current_revision_verification_status(monkeypatch) -> None:
-    """只读追问没有新工具结果，仍要告诉前端当前流程证据等级。"""
+async def test_read_only_reply_does_not_claim_the_assistant_modified_the_flow(monkeypatch) -> None:
+    """验证状态挂在消息气泡上，只读追问复用旧状态会被误读成“本轮做了修改”。"""
     import litellm
 
     async def fake_acompletion(**kwargs: Any) -> Any:
@@ -564,7 +814,7 @@ async def test_stream_exposes_current_revision_verification_status(monkeypatch) 
     )]
 
     verification = [event for event in events if event["type"] == "verification"]
-    assert verification == [{"type": "verification", "status": "run_verified", "revision": 7}]
+    assert verification == []
 
 
 async def test_parallel_tool_calls_after_create_flow_get_placeholder_responses(monkeypatch) -> None:
@@ -839,6 +1089,9 @@ async def test_usage_events_report_rounds_tokens_and_blocked_calls(monkeypatch) 
     assert final["max_rounds"] > 0
     assert events[-1] == {"type": "done"}
     assert events[-2]["type"] == "usage", "终值必须在 done 之前发出，否则最后一次计数丢失"
+    first_tool_result = next(i for i, event in enumerate(events) if event["type"] == "tool_result")
+    assert events[first_tool_result + 1]["type"] == "usage"
+    assert events[first_tool_result + 1]["usage"]["tool_calls"] == 1
 
 
 def test_lint_findings_are_read_from_the_key_lint_flow_actually_returns() -> None:

@@ -21,7 +21,7 @@ from app.services.acceptance_contract import contract_validation_errors
 from app.services.execution_evidence import definition_digest
 from app.services import browser_profile_lock
 from app.services.browser_action_runner import detect_blocking_interstitial, persistent_browser_context
-from app.services.ai_tools.catalog import NODE_TYPE_CATALOG
+from app.services.ai_tools.catalog import select_node_types
 from app.services.ai_tools.diagnostics import (
     SELECTOR_MATCH_HIDDEN_OR_NOT_VISIBLE,
     SELECTOR_MATCH_NOT_VISIBLE,
@@ -167,6 +167,10 @@ def _profile_busy_block(tool_name: str) -> dict[str, Any] | None:
         "status": "blocked_browser_profile_busy",
         "holder": held,
         "error": f"{tool_name} 需要打开浏览器，但{browser_profile_lock.busy_message(held)}",
+        "user_message": (
+            f"{browser_profile_lock.busy_message(held)}"
+            "请先完成或停止该任务；浏览器释放后回复“继续”，我会从当前步骤重新检查。"
+        ),
         "message": (
             "这是浏览器被占用，不是流程配置有问题：不要改流程、不要重试其他工具，"
             "把上面这句话转告用户，等他处理完再继续。"
@@ -248,7 +252,7 @@ class RpaToolExecutor:
             case "lint_flow":
                 return await self._lint_flow_tool(**args)
             case "list_node_types":
-                return await self._list_node_types()
+                return await self._list_node_types(**args)
             case "get_flow":
                 return await self._get_flow(**args)
             case "validate_flow":
@@ -315,8 +319,8 @@ class RpaToolExecutor:
             "summary": summary if findings else "未发现任何问题。",
         }
 
-    async def _list_node_types(self) -> dict[str, Any]:
-        return {"node_types": NODE_TYPE_CATALOG}
+    async def _list_node_types(self, types: list[str] | None = None) -> dict[str, Any]:
+        return select_node_types(types)
 
     @staticmethod
     def _credential_readiness(flow: Any, supplied: set[str] | None = None) -> dict[str, Any]:
@@ -2375,7 +2379,22 @@ class RpaToolExecutor:
         try:
             async with persistent_browser_context(browser_profile, headless=True) as ctx:
                 page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-                await page.goto(url, wait_until="load", timeout=30_000)
+                response = await page.goto(url, wait_until="load", timeout=30_000)
+                http_status = getattr(response, "status", None)
+                if isinstance(http_status, int) and http_status >= 400:
+                    return {
+                        "status": "blocked_page_access",
+                        "http_status": http_status,
+                        "requested_url": url,
+                        "url": str(getattr(page, "url", "") or url),
+                        "error": f"目标页面返回 HTTP {http_status}，无法取得可用于构建流程的真实 DOM。",
+                        "required_action": "report_to_user_and_stop",
+                        "user_message": (
+                            "当前页面检查只能读取 Playwright 持久 Profile，不能读取 Chrome 扩展当前标签页。"
+                            "请通过页面选择器或同一 Playwright Profile 的有头会话完成登录/验证后回复“已完成”，"
+                            "或提供一个当前环境可访问的 URL。"
+                        ),
+                    }
                 try:
                     await page.wait_for_load_state("networkidle", timeout=6_000)
                 except Exception:
@@ -2402,6 +2421,11 @@ class RpaToolExecutor:
                         "challenge_label": challenge.label,
                         "challenge": challenge.summary,
                         "error": f"目标站点返回了{challenge.label}，无头浏览器拿不到真实页面内容。",
+                        "required_action": "report_to_user_and_stop",
+                        "user_message": (
+                            "请通过页面选择器或同一 Playwright Profile 的有头会话完成人机验证后回复“已完成”；"
+                            "验证状态写入持久 Profile 后，我会重新读取真实 DOM。"
+                        ),
                     }
 
                 result = await page.evaluate(PAGE_PROBE_JS, scope_selector)

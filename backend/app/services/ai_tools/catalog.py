@@ -508,3 +508,22 @@ NODE_TYPE_CATALOG: list[dict[str, str]] = [
     },
 ]
 
+
+def select_node_types(types: list[str] | None) -> dict[str, object]:
+    """按需返回节点详情；空查询只给名称索引，避免把整份目录塞进模型上下文。"""
+    available = [entry["type"] for entry in NODE_TYPE_CATALOG]
+    requested = list(dict.fromkeys(str(item).strip() for item in (types or []) if str(item).strip()))
+    if not requested:
+        return {
+            "available_types": available,
+            "node_types": [],
+            "message": "请用 types 指定需要查询的节点类型，单次最多 8 个。",
+        }
+    wanted = set(requested[:8])
+    matches = [entry for entry in NODE_TYPE_CATALOG if entry["type"] in wanted]
+    found = {entry["type"] for entry in matches}
+    return {
+        "node_types": matches,
+        "unknown_types": [item for item in requested[:8] if item not in found],
+        "truncated": len(requested) > 8,
+    }

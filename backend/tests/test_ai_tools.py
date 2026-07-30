@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from typing import Any
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -39,7 +40,7 @@ from app.services.ai_tools.diagnostics import (
     build_navigation_verdict,
 )
 from app.services.ai_tools.lint import _lint_flow
-from app.services.ai_tools.catalog import NODE_TYPE_CATALOG
+from app.services.ai_tools.catalog import NODE_TYPE_CATALOG, select_node_types
 from app.services.ai_tools.lint_scenarios import (
     _lint_claimed_semantic_capability,
     _lint_script_hardcoded_content,
@@ -776,6 +777,41 @@ async def test_run_flow_blocks_when_another_run_holds_the_browser_profile() -> N
         assert extension_result.get("status") != "blocked_browser_profile_busy"
     finally:
         browser_profile_lock.release(profile, "抓取 NodeSeek 帖子内容 · 运行 t_1")
+
+
+async def test_inspect_page_stops_immediately_on_http_403(monkeypatch) -> None:
+    """403 不是 SPA 未渲染；误判会诱导模型重复 inspect_page，再额外截图确认同一事实。"""
+    import app.services.ai_tools.executor as executor_module
+
+    class _Response:
+        status = 403
+
+    class _Page:
+        url = "https://www.nodeseek.com/post-1"
+
+        async def goto(self, *_args: Any, **_kwargs: Any) -> _Response:
+            return _Response()
+
+    class _Context:
+        pages = [_Page()]
+
+    @asynccontextmanager
+    async def _context(*_args: Any, **_kwargs: Any):
+        yield _Context()
+
+    monkeypatch.setattr(executor_module, "find_spec", lambda _name: object())
+    monkeypatch.setattr(executor_module, "persistent_browser_context", _context)
+    monkeypatch.setattr(executor_module.browser_profile_lock, "acquire", lambda *_args: None)
+    monkeypatch.setattr(executor_module.browser_profile_lock, "release", lambda *_args: None)
+
+    executor = RpaToolExecutor(flow_service=FakeFlowService(), task_manager=FakeTaskManager())  # type: ignore[arg-type]
+    result = await executor._inspect_page("https://www.nodeseek.com/post-1")
+
+    assert result["status"] == "blocked_page_access"
+    assert result["http_status"] == 403
+    assert result["required_action"] == "report_to_user_and_stop"
+    assert "SPA" not in result["error"]
+    assert "不能读取 Chrome 扩展当前标签页" in result["user_message"]
 
 
 async def test_get_run_error_returns_root_cause_hints_for_login_detection_failure() -> None:
@@ -2680,8 +2716,12 @@ def test_few_shot_follows_the_current_turn_not_the_whole_session() -> None:
     """
     from app.services.ai_orchestrator import _should_inject_few_shot
 
-    create_turn = [{"role": "user", "content": "帮我创建一个流程，抓取 https://x.test 的表格"}]
+    create_turn = [{"role": "user", "content": "帮我创建一个流程，抓取 https://x.test 的分页表格并按日期筛选"}]
     assert _should_inject_few_shot(create_turn) is True
+
+    # 没有 URL 时只能先追问，简单页面也用不到登录+日期+分页的重型示例
+    assert _should_inject_few_shot([{"role": "user", "content": "帮我根据网页创建抓取流程"}]) is False
+    assert _should_inject_few_shot([{"role": "user", "content": "抓取 https://x.test 的正文"}]) is False
 
     follow_up = create_turn + [
         {"role": "assistant", "content": "已创建"},
@@ -2701,7 +2741,7 @@ async def test_few_shot_requirement_never_leaks_into_the_guard_state(monkeypatch
 
     from app.services.ai_orchestrator import AiOrchestrator, _should_inject_few_shot
 
-    user_request = "帮我创建流程，抓取 https://shop.test 的商品名和价格"
+    user_request = "帮我创建流程，分页抓取 https://shop.test 的商品名和价格并按日期筛选"
     assert _should_inject_few_shot([{"role": "user", "content": user_request}]) is True
 
     captured: list[dict[str, Any]] = []
@@ -3160,16 +3200,28 @@ def test_eval_mock_executor_signature_tracks_the_real_executor() -> None:
     )
 
 
-def test_eval_mock_serves_the_real_node_catalog() -> None:
-    """空清单会让模型以为一个原生节点都没有，只能退化成 script.python——评测就在测一个不存在的产品。"""
+def test_node_catalog_is_returned_on_demand() -> None:
+    """目录按需返回详情，避免一次无参调用把所有长描述塞进模型上下文。"""
+    selected = select_node_types(["browser.extract", "file.write", "missing.type"])
+    assert [entry["type"] for entry in selected["node_types"]] == ["browser.extract", "file.write"]
+    assert selected["unknown_types"] == ["missing.type"]
+
+    index = select_node_types(None)
+    assert index["node_types"] == []
+    assert index["available_types"] == [entry["type"] for entry in NODE_TYPE_CATALOG]
+
+
+async def test_eval_mock_filters_the_real_node_catalog() -> None:
     import sys
     from pathlib import Path
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from evals.run_evals import _DEFAULT_TOOL_RESULTS
-    from app.services.ai_tools.catalog import NODE_TYPE_CATALOG
+    from evals.run_evals import MockToolExecutor
 
-    assert _DEFAULT_TOOL_RESULTS["list_node_types"]["node_types"] == NODE_TYPE_CATALOG
+    result = await MockToolExecutor().execute(
+        "list_node_types", {"types": ["browser.extract", "file.write"]}
+    )
+    assert [entry["type"] for entry in result["node_types"]] == ["browser.extract", "file.write"]
 
 
 def test_count_variable_is_derived_from_output_variable() -> None:

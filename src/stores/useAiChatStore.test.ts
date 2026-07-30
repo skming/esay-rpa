@@ -22,14 +22,14 @@ describe('useAiChatStore.migrateSession', () => {
     expect(useAiChatStore.getState().getMessages('flow_local-1')).toEqual([]);
   });
 
-  it('目标已有对话时不覆盖', () => {
+  it('目标已有对话时按消息 id 合并', () => {
     const store = useAiChatStore.getState();
     store.setMessages('flow_local-1', [message('draft', '草稿')]);
     store.setMessages('flow_real', [message('kept', '正文')]);
 
     store.migrateSession('flow_local-1', 'flow_real');
 
-    expect(useAiChatStore.getState().getMessages('flow_real').map((m) => m.content)).toEqual(['正文']);
-    expect(useAiChatStore.getState().getMessages('flow_local-1').map((m) => m.content)).toEqual(['草稿']);
+    expect(useAiChatStore.getState().getMessages('flow_real').map((m) => m.content)).toEqual(['草稿', '正文']);
+    expect(useAiChatStore.getState().getMessages('flow_local-1')).toEqual([]);
   });
 });

@@ -37,9 +37,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from app.services import ai_orchestrator  # noqa: E402
 from app.services.ai_orchestrator import AiOrchestrator  # noqa: E402
 from app.services.ai_config_service import AiConfigService, AI_MODEL_CATALOG  # noqa: E402
-from app.services.ai_prompts import SYSTEM_PROMPT  # noqa: E402
+from app.services.ai_prompts import PAGE_DISCOVERY_PROMPT, SYSTEM_PROMPT  # noqa: E402
 from app.services.ai_guards import FLOW_WRITE_TOOLS  # noqa: E402
-from app.services.ai_tools.catalog import NODE_TYPE_CATALOG  # noqa: E402
+from app.services.ai_tools.catalog import select_node_types  # noqa: E402
 from app.services.ai_tools.lint import _lint_flow, annotate_lint_findings  # noqa: E402
 from app.services.ai_tools.normalize import (  # noqa: E402
     _normalize_generated_edges,
@@ -82,8 +82,6 @@ _DEFAULT_TOOL_RESULTS: dict[str, dict[str, Any]] = {
     "get_run_error": {"task_id": "eval-task-0001", "status": "error", "failed_node_id": "n3",
                       "error_logs": ["selector 定位超时"], "inspect_hint": None},
     "get_run_logs": {"task_id": "eval-task-0001", "logs": []},
-    # 必须给真实清单：返回空清单时模型以为没有原生节点，只能退化成 script.python
-    "list_node_types": {"node_types": NODE_TYPE_CATALOG},
     "list_flows": {"flows": []},
     "apply_node_fix": {"flow_id": "eval-flow-0001", "status": "patched", "lint_findings": []},
     "publish_flow": {"flow_id": "eval-flow-0001", "status": "published"},
@@ -140,6 +138,8 @@ class MockToolExecutor:
         progress_sink: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self.calls.append((name, args))
+        if name == "list_node_types":
+            return select_node_types(args.get("types"))
         override = self._overrides.get(name)
         if callable(override):
             return override(args, self.calls)
@@ -182,6 +182,7 @@ class Scenario:
     description: str
     user_message: str
     flow_id: str | None = None
+    messages: list[dict[str, Any]] | None = None
     tool_overrides: dict[str, Any] = field(default_factory=dict)
     # 断言（None 表示不检查）
     expect_no_tools: bool = False
@@ -241,6 +242,48 @@ SCENARIOS: list[Scenario] = [
         expect_tool_order=[("inspect_page", "create_flow")],
         expect_tools_not_called=["run_flow"],
         expect_reply_contains_any=["输入变量", "面板", "配置凭据"],
+    ),
+    Scenario(
+        name="page_access_denied_stops_tool_loop",
+        description="目标页返回 403 后立即向用户收尾，不再查询节点目录或空流程",
+        user_message="创建流程：抓取 https://example.com/protected 的帖子和所有回复，输出 Markdown。",
+        tool_overrides={
+            "inspect_page": {
+                "status": "blocked_page_access",
+                "http_status": 403,
+                "requested_url": "https://example.com/protected",
+                "error": "目标页面返回 HTTP 403，无法取得可用于构建流程的真实 DOM。",
+                "required_action": "report_to_user_and_stop",
+                "user_message": "请先在可复用登录态的 Chrome 中确认页面可以正常打开。",
+            }
+        },
+        expect_tools_called=["inspect_page"],
+        expect_tools_not_called=["list_node_types", "get_flow", "create_flow", "update_flow"],
+        expect_reply_contains_any=["403", "Chrome", "无法", "访问"],
+    ),
+    Scenario(
+        name="continue_creation_recovers_task_state",
+        description="继续创建应从历史工具证据恢复 URL，并重新开放页面检查，而不是只复述旧错误",
+        user_message="继续创建",
+        messages=[
+            {"role": "user", "content": "https://example.com/post/1，帖子主题及回帖"},
+            {
+                "role": "assistant",
+                "content": "页面返回 403。",
+                "toolCalls": [{
+                    "tool": "inspect_page",
+                    "args": '{"url":"https://example.com/post/1"}',
+                    "result": {
+                        "status": "blocked_page_access",
+                        "requested_url": "https://example.com/post/1",
+                    },
+                }],
+            },
+            {"role": "user", "content": "继续创建"},
+        ],
+        expect_first_tool="inspect_page",
+        expect_tool_max_calls={"inspect_page": 1},
+        stop_after_tool="inspect_page",
     ),
     Scenario(
         name="repair_intent_lint_first",
@@ -420,7 +463,9 @@ SCENARIOS: list[Scenario] = [
 # 录像存模型这一轮的全部输出（回复 + 工具调用入参），供 --replay 免调模型复判。
 # 改断言、调阈值走重放，不要重跑生成。
 _RECORDINGS_DIR = Path(__file__).resolve().parent / "recordings"
-_PROMPT_FINGERPRINT = hashlib.sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest()[:12]
+_PROMPT_FINGERPRINT = hashlib.sha256(
+    (SYSTEM_PROMPT + "\n<page-discovery>\n" + PAGE_DISCOVERY_PROMPT).encode("utf-8")
+).hexdigest()[:12]
 
 
 def _recording_path(model: str, scenario_name: str, rep: int) -> Path:
@@ -448,7 +493,7 @@ async def run_scenario(
     reply_parts: list[str] = []
     errors: list[str] = []
     stream = orchestrator.stream(
-        messages=[{"role": "user", "content": scenario.user_message}],
+        messages=scenario.messages or [{"role": "user", "content": scenario.user_message}],
         model=model,
         flow_id=scenario.flow_id,
     )

@@ -42,6 +42,9 @@ def test_tool_prompts_keep_the_contract_authoritative_and_bounded() -> None:
     assert "冻结验收契约" in functions["assert_run_output"]["description"]
     assert "blocks_run" in functions["lint_flow"]["description"]
     assert "不得把账号、密码或 Token 写入参数" in functions["create_flow"]["description"]
+    catalog_params = functions["list_node_types"]["parameters"]
+    assert catalog_params["required"] == ["types"]
+    assert catalog_params["properties"]["types"]["maxItems"] == 8
     assert len(json.dumps(TOOL_SCHEMAS, ensure_ascii=False)) < 15_000
 
 

@@ -27,6 +27,14 @@ def _safe_key(value: str) -> str:
     return (re.sub(r"[^\w\-]", "_", value) or "default")[:80]
 
 
+def _message_sort_key(message: dict[str, Any]) -> tuple[int, str]:
+    try:
+        created_at = int(message.get("createdAt") or 0)
+    except (TypeError, ValueError):
+        created_at = 0
+    return created_at, str(message.get("id") or "")
+
+
 class AiChatStore:
     def __init__(self, app_data_dir: str | None = None) -> None:
         self._base = storage.resolve_ai_chats_dir() if app_data_dir is None else Path(app_data_dir) / "ai" / "chats"
@@ -118,16 +126,22 @@ class AiChatStore:
 
 
     def rename(self, from_key: str, to_key: str) -> bool:
-        """把草稿会话改挂到流程保存后拿到的真实 id 上，成功搬迁返回 True。
-
-        目标已存在时一律不搬：那说明该流程已经有自己的对话（例如 AI 自己建流程时就写在真实
-        id 下），搬过去等于用草稿覆盖掉正文。源不存在同理直接返回，让调用方无需先探测。
-        """
+        """把草稿会话改挂到真实流程；目标已落盘时按消息 id 合并，避免保存竞态拆散上下文。"""
         source = self._path(from_key)
         target = self._path(to_key)
-        if source == target or not source.exists() or target.exists():
+        if source == target or not source.exists():
             return False
         target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            merged: dict[str, dict[str, Any]] = {}
+            for message in [*self.load(from_key), *self.load(to_key)]:
+                message_id = str(message.get("id") or "")
+                if message_id:
+                    merged[message_id] = message
+            messages = list(merged.values())
+            messages.sort(key=_message_sort_key)
+            self.save(to_key, messages)
+            return _unlink(source)
         try:
             source.replace(target)
         except OSError:

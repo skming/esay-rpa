@@ -33,10 +33,12 @@ export const useAiChatStore = create<AiChatStore>()(
       migrateSession: (fromKey, toKey) =>
         set((s) => {
           const source = s.sessions[fromKey];
-          // 目标已有对话就不动：那是这个流程自己的历史，覆盖等于拿草稿把正文冲掉
-          if (source === undefined || source.length === 0 || (s.sessions[toKey]?.length ?? 0) > 0) return s;
+          if (source === undefined || source.length === 0) return s;
+          const merged = [...source, ...(s.sessions[toKey] ?? [])]
+            .filter((message, index, messages) => messages.findIndex((item) => item.id === message.id) === index)
+            .sort((left, right) => (left.createdAt ?? 0) - (right.createdAt ?? 0));
           const { [fromKey]: _moved, ...rest } = s.sessions;
-          return { sessions: { ...rest, [toKey]: source } };
+          return { sessions: { ...rest, [toKey]: merged } };
         }),
       setModel: (model) => set({ model }),
     }),

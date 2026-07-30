@@ -49,6 +49,8 @@ Git revision 与候选 revision 运行同一命令，再比较逐场景通过率
 | `off_topic_refusal` | 无关问题一句话拒绝，不调用工具 |
 | `create_requires_inspect_first` | 带 URL 的创建请求先 `inspect_page` 再 `create_flow` |
 | `missing_credentials_use_secure_inputs` | 登录流程只声明空凭据变量，并引导用户在输入变量面板配置秘密 |
+| `page_access_denied_stops_tool_loop` | 页面返回 403 后由服务端立即收尾，不进入第二轮 LLM，也不查询节点目录或空流程 |
+| `continue_creation_recovers_task_state` | “继续创建”从历史工具证据恢复目标和阶段，重新检查页面而不是复述旧错误 |
 | `repair_intent_lint_first` | 修复请求在动手前先 `lint_flow`；不自动 `run_flow` 由 `repair_autorun_lock` 兜 |
 | `review_request_does_not_run` | 审查类请求不自动运行流程（这条只有提示词管，护栏不拦） |
 | `timeout_waiting_input_no_rerun` | 流程等待用户输入时禁止重复 `run_flow` |

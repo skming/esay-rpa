@@ -49,9 +49,10 @@ def attach_tool_events(tool_name: str, result: Any) -> Any:
 def reduce_evidence_state(state: dict[str, Any], result: Any) -> None:
     if not isinstance(result, dict):
         return
-    for event in result.get("events") or []:
-        if not isinstance(event, dict):
-            continue
+    events = [event for event in (result.get("events") or []) if isinstance(event, dict)]
+    if not events:
+        return
+    for event in events:
         event_type = event.get("type")
         if event_type == "flow_written":
             revision = event.get("revision")

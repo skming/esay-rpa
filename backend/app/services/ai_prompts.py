@@ -198,7 +198,8 @@ _SEC['step1_login_challenges'] = """**登录挑战处理规范（验证码 / 2FA
 """
 
 _SEC['step2_mapping'] = """### 第二步：节点映射
-将每个原子操作映射到具体节点类型。如有必要，先调 `list_node_types` 查阅完整能力列表。
+将每个原子操作映射到具体节点类型。只有字段不确定时才调 `list_node_types(types=[...])`，
+一次查询当前需要的少量类型；页面无法访问、DOM 为空或 HTTP 报错与节点能力无关，禁止因此查询节点目录。
 
 **优先使用原生节点**（`browser.extract`、`http.request`、`excel.addrow`、`file.write` 等），只在原生节点无法覆盖某步骤时，才用 `script.python` 补充。
 
@@ -468,7 +469,7 @@ my_var = _vars.get('my_var', '')
 
 _SEC['field_reference'] = """## 关键字段速查
 
-每个节点类型的字段与输出变量字段由 `list_node_types` 返回（`key_fields` / `output_var_field`），以它为准。以下只列它覆盖不到的跨节点规则。
+每个节点类型的字段与输出变量字段由 `list_node_types(types=[...])` 按需返回（`key_fields` / `output_var_field`），以它为准。以下只列它覆盖不到的跨节点规则。
 
 **变量输入与引用统一规范（必须遵守）**：
 
@@ -616,3 +617,25 @@ def _render_system_prompt() -> str:
 
 
 SYSTEM_PROMPT = _render_system_prompt()
+
+
+def render_page_discovery_prompt() -> str:
+    """页面首轮只做事实探测，避免在拿到 DOM 前加载完整构建手册。"""
+    return "".join((
+        _SEC["preamble"],
+        _SEC["output_boundary"],
+        render_guard_contract(),
+        """## 当前阶段：页面事实探测
+
+用户已经提供网页 URL 并要求创建抓取流程。当前只能调用 `inspect_page`：
+- 立即检查用户给出的 URL，`wait_selector` 只填写页面就绪所需的宽泛容器。
+- 不猜测 selector，不描述尚未看到的页面结构，不调用无关工具。
+- HTTP 错误、验证墙或浏览器占用由系统直接向用户收尾；不要自行重试。
+- 不索取、复述或写入账号、密码、Token 等秘密值。
+
+本阶段不要输出过程旁白；直接调用工具。工具成功后，系统会加载流程构建与验证规则继续任务。
+""",
+    ))
+
+
+PAGE_DISCOVERY_PROMPT = render_page_discovery_prompt()

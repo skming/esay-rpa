@@ -218,8 +218,9 @@ RPA 助手（对话面板）通过工具调用（Function Calling）直接操作
 
 ### 提示词与工具契约
 
-- system prompt 在 `backend/app/services/ai_prompts.py` 分段维护，生产运行只使用唯一的
-  `SYSTEM_PROMPT`，不接受环境变量切换或旧版本回退。历史内容由 Git 追溯，避免旧提示词继续绑定新工具契约。
+- system prompt 在 `backend/app/services/ai_prompts.py` 分段维护，不接受环境变量切换或旧版本回退。
+  页面首轮事实探测使用同一份规则源生成的 `PAGE_DISCOVERY_PROMPT`，DOM 检查完成后切换到完整
+  `SYSTEM_PROMPT`；二者是运行阶段，不是可并存的提示词版本。历史内容由 Git 追溯。
 - 当前提示词删除了已由 `lint_flow`、工具返回的 `repair_plan` 和节点目录实时提供的重复诊断内容，
   避免静态说明与代码行为漂移。新增规则前先判断它属于模型决策偏好还是必须执行的不变量；
   后者应进入 Guard 或执行器校验，而不是继续堆叠提示词。
@@ -228,6 +229,31 @@ RPA 助手（对话面板）通过工具调用（Function Calling）直接操作
   `assert_run_output` 的业务验收。
 - `assert_run_output` 对模型只公开 `task_id`。日期、枚举、数量范围等验收要求来自创建流程时冻结的
   acceptance contract（验收契约），不能由模型在验收时临时填写或自我确认。
+
+### Token 与工具调用成本控制
+
+- **按阶段暴露工具**：创建请求缺少 URL 时不发送 Tool Schema（工具参数定义）；拿到 URL、尚未完成
+  页面检查时只暴露 `inspect_page`。页面检查完成后才开放构建和运行工具。当前 inspect 阶段的
+  Tool Schema 从 13,665 字符降到 752 字符，减少 **94.5%**。
+- **按阶段加载提示**：页面首轮只需要判断 URL 能否取得真实 DOM，不加载节点格式、脚本、运行审计等
+  构建手册。该阶段提示由 26,937 字符降到 1,620 字符，减少 **94.0%**；检查成功后才加载完整规则。
+- **few-shot 按复杂度注入**：20,619 字符的登录/日期/筛选/分页示例只用于确实包含这些复杂特征且
+  已提供 URL 的创建请求。缺 URL或只抓正文/简单列表时不注入，避免在澄清轮和简单任务重复付费。
+- **节点目录按需查询**：`list_node_types(types=[...])` 单次最多查询 8 个精确类型。查询两个类型时，
+  返回内容由原全量目录的 15,060 字符降到约 818 字符，减少 **94.6%**；无参调用只返回名称索引。
+- **终止性页面错误服务端直出**：`inspect_page` 直接读取导航响应状态。HTTP 4xx/5xx 返回
+  `blocked_page_access` 后，由编排层根据结构化 `error` / `user_message` 直接生成收尾，不再请求第二轮
+  LLM，也不再重复 DOM 探测、截图、节点目录和空流程读取。
+- **用量即时记账**：每次工具结果之后立即推送累计 usage；即使用户关闭窗口或流中断，已落盘消息的
+  `tool_calls` 也不会停留在调用前的旧值。
+- **历史结果继续压缩**：大体积旧工具结果只保留摘要，重复结果用引用替代；录像和日志应同时观察
+  `prompt_tokens`、`cached_tokens`、轮数与工具调用数，不能只看最终回复长度。
+- **任务状态先于上下文压缩恢复**：编排层从完整会话的用户原话与真实 `toolCalls` 恢复目标 URL、
+  需求、页面检查阶段和上次状态，再把结构化状态放入受保护前缀。“继续／重试／已完成”沿用当前任务；
+  显式新 URL 覆盖旧目标，“另一个流程／新任务”不会误继承。历史 DOM 已成功取得时直接进入构建，
+  403 或验证墙则只重新开放页面检查工具。
+- **会话迁移采用合并语义**：草稿保存为正式流程时，即使流式落盘已提前创建目标会话，也会按消息 ID
+  去重并按时间合并源、目标记录，避免前置需求和最终回复分散在两个 JSONL 文件中。
 
 ### 凭据与敏感输入
 
@@ -246,7 +272,7 @@ RPA 助手**无法做到**：
 
 - 直接“看懂”截图中的视觉细节；非视觉模型应优先使用 `inspect_page` 读取 DOM，而不是依赖截图节点
 - 保证首次生成的选择器（CSS selector）一定匹配目标页面；选择器基于 DOM 检查和运行反馈持续修复
-- 记住跨会话的对话内容本身（新对话从空上下文开始；跨会话延续的只有下方「站点经验档案」「修复台账」「会话检查点」这三份**由真实运行结果沉淀**的结构化记录）
+- 记住不同会话之间的对话内容（同一草稿保存为流程时会迁移完整历史；主动新建的独立会话仍从空上下文开始。跨独立会话延续的只有下方三份结构化记录）
 - 操作需要强验证或反爬保护的网站
 - **做语义加工**：平台没有会调模型的节点，所以「总结/摘要/润色/翻译」只能得到规则产物（原文摘录、按句截取、词频统计）。助手会先说明这件事，由用户决定接受还是改需求；把规则产物命名成「总结」会被 lint 在运行前拦下
 - 生成当前环境缺库的产物格式（见 3.6「脚本的能力边界」）：会停下来问用户装库还是换格式，不会自己拼字节流糊过去
@@ -266,6 +292,7 @@ RPA 助手的关键安全规则不只依赖 system prompt，而是在编排层�
 | Selector 失败熔断 | `get_run_error` 返回 `inspect_hint` 后，编排层会阻止继续 `run_flow` 或盲目修节点，直到调用 `inspect_page` 获取真实 DOM                                                    |
 | 质量审计熔断      | `assert_run_output.passed=false` 后，未按 `repair_plan` 修复前会阻止再次 `run_flow`                                                                                       |
 | 凭据写入熔断      | `create_flow` 中 credential/sensitive 变量携带非空默认值时直接阻断，要求清空值并改由输入变量面板配置                                                                    |
+| 页面访问终止      | `inspect_page` 收到 HTTP 4xx/5xx 时返回 `blocked_page_access`，立即转为用户可操作的收尾，不再调用其他工具                                                              |
 | 阻断级 lint       | `critical_action_continue_on_error`、`script_uses_browser_dom`、`table_extract_selector_targets_container`、`date_filter_missing_verification`、`submit_key_on_body`、`client_side_filter_masks_page_filter`、`login_without_navigation_to_data_page`、`probe_extract_without_continue_on_error`、`unavailable_artifact_format`、`claimed_semantic_capability_unavailable` 等发现会阻止不可信运行。这类 finding 多数只是 `warn` 级（流程不报错，只是安静地跑出错数据），所以 `create_flow` / `update_flow` / `apply_node_fix` / `lint_flow` 的返回值会逐条标出 `blocks_run`，助手据此先修再跑，而不是撞上阻断才知道 |
 | 修复不顺手重跑    | 用户只说「修一下 / 报错了」时，助手改完必须交回用户，不会自己 `run_flow`——运行会真的打开浏览器操作目标站点，这个决定归用户。用户下一句表示要跑时限制自动解除；本轮自己跑出来的错另算，那次运行是用户点的 |
 | 重复修复去重      | 同一对话中重复提交完全相同的节点 patch 会被拒绝，防止弱模型反复无效尝试                                                                                                   |

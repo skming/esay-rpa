@@ -21,8 +21,8 @@ def test_blocked_or_failed_write_does_not_invalidate_evidence() -> None:
     assert state["current_flow_revision"] == 3
     assert state["run_verified_revision"] == 3
     assert state["accepted_revision"] == 3
-    assert blocked["verification_status"] == "accepted"
-    assert failed["verification_status"] == "accepted"
+    assert "verification_status" not in blocked
+    assert "verification_status" not in failed
 
 
 def test_new_revision_invalidates_old_run_and_audit_evidence() -> None:

@@ -22,7 +22,7 @@ from app.services.ai_guards import (
     node_field_changes as _node_field_changes,
     selector_change_node_ids as _selector_change_node_ids,
 )
-from app.services.ai_prompts import SYSTEM_PROMPT
+from app.services.ai_prompts import PAGE_DISCOVERY_PROMPT, SYSTEM_PROMPT
 from app.services.ai_tool_events import attach_tool_events, current_verification_status, reduce_evidence_state
 from app.services.ai_evidence_ledger import load_verification_state, record_events
 from app.services.ai_tools import TOOL_SCHEMAS, RpaToolExecutor
@@ -213,6 +213,11 @@ _TERMINAL_GUARD_ACTIONS = frozenset({
     "report_to_user_and_stop",
     "needs_user_navigation_target",
 })
+_TERMINAL_TOOL_STATUSES = frozenset({
+    "blocked_page_access",
+    "blocked_challenge_page",
+    "blocked_browser_profile_busy",
+})
 
 _GUIDANCE_AFTER_TERMINAL_BLOCK = (
     "本轮到此结束：编排层判定继续调用工具不会推进任务，需要用户参与。\n"
@@ -288,6 +293,12 @@ _CREATE_INTENT_KEYWORDS = frozenset({
     "帮我创", "帮我生成", "自动化", "爬取", "抓取", "登录", "流程",
     "create", "make", "build", "generate", "scrape", "automate",
 })
+
+_RESUME_TASK_RE = re.compile(
+    r"(继续|接着|重试|再试|重新检查|页面已打开|已经打开|已完成|完成了|登录好了|验证好了|继续创建|continue|retry)",
+    re.IGNORECASE,
+)
+_NEW_TASK_RE = re.compile(r"(另一个|另外一个|换一个|换个网站|新的网址|新任务)")
 
 # build_tool 随入口而变：全新会话是 create_flow，Studio 空白流程里提需求则是 update_flow
 def _build_guidance_before_create(build_tool: str) -> str:
@@ -537,6 +548,9 @@ _FEW_SHOT_WEB_SIGNALS = frozenset((
     "http://", "https://", "网页", "页面", "表格", "筛选", "登录", "验证码", "分页", "excel",
     "网站", "列表页", "后台", "管理系统",
 ))
+_FEW_SHOT_COMPLEX_SIGNALS = frozenset((
+    "登录", "验证码", "日期", "筛选", "分页", "翻页", "excel", "下拉", "多选",
+))
 _FEW_SHOT_REPAIR_SIGNALS = frozenset((
     "修复", "报错", "失败", "审查", "分析", "优化", "重命名", "改名", "删除",
     "跑不起来", "跑不通", "不能用", "怎么错了", "为什么错", "运行不了", "卡住",
@@ -553,7 +567,12 @@ def _should_inject_few_shot(messages: list[dict[str, Any]]) -> bool:
         return False
     if any(signal in user_text for signal in _FEW_SHOT_REPAIR_SIGNALS):
         return False
-    return any(signal in user_text for signal in _FEW_SHOT_CREATE_SIGNALS) and any(signal in user_text for signal in _FEW_SHOT_WEB_SIGNALS)
+    return (
+        bool(_URL_IN_TEXT_RE.search(user_text))
+        and any(signal in user_text for signal in _FEW_SHOT_CREATE_SIGNALS)
+        and any(signal in user_text for signal in _FEW_SHOT_WEB_SIGNALS)
+        and any(signal in user_text for signal in _FEW_SHOT_COMPLEX_SIGNALS)
+    )
 
 
 # 弱模型额外注入的开篇提示，让模型在有限轮次内尽量聚焦
@@ -563,7 +582,7 @@ _WEAK_MODEL_PREAMBLE = (
     "② create_flow / update_flow 构建或修改流程\n"
     "③ lint_flow + validate_flow 修复所有 error\n"
     "④ run_flow → get_run_output → assert_run_output\n"
-    "字段不确定时调用 list_node_types；selector 失效时调用 inspect_page。禁止盲猜。"
+    "字段不确定时用 list_node_types(types=[...]) 只查所需节点；selector 失效时调用 inspect_page。禁止盲猜。"
 )
 
 
@@ -1040,18 +1059,22 @@ def _strip_image_messages(messages: list[dict[str, Any]]) -> bool:
     return stripped
 
 
-def _build_system_message(model: str, relayed: bool) -> dict[str, Any]:
+def _build_system_message(
+    model: str,
+    relayed: bool,
+    prompt: str = SYSTEM_PROMPT,
+) -> dict[str, Any]:
     """构造系统消息，Anthropic 原生端点额外打一个提示词缓存断点。
 
-    Anthropic 的缓存前缀按 tools → system → messages 累积，断点打在 system 上等于
-    把 TOOL_SCHEMAS 一起缓进去，合计 4.4 万字符。OpenAI/DeepSeek 自动缓存，不需要
-    标记；中转端点是否透传 cache_control 不可知，按普通字符串发。
+    Anthropic 的缓存前缀按 tools → system → messages 累积，断点打在 system 上会把当前阶段
+    的工具 Schema 一并缓存。OpenAI/DeepSeek 自动缓存，不需要标记；中转端点是否透传
+    cache_control 不可知，按普通字符串发。
     """
     if relayed or not _model_caps(model).supports_cache_control:
-        return {"role": "system", "content": SYSTEM_PROMPT}
+        return {"role": "system", "content": prompt}
     return {
         "role": "system",
-        "content": [{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
+        "content": [{"type": "text", "text": prompt, "cache_control": {"type": "ephemeral"}}],
     }
 
 
@@ -1323,12 +1346,135 @@ _URL_IN_TEXT_RE = re.compile(r'https?://[^\s,，。？！\]）)]+')
 class _TurnIntents:
     repair: bool = False
     preserve_execution_channel: bool = False
+    create_requested: bool = False
     # 非 None 即检测到创建意图，值为需求里的首个 URL
     create_url: str | None = None
 
 
+@dataclass
+class _ResumableTaskState:
+    """从完整会话恢复的当前任务事实；只保存用户原话和真实工具结果，不保存模型推断。"""
+
+    requirement_text: str = ""
+    target_url: str | None = None
+    target_source: str | None = None
+    phase: str | None = None
+    last_inspection_status: str | None = None
+    resume_requested: bool = False
+
+
+def _tool_call_payload(call: dict[str, Any], key: str) -> dict[str, Any]:
+    raw = call.get(key)
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _latest_page_inspection(messages: list[dict[str, Any]]) -> tuple[str | None, str | None]:
+    """读取最近一次真实页面检查；工具结果比模型正文更适合作为恢复依据。"""
+    for message in reversed(messages):
+        if message.get("role") != "assistant":
+            continue
+        calls = message.get("toolCalls") or message.get("tool_calls") or []
+        for call in reversed(calls if isinstance(calls, list) else []):
+            if not isinstance(call, dict) or call.get("tool") != "inspect_page":
+                continue
+            args = _tool_call_payload(call, "args")
+            result = _tool_call_payload(call, "result")
+            url = str(
+                result.get("requested_url")
+                or result.get("url")
+                or args.get("url")
+                or ""
+            ).strip()
+            status = str(result.get("status") or "").strip() or None
+            if status is None and result:
+                status = "error" if result.get("error") else "success"
+            return (url or None), status
+    return None, None
+
+
+def _resolve_resumable_task_state(
+    messages: list[dict[str, Any]],
+    flow_id: str | None,
+    flow_ctx: _FlowContext,
+) -> _ResumableTaskState:
+    latest = _latest_user_message(messages)
+    state = _ResumableTaskState(
+        requirement_text=_session_requirement_text(messages),
+        resume_requested=bool(_RESUME_TASK_RE.search(latest)),
+    )
+    if flow_id and not flow_ctx.is_blank:
+        return state
+
+    current_urls = _URL_IN_TEXT_RE.findall(latest)
+    if current_urls:
+        state.target_url = current_urls[0]
+        state.target_source = "current_message"
+    elif state.resume_requested and not _NEW_TASK_RE.search(latest):
+        inspected_url, status = _latest_page_inspection(messages)
+        if inspected_url:
+            state.target_url = inspected_url
+            state.target_source = "inspection_history"
+            state.last_inspection_status = status
+        else:
+            for message in reversed(messages[:-1]):
+                if message.get("role") != "user":
+                    continue
+                content = message.get("content")
+                if not isinstance(content, str):
+                    continue
+                urls = _URL_IN_TEXT_RE.findall(content)
+                if urls:
+                    state.target_url = urls[0]
+                    state.target_source = "conversation_history"
+                    break
+
+    if state.target_url:
+        if state.last_inspection_status == "success":
+            state.phase = "page_inspected"
+        elif state.last_inspection_status in _TERMINAL_TOOL_STATUSES:
+            state.phase = "page_inspection_blocked"
+        else:
+            state.phase = "awaiting_page_inspection"
+    return state
+
+
+def _task_state_message(state: _ResumableTaskState) -> dict[str, Any] | None:
+    if not state.target_url or state.target_source == "current_message":
+        return None
+    payload = {
+        "goal": state.requirement_text[:_SESSION_REQUIREMENT_MAX_CHARS],
+        "target_url": state.target_url,
+        "phase": state.phase,
+        "last_inspection_status": state.last_inspection_status,
+        "next_action": (
+            "build_flow"
+            if state.phase == "page_inspected"
+            else "retry_page_inspection" if state.resume_requested else "inspect_page"
+        ),
+    }
+    return {
+        "role": "system",
+        "content": (
+            "【当前可恢复任务状态】以下字段来自本会话用户原话和真实工具结果，不是模型推断。"
+            "当前消息是在继续原任务，不要再次索取已存在的 URL 或需求：\n"
+            + json.dumps(payload, ensure_ascii=False)
+        ),
+    }
+
+
 def _detect_turn_intents(
-    messages: list[dict[str, Any]], flow_id: str | None, flow_ctx: _FlowContext
+    messages: list[dict[str, Any]],
+    flow_id: str | None,
+    flow_ctx: _FlowContext,
+    task_state: _ResumableTaskState | None = None,
 ) -> _TurnIntents:
     intents = _TurnIntents()
     last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
@@ -1345,10 +1491,56 @@ def _detect_turn_intents(
         intents.preserve_execution_channel = True
     # 只看 `not flow_id` 会漏掉「Studio 新建流程后再对 AI 提需求」这个最常见入口。
     if (not flow_id or flow_ctx.is_blank) and not intents.repair:
+        resolved = task_state or _resolve_resumable_task_state(messages, flow_id, flow_ctx)
+        intents.create_requested = (
+            any(kw in user_text_lower for kw in _CREATE_INTENT_KEYWORDS)
+            or (resolved.resume_requested and resolved.target_url is not None)
+        )
         urls = _URL_IN_TEXT_RE.findall(user_text)
-        if urls and any(kw in user_text_lower for kw in _CREATE_INTENT_KEYWORDS):
+        if urls and intents.create_requested:
             intents.create_url = urls[0]
+        elif intents.create_requested and resolved.target_url and not _NEW_TASK_RE.search(user_text):
+            intents.create_url = resolved.target_url
     return intents
+
+
+def _tool_schemas_for_round(
+    state: dict[str, Any], intents: _TurnIntents
+) -> list[dict[str, Any]]:
+    """只暴露当前阶段能推进任务的工具，减少 schema tokens 并消除无效并行调用。"""
+    if state.get("terminal_response_only"):
+        return []
+    if intents.create_requested and not intents.create_url:
+        return []
+    gate = state.get("pre_create_inspect_gate")
+    if isinstance(gate, dict) and not gate.get("inspect_done"):
+        return [
+            schema for schema in TOOL_SCHEMAS
+            if schema.get("function", {}).get("name") == "inspect_page"
+        ]
+    return TOOL_SCHEMAS
+
+
+def _system_prompt_for_round(state: dict[str, Any]) -> str:
+    """页面探测完成前只加载探测契约；DOM 到手后再加载完整构建规则。"""
+    gate = state.get("pre_create_inspect_gate")
+    if isinstance(gate, dict) and not gate.get("inspect_done"):
+        return PAGE_DISCOVERY_PROMPT
+    return SYSTEM_PROMPT
+
+
+def _terminal_tool_response(tool_name: str, result: Any) -> str | None:
+    """把终止类工具结果转换为确定性用户回复，避免再烧一轮模型上下文。"""
+    guidance, _ = _after_tool_guidance(tool_name, result)
+    if guidance is None or not isinstance(result, dict):
+        return None
+
+    error = str(result.get("error") or "").strip()
+    user_message = str(result.get("user_message") or result.get("message") or "").strip()
+    if error and user_message and error != user_message:
+        return f"**当前无法继续。** {error}\n\n{user_message}"
+    detail = user_message or error
+    return f"**当前无法继续。** {detail}" if detail else "**当前无法继续，需要用户处理后再试。**"
 
 
 def _after_tool_guidance(tool_name: str, result: Any) -> tuple[str | None, bool]:
@@ -1356,8 +1548,8 @@ def _after_tool_guidance(tool_name: str, result: Any) -> tuple[str | None, bool]
     if not isinstance(result, dict):
         return None, False
     if (
-        result.get("status") == "blocked_by_orchestrator_guard"
-        and result.get("required_action") in _TERMINAL_GUARD_ACTIONS
+        result.get("required_action") in _TERMINAL_GUARD_ACTIONS
+        or result.get("status") in _TERMINAL_TOOL_STATUSES
     ):
         # 拦截本身不产出正文。不明确要求收尾，模型常常直接空轮结束，
         # 用户只看到一个空气泡，既不知道被挡住了也不知道该给什么。
@@ -1453,7 +1645,12 @@ class AiOrchestrator:
             if flow_ctx.context_message:
                 full_messages.append(flow_ctx.context_message)
 
-        # 静态前缀边界：超预算丢弃历史时，system/few-shot/流程上下文不能被丢掉
+        task_state = _resolve_resumable_task_state(messages, flow_id, flow_ctx)
+        resumable_state_message = _task_state_message(task_state)
+        if resumable_state_message:
+            full_messages.append(resumable_state_message)
+
+        # 静态前缀边界：超预算丢弃历史时，system/few-shot/流程上下文与恢复状态不能被丢掉
         protect_prefix = len(full_messages)
         context_budget = _context_char_budget(model)
 
@@ -1463,7 +1660,7 @@ class AiOrchestrator:
         if site_knowledge:
             full_messages.append(site_knowledge)
 
-        intents = _detect_turn_intents(messages, flow_id, flow_ctx)
+        intents = _detect_turn_intents(messages, flow_id, flow_ctx, task_state)
 
         # 按模型分级：weak 模型注入精简开篇提示且轮次更少
         tier = _model_caps(model).tier
@@ -1497,6 +1694,7 @@ class AiOrchestrator:
             "navigation_failure_counts": {},
             "navigation_budget_lock": None,
             "challenge_page_lock": None,
+            "terminal_response_only": False,
             "quality_issue_counts": {},
             "quality_budget_lock": None,
             "pending_repair_gate": None,   # {lint_done, inspect_done} — set on repair intent
@@ -1505,8 +1703,13 @@ class AiOrchestrator:
             "read_only_tools": read_only,     # 自愈诊断模式：阻断所有写入类工具
             "model_no_vision": not _model_caps(model).supports_vision,  # 阻断 inspect_screenshot
             # full_messages 里混着 few-shot 那轮虚构的 user 消息
-            "user_requirement_text": _session_requirement_text(messages),
+            "user_requirement_text": task_state.requirement_text,
             "latest_user_message": _latest_user_message(messages),
+            "active_task": {
+                "target_url": task_state.target_url,
+                "phase": task_state.phase,
+                "last_inspection_status": task_state.last_inspection_status,
+            },
         }
 
         # 上一轮被中断（用户点停止、断流、关窗）时留下的预算与未了结义务。
@@ -1535,7 +1738,7 @@ class AiOrchestrator:
             # 空白流程已有 flow_id，该走 update_flow 落节点而不是再建一个
             build_tool = "update_flow" if flow_id else "create_flow"
             guard_state["pre_create_inspect_gate"] = {
-                "inspect_done": False,
+                "inspect_done": task_state.phase == "page_inspected",
                 "suggested_url": intents.create_url,
                 "build_tool": build_tool,
             }
@@ -1546,14 +1749,8 @@ class AiOrchestrator:
         consecutive_empty_rounds = 0
         meter = _SessionMeter()
         repeated_results: dict[tuple[str, str], str] = {}
-        last_verification_status: str | None = None
-        if guard_state.get("current_flow_revision") is not None:
-            last_verification_status = current_verification_status(guard_state)
-            yield {
-                "type": "verification",
-                "status": last_verification_status,
-                "revision": guard_state.get("current_flow_revision"),
-            }
+        last_verification_status = current_verification_status(guard_state)
+        last_verification_revision = guard_state.get("current_flow_revision")
 
         for round_num in range(effective_max_rounds):
             if round_num == 0:
@@ -1574,18 +1771,26 @@ class AiOrchestrator:
 
             try:
                 effective_model, extra = await self._completion_kwargs(model)
-                response = await litellm.acompletion(
-                    model=effective_model,
-                    messages=full_messages,
-                    tools=TOOL_SCHEMAS,
-                    tool_choice="auto",
-                    stream=True,
-                    # 流式响应默认不带 usage，缺了它缓存命中就没有任何数据可查
-                    stream_options={"include_usage": True},
-                    # 不认识上述参数的厂商交给 litellm 丢弃，而不是整轮 400 失败
-                    drop_params=True,
-                    timeout=LLM_REQUEST_TIMEOUT,
+                full_messages[0] = _build_system_message(
+                    model,
+                    relayed,
+                    _system_prompt_for_round(guard_state),
+                )
+                round_tools = _tool_schemas_for_round(guard_state, intents)
+                completion_args: dict[str, Any] = {
+                    "model": effective_model,
+                    "messages": full_messages,
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                    "drop_params": True,
+                    "timeout": LLM_REQUEST_TIMEOUT,
                     **extra,
+                }
+                if round_tools:
+                    completion_args["tools"] = round_tools
+                    completion_args["tool_choice"] = "auto"
+                response = await litellm.acompletion(
+                    **completion_args,
                 )
             except _MissingApiKeyError as key_exc:
                 yield {"type": "error", "message": str(key_exc)}
@@ -1767,6 +1972,7 @@ class AiOrchestrator:
                     )
 
             _stop_after: int | None = None
+            terminal_response: str | None = None
             for _exec_idx, (stream_idx, tc) in enumerate(tool_items):
                 tool_name = tc["name"]
                 raw_args = tc["arguments"]
@@ -1860,16 +2066,23 @@ class AiOrchestrator:
                 _session_checkpoint.save(flow_id, guard_state, rounds=meter.rounds)
 
                 yield {"type": "tool_result", "tool": tool_name, "result": result, "call_id": tc["call_id"]}
+                # 工具计数发生后立即推送；若用户此时关闭窗口，落盘的 usage 仍与工具卡片一致。
+                yield {"type": "usage", "usage": meter.snapshot(effective_max_rounds)}
                 verification_status = current_verification_status(guard_state)
+                verification_revision = guard_state.get("current_flow_revision")
                 if (
-                    guard_state.get("current_flow_revision") is not None
-                    and verification_status != last_verification_status
+                    verification_revision is not None
+                    and (
+                        verification_status != last_verification_status
+                        or verification_revision != last_verification_revision
+                    )
                 ):
                     last_verification_status = verification_status
+                    last_verification_revision = verification_revision
                     yield {
                         "type": "verification",
                         "status": verification_status,
-                        "revision": guard_state.get("current_flow_revision"),
+                        "revision": verification_revision,
                     }
 
                 full_messages.append({
@@ -1895,6 +2108,8 @@ class AiOrchestrator:
                 guidance, stop_round = _after_tool_guidance(tool_name, result)
                 if guidance:
                     full_messages.append({"role": "system", "content": guidance})
+                if guard_state.get("terminal_response_only"):
+                    terminal_response = _terminal_tool_response(tool_name, result)
                 if stop_round:
                     _stop_after = _exec_idx
                     break
@@ -1920,6 +2135,13 @@ class AiOrchestrator:
                         "tool_call_id": _skip_tc["id"],
                         "content": json.dumps(_skip_result, ensure_ascii=False),
                     })
+
+            if terminal_response is not None:
+                _session_checkpoint.clear(flow_id)
+                yield {"type": "text", "delta": terminal_response}
+                yield {"type": "usage", "usage": meter.snapshot(effective_max_rounds)}
+                yield {"type": "done"}
+                return
 
         # 唯一一条不经模型的收尾路径，措辞要能独立成话：这轮的正文可能一个字都没有
         yield {
@@ -2102,7 +2324,7 @@ _SESSION_REQUIREMENT_MAX_CHARS = 2000
 _META_COMMAND_RE = re.compile(
     r"^[\s，。、!！?？~]*"
     r"((流程|帮我|你|请|再|重新|继续)?\s*"
-    r"(审查|验收|校验|检查|修复|优化|运行|执行|测试|跑|看|确认|继续|试试)"
+    r"(审查|验收|校验|检查|修复|优化|运行|执行|测试|跑|看|确认|继续|重试|创建|已完成|完成|试试)"
     r"\s*(一下|一次|下|看|吧|了)?\s*[，。、!！?？~]*)+$"
 )
 
@@ -2180,6 +2402,12 @@ def _orchestrator_guard_after_tool(tool_name: str, result: Any, state: dict[str,
     # 被阻断的调用不携带真实工具输出，不应影响 state
     if result.get("status") == "blocked_by_orchestrator_guard":
         return
+
+    if (
+        result.get("required_action") in _TERMINAL_GUARD_ACTIONS
+        or result.get("status") in _TERMINAL_TOOL_STATUSES
+    ):
+        state["terminal_response_only"] = True
 
     if tool_name in {"inspect_page", "inspect_screenshot"}:
         if result.get("error"):
