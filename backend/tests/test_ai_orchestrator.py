@@ -381,6 +381,49 @@ def test_explicit_new_url_overrides_the_previous_task_target() -> None:
     assert detected.create_url == "https://new.example.com/list"
 
 
+def test_static_evidence_channel_outlives_the_flow_being_saved() -> None:
+    """流程存下来之后 _resolve_resumable_task_state 提前返回，但证据通道不能跟着断。
+
+    这条断的是最贵的一种静默失败：第一轮浏览器通道拿不到页面、降级成静态抓取，
+    第二轮护栏一消失，模型改个 fetcher 就把执行通道换回刚刚失败的 Playwright，
+    而流程照样存下来、照样交付给用户。
+    """
+    messages = [
+        {"role": "user", "content": "抓取 https://example.com/list"},
+        {
+            "role": "assistant",
+            "content": "",
+            "toolCalls": [{
+                "tool": "inspect_page",
+                "args": '{"url":"https://example.com/list"}',
+                "result": {
+                    "requested_url": "https://example.com/list",
+                    "status": "success",
+                    "inspection_source": "scrapling_static",
+                },
+            }],
+        },
+        {"role": "user", "content": "字段少了一个"},
+    ]
+
+    built = _resolve_resumable_task_state(messages, "flow-1", _FlowContext(is_blank=False))
+    assert built.last_inspection_source == "scrapling_static"
+    assert built.target_url is None, "已有流程时不该再改写目标 URL，只取证据通道"
+
+    # 浏览器通道恢复可用是唯一的解锁方式，靠的是新的探测结果而不是时间
+    messages.append({
+        "role": "assistant",
+        "content": "",
+        "toolCalls": [{
+            "tool": "inspect_page",
+            "args": '{"url":"https://example.com/list"}',
+            "result": {"requested_url": "https://example.com/list", "status": "success"},
+        }],
+    })
+    recovered = _resolve_resumable_task_state(messages, "flow-1", _FlowContext(is_blank=False))
+    assert recovered.last_inspection_source is None
+
+
 def test_successful_inspection_resumes_at_build_instead_of_reinspecting() -> None:
     blank = _FlowContext(is_blank=True)
     messages = [

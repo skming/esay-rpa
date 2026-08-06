@@ -532,10 +532,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "inspect_page",
             "description": (
-                "使用持久化浏览器 Profile 打开 URL 并返回客观 DOM 事实：inputs、buttons、selects、"
+                "使用持久化浏览器 Profile 打开 URL；浏览器收到 HTTP 错误时自动降级为 Scrapling 静态抓取。"
+                "浏览器成功时返回客观 DOM 事实：inputs、buttons、selects、"
                 "links、tables、visible_options、page_classes、page_layout 和 frames。构建或修复"
                 "selector 时优先使用返回值；tables[].row_selector 可直接用于表格抽取。元素为空时"
                 "结合 warning 以 wait_selector 重试，登录重定向时不得把登录页 DOM 当成目标页。"
+                "降级成功时 inspection_source=scrapling_static，此时证据只覆盖纯 HTTP 通道。"
             ),
             "parameters": {
                 "type": "object",

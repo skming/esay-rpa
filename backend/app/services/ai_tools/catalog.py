@@ -78,11 +78,11 @@ NODE_TYPE_CATALOG: list[dict[str, str]] = [
     },
     {
         "type": "browser.fetch",
-        "key_fields": "targetUrl, selector, extractMode",
+        "key_fields": "targetUrl, selector, fetcher, extractMode",
         "output_var_field": "outputVariable（提取结果存入该变量）",
         "description": (
-            "轻量抓取：直接请求 targetUrl 并用 selector 提取内容，无需打开持久浏览器会话，"
-            "适合静态/服务端渲染页面的一次性抓取。extractMode: text|html|attribute。"
+            "轻量抓取：fetcher 控制抓取通道——static 用纯 HTTP（默认），dynamic/stealthy 用 Playwright。"
+            "extractMode: text|html|attribute。"
             "注意地址字段是 targetUrl（不是 url）。需要点击/填表等交互时改用 browser.open + browser.* 序列"
         ),
     },

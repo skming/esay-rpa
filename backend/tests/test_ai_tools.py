@@ -780,7 +780,7 @@ async def test_run_flow_blocks_when_another_run_holds_the_browser_profile() -> N
 
 
 async def test_inspect_page_stops_immediately_on_http_403(monkeypatch) -> None:
-    """403 不是 SPA 未渲染；误判会诱导模型重复 inspect_page，再额外截图确认同一事实。"""
+    """浏览器和静态通道都失败后才终止，避免把单通道 403 误判成站点不可达。"""
     import app.services.ai_tools.executor as executor_module
 
     class _Response:
@@ -801,6 +801,10 @@ async def test_inspect_page_stops_immediately_on_http_403(monkeypatch) -> None:
 
     monkeypatch.setattr(executor_module, "find_spec", lambda _name: object())
     monkeypatch.setattr(executor_module, "persistent_browser_context", _context)
+    async def blocked_static(_url: str) -> dict[str, Any]:
+        return {"status": "blocked", "http_status": 403, "error": "静态抓取返回 HTTP 403"}
+
+    monkeypatch.setattr(executor_module, "inspect_static_page", blocked_static)
     monkeypatch.setattr(executor_module.browser_profile_lock, "acquire", lambda *_args: None)
     monkeypatch.setattr(executor_module.browser_profile_lock, "release", lambda *_args: None)
 
@@ -811,7 +815,99 @@ async def test_inspect_page_stops_immediately_on_http_403(monkeypatch) -> None:
     assert result["http_status"] == 403
     assert result["required_action"] == "report_to_user_and_stop"
     assert "SPA" not in result["error"]
-    assert "不能读取 Chrome 扩展当前标签页" in result["user_message"]
+    assert [item["channel"] for item in result["access_attempts"]] == [
+        "stealth_browser",
+        "scrapling_static",
+    ]
+    assert "已依次尝试" in result["user_message"]
+
+
+async def test_inspect_page_falls_back_to_static_fetch_after_browser_403(monkeypatch) -> None:
+    import app.services.ai_tools.executor as executor_module
+
+    class _Response:
+        status = 403
+
+    class _Page:
+        url = "https://forum.example/post-1"
+
+        async def goto(self, *_args: Any, **_kwargs: Any) -> _Response:
+            return _Response()
+
+    class _Context:
+        pages = [_Page()]
+
+    @asynccontextmanager
+    async def _context(*_args: Any, **_kwargs: Any):
+        yield _Context()
+
+    async def successful_static(_url: str) -> dict[str, Any]:
+        return {
+            "status": "success",
+            "inspection_source": "scrapling_static",
+            "selector_candidates": [{"selector": ".reply"}],
+            "recommended_node_type": "browser.fetch",
+        }
+
+    monkeypatch.setattr(executor_module, "find_spec", lambda _name: object())
+    monkeypatch.setattr(executor_module, "persistent_browser_context", _context)
+    monkeypatch.setattr(executor_module, "inspect_static_page", successful_static)
+    monkeypatch.setattr(executor_module.browser_profile_lock, "acquire", lambda *_args: None)
+    monkeypatch.setattr(executor_module.browser_profile_lock, "release", lambda *_args: None)
+
+    executor = RpaToolExecutor(flow_service=FakeFlowService(), task_manager=FakeTaskManager())  # type: ignore[arg-type]
+    result = await executor._inspect_page("https://forum.example/post-1")
+
+    assert result["status"] == "success"
+    assert result["inspection_source"] == "scrapling_static"
+    assert result["browser_attempt"]["http_status"] == 403
+    assert result["requested_url"] == "https://forum.example/post-1"
+
+
+async def test_inspect_page_falls_back_to_static_fetch_on_challenge_page(monkeypatch) -> None:
+    import app.services.ai_tools.executor as executor_module
+
+    class _Response:
+        status = 200
+
+    class _Page:
+        url = "https://forum.example/post-1"
+
+        async def goto(self, *_args: Any, **_kwargs: Any) -> _Response:
+            return _Response()
+
+        async def wait_for_load_state(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        async def wait_for_timeout(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+    class _Context:
+        pages = [_Page()]
+
+    @asynccontextmanager
+    async def _context(*_args: Any, **_kwargs: Any):
+        yield _Context()
+
+    async def successful_static(_url: str) -> dict[str, Any]:
+        return {"status": "success", "inspection_source": "scrapling_static"}
+
+    async def challenge(_page: object) -> SimpleNamespace:
+        return SimpleNamespace(label="Cloudflare 验证页", summary="需要验证")
+
+    monkeypatch.setattr(executor_module, "find_spec", lambda _name: object())
+    monkeypatch.setattr(executor_module, "persistent_browser_context", _context)
+    monkeypatch.setattr(executor_module, "inspect_static_page", successful_static)
+    monkeypatch.setattr(executor_module, "detect_blocking_interstitial", challenge)
+    monkeypatch.setattr(executor_module.browser_profile_lock, "acquire", lambda *_args: None)
+    monkeypatch.setattr(executor_module.browser_profile_lock, "release", lambda *_args: None)
+
+    executor = RpaToolExecutor(flow_service=FakeFlowService(), task_manager=FakeTaskManager())  # type: ignore[arg-type]
+    result = await executor._inspect_page("https://forum.example/post-1")
+
+    assert result["status"] == "success"
+    assert result["browser_attempt"]["status"] == "blocked_challenge_page"
+    assert result["browser_attempt"]["challenge_label"] == "Cloudflare 验证页"
 
 
 async def test_get_run_error_returns_root_cause_hints_for_login_detection_failure() -> None:

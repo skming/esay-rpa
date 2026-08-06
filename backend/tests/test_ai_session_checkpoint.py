@@ -72,6 +72,24 @@ def test_clear_removes_the_checkpoint() -> None:
     assert checkpoint.load("f1") == {}
 
 
+def test_static_page_evidence_survives_into_the_next_turn() -> None:
+    """流程存下来之后，下一轮不再回读探测历史——不持久化这条，第二轮护栏就凭空消失。"""
+    checkpoint.save("f1", {"page_evidence_source": "scrapling_static"}, rounds=1)
+    assert checkpoint.load("f1").get("page_evidence_source") == "scrapling_static"
+
+
+def test_summarize_explains_the_static_evidence_channel() -> None:
+    """只带着限制不解释，模型会反复交出 browser.open 然后反复被拦。"""
+    note = checkpoint.summarize({"page_evidence_source": "scrapling_static"})
+    assert note is not None
+    assert "browser.fetch" in note and "static" in note
+
+
+def test_summarize_stays_quiet_for_browser_dom_evidence() -> None:
+    """浏览器通道本来就可用，没有任何限制要交代。"""
+    assert checkpoint.summarize({"page_evidence_source": "browser_dom"}) is None
+
+
 def test_summarize_speaks_only_when_something_is_unfinished() -> None:
     assert checkpoint.summarize({}) is None
     assert checkpoint.summarize({"navigation_failure_counts": {"a": 1}}) is None

@@ -469,6 +469,74 @@ def _check_pre_create_inspect_gate(tool_name: str, args: dict[str, Any], state: 
     )
 
 
+def _check_static_page_evidence_channel(
+    tool_name: str,
+    args: dict[str, Any],
+    state: dict[str, Any],
+) -> dict[str, Any] | None:
+    if state.get("page_evidence_source") != "scrapling_static":
+        return None
+    raw_nodes = [*(args.get("nodes") or []), *(args.get("add_nodes") or [])]
+    raw_nodes.extend(
+        item.get("patch")
+        for item in args.get("update_nodes") or []
+        if isinstance(item, dict) and isinstance(item.get("patch"), dict)
+    )
+    nodes = [item for item in raw_nodes if isinstance(item, dict)]
+    node_types = {str(item.get("type") or "") for item in nodes}
+    unsupported = sorted(
+        node_type
+        for node_type in node_types
+        if node_type.startswith(("browser.", "ui.")) and node_type != "browser.fetch"
+    )
+    if unsupported:
+        return _blocked(
+            tool_name,
+            guard_id="static_page_evidence_requires_fetch_flow",
+            required_action="build_static_fetch_flow",
+            unsupported_node_types=unsupported,
+            message=(
+                "当前页面证据来自 Scrapling 静态 HTML，只能证明 browser.fetch 可用，不能证明浏览器交互可用。"
+                "请创建包含 browser.fetch 的静态抓取流程，并移除 browser.open/click/extract 或 ui.* 节点。"
+            ),
+        )
+    # create_flow 必须自带 browser.fetch 主链路；update_flow 只改非浏览器节点时，
+    # 主链路已在库里且本次不引入未经验证的交互，拦下来只会挡住正常修复。
+    if tool_name == "create_flow" and "browser.fetch" not in node_types:
+        return _blocked(
+            tool_name,
+            guard_id="static_page_evidence_requires_fetch_flow",
+            required_action="build_static_fetch_flow",
+            unsupported_node_types=[],
+            message=(
+                "当前页面证据来自 Scrapling 静态 HTML，抓取主链路必须是 browser.fetch 节点。"
+            ),
+        )
+    # patch 可以只带 fetcher 不带 type，这种改写同样会把执行通道切回 Playwright。
+    for node in nodes:
+        node_type = str(node.get("type") or "")
+        if node_type and node_type != "browser.fetch":
+            continue
+        if "fetcher" not in node:
+            continue
+        fetcher = str(node.get("fetcher") or "static").strip()
+        if fetcher != "static":
+            # 与上面同一条 guard_id：判据是同一句「证据通道必须等于执行通道」，
+            # 只是躲开的方式不同。拆成两个 id 会多出一个不在 GUARDS 里的条目——
+            # 它既没有 contract 进不了 system prompt，也躲过「每条 guard 都要有用例」的检查。
+            return _blocked(
+                tool_name,
+                guard_id="static_page_evidence_requires_fetch_flow",
+                required_action="set_fetcher_to_static",
+                found_fetcher=fetcher,
+                message=(
+                    f"当前页面证据来自静态 HTTP 抓取，browser.fetch 必须使用 fetcher='static'，"
+                    f"但发现 fetcher='{fetcher}'。dynamic/stealthy 会重新走刚失败的 Playwright 通道。"
+                ),
+            )
+    return None
+
+
 def _check_consecutive_inspect(tool_name: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
     inspect_count = int(state.get("consecutive_inspect_page_count") or 0)
     if inspect_count < MAX_CONSECUTIVE_INSPECT_PAGE:
@@ -787,6 +855,19 @@ GUARDS: tuple[Guard, ...] = (
         requires_state=("pre_create_inspect_gate",),
         check=_check_pre_create_inspect_gate,
         contract="用户给了 URL 时，create_flow/update_flow 之前必须先 inspect_page，selector 只能来自检查结果。",
+    ),
+    Guard(
+        id="static_page_evidence_requires_fetch_flow",
+        summary="静态页面证据只能用于创建 browser.fetch 流程",
+        scope=ToolScope(include=frozenset({"create_flow", "update_flow"})),
+        requires_state=("page_evidence_source",),
+        check=_check_static_page_evidence_channel,
+        contract=(
+            "inspect_page 若返回 inspection_source=scrapling_static，"
+            "只能创建 browser.fetch + fetcher='static' 的静态抓取流程："
+            "不得生成未经验证的浏览器/UI 交互，也不得把 fetcher 改成 dynamic/stealthy"
+            "（那两个走的是刚刚失败的 Playwright 通道）。"
+        ),
     ),
     Guard(
         id="challenge_page_lock",

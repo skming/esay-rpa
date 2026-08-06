@@ -69,6 +69,7 @@ from app.services.ai_tools.normalize import (
     _read_node_y,
 )
 from app.services.ai_tools.page_probe_js import PAGE_PROBE_JS
+from app.services.ai_tools.static_page_probe import inspect_static_page
 from app.services.ai_tools.variables import _RUNTIME_BUILTINS, _collect_defined_vars, _validate_variable_refs
 
 if TYPE_CHECKING:
@@ -2360,7 +2361,77 @@ class RpaToolExecutor:
         wait_selector: str | None = None,
         scope_selector: str | None = None,
     ) -> dict[str, Any]:
-        """Navigate to a URL with the persistent browser profile and return structured DOM info."""
+        """浏览器通道拿不到真实页面时降级为静态抓取；两条通道都失败才终止。"""
+        outcome = await self._inspect_page_via_browser(url, wait_selector, scope_selector)
+        blocked = outcome.get("_browser_blocked")
+        if not isinstance(blocked, dict):
+            return outcome
+
+        # 静态降级刻意放在浏览器 profile 锁和 browser context 之外：这是一次纯 HTTP 请求，
+        # 既不需要浏览器进程，也不该占着跨进程的 profile 锁——最长占 20s，
+        # 用户这期间点运行只会拿到「浏览器被占用」，而真正占着它的活儿跟浏览器无关。
+        static_result = await inspect_static_page(url)
+        browser_attempt = {key: value for key, value in blocked.items() if key != "kind"}
+        if static_result.get("status") == "success":
+            static_result["requested_url"] = url
+            static_result["browser_attempt"] = browser_attempt
+            return static_result
+
+        access_attempts = [
+            {**browser_attempt, "channel": "stealth_browser"},
+            {
+                "channel": "scrapling_static",
+                "status": static_result.get("status"),
+                "http_status": static_result.get("http_status"),
+                "error": static_result.get("error"),
+            },
+        ]
+        if blocked.get("kind") == "challenge":
+            label = blocked.get("challenge_label") or "人机验证拦截页"
+            # 这里只陈述事实：「不要改流程、不要重试」交给 challenge_page_lock 护栏，
+            # 同一条规则写两处必然漂移，而只有护栏那份真拦得住。
+            return {
+                "status": "blocked_challenge_page",
+                "requested_url": url,
+                "challenge_label": blocked.get("challenge_label"),
+                "challenge": blocked.get("challenge"),
+                "access_attempts": access_attempts,
+                "error": f"目标站点返回了{label}，静态抓取也未取得真实业务内容。",
+                "required_action": "report_to_user_and_stop",
+                "user_message": (
+                    "已尝试 Stealth Browser 和 Scrapling 静态抓取。"
+                    "请通过页面选择器或同一 Playwright Profile 的有头会话完成人机验证后回复“已完成”；"
+                    "验证状态写入持久 Profile 后，我会重新读取真实 DOM。"
+                ),
+            }
+        return {
+            "status": "blocked_page_access",
+            "http_status": blocked.get("http_status"),
+            "requested_url": url,
+            "url": blocked.get("url") or url,
+            "access_attempts": access_attempts,
+            "error": (
+                f"浏览器通道返回 HTTP {blocked.get('http_status')}，静态抓取也未取得真实业务内容。"
+            ),
+            "required_action": "report_to_user_and_stop",
+            "user_message": (
+                "已依次尝试 Stealth Browser 和 Scrapling 静态抓取。当前工具不能读取 Chrome 扩展当前标签页。"
+                "请通过页面选择器或同一 Playwright Profile 的有头会话完成登录/验证后回复“已完成”，"
+                "或提供一个当前环境可访问的 URL。"
+            ),
+        }
+
+    async def _inspect_page_via_browser(
+        self,
+        url: str,
+        wait_selector: str | None = None,
+        scope_selector: str | None = None,
+    ) -> dict[str, Any]:
+        """Navigate to a URL with the persistent browser profile and return structured DOM info.
+
+        判定浏览器通道拿不到真实页面时返回 {"_browser_blocked": {...}}，由调用方在锁外决定降级；
+        就地抓静态页会把一次纯 HTTP 请求压在 profile 锁和 browser context 里。
+        """
         busy = _profile_busy_block("inspect_page")
         if busy is not None:
             return busy
@@ -2383,17 +2454,12 @@ class RpaToolExecutor:
                 http_status = getattr(response, "status", None)
                 if isinstance(http_status, int) and http_status >= 400:
                     return {
-                        "status": "blocked_page_access",
-                        "http_status": http_status,
-                        "requested_url": url,
-                        "url": str(getattr(page, "url", "") or url),
-                        "error": f"目标页面返回 HTTP {http_status}，无法取得可用于构建流程的真实 DOM。",
-                        "required_action": "report_to_user_and_stop",
-                        "user_message": (
-                            "当前页面检查只能读取 Playwright 持久 Profile，不能读取 Chrome 扩展当前标签页。"
-                            "请通过页面选择器或同一 Playwright Profile 的有头会话完成登录/验证后回复“已完成”，"
-                            "或提供一个当前环境可访问的 URL。"
-                        ),
+                        "_browser_blocked": {
+                            "kind": "http_error",
+                            "status": "blocked",
+                            "http_status": http_status,
+                            "url": str(getattr(page, "url", "") or url),
+                        }
                     }
                 try:
                     await page.wait_for_load_state("networkidle", timeout=6_000)
@@ -2413,19 +2479,14 @@ class RpaToolExecutor:
                 # 用户看到的「第一次助手被 cloudflare 拦截、什么也没生成」就是这么来的。
                 challenge = await detect_blocking_interstitial(page)
                 if challenge is not None:
-                    # 这里只陈述事实：「不要改流程、不要重试」交给 challenge_page_lock 护栏，
-                    # 同一条规则写两处必然漂移，而只有护栏那份真拦得住。
                     return {
-                        "status": "blocked_challenge_page",
-                        "requested_url": url,
-                        "challenge_label": challenge.label,
-                        "challenge": challenge.summary,
-                        "error": f"目标站点返回了{challenge.label}，无头浏览器拿不到真实页面内容。",
-                        "required_action": "report_to_user_and_stop",
-                        "user_message": (
-                            "请通过页面选择器或同一 Playwright Profile 的有头会话完成人机验证后回复“已完成”；"
-                            "验证状态写入持久 Profile 后，我会重新读取真实 DOM。"
-                        ),
+                        "_browser_blocked": {
+                            "kind": "challenge",
+                            "status": "blocked_challenge_page",
+                            "challenge_label": challenge.label,
+                            "challenge": challenge.summary,
+                            "url": str(getattr(page, "url", "") or url),
+                        }
                     }
 
                 result = await page.evaluate(PAGE_PROBE_JS, scope_selector)

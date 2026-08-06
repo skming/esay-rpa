@@ -90,6 +90,73 @@ def test_pre_create_gate_cannot_be_bypassed_by_switching_write_tool() -> None:
     assert apply_pre_tool_guards("create_flow", {}, state) is None
 
 
+def test_static_page_evidence_only_allows_fetch_flow() -> None:
+    state = {"page_evidence_source": "scrapling_static"}
+    blocked = _blocked_by("create_flow", {
+        "nodes": [
+            {"id": "open", "type": "browser.open"},
+            {"id": "extract", "type": "browser.extract"},
+        ],
+    }, state)
+    assert blocked["guard_id"] == "static_page_evidence_requires_fetch_flow"
+    assert blocked["required_action"] == "build_static_fetch_flow"
+
+    # create_flow 必须自带 browser.fetch 主链路
+    blocked = _blocked_by("create_flow", {
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {"id": "write", "type": "file.write", "path": "output.json"},
+            {"id": "end", "type": "end"},
+        ],
+    }, state)
+    assert blocked["guard_id"] == "static_page_evidence_requires_fetch_flow"
+
+    # update_flow 只改非浏览器节点不拦
+    assert apply_pre_tool_guards("update_flow", {
+        "update_nodes": [{"id": "write", "patch": {"path": "result.json"}}],
+    }, state) is None
+
+    assert apply_pre_tool_guards("create_flow", {
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {"id": "fetch", "type": "browser.fetch"},
+            {"id": "end", "type": "end"},
+        ],
+    }, state) is None
+    assert apply_pre_tool_guards("update_flow", {
+        "add_nodes": [{"id": "fetch", "type": "browser.fetch"}],
+    }, state) is None
+    assert apply_pre_tool_guards("create_flow", {
+        "nodes": [{"id": "fetch", "type": "browser.fetch"}],
+    }, {"page_evidence_source": "browser_dom"}) is None
+
+
+def test_static_page_evidence_enforces_static_fetcher() -> None:
+    state = {"page_evidence_source": "scrapling_static"}
+    blocked = _blocked_by("create_flow", {
+        "nodes": [
+            {"id": "fetch", "type": "browser.fetch", "fetcher": "dynamic"},
+        ],
+    }, state)
+    assert blocked["guard_id"] == "static_page_evidence_requires_fetch_flow"
+    assert blocked["required_action"] == "set_fetcher_to_static"
+    assert blocked["found_fetcher"] == "dynamic"
+
+    blocked = _blocked_by("update_flow", {
+        "update_nodes": [{"id": "fetch", "patch": {"fetcher": "stealthy"}}],
+    }, state)
+    assert blocked["required_action"] == "set_fetcher_to_static"
+    assert blocked["found_fetcher"] == "stealthy"
+
+    # fetcher="static" 或缺省都通过
+    assert apply_pre_tool_guards("create_flow", {
+        "nodes": [{"id": "fetch", "type": "browser.fetch", "fetcher": "static"}],
+    }, state) is None
+    assert apply_pre_tool_guards("create_flow", {
+        "nodes": [{"id": "fetch", "type": "browser.fetch"}],
+    }, state) is None
+
+
 def test_consecutive_inspect_limit_forces_a_change_of_strategy() -> None:
     state = {"consecutive_inspect_page_count": MAX_CONSECUTIVE_INSPECT_PAGE - 1}
     assert apply_pre_tool_guards("inspect_page", {}, state) is None

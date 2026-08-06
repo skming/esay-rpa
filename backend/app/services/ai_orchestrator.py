@@ -1360,6 +1360,7 @@ class _ResumableTaskState:
     target_source: str | None = None
     phase: str | None = None
     last_inspection_status: str | None = None
+    last_inspection_source: str | None = None
     resume_requested: bool = False
 
 
@@ -1376,7 +1377,9 @@ def _tool_call_payload(call: dict[str, Any], key: str) -> dict[str, Any]:
     return {}
 
 
-def _latest_page_inspection(messages: list[dict[str, Any]]) -> tuple[str | None, str | None]:
+def _latest_page_inspection(
+    messages: list[dict[str, Any]],
+) -> tuple[str | None, str | None, str | None]:
     """读取最近一次真实页面检查；工具结果比模型正文更适合作为恢复依据。"""
     for message in reversed(messages):
         if message.get("role") != "assistant":
@@ -1396,8 +1399,9 @@ def _latest_page_inspection(messages: list[dict[str, Any]]) -> tuple[str | None,
             status = str(result.get("status") or "").strip() or None
             if status is None and result:
                 status = "error" if result.get("error") else "success"
-            return (url or None), status
-    return None, None
+            source = str(result.get("inspection_source") or "").strip() or None
+            return (url or None), status, source
+    return None, None, None
 
 
 def _resolve_resumable_task_state(
@@ -1410,19 +1414,27 @@ def _resolve_resumable_task_state(
         requirement_text=_session_requirement_text(messages),
         resume_requested=bool(_RESUME_TASK_RE.search(latest)),
     )
+    current_urls = _URL_IN_TEXT_RE.findall(latest)
+    inspected_url, inspected_status, inspected_source = _latest_page_inspection(messages)
+
+    # 证据通道要在提前返回之前认下：下面的分支解决的是「这轮该去看哪个 URL」，
+    # 而「上次那页是靠哪条通道拿到的」跟流程建没建好无关。放到返回之后，
+    # 流程一存下来护栏就凭空消失，模型接着改 fetcher 或加 browser.click 无人阻拦。
+    # 这轮自带新 URL 就不认：那条通道结论说的是上一个站点。
+    if not current_urls:
+        state.last_inspection_source = inspected_source
     if flow_id and not flow_ctx.is_blank:
         return state
 
-    current_urls = _URL_IN_TEXT_RE.findall(latest)
     if current_urls:
         state.target_url = current_urls[0]
         state.target_source = "current_message"
     elif state.resume_requested and not _NEW_TASK_RE.search(latest):
-        inspected_url, status = _latest_page_inspection(messages)
         if inspected_url:
             state.target_url = inspected_url
             state.target_source = "inspection_history"
-            state.last_inspection_status = status
+            state.last_inspection_status = inspected_status
+            state.last_inspection_source = inspected_source
         else:
             for message in reversed(messages[:-1]):
                 if message.get("role") != "user":
@@ -1454,6 +1466,7 @@ def _task_state_message(state: _ResumableTaskState) -> dict[str, Any] | None:
         "target_url": state.target_url,
         "phase": state.phase,
         "last_inspection_status": state.last_inspection_status,
+        "last_inspection_source": state.last_inspection_source,
         "next_action": (
             "build_flow"
             if state.phase == "page_inspected"
@@ -1700,6 +1713,7 @@ class AiOrchestrator:
             "pending_repair_gate": None,   # {lint_done, inspect_done} — set on repair intent
             "repair_autorun_lock": None,
             "pre_create_inspect_gate": None,  # {inspect_done, suggested_url} — set on create intent
+            "page_evidence_source": task_state.last_inspection_source,
             "read_only_tools": read_only,     # 自愈诊断模式：阻断所有写入类工具
             "model_no_vision": not _model_caps(model).supports_vision,  # 阻断 inspect_screenshot
             # full_messages 里混着 few-shot 那轮虚构的 user 消息
@@ -1709,6 +1723,7 @@ class AiOrchestrator:
                 "target_url": task_state.target_url,
                 "phase": task_state.phase,
                 "last_inspection_status": task_state.last_inspection_status,
+                "last_inspection_source": task_state.last_inspection_source,
             },
         }
 
@@ -2419,6 +2434,8 @@ def _orchestrator_guard_after_tool(tool_name: str, result: Any, state: dict[str,
             # 落到登录页的检查看到的是登录表单，对目标页不构成证据，不能解锁。
             if not result.get("redirected_to_login"):
                 state["fresh_page_evidence"] = True
+            if tool_name == "inspect_page":
+                state["page_evidence_source"] = result.get("inspection_source") or "browser_dom"
             if tool_name == "inspect_page" and state.get("pre_create_inspect_gate") is not None:
                 state["pre_create_inspect_gate"]["inspect_done"] = True
     elif tool_name in {*_FLOW_WRITE_TOOLS, "run_flow"}:

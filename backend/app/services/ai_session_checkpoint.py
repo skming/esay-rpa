@@ -32,6 +32,11 @@ _PERSISTED_KEYS = (
     "requires_inspect_page",
     "requires_quality_fix",
     "requires_lint_fix",
+    # 例外：这条不是预算而是「本次证据只能证明哪条执行通道」。正常轮次由
+    # _resolve_resumable_task_state 从对话历史里重算，这里存的是前端裁剪过历史、
+    # 或进程重启后仍要认的那一份——判据只有一条，来源可以有两条。
+    # 解锁不依赖过期：任何一次成功的浏览器 inspect_page 都会把它覆写成 browser_dom。
+    "page_evidence_source",
 )
 
 # 中断后隔了很久再回来，页面和流程多半都变了，旧预算不该再挡人。
@@ -109,6 +114,12 @@ def summarize(checkpoint: dict[str, Any]) -> str | None:
         lines.append("- 上次 lint 的阻断级问题尚未修完，run_flow 会被阻断。")
     if checkpoint.get("requires_inspect_page"):
         lines.append("- 上次运行报了 selector 超时，必须先 inspect_page 拿真实 DOM 才能继续改。")
+    if checkpoint.get("page_evidence_source") == "scrapling_static":
+        lines.append(
+            "- 本任务的页面证据来自静态 HTTP 抓取（浏览器通道当时拿不到真实页面）："
+            "只能用 browser.fetch + fetcher='static'，加 browser.open/click 或改成 dynamic/stealthy 都会被阻断。"
+            "若需要浏览器交互，先重新 inspect_page 确认浏览器通道已经可用。"
+        )
     if not lines:
         return None
     return "【上次未完成的会话】上一轮在中途结束，以下状态继续有效：\n" + "\n".join(lines)
