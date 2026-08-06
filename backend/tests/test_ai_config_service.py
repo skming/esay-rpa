@@ -9,6 +9,22 @@ from app.services.ai_config_service import AI_MODEL_CATALOG, AiConfigService
 _ENV_KEY = "ANTHROPIC_API_KEY"
 
 
+@pytest.fixture(autouse=True)
+def _restore_module_catalog():
+    """还原模块级全局。AI_MODEL_CATALOG 被 _refresh_cache 原地改写、_ALL_ENV_KEYS 被整体重赋值，
+    本文件的测试会删模型，不还原就顺着同一个进程漏给后面的测试——test_api 的目录断言
+    依赖 claude-sonnet-5 还在目录里，把 anthropic 删空会让它报「模型不在目录中」。
+    """
+    import app.services.ai_config_service as mod
+
+    catalog = [dict(m) for m in mod.AI_MODEL_CATALOG]
+    env_keys = set(mod._ALL_ENV_KEYS)
+    yield
+    mod.AI_MODEL_CATALOG.clear()
+    mod.AI_MODEL_CATALOG.extend(catalog)
+    mod._ALL_ENV_KEYS = env_keys
+
+
 @pytest.fixture()
 def service(tmp_path, monkeypatch: pytest.MonkeyPatch) -> AiConfigService:
     monkeypatch.delenv(_ENV_KEY, raising=False)
@@ -159,3 +175,53 @@ async def test_user_edits_survive_the_seed_refresh(tmp_path) -> None:
     row = next(r for r in store.rows if r["id"] == target)
     assert row["label"] == "我自己的叫法"
     assert row["user_edited"] is True
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_providers_last_model_keeps_the_provider(tmp_path) -> None:
+    """厂商分组曾按「目录里还剩几个模型」推导，删掉某厂商最后一个模型分组就整条消失：
+    设置页没有它的 API Key 输入框，也没有「添加模型」入口——而添加模型必须挂在已有分组下，
+    于是这个厂商再也加不回来，已存的密钥变成读不到又清不掉的孤儿。
+    删哪个厂商不影响这条行为，所以从播种结果里挑一个，写死厂商名会在改版时误报。
+    """
+    store = _MemoryCatalogStore()
+    service = _service_with(tmp_path, store)
+    await service.init_catalog()
+
+    victim = service.get_provider_groups()[0]
+    doomed = [m["id"] for m in service.get_model_catalog() if m.get("provider") == victim["id"]]
+    assert doomed, "挑中的厂商本来就没有模型，测不到删空这件事"
+    for model_id in doomed:
+        await service.delete_catalog_model(model_id)
+
+    assert not any(m.get("provider") == victim["id"] for m in service.get_model_catalog())
+    groups = service.get_provider_groups()
+    assert victim["id"] in [g["id"] for g in groups], "删空最后一个模型后厂商分组丢了"
+    # label/env_key 也要还在，否则输入框存在却对不上密钥
+    restored = next(g for g in groups if g["id"] == victim["id"])
+    assert restored["env_key"] == victim["env_key"]
+    assert restored["label"] == victim["label"]
+
+
+@pytest.mark.asyncio
+async def test_an_emptied_providers_key_can_still_be_read_and_cleared(tmp_path) -> None:
+    """_ALL_ENV_KEYS 是 api_keys 能否写入的闸门。跟着目录缩水的话，
+    某厂商被删空后它已存的密钥既改不动也删不掉，只能留在磁盘上。"""
+    store = _MemoryCatalogStore()
+    service = _service_with(tmp_path, store)
+    await service.init_catalog()
+
+    victim = service.get_provider_groups()[0]
+    env_key = victim["env_key"]
+    service.save({"api_keys": {env_key: "sk-still-mine"}})
+
+    for model_id in [m["id"] for m in service.get_model_catalog() if m.get("provider") == victim["id"]]:
+        await service.delete_catalog_model(model_id)
+
+    assert service.load()["api_keys"][env_key] == "sk-still-mine", "密钥不该因为模型被删空而消失"
+    # 改得动
+    service.save({"api_keys": {env_key: "sk-rotated"}})
+    assert service.load()["api_keys"][env_key] == "sk-rotated"
+    # 也清得掉
+    service.save({"api_keys": {env_key: ""}})
+    assert env_key not in service.load()["api_keys"]

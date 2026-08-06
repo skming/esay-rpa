@@ -552,7 +552,13 @@ async def list_ai_models() -> dict:
         env_key = m.get("env_key", "")
         configured = bool(api_keys.get(env_key) or (env_key and _os.environ.get(env_key)))
         models.append({**m, "configured": configured})
-    return {"models": models, "default": config["default_model"]}
+    # 厂商单独给：设置页的分组不能从 models 推，否则某厂商被删空后分组消失，
+    # 它的 API Key 入口和「添加模型」入口跟着没了，这个厂商再也加不回来。
+    return {
+        "models": models,
+        "default": config["default_model"],
+        "providers": ai_config_service.get_provider_groups(),
+    }
 
 
 @app.post("/api/ai/models")
@@ -583,43 +589,65 @@ async def delete_ai_model(payload: AiCatalogDeleteRequest) -> dict:
     return await list_ai_models()
 
 
+def _test_model_error(raw: str, env_key: str, used_placeholder_key: bool) -> str:
+    """原样返回上游报错。
+
+    测试按钮的用途就是看上游到底说了什么，所以这里不翻译、不归类、不替换。翻译过一轮：
+    agentrouter 的 unauthorized client detected 被裸子串 unauthorized 归进鉴权类，显示成
+    「API Key 无效或已过期」，把「中转拒了这个客户端」说成了密钥失效，还删掉了上游原话里的申诉入口。
+    """
+    if used_placeholder_key:
+        # 占位符是我们替用户编的假密钥（sk-relay），上游冲它报的错不算用户配置的诊断结论
+        return f"（未配置 {env_key}，本次用占位符 sk-relay 发起）{raw}"
+    return raw
+
+
 @app.post("/api/ai/test-model")
 async def test_ai_model(payload: dict) -> dict:
     """Make a real 1-token call to verify credentials and reachability."""
     import time as _time
 
+    # 置位后 _test_model_error 才能声明这把密钥是我们编的，不是用户配的
+    used_placeholder_key = False
+    env_key: str = str(payload.get("env_key", "")).strip()
+    # 目录校验之前抛异常时 except 也要回报模型名，不预绑定会在拼响应时再抛 UnboundLocalError
+    catalog_model = ""
+
     try:
-        env_key: str = str(payload.get("env_key", "")).strip()
         draft_api_key: str = str(payload.get("api_key", "")).strip()
         draft_base_url: str = str(payload.get("base_url", "")).strip()
 
-        # Save draft values first so subsequent lookups see them
-        if draft_api_key and env_key:
-            ai_config_service.save({"api_keys": {env_key: draft_api_key}})
-            ai_config_service.apply_to_env(ai_config_service.load())
-        if env_key:
-            ai_config_service.save({"base_urls": {env_key: draft_base_url}})
+        # 探测全程不落盘：配置的唯一写入口是保存按钮，否则一次「测试」就足以改掉
+        # 甚至清空用户已存的密钥和 relay 地址。
+        # 掩码串是展示值不是凭据，当成草稿会拿一串星号去鉴权。
+        if "****" in draft_api_key:
+            draft_api_key = ""
 
         catalog = ai_config_service.get_model_catalog()
-        provider_models = [m for m in catalog if m.get("env_key") == env_key]
-        catalog_model = str(provider_models[0].get("id", "")) if provider_models else ""
-        if not catalog_model:
-            return {"ok": False, "error": f"未知提供商 key: {env_key}"}
+        requested_model = str(payload.get("model", "")).strip()
+        if not requested_model:
+            return {"ok": False, "error": "未指定要测试的模型"}
+        # 模型必须确属这把密钥：拿 A 家的模型配 B 家的 key 去测，失败原因会指向密钥，
+        # 而真正的错是选错了模型。校验放在发请求之前，错法才说得准。
+        entry = next((m for m in catalog if m.get("id") == requested_model), None)
+        if entry is None:
+            return {"ok": False, "error": f"模型不在目录中: {requested_model}"}
+        if entry.get("env_key") != env_key:
+            return {"ok": False, "error": f"模型 {requested_model} 不属于 {env_key}"}
+        catalog_model = requested_model
 
-        # 优先用户配置的默认模型（若属于同一 provider），比 catalog 里随便取一个更可能在 relay 上可用
-        cfg_default = ai_config_service.load().get("default_model", "")
-        if cfg_default:
-            default_env_key = next((m.get("env_key", "") for m in catalog if m.get("id") == cfg_default), "")
-            if default_env_key == env_key:
-                catalog_model = cfg_default
-
-        api_key = ai_config_service.get_api_key_for_model(catalog_model)
-        base_url = ai_config_service.get_base_url_for_model(catalog_model)
+        # 草稿优先、已存值兜底：用户没重新输入密钥就是要测「已经存着的那把」，
+        # 前端传空串不代表清除，只代表输入框里没有明文可给。
+        api_key = draft_api_key or ai_config_service.get_api_key_for_model(catalog_model)
+        # base_url 相反：输入框只要出现在请求里，它的值就是本次测试的完整意图，
+        # 空串意味着「这次走官方接口」，不能回退到已存的 relay 地址。
+        base_url = draft_base_url if "base_url" in payload else ai_config_service.get_base_url_for_model(catalog_model)
 
         if not api_key:
             if base_url:
                 # relay 常自行处理鉴权，占位符让 litellm 能组出合法 Authorization header
                 api_key = "sk-relay"
+                used_placeholder_key = True
             else:
                 return {"ok": False, "error": f"未配置 {env_key}，请先填写 API Key"}
 
@@ -633,15 +661,18 @@ async def test_ai_model(payload: dict) -> dict:
             except Exception:
                 pass  # 回退用 catalog_model
     except Exception as exc:
-        from app.services.ai_orchestrator import _clean_litellm_error
-        return {"ok": False, "error": _clean_litellm_error(str(exc))}
+        return {"ok": False, "error": _test_model_error(str(exc), env_key, used_placeholder_key)}
+
+    # 中转没有目标模型时 _resolve_relay_model 会模糊匹配到另一个（对话也这么走）。
+    # 不回报的话，「claude-opus-5 连接正常」可能是 gpt-4o-mini 答的——测试通过反而误导。
+    answered_model = test_model.split("/", 1)[-1]
+    served_by = answered_model if answered_model != catalog_model else None
 
     try:
         t0 = _time.monotonic()
         if normalized_base:
             # 用裸 httpx 测 relay：litellm 底层的 OpenAI SDK 会注入 x-stainless-* 头，很多 relay 会拦
             import httpx as _httpx
-            bare_model = test_model.split("/", 1)[-1]  # strip "openai/" litellm prefix
             async with _httpx.AsyncClient(timeout=15) as _client:
                 _r = await _client.post(
                     normalized_base.rstrip("/") + "/chat/completions",
@@ -649,18 +680,15 @@ async def test_ai_model(payload: dict) -> dict:
                         "Authorization": f"Bearer {api_key}",
                         "Content-Type": "application/json",
                     },
-                    json={"model": bare_model, "messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 1},
+                    json={"model": answered_model, "messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 1},
                 )
             ms = int((_time.monotonic() - t0) * 1000)
             if _r.status_code == 200:
-                return {"ok": True, "latency_ms": ms}
-            _relay_err = _r.json() if _r.headers.get("content-type", "").startswith("application/json") else {}
-            _relay_msg = (
-                (_relay_err.get("error") or {}).get("message")
-                or _relay_err.get("message")
-                or _r.text[:300]
-            )
-            raise Exception(_relay_msg)
+                return {"ok": True, "latency_ms": ms, "model": catalog_model, "served_by": served_by}
+            # 整个 body 原样交出：中转把关键信息散在 error.message 之外的字段里
+            # （agentrouter 的 type=unauthorized_client_error 才说明拒的是客户端不是密钥），
+            # 只挑 message 会把判断依据丢掉。
+            raise Exception(f"HTTP {_r.status_code}: {_r.text[:1000]}")
         else:
             import litellm as _litellm
             await _litellm.acompletion(
@@ -671,10 +699,13 @@ async def test_ai_model(payload: dict) -> dict:
                 api_key=api_key,
             )
         ms = int((_time.monotonic() - t0) * 1000)
-        return {"ok": True, "latency_ms": ms}
+        return {"ok": True, "latency_ms": ms, "model": catalog_model, "served_by": served_by}
     except Exception as exc:
-        from app.services.ai_orchestrator import _clean_litellm_error
-        return {"ok": False, "error": _clean_litellm_error(str(exc))}
+        return {
+            "ok": False,
+            "error": _test_model_error(str(exc), env_key, used_placeholder_key),
+            "model": catalog_model,
+        }
 
 
 @app.post("/api/ai/chat")

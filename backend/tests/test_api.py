@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 from fastapi.testclient import TestClient
@@ -481,3 +482,181 @@ def test_openapi_schema_generates() -> None:
         response = client.get("/openapi.json")
         assert response.status_code == 200
         assert response.json()["paths"], "OpenAPI 未生成任何路径"
+
+
+async def test_test_model_never_writes_config(monkeypatch) -> None:
+    """回归：测试连接曾经先把草稿 save 进配置再读回，于是一次探测就能改配置——
+    前端没回填已存 base_url 时传的空串会把它 pop 掉，掩码串会顶掉真钥。
+    探测是只读的：无论请求里带什么，落盘内容必须逐字节不变。"""
+    import app.main as main_module
+
+    service = main_module.ai_config_service
+    env_key = "ANTHROPIC_API_KEY"
+    try:
+        service.save({"api_keys": {env_key: "sk-ant-real-key-value"},
+                      "base_urls": {env_key: "https://relay.example.com/v1"}})
+        before = json.dumps(service.load(), sort_keys=True)
+
+        # 让探测在选模型阶段就返回，测试关心的是落盘副作用而非网络结果；
+        # 改造前的 save 发生在这一步之前，所以这里照样能抓住回归
+        monkeypatch.setattr(service, "get_model_catalog", lambda: [])
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+            # 空 base_url + 掩码密钥：改造前这两个字段一个清空 relay 地址、一个顶掉真钥
+            response = await client.post("/api/ai/test-model", json={
+                "env_key": env_key, "model": "claude-sonnet-5",
+                "api_key": "sk-a****alue", "base_url": "",
+            })
+
+        assert response.status_code == 200
+        assert json.dumps(service.load(), sort_keys=True) == before, "测试连接写了配置"
+    finally:
+        service.save({"api_keys": {env_key: ""}, "base_urls": {env_key: ""}})
+
+
+async def test_test_model_falls_back_to_the_stored_key(monkeypatch) -> None:
+    """前端不再回传掩码，未重新输入时 api_key 是空串——这不代表「没有密钥」，
+    而是「用已经存着的那把测」。回退丢了的话，已配置的服务商会报未配置或拿占位符去鉴权。"""
+    import litellm
+
+    import app.main as main_module
+
+    service = main_module.ai_config_service
+    env_key = "ANTHROPIC_API_KEY"
+    seen: dict[str, object] = {}
+    try:
+        service.save({"api_keys": {env_key: "sk-ant-stored-key"}})
+
+        async def fake_completion(**kwargs):
+            seen.update(kwargs)
+            return None
+
+        monkeypatch.setattr(litellm, "acompletion", fake_completion)
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+            response = await client.post("/api/ai/test-model", json={
+                "env_key": env_key, "model": "claude-sonnet-5", "api_key": "", "base_url": "",
+            })
+
+        assert response.json()["ok"] is True, response.json()
+        assert seen["api_key"] == "sk-ant-stored-key"
+        assert response.json()["model"] == "claude-sonnet-5"
+    finally:
+        service.save({"api_keys": {env_key: ""}})
+
+
+def test_upstream_error_reaches_the_user_verbatim() -> None:
+    """翻译层删除的回归。agentrouter 的 unauthorized client detected 曾被裸子串 unauthorized
+    归进鉴权类，显示成「API Key 无效或已过期」——拒的是客户端不是密钥，同一把密钥换模型照样被拒，
+    重填永远修不好；上游原话里的申诉入口也一并被删掉。测试按钮要的就是上游原话。"""
+    from app.main import _test_model_error
+
+    raw = '{"error":{"message":"unauthorized client detected, contact support for assistance at https://discord.gg/aYq5B4RW3"},"message":"UNAUTHENTICATED","success":false,"type":"unauthorized_client_error"}'
+    message = _test_model_error(raw, "OPENAI_API_KEY", used_placeholder_key=False)
+    assert message == raw
+
+    # 判断依据散在 error.message 之外：type 才说明拒的是客户端
+    assert "unauthorized_client_error" in message
+    assert "discord.gg" in message
+    assert "无效或已过期" not in message
+
+
+def test_placeholder_key_is_disclosed_not_translated() -> None:
+    """占位符 sk-relay 是我们替用户编的假密钥，上游冲它报的错不是用户配置的诊断结论。
+    但这只能加一句说明，不能把上游原话换掉——换掉就又回到「照着提示修一个不存在的问题」。"""
+    from app.main import _test_model_error
+
+    raw = "invalid api key"
+    placeholder = _test_model_error(raw, "ANTHROPIC_API_KEY", used_placeholder_key=True)
+    assert raw in placeholder
+    assert "sk-relay" in placeholder
+    assert "未配置 ANTHROPIC_API_KEY" in placeholder
+
+    # 用户真填了密钥时不加任何前缀，上游说什么就是什么
+    assert _test_model_error(raw, "ANTHROPIC_API_KEY", used_placeholder_key=False) == raw
+
+
+async def test_test_model_requires_a_model_belonging_to_the_key() -> None:
+    """后端自己从目录里挑模型的话，绿勾说的是「第 0 个模型能答」却被读成「这个服务商通了」；
+    挑中的模型在中转上不存在时，失败又会落到密钥头上。拿别家模型配这把密钥测同理。"""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        missing = await client.post("/api/ai/test-model", json={"env_key": "ANTHROPIC_API_KEY"})
+        assert missing.json()["ok"] is False
+        assert "未指定" in missing.json()["error"]
+
+        unknown = await client.post("/api/ai/test-model", json={
+            "env_key": "ANTHROPIC_API_KEY", "model": "no-such-model-id",
+        })
+        assert unknown.json()["ok"] is False
+        assert "不在目录" in unknown.json()["error"]
+
+        # claude-sonnet-5 存在，但它不属于 OPENAI_API_KEY
+        mismatched = await client.post("/api/ai/test-model", json={
+            "env_key": "OPENAI_API_KEY", "model": "claude-sonnet-5",
+        })
+        assert mismatched.json()["ok"] is False
+        assert "不属于" in mismatched.json()["error"]
+
+
+async def test_relay_failure_body_reaches_the_user_whole(monkeypatch) -> None:
+    """端到端：中转非 200 时整个 body 连状态码一起原样交出。曾经只挑 error.message 再翻译，
+    于是 type=unauthorized_client_error 这个「拒的是客户端不是密钥」的判断依据被丢掉，
+    剩下一句「API Key 无效或已过期」把人指向了错的方向。"""
+    import app.main as main_module
+    import app.services.ai_orchestrator as orch
+
+    service = main_module.ai_config_service
+    env_key = "OPENAI_API_KEY"
+    relay_body = '{"error":{"message":"unauthorized client detected, contact support for assistance at https://discord.gg/aYq5B4RW3"},"message":"UNAUTHENTICATED","success":false,"type":"unauthorized_client_error"}'
+    orch._relay_models_cache.clear()
+    try:
+        monkeypatch.setattr(service, "get_model_catalog",
+                            lambda: [{"id": "gpt-5.6-sol", "env_key": env_key}])
+
+        async def fake_resolve(model, base_url, api_key):
+            return f"openai/{model}"
+
+        monkeypatch.setattr(orch, "_resolve_relay_model", fake_resolve)
+
+        sent: dict[str, object] = {}
+
+        class _Resp:
+            status_code = 401
+            headers = {"content-type": "application/json"}
+            text = relay_body
+
+            def json(self) -> dict:
+                return json.loads(relay_body)
+
+        class _Client:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args) -> bool:
+                return False
+
+            async def post(self, url, headers=None, json=None):
+                sent.update({"url": url, "json": json})
+                return _Resp()
+
+        import httpx
+        monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+            response = await client.post("/api/ai/test-model", json={
+                "env_key": env_key, "model": "gpt-5.6-sol",
+                "api_key": "sk-relay-real-key", "base_url": "https://relay.example.com/v1",
+            })
+
+        body = response.json()
+        assert body["ok"] is False, body
+        assert "HTTP 401" in body["error"]
+        assert relay_body in body["error"], "整个 body 都要在，判断依据散在 error.message 之外"
+        assert "无效或已过期" not in body["error"]
+        # 点中的模型就是发出去的模型，不能被同族匹配换掉
+        assert sent["json"]["model"] == "gpt-5.6-sol"
+    finally:
+        orch._relay_models_cache.clear()

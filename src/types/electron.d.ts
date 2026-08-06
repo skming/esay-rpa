@@ -91,13 +91,19 @@ export type AiModelCatalogUpdatePatch = {
   recommended?: boolean;
 };
 
+/** 设置页的厂商分组。后端单独给，不从 models 推：某厂商被删空后分组不能跟着消失。 */
+export type AiProviderGroupMeta = { id: string; label: string; env_key: string };
+
 export type AiModelsResult = {
   models: AiModelMeta[];
   default: string;
+  /** 老后端不返回此字段，前端回退到按 models 推导 */
+  providers?: AiProviderGroupMeta[];
 };
 
 export type AiModelTestPayload = {
   env_key: string;
+  model: string;
   api_key?: string;
   base_url?: string;
 };
@@ -105,6 +111,8 @@ export type AiModelTestPayload = {
 export type AiModelTestResult = {
   ok: boolean;
   latency_ms?: number;
+  model?: string;
+  served_by?: string | null;
   error?: string;
 };
 

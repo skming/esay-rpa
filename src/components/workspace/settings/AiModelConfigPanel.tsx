@@ -6,7 +6,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { backend } from '../../../lib/backendClient';
 import { cn } from '../../../lib/utils';
 import type { ElectronBridgeState } from '../../../hooks/useElectronBridge';
-import type { AiConfig, AiModelMeta, AiModelTestResult } from '../../../types/electron';
+import type { AiConfig, AiModelMeta, AiModelsResult, AiModelTestResult, AiProviderGroupMeta } from '../../../types/electron';
 import {
   AlertDialog,
   AlertDialogAction,
@@ -37,24 +37,36 @@ const PROVIDER_HINTS: Record<string, { placeholder: string; docsUrl: string }> =
   xai: { placeholder: 'xai-…', docsUrl: 'https://console.x.ai/' },
 };
 
-/** 厂商分组由模型目录推导。写死一份等于第二套事实来源——新厂商进了目录，
- *  选择器里能选、设置页却没有它的 API Key 输入框，模型永远是「未配置」。 */
-function deriveProviderGroups(catalog: AiModelMeta[]): ProviderGroup[] {
-  const groups = new Map<string, ProviderGroup>();
+/** 厂商分组来自后端，不由模型目录推导。按目录推导的话，删掉某厂商最后一个模型
+ *  就等于把这条分组连同它的 API Key 输入框一起删掉——而「添加模型」必须挂在已有分组下，
+ *  这个厂商于是再也加不回来，已存的密钥也变成读不到又清不掉的孤儿。
+ *  只有老后端不返回 providers 时才回退到按目录推导（此时空分组仍会丢）。 */
+function toProviderGroups(providers: AiProviderGroupMeta[], catalog: AiModelMeta[]): ProviderGroup[] {
+  const source = providers.length > 0 ? providers : deriveProviderGroupsFromCatalog(catalog);
+  return source.map(p => ({
+    key: p.id,
+    label: p.label,
+    env_key: p.env_key,
+    ...(PROVIDER_HINTS[p.id] ?? { placeholder: '…', docsUrl: '' }),
+  }));
+}
+
+function deriveProviderGroupsFromCatalog(catalog: AiModelMeta[]): AiProviderGroupMeta[] {
+  const groups = new Map<string, AiProviderGroupMeta>();
   for (const model of catalog) {
     if (!model.provider || !model.env_key || groups.has(model.provider)) continue;
     groups.set(model.provider, {
-      key: model.provider,
+      id: model.provider,
       label: model.provider_label ?? model.provider,
       env_key: model.env_key,
-      ...(PROVIDER_HINTS[model.provider] ?? { placeholder: '…', docsUrl: '' }),
     });
   }
   return [...groups.values()];
 }
 
 type TestStatus = 'idle' | 'testing' | 'ok' | 'fail';
-type TestResult = { status: TestStatus; latencyMs?: number; error?: string };
+/** 按模型 id 归属，不是按 env_key：一个服务商下各模型在中转上的可用性互不代表。 */
+type TestResult = { status: TestStatus; latencyMs?: number; error?: string; servedBy?: string };
 
 const aiFieldClass = 'h-8 w-full rounded-md border border-rule-2 bg-surface px-2.5 text-[11px] text-ink-2 outline-none transition placeholder:text-ink-3 focus-visible:border-accent-line focus-visible:ring-2 focus-visible:ring-accent-soft';
 const aiMonoFieldClass = cn(aiFieldClass, 'font-mono');
@@ -84,6 +96,7 @@ type ModelDialogState =
 export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState }): ReactElement {
   const [config, setConfig] = useState<AiConfig | null>(null);
   const [modelCatalog, setModelCatalog] = useState<AiModelMeta[]>([]);
+  const [providerMeta, setProviderMeta] = useState<AiProviderGroupMeta[]>([]);
   const [modelDialog, setModelDialog] = useState<ModelDialogState | null>(null);
   const [catalogBusy, setCatalogBusy] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<AiModelMeta | null>(null);
@@ -98,9 +111,14 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
 
   const bridge = typeof window !== 'undefined' ? (window.rpaBridge ?? null) : null;
 
-  const applyModelsResult = (models: AiModelMeta[] | undefined): void => {
-    if (Array.isArray(models)) {
-      setModelCatalog(models.filter(model => !model.custom));
+  const applyModelsResult = (result: AiModelsResult | undefined): void => {
+    if (!result) return;
+    if (Array.isArray(result.models)) {
+      setModelCatalog(result.models.filter(model => !model.custom));
+    }
+    // 只在后端确实给了才覆盖：老后端不返回该字段，写空数组会把分组清光
+    if (Array.isArray(result.providers)) {
+      setProviderMeta(result.providers);
     }
   };
 
@@ -113,12 +131,14 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
         ? (await bridge.getAiConfig()).data
         : await backend.getAiConfig();
       if (cfg) {
+        // config 是「后端存了哪些密钥」的唯一来源：漏掉它，storedValue 恒为空，
+        // 已配置的服务商会显示成未配置，测试连接也拿不到密钥。
         setConfig(cfg);
         setDraftBaseUrls(cfg.base_urls ?? {});
       }
       applyModelsResult(electron.available && bridge
-        ? (await bridge.listAiModels()).data?.models
-        : (await backend.listAiModels()).models);
+        ? (await bridge.listAiModels()).data
+        : await backend.listAiModels());
     } catch {
       // 配置读取失败不阻断设置页渲染，用户仍可通过保存操作重试。
     } finally {
@@ -157,13 +177,17 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
     }
   };
 
-  const handleTestKey = async (envKey: string): Promise<void> => {
-    setTestResults(prev => ({ ...prev, [envKey]: { status: 'testing' } }));
-    if (testTimers.current[envKey]) clearTimeout(testTimers.current[envKey]);
+  const handleTestModel = async (provider: ProviderGroup, modelId: string): Promise<void> => {
+    const envKey = provider.env_key;
+    setTestResults(prev => ({ ...prev, [modelId]: { status: 'testing' } }));
+    if (testTimers.current[modelId]) clearTimeout(testTimers.current[modelId]);
     try {
       const payload = {
         env_key: envKey,
-        api_key: draftKeys[envKey] ?? config?.api_keys[envKey] ?? '',
+        model: modelId,
+        // 只发明文草稿。后端读到的 config.api_keys 是掩码（sk-1****abcd），
+        // 把它当密钥发回去，等于拿一串星号去鉴权；留空则由后端用已存的那把测。
+        api_key: draftKeys[envKey] ?? '',
         base_url: draftBaseUrls[envKey] ?? '',
       };
       const data = await (async (): Promise<AiModelTestResult> => {
@@ -175,21 +199,22 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
         return await backend.testAiModel(payload);
       })();
       const result: TestResult = data.ok
-        ? { status: 'ok', latencyMs: data.latency_ms }
+        ? { status: 'ok', latencyMs: data.latency_ms, servedBy: data.served_by ?? undefined }
         : { status: 'fail', error: data.error };
-      setTestResults(prev => ({ ...prev, [envKey]: result }));
-      void load();
-      testTimers.current[envKey] = setTimeout(
-        () => setTestResults(prev => ({ ...prev, [envKey]: { status: 'idle' } })),
+      setTestResults(prev => ({ ...prev, [modelId]: result }));
+      // 这里刻意不重新拉配置：测试连接不写盘，没有新状态可读回，
+      // 而 load() 会用已存值覆盖 draftBaseUrls —— 刚输入还没保存的 Base URL 会被抹掉。
+      testTimers.current[modelId] = setTimeout(
+        () => setTestResults(prev => ({ ...prev, [modelId]: { status: 'idle' } })),
         5000
       );
     } catch (err) {
       const message = err instanceof TypeError && String(err.message).includes('fetch')
         ? '无法连接后端服务，请检查后端是否已启动'
         : String(err);
-      setTestResults(prev => ({ ...prev, [envKey]: { status: 'fail', error: message } }));
-      testTimers.current[envKey] = setTimeout(
-        () => setTestResults(prev => ({ ...prev, [envKey]: { status: 'idle' } })),
+      setTestResults(prev => ({ ...prev, [modelId]: { status: 'fail', error: message } }));
+      testTimers.current[modelId] = setTimeout(
+        () => setTestResults(prev => ({ ...prev, [modelId]: { status: 'idle' } })),
         5000
       );
     }
@@ -238,15 +263,15 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
           tier: draftCatalogModel.tier || 'standard',
           recommended: draftCatalogModel.recommended,
         };
-        const models = await (async (): Promise<AiModelMeta[] | undefined> => {
+        const refreshed = await (async (): Promise<AiModelsResult | undefined> => {
           if (electron.available && bridge) {
             const result = await bridge.addAiModel(payload);
             if (!result.ok) throw new Error(result.error ?? '模型添加失败');
-            return result.data?.models;
+            return result.data;
           }
-          return (await backend.addAiModel(payload)).models;
+          return await backend.addAiModel(payload);
         })();
-        applyModelsResult(models);
+        applyModelsResult(refreshed);
         setModelDialog(null);
         electron.pushToast('success', '模型已添加');
       } catch (error) {
@@ -267,15 +292,15 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
         tier: draftCatalogModel.tier || 'standard',
         recommended: draftCatalogModel.recommended,
       };
-      const models = await (async (): Promise<AiModelMeta[] | undefined> => {
+      const refreshed = await (async (): Promise<AiModelsResult | undefined> => {
         if (electron.available && bridge) {
           const result = await bridge.updateAiModel(payload);
           if (!result.ok) throw new Error(result.error ?? '模型更新失败');
-          return result.data?.models;
+          return result.data;
         }
-        return (await backend.updateAiModel(payload)).models;
+        return await backend.updateAiModel(payload);
       })();
-      applyModelsResult(models);
+      applyModelsResult(refreshed);
       setModelDialog(null);
       electron.pushToast('success', '模型已更新');
     } catch (error) {
@@ -288,15 +313,15 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
   const handleDeleteModel = async (model: AiModelMeta): Promise<void> => {
     setCatalogBusy(`delete:${model.id}`);
     try {
-      const models = await (async (): Promise<AiModelMeta[] | undefined> => {
+      const refreshed = await (async (): Promise<AiModelsResult | undefined> => {
         if (electron.available && bridge) {
           const result = await bridge.deleteAiModel(model.id);
           if (!result.ok) throw new Error(result.error ?? '模型删除失败');
-          return result.data?.models;
+          return result.data;
         }
-        return (await backend.deleteAiModel(model.id)).models;
+        return await backend.deleteAiModel(model.id);
       })();
-      applyModelsResult(models);
+      applyModelsResult(refreshed);
       setDeleteTarget(null);
       electron.pushToast('success', '模型已删除');
     } catch (error) {
@@ -306,7 +331,7 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
     }
   };
 
-  const providerGroups = deriveProviderGroups(modelCatalog);
+  const providerGroups = toProviderGroups(providerMeta, modelCatalog);
 
   const configuredCount = providerGroups.filter(g => {
     const draft = draftKeys[g.env_key];
@@ -314,8 +339,8 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
   }).length;
   const catalogCount = modelCatalog.length;
 
-  const getTestResult = (envKey: string): TestResult =>
-    testResults[envKey] ?? { status: 'idle' };
+  const getTestResult = (modelId: string): TestResult =>
+    testResults[modelId] ?? { status: 'idle' };
 
   return (
     <SettingsContent
@@ -341,11 +366,12 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
             {providerGroups.map(g => {
               const storedValue = config?.api_keys[g.env_key] ?? '';
               const draftValue = draftKeys[g.env_key];
-              const displayValue = draftValue ?? storedValue;
+              // 输入框永不预填 storedValue：它是掩码（sk-1****abcd），一旦落进 value，
+              // 用户在后面补两个字符就得到 sk-1****abcdXY —— 含掩码的串会被保存逻辑静默丢弃，
+              // 界面看着填了、点保存没报错、密钥其实没变。掩码只作占位提示出现。
+              const displayValue = draftValue ?? '';
               const isConfigured = draftValue !== undefined ? draftValue !== '' : storedValue !== '';
               const isVisible = showKeys[g.env_key] ?? false;
-              const tr = getTestResult(g.env_key);
-              const ts = tr.status;
               const providerModels = modelCatalog.filter(model => model.provider === g.key);
 
               return (
@@ -379,7 +405,7 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
                       <div className="min-w-0">
                         <input
                           className={cn(aiMonoFieldClass, 'pr-8')}
-                          placeholder={g.placeholder}
+                          placeholder={storedValue && draftValue === undefined ? `已配置 ${storedValue}` : g.placeholder}
                           type={isVisible ? 'text' : 'password'}
                           value={displayValue}
                           onChange={e => setDraftKeys(prev => ({ ...prev, [g.env_key]: e.target.value }))}
@@ -403,11 +429,6 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
                       />
 
                       <div className="flex h-7 items-center justify-end gap-1 @min-3xl:gap-0.5 @min-3xl:rounded-md @min-3xl:bg-surface @min-3xl:p-0.5">
-                        <TestModelButton
-                          disabled={ts === 'testing' || (!isConfigured && !draftValue)}
-                          result={tr}
-                          onClick={() => void handleTestKey(g.env_key)}
-                        />
                         <IconButton
                           className="h-6 w-6 text-ink-4 hover:text-ink"
                           label={`打开 ${g.label} API Key 页面`}
@@ -429,12 +450,6 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
                       </div>
                     </div>
 
-                    {ts === 'fail' && tr.error && (
-                      <p className="rounded-md bg-red-50/70 px-2.5 py-1.5 text-[11px] leading-snug text-red-600">
-                        {tr.error}
-                      </p>
-                    )}
-
                     {providerModels.length > 0 && (
                       <div className={cn('grid items-start gap-2 border-t border-rule pt-2.5', aiProviderGridClass)}>
                         <div className="flex h-7 items-center text-[11px] text-ink-3">
@@ -447,11 +462,26 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
                                 busy={catalogBusy === `delete:${model.id}`}
                                 key={model.id}
                                 model={model}
+                                testDisabled={!isConfigured && !draftValue}
+                                testResult={getTestResult(model.id)}
                                 onDelete={() => setDeleteTarget(model)}
                                 onEdit={() => handleStartEditModel(model)}
+                                onTest={() => void handleTestModel(g, model.id)}
                               />
                             ))}
                           </div>
+                          {providerModels.map(model => {
+                            const mt = getTestResult(model.id);
+                            if (mt.status !== 'fail' || !mt.error) return null;
+                            return (
+                              <p
+                                className="mt-1.5 wrap-break-word rounded-md bg-red-50/70 px-2.5 py-1.5 font-mono text-[11px] leading-snug text-red-600"
+                                key={model.id}
+                              >
+                                <span className="font-semibold">{model.id}</span>：{mt.error}
+                              </p>
+                            );
+                          })}
                         </div>
                       </div>
                     )}
@@ -521,17 +551,40 @@ function ManagedModelTag({
   model,
   onDelete,
   onEdit,
+  onTest,
+  testDisabled,
+  testResult,
 }: {
   busy: boolean;
   model: AiModelMeta;
   onDelete: () => void;
   onEdit: () => void;
+  onTest: () => void;
+  testDisabled: boolean;
+  testResult: TestResult;
 }): ReactElement {
   const context = model.context_window > 0 ? `${Math.round(model.context_window / 1000)}k` : null;
   const title = `${model.label} · ${model.id}${context ? ` · ${context}` : ''} · 点击编辑`;
+  const ts = testResult.status;
+  const testTitle = (() => {
+    if (testDisabled) return '先填写该服务商的 API Key';
+    if (ts === 'testing') return '测试连接中';
+    if (ts === 'ok') {
+      const latency = testResult.latencyMs ? `，${testResult.latencyMs}ms` : '';
+      // 中转按 family 模糊匹配时答话的是另一个模型，不说出来「连接正常」就是假的
+      return testResult.servedBy
+        ? `连接正常${latency}（实际由 ${testResult.servedBy} 应答）`
+        : `连接正常${latency}`;
+    }
+    if (ts === 'fail') return testResult.error ? `连接失败：${testResult.error}` : '连接失败';
+    return `测试 ${model.id} 连接`;
+  })();
   return (
     <span
-      className="inline-flex h-7 min-w-0 max-w-full items-center overflow-hidden rounded-md border border-rule bg-paper-sunk/70 text-[11px] text-ink-2"
+      className={cn(
+        'inline-flex h-7 min-w-0 max-w-full items-center overflow-hidden rounded-md border bg-paper-sunk/70 text-[11px] text-ink-2',
+        ts === 'ok' ? 'border-emerald-200' : ts === 'fail' ? 'border-red-200' : 'border-rule',
+      )}
       title={title}
     >
       <button
@@ -545,6 +598,27 @@ function ManagedModelTag({
       {model.recommended && (
         <span className="border-l border-rule px-1.5 text-[10px] text-accent-strong">推荐</span>
       )}
+      {ts === 'ok' && testResult.servedBy && (
+        <span className="border-l border-rule px-1.5 font-mono text-[10px] text-amber-600">
+          ↦{testResult.servedBy}
+        </span>
+      )}
+      <button
+        className={cn(
+          'flex h-7 w-7 shrink-0 items-center justify-center border-l border-rule transition-colors disabled:opacity-50',
+          ts === 'ok' && 'text-emerald-600 hover:bg-emerald-50',
+          ts === 'fail' && 'text-red-500 hover:bg-red-50',
+          ts !== 'ok' && ts !== 'fail' && 'text-ink-4 hover:bg-surface hover:text-ink',
+        )}
+        disabled={testDisabled || ts === 'testing'}
+        onClick={onTest}
+        title={testTitle}
+        type="button"
+      >
+        {ts === 'testing' && <Loader2 className="h-3 w-3 animate-spin" />}
+        {ts === 'fail' && <WifiOff className="h-3 w-3" />}
+        {ts !== 'testing' && ts !== 'fail' && <Wifi className="h-3 w-3" />}
+      </button>
       <button
         className="flex h-7 w-7 shrink-0 items-center justify-center border-l border-rule text-ink-4 transition-colors hover:bg-red-50 hover:text-red-500 disabled:opacity-50"
         disabled={busy}
@@ -695,40 +769,5 @@ function ModelField({ className, label, children }: { className?: string; label:
       <span className="text-[10px] text-ink-3">{label}</span>
       {children}
     </label>
-  );
-}
-
-function TestModelButton({
-  disabled,
-  onClick,
-  result,
-}: {
-  disabled: boolean;
-  onClick: () => void;
-  result: TestResult;
-}): ReactElement {
-  const label = (() => {
-    if (result.status === 'testing') return '测试连接中';
-    if (result.status === 'ok') return `连接正常${result.latencyMs ? `，${result.latencyMs}ms` : ''}`;
-    if (result.status === 'fail') return result.error ? `连接失败：${result.error}` : '连接失败';
-    return '测试模型连接';
-  })();
-
-  return (
-    <IconButton
-      className={cn(
-        'h-6 w-6 text-ink-4 hover:text-ink',
-        result.status === 'ok' && 'text-emerald-600 hover:text-emerald-700',
-        result.status === 'fail' && 'text-red-500 hover:bg-red-50 hover:text-red-600',
-      )}
-      disabled={disabled}
-      label={label}
-      onClick={onClick}
-    >
-      {result.status === 'testing' && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-      {result.status === 'ok' && <Wifi className="h-3.5 w-3.5" strokeWidth={1.5} />}
-      {result.status === 'fail' && <WifiOff className="h-3.5 w-3.5" strokeWidth={1.5} />}
-      {result.status === 'idle' && <Wifi className="h-3.5 w-3.5" strokeWidth={1.5} />}
-    </IconButton>
   );
 }

@@ -98,7 +98,26 @@ def _is_balance_error(msg: str) -> bool:
     return any(hint in lower for hint in _BALANCE_ERROR_HINTS)
 
 
+# 中转拒绝的是「调用方这个客户端」而不是凭据（agentrouter 回 unauthorized client detected）。
+# 这类文案里带 unauthorized，会被 _AUTH_ERROR_HINTS 的裸子串吃掉，于是同一把好密钥、
+# 连中转确实上架的模型也照样被判成「API Key 无效」。所以要先于鉴权判，并把上游原话留给用户。
+_CLIENT_REJECTED_HINTS = (
+    "unauthorized client",
+    "unauthorized_client",
+    "client not allowed",
+    "forbidden client",
+)
+
+
+def _is_client_rejection(msg: str) -> bool:
+    lower = msg.lower()
+    return any(hint in lower for hint in _CLIENT_REJECTED_HINTS)
+
+
 def _is_auth_error(msg: str) -> bool:
+    # 客户端被拒不算凭据失效：落进鉴权分支会让用户去重填一把本来就好的密钥
+    if _is_client_rejection(msg):
+        return False
     lower = msg.lower()
     return any(hint in lower for hint in _AUTH_ERROR_HINTS)
 
@@ -156,6 +175,10 @@ def _clean_litellm_error(msg: str) -> str:
 
     if _is_balance_error(msg) or is_balance_by_type:
         return "模型账户余额不足，请前往服务商平台充值后重试。"
+
+    if _is_client_rejection(msg):
+        # 上游原话里通常带着申诉入口（支持群/工单地址），换成我们自己的措辞等于把出路删掉
+        return f"中转拒绝了本客户端（不是密钥问题，同一把密钥换模型同样被拒）：{msg[:200]}"
 
     if _is_auth_error(msg):
         return "API Key 无效或已过期，请在设置页重新配置正确的 API Key。"
@@ -651,25 +674,34 @@ def _normalize_base_url(url: str | None) -> str | None:
     return url
 
 
-async def _resolve_relay_model(model: str, base_url: str, api_key: str) -> str:
-    """在中转 base_url 下从其实际提供的模型中匹配最接近的一个，按 openai/ 前缀路由。"""
+async def _fetch_relay_models(base_url: str, api_key: str) -> list[str]:
+    """中转上架的模型 ID；空列表表示没问出来（网络失败、非 200、或该密钥无权列举）。
+
+    空和「确实一个模型都没有」不可分，所以空列表只能当作无证据，不能拿来判某模型不存在。
+    """
     import httpx
 
     cache_key = f"{base_url}|{api_key}"
     cached = _relay_models_cache.get(cache_key)
     if cached and time.monotonic() - cached[1] < _RELAY_CACHE_TTL:
-        relay_models = cached[0]
-    else:
-        try:
-            async with httpx.AsyncClient(timeout=8) as client:
-                r = await client.get(
-                    base_url.rstrip("/") + "/models",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                )
-            relay_models = [m["id"] for m in r.json().get("data", []) if m.get("id")] if r.status_code == 200 else []
-        except Exception:
-            relay_models = []
-        _relay_models_cache[cache_key] = (relay_models, time.monotonic())
+        return cached[0]
+
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(
+                base_url.rstrip("/") + "/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+        relay_models = [m["id"] for m in r.json().get("data", []) if m.get("id")] if r.status_code == 200 else []
+    except Exception:
+        relay_models = []
+    _relay_models_cache[cache_key] = (relay_models, time.monotonic())
+    return relay_models
+
+
+async def _resolve_relay_model(model: str, base_url: str, api_key: str) -> str:
+    """在中转 base_url 下从其实际提供的模型中匹配最接近的一个，按 openai/ 前缀路由。"""
+    relay_models = await _fetch_relay_models(base_url, api_key)
 
     if not relay_models:
         bare = model.split("/", 1)[-1]

@@ -43,7 +43,32 @@ AI_MODEL_CATALOG: list[dict[str, Any]] = _load_seed_catalog()
 
 DEFAULT_MODEL = "claude-sonnet-5"
 
-_ALL_ENV_KEYS: set[str] = {m["env_key"] for m in AI_MODEL_CATALOG if "env_key" in m}
+
+def _provider_groups_from(catalog: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """按目录出现顺序取厂商，每个厂商只留第一次见到的 label/env_key。"""
+    groups: dict[str, dict[str, str]] = {}
+    for model in catalog:
+        provider = str(model.get("provider", "")).strip()
+        env_key = str(model.get("env_key", "")).strip()
+        if not provider or not env_key or provider in groups:
+            continue
+        groups[provider] = {
+            "id": provider,
+            "label": str(model.get("provider_label", "")).strip() or provider,
+            "env_key": env_key,
+        }
+    return list(groups.values())
+
+
+# 厂商清单以播种目录为底：厂商不随「这个厂商此刻还剩几个模型」存亡。删掉某厂商最后一个模型后，
+# 若厂商跟着消失，设置页就没有它的 API Key 输入框和「添加模型」入口了——而添加模型必须挂在
+# 已有厂商下，于是这个厂商再也加不回来，已存的密钥也变成既读不到又删不掉的孤儿。
+_SEED_PROVIDER_GROUPS: list[dict[str, str]] = _provider_groups_from(_load_seed_catalog())
+_SEED_ENV_KEYS: set[str] = {g["env_key"] for g in _SEED_PROVIDER_GROUPS}
+
+# 播种厂商的 env_key 常驻：这个集合是 api_keys/base_urls 能否写入的闸门（见 save()），
+# 跟着目录缩水会让孤儿密钥连清空都做不到，还会在下次保存时静默丢掉 provider_models。
+_ALL_ENV_KEYS: set[str] = _SEED_ENV_KEYS | {m["env_key"] for m in AI_MODEL_CATALOG if "env_key" in m}
 
 
 def _normalize_catalog_model(raw: dict[str, Any]) -> dict[str, Any]:
@@ -163,8 +188,21 @@ class AiConfigService:
         global _ALL_ENV_KEYS
         AI_MODEL_CATALOG.clear()
         AI_MODEL_CATALOG.extend(catalog)
-        _ALL_ENV_KEYS = {m["env_key"] for m in AI_MODEL_CATALOG if "env_key" in m}
+        # 并上播种 key：目录里某厂商被删空时，它的密钥仍要能读能改能清
+        _ALL_ENV_KEYS = _SEED_ENV_KEYS | {m["env_key"] for m in AI_MODEL_CATALOG if "env_key" in m}
         return AI_MODEL_CATALOG
+
+    def get_provider_groups(self) -> list[dict[str, str]]:
+        """设置页的厂商分组：播种厂商恒在，用户新增厂商追加在后。
+
+        分组不由「当前目录里还有没有这个厂商的模型」决定，否则删掉最后一个模型
+        就等于把这个厂商的密钥入口一起删了，且无法恢复。
+        """
+        groups = {g["id"]: dict(g) for g in _SEED_PROVIDER_GROUPS}
+        for group in _provider_groups_from(self.get_model_catalog()):
+            # 播种厂商以播种的 label/env_key 为准，避免用户改一行模型就换掉整组身份
+            groups.setdefault(group["id"], group)
+        return list(groups.values())
 
     async def _persist_catalog(self, catalog: list[dict[str, Any]]) -> list[dict[str, Any]]:
         await self._catalog_store.replace_all(catalog)

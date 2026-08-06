@@ -1213,3 +1213,23 @@ def test_a_failed_lint_call_is_not_read_as_a_clean_flow() -> None:
     _orchestrator_guard_after_tool("lint_flow", {"error": "流程 x 不存在"}, state)
 
     assert state["requires_lint_fix"]
+
+
+def test_client_rejection_is_not_reported_as_a_bad_api_key() -> None:
+    """裸子串匹配把两种毛病归成了一类：_AUTH_ERROR_HINTS 里的 "unauthorized" 吃掉了中转的
+    unauthorized client detected，于是「中转拒了这个调用方」显示成「API Key 无效或已过期」。
+    密钥是好的、模型也在中转上，用户照提示重填密钥永远修不好——同一把密钥换模型照样被拒。
+    这条挂在判据顺序上：客户端被拒必须先于鉴权判，谁往关键词表里再加词都不能让它回到鉴权分支。
+    """
+    from app.services.ai_orchestrator import _clean_litellm_error
+
+    raw = ("unauthorized client detected, contact support for assistance "
+           "at https://discord.gg/aYq5B4RW3")
+    cleaned = _clean_litellm_error(raw)
+
+    assert "无效或已过期" not in cleaned, "客户端被拒被归进了鉴权类"
+    # 上游原话带着申诉入口，换成自己的措辞等于把用户的出路删掉
+    assert "discord.gg" in cleaned
+
+    # 真正的鉴权失败仍然要翻译，别为了修上面那条把整条分支废掉
+    assert "无效或已过期" in _clean_litellm_error("Invalid API key provided")
