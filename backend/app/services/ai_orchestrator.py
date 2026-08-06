@@ -1315,8 +1315,16 @@ class _FlowContext:
 _STRIP_NODE_FIELDS = frozenset({"position", "status", "kind"})
 
 
+def _is_local_draft_flow_id(flow_id: str | None) -> bool:
+    return bool(flow_id and flow_id.startswith("local-"))
+
+
 async def _load_flow_context(executor: RpaToolExecutor, flow_id: str) -> _FlowContext:
     """读取当前流程并剥离 position/status/kind 等画布字段降低 token 开销。"""
+    if _is_local_draft_flow_id(flow_id):
+        # local-* 只是前端在首次保存前的草稿标识；拿它查后端只会注入一份错误结果，
+        # 还会把新建任务误路由到完整提示词和全部工具。
+        return _FlowContext(is_blank=True)
     ctx = _FlowContext()
     try:
         flow = await executor.execute("get_flow", {"flow_id": flow_id})
@@ -1783,7 +1791,7 @@ class AiOrchestrator:
 
         if intents.create_url:
             # 空白流程已有 flow_id，该走 update_flow 落节点而不是再建一个
-            build_tool = "update_flow" if flow_id else "create_flow"
+            build_tool = "update_flow" if flow_id and not _is_local_draft_flow_id(flow_id) else "create_flow"
             guard_state["pre_create_inspect_gate"] = {
                 "inspect_done": task_state.phase == "page_inspected",
                 "suggested_url": intents.create_url,

@@ -19,6 +19,8 @@ from app.services.ai_orchestrator import (
     _mark_history_cache_anchor,
     _stable_prefix_end,
     _FlowContext,
+    _is_local_draft_flow_id,
+    _load_flow_context,
     _MAX_REPAIR_CYCLES,
     _OLD_SCREENSHOT_PLACEHOLDER,
     _orchestrator_guard_after_tool,
@@ -312,6 +314,23 @@ def test_create_intent_needs_url_and_is_suppressed_by_repair_intent() -> None:
         [{"role": "user", "content": "https://example.com 抓不全，帮我修一下"}], "flow-1", blank
     )
     assert repair.repair and repair.create_url is None
+
+
+async def test_local_draft_flow_uses_blank_creation_context() -> None:
+    class _Executor:
+        async def execute(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("local draft 不应查询后端流程")
+
+    context = await _load_flow_context(_Executor(), "local-1785390406146")  # type: ignore[arg-type]
+    assert context.is_blank is True
+    assert context.context_message is None
+
+    messages = [{"role": "user", "content": "抓取 https://example.com/posts 的帖子"}]
+    intents = _detect_turn_intents(messages, "local-1785390406146", context)
+    assert intents.create_requested is True
+    assert intents.create_url == "https://example.com/posts"
+    assert _is_local_draft_flow_id("local-1785390406146") is True
+    assert _is_local_draft_flow_id("flow-1") is False
 
 
 def test_continuation_recovers_the_active_task_from_real_tool_history() -> None:
