@@ -1,0 +1,244 @@
+{
+  "model": "gpt-5.5",
+  "prompt_fingerprint": "cdc6d62c868d",
+  "scenario": "gen_table_to_excel",
+  "reply": "",
+  "calls": [
+    {
+      "name": "inspect_page",
+      "args": {
+        "url": "https://example.com/list",
+        "wait_selector": "main, table, [role=grid], body"
+      }
+    },
+    {
+      "name": "list_node_types",
+      "args": {
+        "types": [
+          "browser.open",
+          "browser.wait",
+          "browser.extract",
+          "foreach",
+          "excel.addrow",
+          "excel.save"
+        ]
+      }
+    },
+    {
+      "name": "list_node_types",
+      "args": {
+        "types": [
+          "control.foreach",
+          "excel.addrow",
+          "excel.save"
+        ]
+      }
+    },
+    {
+      "name": "create_flow",
+      "args": {
+        "name": "Example表格导出Excel",
+        "description": "打开示例列表页，提取表格并导出 Excel 文件",
+        "input_variables": [],
+        "nodes": [
+          {
+            "id": "start",
+            "type": "start",
+            "title": "开始",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 100
+            },
+            "description": "启动流程"
+          },
+          {
+            "id": "n1_open",
+            "type": "browser.open",
+            "title": "打开列表页",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 220
+            },
+            "targetUrl": "https://example.com/list",
+            "delayMs": 2000,
+            "description": "打开 https://example.com/list"
+          },
+          {
+            "id": "n2_wait",
+            "type": "browser.wait",
+            "title": "等待表格",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 340
+            },
+            "selector": ".data-table tbody tr",
+            "timeoutMs": 15000,
+            "description": "等待表格数据行出现"
+          },
+          {
+            "id": "n3_extract",
+            "type": "browser.extract",
+            "title": "提取表格数据",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 460
+            },
+            "selector": ".data-table tbody tr",
+            "extractMode": "table",
+            "outputVariable": "table_data",
+            "description": "按表格模式提取名称、创建时间、状态 → table_data"
+          },
+          {
+            "id": "n4_foreach",
+            "type": "control.foreach",
+            "title": "遍历表格行",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 580
+            },
+            "itemsVariable": "table_data",
+            "itemVariable": "row",
+            "description": "逐行写入 Excel"
+          },
+          {
+            "id": "n5_addrow",
+            "type": "excel.addrow",
+            "title": "追加 Excel 行",
+            "kind": "excel",
+            "status": "pending",
+            "position": {
+              "x": 320,
+              "y": 700
+            },
+            "path": "${var.output_prefix}.xlsx",
+            "sheetName": "表格数据",
+            "rowData": "${var.row}",
+            "description": "把当前表格行追加到 Excel"
+          },
+          {
+            "id": "n6_save",
+            "type": "excel.save",
+            "title": "保存 Excel 文件",
+            "kind": "excel",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 820
+            },
+            "path": "${var.output_prefix}.xlsx",
+            "description": "保存 Excel 文件到本次运行目录"
+          },
+          {
+            "id": "end",
+            "type": "end",
+            "title": "结束",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 940
+            },
+            "description": "流程结束"
+          }
+        ],
+        "edges": [
+          {
+            "id": "e_start_n1_open",
+            "source": "start",
+            "target": "n1_open"
+          },
+          {
+            "id": "e_n1_open_n2_wait",
+            "source": "n1_open",
+            "target": "n2_wait"
+          },
+          {
+            "id": "e_n2_wait_n3_extract",
+            "source": "n2_wait",
+            "target": "n3_extract"
+          },
+          {
+            "id": "e_n3_extract_n4_foreach",
+            "source": "n3_extract",
+            "target": "n4_foreach"
+          },
+          {
+            "id": "e_n4_foreach_n5_addrow",
+            "source": "n4_foreach",
+            "target": "n5_addrow",
+            "label": "body"
+          },
+          {
+            "id": "e_n4_foreach_n6_save",
+            "source": "n4_foreach",
+            "target": "n6_save",
+            "label": "exit"
+          },
+          {
+            "id": "e_n5_addrow_n6_save",
+            "source": "n5_addrow",
+            "target": "n6_save"
+          },
+          {
+            "id": "e_n6_save_end",
+            "source": "n6_save",
+            "target": "end"
+          }
+        ],
+        "acceptance_contract": {
+          "requirements": [
+            {
+              "id": "req_open_export_excel",
+              "confidence": 1,
+              "confirmed": true,
+              "description": "打开目标 URL 并把表格数据导出成 Excel 文件，无需登录",
+              "source_kind": "user",
+              "source_quote": "创建流程：打开 https://example.com/list，把表格数据导出成 Excel 文件。无需登录。"
+            }
+          ],
+          "deliverables": [
+            {
+              "id": "excel_table_file",
+              "variable": "excel_file",
+              "kind": "file",
+              "requirement_ids": [
+                "req_open_export_excel"
+              ],
+              "extensions": [
+                ".xlsx"
+              ],
+              "required": true
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "guard_hits": [],
+  "metrics": {
+    "rounds": 4,
+    "max_rounds": 30,
+    "tool_calls": 4,
+    "duplicate_calls": 0,
+    "blocked_calls": 0,
+    "prompt_tokens": 72776,
+    "completion_tokens": 1461,
+    "cached_tokens": 47616,
+    "guard_hits": [],
+    "call_histogram": {
+      "list_node_types": 2,
+      "inspect_page": 1,
+      "create_flow": 1
+    }
+  }
+}

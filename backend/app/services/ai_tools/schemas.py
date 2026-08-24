@@ -1,4 +1,10 @@
-"""暴露给模型的工具 JSON Schema（OpenAI tool 格式）。"""
+"""暴露给模型的工具 JSON Schema（OpenAI tool 格式）。
+
+这里刻意比 executor 支持的能力少。`get_flow` / `lint_flow` / `validate_flow` /
+`get_run_status` 回答的都是「现在是什么状态」，而 `ai_flow_state` 每轮
+开头就把答案放进了消息尾部的状态块。留着它们只会让模型多花一轮去确认自己已经知道的事，
+删掉的是那一轮，不是那份能力——executor 的方法还在，调用方从模型换成了状态构建器。
+"""
 from __future__ import annotations
 
 from typing import Any
@@ -6,25 +12,6 @@ from typing import Any
 # Tool JSON Schemas (OpenAI tool format)
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "lint_flow",
-            "description": (
-                "对当前流程做程序化静态质量检查，覆盖图拓扑、节点配置、变量契约、选择器、"
-                "筛选、抓取、脚本及交付风险。返回 findings；每项包含 severity、issue、node_id、"
-                "message、fix 和 blocks_run。优先修复 blocks_run=true 的项，不要根据工具描述里的"
-                "示例清单推断检查范围。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "flow_id": {"type": "string", "description": "要检查的流程 ID"}
-                },
-                "required": ["flow_id"],
-            },
-        },
-    },
     {
         "type": "function",
         "function": {
@@ -46,49 +33,6 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 },
                 "required": ["types"],
             },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_flow",
-            "description": (
-                "获取流程结构、revision、input_variables、验收契约和 run_readiness，修改前调用。"
-                "凭据 value 永不返回，仅用 has_value 表示是否已配置；复用已有变量名，不要重复声明同一概念。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "flow_id": {"type": "string", "description": "流程 ID"}
-                },
-                "required": ["flow_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "validate_flow",
-            "description": (
-                "扫描流程的变量依赖关系，返回：\n"
-                "  • defined_variables — 所有已定义变量（含输入变量和运行时内置）\n"
-                "  • issues — 每个引用了未定义变量的节点及缺失变量名\n"
-                "  • is_valid — 无问题时为 true"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "flow_id": {"type": "string"}
-                },
-                "required": ["flow_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_flows",
-            "description": "列出所有已有流程（id、名称、状态）。",
         },
     },
     {
@@ -182,7 +126,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                                         "min_chars": {"type": "integer"},
                                         "required_terms": {"type": "array", "items": {"type": "string"}},
                                         "forbidden_terms": {"type": "array", "items": {"type": "string"}},
-                                        "source_variables": {"type": "array", "items": {"type": "string"}},
+                                        "source_variables": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                            "description": (
+                                                "文档正文取自哪些运行变量。kind=document 时必填："
+                                                "审计用它验证正文里确实含有本次运行抓到的数据。"
+                                            ),
+                                        },
                                         "extensions": {"type": "array", "items": {"type": "string"}},
                                         "min_bytes": {"type": "integer"},
                                         "requirement_ids": {"type": "array", "items": {"type": "string"}},
@@ -210,8 +161,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "update_flow",
             "description": (
-                "直接修改现有流程并写入。调用前先 get_flow：add_nodes 只放新 ID，update_nodes"
-                "使用 {id, patch} 修改已有节点，结构变化同时维护入边和出边。返回 revision、"
+                "直接修改现有流程并写入。节点 id 与当前结构以状态块为准：add_nodes 只放新 ID，"
+                "update_nodes 使用 {id, patch} 修改已有节点，结构变化同时维护入边和出边。返回 revision、"
                 "changed_nodes、updated_node_snapshots、connectivity_warning 和 lint_findings；"
                 "必须核对 patched_fields，且先修复 blocks_run=true 的 finding。占位流程名可随本次"
                 "完整构建一起更新，已有准确名称不要覆盖。"
@@ -267,7 +218,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "name": "run_flow",
             "description": (
                 "启动流程并最多等待 90 秒，返回 task_id、flow_revision、progress 和 status。"
-                "success 后读取并审计输出；error 后诊断；paused_for_human / waiting_for_user_input"
+                "status=success 时同时返回 acceptance_audit——平台按流程冻结的验收契约算出的结论，"
+                "passed=true 才算交付达标，passed=false 按 repair_plan 修流程后重跑；"
+                "error 后诊断；paused_for_human / waiting_for_user_input"
                 "表示原任务仍在等待用户，禁止重新运行；timeout 可查询状态。extension 未连接时"
                 "返回 extension_not_connected，不会回退到 Playwright。"
             ),
@@ -397,28 +350,15 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "get_run_status",
-            "description": "手动查询运行任务的状态（running/success/error）和进度百分比。通常无需调用，run_flow 已等待完成。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task_id": {"type": "string"}
-                },
-                "required": ["task_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "get_run_error",
             "description": (
-                "获取运行失败的完整诊断：failed_node_id、run_error、error_logs、failed_node_config、"
-                "last_browser_url、inspect_hint（selector 超时时存在）。\n"
+                "下钻运行失败的现场：error_logs、failed_node_config、last_browser_url、"
+                "失败截图、inspect_hint（selector 超时时存在）。\n"
                 "navigation_trace 给出每个导航节点「请求了哪个 URL、实际停在哪个 URL」；"
                 "其中任一条 redirected=true 即表示导航没到目标页，"
                 "后续节点是在错误页面上找元素，改它们的 selector/delayMs 无效。\n"
-                "仅用于流程已启动后的运行时错误；运行前错误（'引用了未定义变量'等）用 validate_flow。"
+                "状态块已给出 status、失败原因和失败节点，不必为知道「跑成没成」调这个；"
+                "要看现场才调。"
             ),
             "parameters": {
                 "type": "object",
@@ -498,30 +438,13 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "name": "get_run_output",
             "description": (
                 "读取任务的实际输出。返回 variables（变量名到值）、artifacts（含 filename/type 的对象列表）"
-                "和 summary。它只展示产物，不判定是否满足需求；成功运行后仍需 assert_run_output。"
+                "和 summary。它只展示产物本身；这次运行有没有通过验收，由 run_flow 返回的 "
+                "acceptance_audit 给出，那份结论由平台自己算，不需要你调用任何工具。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "string"}
-                },
-                "required": ["task_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "assert_run_output",
-            "description": (
-                "按该次运行携带的冻结验收契约审计实际输出与执行证据。run_flow success 只代表节点"
-                "未报错；本工具的 passed=true 才允许宣称验收通过。passed=false 时按 issues 和"
-                "repair_plan 修流程并重新运行，不得修改契约来消除失败。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task_id": {"type": "string", "description": "要检查的运行任务 ID"},
                 },
                 "required": ["task_id"],
             },

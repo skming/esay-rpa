@@ -1,0 +1,156 @@
+{
+  "model": "gpt-5.5",
+  "prompt_fingerprint": "cdc6d62c868d",
+  "scenario": "gen_api_to_file",
+  "reply": "​​​​",
+  "calls": [
+    {
+      "name": "inspect_page",
+      "args": {
+        "url": "https://api.example.com/orders",
+        "wait_selector": "body"
+      }
+    },
+    {
+      "name": "list_node_types",
+      "args": {
+        "types": [
+          "http.request",
+          "file.write"
+        ]
+      }
+    },
+    {
+      "name": "list_node_types",
+      "args": {
+        "types": [
+          "data.json.parse"
+        ]
+      }
+    },
+    {
+      "name": "create_flow",
+      "args": {
+        "name": "获取订单接口数据",
+        "description": "调用订单 GET 接口并将返回的 JSON 写入本地文件。",
+        "nodes": [
+          {
+            "id": "n1_get_orders",
+            "type": "http.request",
+            "title": "获取订单数据",
+            "kind": "http",
+            "status": "pending",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "description": "GET ${var.api_url} 并将响应体存入 orders_response",
+            "url": "${var.api_url}",
+            "method": "GET",
+            "outputVariable": "orders_response"
+          },
+          {
+            "id": "n2_parse_orders",
+            "type": "data.json.parse",
+            "title": "解析订单 JSON",
+            "kind": "data",
+            "status": "pending",
+            "position": {
+              "x": 260,
+              "y": 0
+            },
+            "description": "解析接口返回的 JSON → orders",
+            "inputVariable": "orders_response",
+            "outputVariable": "orders"
+          },
+          {
+            "id": "n3_write_orders",
+            "type": "file.write",
+            "title": "保存订单文件",
+            "kind": "file",
+            "status": "pending",
+            "position": {
+              "x": 520,
+              "y": 0
+            },
+            "description": "将解析后的订单 JSON 写入本次运行输出目录",
+            "path": "${var.output_prefix}.json",
+            "content": "${var.orders}"
+          }
+        ],
+        "edges": [
+          {
+            "id": "e_n1_get_orders_n2_parse_orders",
+            "source": "n1_get_orders",
+            "target": "n2_parse_orders"
+          },
+          {
+            "id": "e_n2_parse_orders_n3_write_orders",
+            "source": "n2_parse_orders",
+            "target": "n3_write_orders"
+          }
+        ],
+        "input_variables": [
+          {
+            "name": "api_url",
+            "type": "String",
+            "value": "https://api.example.com/orders",
+            "category": "flow"
+          }
+        ],
+        "acceptance_contract": {
+          "requirements": [
+            {
+              "id": "req_1",
+              "description": "调用 https://api.example.com/orders 这个 GET 接口",
+              "source_kind": "user",
+              "source_quote": "调用 https://api.example.com/orders 这个 GET 接口",
+              "confidence": 1,
+              "confirmed": true
+            },
+            {
+              "id": "req_2",
+              "description": "把返回的 JSON 里每条订单写进本地文件",
+              "source_kind": "user",
+              "source_quote": "把返回的 JSON 里每条订单写进本地文件。",
+              "confidence": 0.95,
+              "confirmed": true
+            }
+          ],
+          "deliverables": [
+            {
+              "id": "orders_json_file",
+              "variable": "orders",
+              "kind": "file",
+              "required": true,
+              "extensions": [
+                ".json"
+              ],
+              "min_bytes": 1,
+              "requirement_ids": [
+                "req_2"
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "guard_hits": [],
+  "metrics": {
+    "rounds": 4,
+    "max_rounds": 30,
+    "tool_calls": 4,
+    "duplicate_calls": 0,
+    "blocked_calls": 0,
+    "prompt_tokens": 130633,
+    "completion_tokens": 920,
+    "cached_tokens": 63591,
+    "guard_hits": [],
+    "call_histogram": {
+      "list_node_types": 2,
+      "inspect_page": 1,
+      "create_flow": 1
+    }
+  }
+}

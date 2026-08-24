@@ -1,0 +1,29 @@
+{
+  "model": "xai/grok-4.5",
+  "prompt_fingerprint": "cdc6d62c868d",
+  "scenario": "continue_creation_recovers_task_state",
+  "reply": "",
+  "calls": [
+    {
+      "name": "inspect_page",
+      "args": {
+        "url": "https://example.com/post/1"
+      }
+    }
+  ],
+  "guard_hits": [],
+  "metrics": {
+    "rounds": 1,
+    "max_rounds": 30,
+    "tool_calls": 1,
+    "duplicate_calls": 0,
+    "blocked_calls": 0,
+    "prompt_tokens": 1757,
+    "completion_tokens": 17,
+    "cached_tokens": 192,
+    "guard_hits": [],
+    "call_histogram": {
+      "inspect_page": 1
+    }
+  }
+}

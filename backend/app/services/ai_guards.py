@@ -1,10 +1,17 @@
-"""编排层硬护栏的策略表。
+"""编排层硬护栏的策略表：判「这次调用本身不该发生」。
 
 护栏挡的是「模型明知规则仍会犯」的那类错——所以它不能写在 prompt 里靠自觉，
 必须在工具真正执行之前拦下来。这里把每一条拦截做成一个 `Guard` 条目而不是
-一串 if：护栏之间存在优先级依赖（粗粒度的熔断必须排在细粒度的预算之前，
-否则模型每轮换个节点改就一条都不触发），顺序即优先级这件事必须写成数据、
-能被读出来，而不是藏在函数的行号里。
+一串 if，是为了让「顺序即优先级」写成数据、能被读出来，而不是藏在行号里。
+
+判据的边界：**只看这次调用的参数与当前授权，不看失败历史。**
+凭据外泄、契约被改写、只读模式、模型没有视觉、证据通道≠执行通道、整页人机验证——
+这些成立与否与之前跑了几次、改了几个节点全都无关。
+
+带历史的那一半（「先做 X 再做 Y」和「别再原地打转」）已经搬去 [[ai_phases]]：
+它们原来是十条独立闸门，各自一个 state 键、各自一份计数，有两个无症状的坑——
+相对优先级只存在于本表的行号里（重排即失效），七个计数器各管一个维度
+（模型换个维度就是一份新额度）。搬过去换成一条阶段推导 + 一份总预算。
 
 副产物有三个，都是「能枚举」直接换来的：
 - `guard_contract_lines()` 把契约摘要注入 system prompt，prompt 不再手抄一遍规则；
@@ -14,24 +21,9 @@
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Callable
-
-from app.services.ai_tools.variables import (
-    _SCRIPT_CHANNEL_NODE_TYPES,
-    _find_script_http_fetch_marker,
-)
-
-# ── 阈值 ──────────────────────────────────────────────────────────────────────
-
-MAX_CONSECUTIVE_INSPECT_PAGE = 3  # 连续调用超过此数视为卡死，guard 强制换策略
-NODE_SELECTOR_FIX_BUDGET = 2  # 同一节点 selector 反复改仍失败超过此数，判定为方向性错误而非手误
-NAV_FAILURE_BUDGET = 2  # 同一节点导航连续失败超过此数才升级为阻断，允许偶发网络抖动重试
-
-# 「改流程 → 跑 → 又失败」的总次数上限。其余护栏都按节点/按问题类型计数，
-# 模型每轮换个节点改就一条都不触发，能一路空转到 MAX_TOOL_ROUNDS；
-# 这条不关心改的是哪里，只认「又跑了一次、又没成」。
-MAX_REPAIR_CYCLES = 3
 
 # ── 工具分组 ──────────────────────────────────────────────────────────────────
 
@@ -43,32 +35,47 @@ WRITE_TOOLS = frozenset({
 
 FLOW_WRITE_TOOLS = frozenset({"create_flow", "update_flow", "apply_node_fix", "set_acceptance_contract"})
 
-# 可并发起跑的工具：纯读、无副作用、不参与 guard 计数。
-# 不含 inspect_page / inspect_screenshot / get_run_error——它们会改熔断计数与
-# fresh_page_evidence，并发会让「连续 inspect 3 次」这类按顺序计数的护栏失效。
+# 可并发起跑的工具：纯读、无副作用、不参与收敛记账。
+# 不含 inspect_page / inspect_screenshot / get_run_error——它们会写证据指纹与
+# fresh_page_evidence，并发会让「同一次取证重复调用」判不出先后。
 PARALLEL_SAFE_TOOLS = frozenset({
-    "get_flow",
     "get_run_logs",
     "get_run_output",
-    "get_run_status",
-    "lint_flow",
-    "list_flows",
     "list_node_types",
     "list_schedules",
-    "validate_flow",
-})
-
-# 这些字段代表"用哪套方案抓"，改回旧值意味着在两个方案之间打转而不是在收敛
-OSCILLATION_TRACKED_FIELDS = ("selector", "extractMode")
-
-_DIAGNOSTIC_TOOLS = frozenset({
-    "get_run_error", "get_run_logs", "get_flow", "lint_flow",
-    "validate_flow", "inspect_page", "inspect_screenshot", "get_run_output",
 })
 
 _CREDENTIAL_NAME_TOKENS = (
     "password", "passwd", "pwd", "token", "secret", "api_key", "apikey", "credential",
 )
+
+
+def exposed_credential_values(input_variables: Any) -> list[str]:
+    """挑出「声明成凭据却带着非空值」的变量名。
+
+    判据放在这里而不是各自实现一份，是因为它有两个执行点：这一层在调用前拦下来
+    （模型还能改），执行器在写盘前再判一次（真正拥有这条不变量的层）。
+    两份实现会各自演化，而这条判据判漏的代价是秘密值落进流程定义。
+
+    `defaultValue` 必须一起看：执行器把它当 `value` 的输入别名收下
+    （见 executor._create_flow），只看 `value` 等于留了一条同样能写进存储的路。
+    """
+    exposed: list[str] = []
+    for item in input_variables or []:
+        if not isinstance(item, dict):
+            continue
+        value = str(item.get("value") or item.get("defaultValue") or "").strip()
+        if not value:
+            continue
+        name = str(item.get("name") or "")
+        lowered = name.lower()
+        if (
+            item.get("category") == "credential"
+            or item.get("sensitive") is True
+            or any(token in lowered for token in _CREDENTIAL_NAME_TOKENS)
+        ):
+            exposed.append(name or "<unnamed>")
+    return exposed
 
 
 # ── 策略表结构 ────────────────────────────────────────────────────────────────
@@ -127,50 +134,16 @@ class Guard:
 # ── 通用小工具 ────────────────────────────────────────────────────────────────
 
 
-def selector_change_node_ids(tool_name: str, args: dict[str, Any]) -> list[str]:
-    """本次 update_flow/apply_node_fix 调用会修改 selector 的节点 id 列表。"""
-    if not isinstance(args, dict):
-        return []
-    if tool_name == "apply_node_fix":
-        patch = args.get("config_patch")
-        if isinstance(patch, dict) and "selector" in patch:
-            node_id = str(args.get("node_id") or "")
-            return [node_id] if node_id else []
-        return []
-    if tool_name == "update_flow":
-        node_ids: list[str] = []
-        for item in args.get("update_nodes") or []:
-            if not isinstance(item, dict):
-                continue
-            patch = item.get("patch")
-            if isinstance(patch, dict) and "selector" in patch and item.get("id"):
-                node_ids.append(str(item["id"]))
-        return node_ids
-    return []
+def call_fingerprint(tool_name: str, args: dict[str, Any]) -> str:
+    """一次调用的身份。编排层记账与 guard 判定必须用同一个算法，否则两边永远对不上。
 
-
-def node_field_changes(tool_name: str, args: dict[str, Any]) -> list[tuple[str, str, str]]:
-    """本次调用写入的 (节点 id, 字段名, 新值)，只覆盖 OSCILLATION_TRACKED_FIELDS。"""
-    if not isinstance(args, dict):
-        return []
-    if tool_name == "apply_node_fix":
-        patches = [(str(args.get("node_id") or ""), args.get("config_patch"))]
-    elif tool_name == "update_flow":
-        patches = [
-            (str(item.get("id") or ""), item.get("patch"))
-            for item in args.get("update_nodes") or []
-            if isinstance(item, dict)
-        ]
-    else:
-        return []
-    changes: list[tuple[str, str, str]] = []
-    for node_id, patch in patches:
-        if not node_id or not isinstance(patch, dict):
-            continue
-        for field_name in OSCILLATION_TRACKED_FIELDS:
-            if field_name in patch:
-                changes.append((node_id, field_name, str(patch[field_name])))
-    return changes
+    sort_keys 是必需的：模型两次发出的 JSON 字段顺序可能不同，语义完全一样。
+    """
+    try:
+        payload = json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        payload = repr(sorted(args.items())) if isinstance(args, dict) else repr(args)
+    return f"{tool_name}:{payload}"
 
 
 def _blocked(tool_name: str, **payload: Any) -> dict[str, Any]:
@@ -183,18 +156,7 @@ def _check_credential_values_in_flow(
     state: dict[str, Any],
 ) -> dict[str, Any] | None:
     del state
-    exposed: list[str] = []
-    for item in args.get("input_variables") or []:
-        if not isinstance(item, dict) or not str(item.get("value") or "").strip():
-            continue
-        name = str(item.get("name") or "")
-        lowered = name.lower()
-        if (
-            item.get("category") == "credential"
-            or item.get("sensitive") is True
-            or any(token in lowered for token in _CREDENTIAL_NAME_TOKENS)
-        ):
-            exposed.append(name or "<unnamed>")
+    exposed = exposed_credential_values(args.get("input_variables"))
     if not exposed:
         return None
     return _blocked(
@@ -283,157 +245,10 @@ def _check_read_only_mode(tool_name: str, args: dict[str, Any], state: dict[str,
         required_action="diagnose_only",
         message=(
             "当前为只读诊断模式（自动自愈诊断）：禁止修改流程或触发运行。"
-            "请只使用诊断类工具（get_run_error / get_run_logs / get_flow / lint_flow / "
-            "validate_flow / inspect_page / inspect_screenshot / get_run_output），"
+            "流程结构与静态诊断已在状态块里，还需要现场时用 get_run_error / get_run_logs / "
+            "get_run_output / inspect_page / inspect_screenshot，"
             "然后用文字给出根因分析和具体修复提案（写明节点 id、字段、建议值），由用户确认后执行。"
         ),
-    )
-
-
-def _check_execution_channel(tool_name: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
-    if state.get("repair_intent") != "preserve_execution_channel":
-        return None
-
-    # 只保护本轮开始时确实属于浏览器主链路的节点；删改无关辅助/控制节点属正常编辑
-    browser_chain_node_ids: set[str] = state.get("browser_chain_node_ids") or set()
-
-    violations: list[dict[str, Any]] = []
-    if tool_name == "update_flow":
-        remove_node_ids = [str(nid) for nid in (args.get("remove_node_ids") or [])]
-        removed_chain_ids = [nid for nid in remove_node_ids if nid in browser_chain_node_ids]
-        if removed_chain_ids:
-            violations.append({
-                "issue": "repair_removed_existing_nodes",
-                "message": (
-                    "用户报告的是原流程上的局部问题，不能删除已有的浏览器主链路节点。"
-                    "请保留原网页打开/等待/提取主链路，只针对性追加或调整节点。"
-                ),
-                "remove_node_ids": removed_chain_ids,
-            })
-
-        for item in args.get("update_nodes") or []:
-            if not isinstance(item, dict):
-                continue
-            patch = item.get("patch") if isinstance(item.get("patch"), dict) else {}
-            item_id = str(item.get("id")) if item.get("id") is not None else None
-            if patch.get("type") in _SCRIPT_CHANNEL_NODE_TYPES and item_id in browser_chain_node_ids:
-                violations.append({
-                    "issue": "repair_replaced_node_with_script",
-                    "message": (
-                        f"用户要求修复原流程问题，但补丁试图把已有的浏览器主链路节点改成 {patch.get('type')}。"
-                        "这属于执行通道切换，必须先获得用户明确确认。"
-                    ),
-                    "node_id": item.get("id"),
-                })
-            marker = _find_script_http_fetch_marker(str(patch.get("code") or ""))
-            if marker is not None and item_id in browser_chain_node_ids:
-                violations.append({
-                    "issue": "repair_uses_script_http_fetch",
-                    "message": (
-                        f"增量修复不能用 `{marker}` 这类脚本 HTTP 请求替代浏览器采集链路。"
-                        "请在原 browser.* 流程上追加节点解决用户反馈的问题。"
-                    ),
-                    "node_id": item.get("id"),
-                    "marker": marker,
-                })
-
-        for node in args.get("add_nodes") or []:
-            if not isinstance(node, dict):
-                continue
-            marker = _find_script_http_fetch_marker(str(node.get("code") or ""))
-            if node.get("type") in _SCRIPT_CHANNEL_NODE_TYPES and marker is not None:
-                violations.append({
-                    "issue": "repair_uses_script_http_fetch",
-                    "message": (
-                        f"增量修复不能新增使用 `{marker}` 抓网页的脚本节点来替代浏览器流程。"
-                        "需要新增 browser.open/browser.click/control.foreach 等节点。"
-                    ),
-                    "node_id": node.get("id"),
-                    "marker": marker,
-                })
-
-        # 改边绕过：受保护节点未出现在 remove_node_ids 中，但其全部连线被
-        # remove_edge_ids 切断且无新连线接回——节点存活但功能上已被移除
-        browser_chain_edges_by_id: dict[str, tuple[str, str]] = state.get("browser_chain_edges_by_id") or {}
-        if browser_chain_edges_by_id:
-            remove_edge_ids = {str(eid) for eid in (args.get("remove_edge_ids") or [])}
-            added_pairs: set[tuple[str, str]] = set()
-            for edge in args.get("add_edges") or []:
-                if isinstance(edge, dict) and "source" in edge and "target" in edge:
-                    added_pairs.add((str(edge["source"]), str(edge["target"])))
-
-            orphaned_ids: list[str] = []
-            for node_id in browser_chain_node_ids:
-                if node_id in removed_chain_ids:
-                    continue  # 已作为直接删除上报
-                touching = {
-                    eid: pair for eid, pair in browser_chain_edges_by_id.items()
-                    if node_id in pair
-                }
-                if not touching:
-                    continue  # 本轮开始时该节点本就无连线，不在此检查范围
-                surviving = {eid: pair for eid, pair in touching.items() if eid not in remove_edge_ids}
-                if surviving:
-                    continue  # 仍有原连线未被动过
-                reattached = any(node_id in pair for pair in added_pairs)
-                if not reattached:
-                    orphaned_ids.append(node_id)
-
-            if orphaned_ids:
-                violations.append({
-                    "issue": "repair_orphaned_browser_chain_node_via_edges",
-                    "message": (
-                        "补丁没有删除浏览器主链路节点本身，但通过 remove_edge_ids 切断了它与流程的"
-                        "全部连线，且没有新增连线接回——这等同于把该节点从执行路径中移除，"
-                        "只是没有直接删除节点。请保留原有连线，或新增连线让该节点仍在执行路径上。"
-                    ),
-                    "node_ids": orphaned_ids,
-                })
-
-    if tool_name == "apply_node_fix":
-        patch = args.get("config_patch") if isinstance(args.get("config_patch"), dict) else {}
-        fix_node_id = str(args.get("node_id")) if args.get("node_id") is not None else None
-        if patch.get("type") in _SCRIPT_CHANNEL_NODE_TYPES and fix_node_id in browser_chain_node_ids:
-            violations.append({
-                "issue": "repair_replaced_node_with_script",
-                "message": (
-                    f"用户要求修复原流程问题，但补丁试图把浏览器主链路节点改成 {patch.get('type')}。"
-                    "这会改变原流程方案，必须先获得用户明确确认。"
-                ),
-                "node_id": args.get("node_id"),
-            })
-        marker = _find_script_http_fetch_marker(str(patch.get("code") or ""))
-        if marker is not None and fix_node_id in browser_chain_node_ids:
-            violations.append({
-                "issue": "repair_uses_script_http_fetch",
-                "message": (
-                    f"增量修复不能用 `{marker}` 这类脚本 HTTP 请求替代原浏览器采集。"
-                    "请追加节点解决问题，而不是重写成脚本抓取。"
-                ),
-                "node_id": args.get("node_id"),
-                "marker": marker,
-            })
-
-    if not violations:
-        return None
-
-    return _blocked(
-        tool_name,
-        required_action="preserve_execution_channel",
-        issue="user_intent_drift",
-        message=(
-            "用户是在原流程基础上补充约束或报告局部问题，含义是增量修复原流程。"
-            "当前补丁会删除或替换原流程主链路，属于未经确认的方案切换。"
-        ),
-        violations=violations,
-        allowed_changes=[
-            "保留已有 browser.open/browser.wait/browser.extract 节点",
-            "新增针对性节点解决用户反馈的具体问题",
-            "新增 control.foreach/control.condition/control.retry 等循环或分支节点",
-            "新增用于验证修复效果的证据变量",
-            "必要时微调原提取 selector，但不能切换执行通道",
-        ],
-        needs_user_confirmation_for="切换到 Python/Scrapling/HTTP/API 抓取方案",
     )
 
 
@@ -445,27 +260,6 @@ def _check_model_no_vision(tool_name: str, args: dict[str, Any], state: dict[str
             "当前模型不支持图片输入，inspect_screenshot 无法使用。"
             "请改用 inspect_page 获取结构化 DOM 信息。"
         ),
-    )
-
-
-def _check_pre_create_inspect_gate(tool_name: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
-    gate = state["pre_create_inspect_gate"]
-    if gate.get("inspect_done"):
-        return None
-    suggested_url = gate.get("suggested_url", "")
-    return _blocked(
-        tool_name,
-        required_tool="inspect_page",
-        message=(
-            "创建流程前必须先调用 inspect_page 检查目标页面 DOM，"
-            "否则 selector 只能靠猜测，会导致大量运行失败。"
-            + (f" 建议先检查：{suggested_url}" if suggested_url else "")
-        ),
-        required_action="call_inspect_page_first",
-        suggested_args={
-            "url": suggested_url,
-            "wait_selector": "input[type='password'], input[type='text'], form, table, nav, main",
-        },
     )
 
 
@@ -537,69 +331,6 @@ def _check_static_page_evidence_channel(
     return None
 
 
-def _check_consecutive_inspect(tool_name: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
-    inspect_count = int(state.get("consecutive_inspect_page_count") or 0)
-    if inspect_count < MAX_CONSECUTIVE_INSPECT_PAGE:
-        return None
-    return _blocked(
-        tool_name,
-        required_action="stop_repeating_inspect_page",
-        message=(
-            f"已连续调用 inspect_page {inspect_count} 次。继续探测页面不会推进任务，"
-            "请基于已有 DOM 结果转入创建/修复流程，或调用 get_flow/lint_flow/get_run_error "
-            "做拓扑诊断。若确实需要重新探测，请先完成一次 create_flow/update_flow/apply_node_fix。"
-        ),
-        allowed_next_tools=[
-            "create_flow",
-            "update_flow",
-            "apply_node_fix",
-            "get_flow",
-            "lint_flow",
-            "get_run_error",
-            "get_run_logs",
-        ],
-    )
-
-
-def _check_repair_cycle_lock(tool_name: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
-    locked = state["repair_cycle_lock"]
-    return _blocked(
-        tool_name,
-        required_action="report_to_user_and_stop",
-        message=(
-            f"本轮已经「修改流程 → 运行 → 仍失败」{locked.get('cycles')} 次，达到修复次数上限。"
-            "继续改下去大概率还是同样的结果——问题多半不在流程定义里，"
-            "而在页面状态、登录态、网络或需求本身的歧义。"
-            "请立即停止修改与运行，改为用文字向用户说明：已经试过哪些方向、"
-            "各自失败在哪一步、你判断的根因是什么、需要用户提供什么信息才能继续。"
-        ),
-        user_message=(
-            f"我连续修了 {locked.get('cycles')} 次仍然没跑通，先停下来避免空转。"
-            "下面是我已经试过的方向和判断，需要你确认或补充信息后再继续。"
-        ),
-        last_error=locked.get("last_error"),
-        allowed_next_tools=[
-            "get_run_error", "get_run_logs", "get_flow", "lint_flow",
-            "inspect_page", "inspect_screenshot", "get_run_output",
-        ],
-    )
-
-
-def _check_quality_budget_lock(tool_name: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
-    locked = state["quality_budget_lock"]
-    return _blocked(
-        tool_name,
-        required_action="fix_root_cause_before_retry",
-        message=(
-            f"质量 failure budget 已触发：同一问题 {locked.get('issue')} 已连续失败 {locked.get('count')} 次。"
-            "说明当前修复方向未能解决根因，继续 update_flow/run_flow 只会循环。"
-            "请先用 get_run_output 对比修复前后输出差异，再用 inspect_page 确认筛选控件实际触发了查询，"
-            "或用 apply_node_fix 精准修复已确认的单个问题节点。"
-        ),
-        quality_budget_lock=locked,
-    )
-
-
 def _check_challenge_page_lock(tool_name: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
     locked = state["challenge_page_lock"]
     locked_url = str(locked.get("url") or "")
@@ -622,32 +353,6 @@ def _check_challenge_page_lock(tool_name: str, args: dict[str, Any], state: dict
     )
 
 
-def _check_navigation_budget_lock(tool_name: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
-    locked = state["navigation_budget_lock"]
-    return _blocked(
-        tool_name,
-        required_action="needs_user_navigation_target",
-        message=(
-            f"导航 failure budget 已触发：节点 `{locked.get('node_id')}` 已连续导航失败 {locked.get('count')} 次。"
-            "系统已停止继续猜测菜单 selector，避免反复无效运行。"
-            "需要用户提供目标页面导航信息后再继续修复。"
-        ),
-        user_message=(
-            "我已经连续无法稳定进入目标数据页，继续猜菜单选择器会浪费运行次数。"
-            "请提供以下任意一种信息：1）手动打开目标列表页后的完整浏览器 URL；"
-            "2）从首页到目标页的完整菜单路径（每一级菜单名称）；"
-            "3）允许你先在浏览器里手动进入目标页，然后让我读取当前页面 URL/DOM 继续修复。"
-        ),
-        needed_from_user=[
-            "目标页面完整 URL（path/query/hash/完整 URL 均可）",
-            "或完整菜单路径（从首页开始，每一级菜单名称）",
-            "或允许用户手动打开目标页后，由助手读取当前 URL 和 DOM",
-        ],
-        allowed_next_tools=["get_flow", "get_run_error", "get_run_logs", "inspect_page", "inspect_screenshot", "apply_node_fix"],
-        navigation_budget_lock=locked,
-    )
-
-
 def _check_failure_budget_lock(tool_name: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
     locked = state["failure_budget_lock"]
     return _blocked(
@@ -656,149 +361,28 @@ def _check_failure_budget_lock(tool_name: str, args: dict[str, Any], state: dict
         message=(
             "failure budget 已触发，说明最近失败高度重复。"
             "已阻止继续普通 update_flow/run_flow，避免模型在未定位根因时批量改流程。"
-            "请先调用 get_run_error/get_run_logs/get_flow/lint_flow/inspect_page 完成诊断；"
+            "流程结构与静态诊断在状态块里，请再取运行/页面证据："
+            "get_run_error / get_run_logs / inspect_page；"
             "若只需修复单个已确认节点，可使用 apply_node_fix。"
         ),
         failure_budget=locked,
     )
 
 
-def _check_requires_inspect_page(tool_name: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
-    return _blocked(
-        tool_name,
-        required_tool="inspect_page",
-        message=(
-            "上一次运行错误包含 inspect_hint，说明 selector/页面状态必须先用真实 DOM 诊断。"
-            "已阻止继续修节点或 run_flow。请先调用 inspect_page。"
-        ),
-        suggested_args=state["requires_inspect_page"],
-    )
-
-
-def _check_requires_quality_fix(tool_name: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
-    required = state["requires_quality_fix"]
-    return _blocked(
-        tool_name,
-        required_action="repair_quality_issues",
-        message=(
-            "上一次 assert_run_output 未通过。禁止在未修复 repair_plan 前继续 run_flow，"
-            "否则只会重复得到技术成功但业务不可信的结果。"
-        ),
-        repair_plan=required.get("repair_plan", []),
-        issues=required.get("issues", []),
-    )
-
-
-def _check_requires_lint_fix(tool_name: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
-    return _blocked(
-        tool_name,
-        required_action="repair_lint_findings",
-        message="静态检查仍存在会导致不可信运行的阻断级 warning/error，已阻止 run_flow。",
-        lint_findings=state["requires_lint_fix"],
-    )
-
-
-def _check_field_oscillation(tool_name: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
-    """拦截"把字段改回本会话用过的旧值"。
-
-    history[-1] 是当前值，重复写入属幂等；命中更早的值才说明方案在来回翻，
-    两个方案都失败过却没有新证据，再翻一次同样不会成功。
-    """
-    history: dict[str, list[str]] = state.get("node_field_history") or {}
-    warned: set[str] = state.setdefault("oscillation_warned", set())
-    for node_id, field_name, value in node_field_changes(tool_name, args):
-        key = f"{node_id}.{field_name}"
-        past = history.get(key) or []
-        if value not in past[:-1] or key in warned:
-            continue
-        warned.add(key)
-        return _blocked(
-            tool_name,
-            required_action="stop_oscillating_between_known_failed_options",
-            message=(
-                f"节点 {node_id} 的 {field_name} 正被改回以前用过的旧值 {value!r}"
-                f"（历史取值：{past}，跨会话累计）。这两个方案都已试过并未解决问题，再翻一次同样不会。\n"
-                "先说明哪一个是对的、依据是什么；若无法判断，"
-                "改用 inspect_screenshot 看页面实际渲染，或 run_flow 后用 assert_run_output 比对两者的真实输出，"
-                "不要凭推测继续切换。"
-            ),
-            field_history={key: past},
-        )
-    return None
-
-
-def _check_node_selector_fix_budget(tool_name: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
-    """同一节点的 selector 已盲改 2 次仍失败时，第 3 次修改必须先拿到新的页面证据。
-
-    防止「换一种 selector 写法再试」绕过字段回摆熔断的死循环。
-    """
-    if state.get("fresh_page_evidence"):
-        return None
-    fix_counts: dict[str, int] = state.get("node_selector_fix_counts") or {}
-    exhausted = [
-        nid for nid in selector_change_node_ids(tool_name, args)
-        if fix_counts.get(nid, 0) >= NODE_SELECTOR_FIX_BUDGET
-    ]
-    if not exhausted:
-        return None
-    return _blocked(
-        tool_name,
-        required_action="gather_page_evidence_before_selector_fix",
-        message=(
-            f"节点 {exhausted} 的 selector 已累计修改 {NODE_SELECTOR_FIX_BUDGET} 次仍未解决（含之前会话）——"
-            "继续盲改写法只会浪费运行次数。历史事故表明这类循环的根因往往不是 selector 写错，"
-            "而是页面出现了 DOM 看不见的状态（滑块验证/弹窗遮挡/页面未跳转）。"
-            "请先调用 inspect_screenshot 查看页面实际状态（或 inspect_page 复核 DOM、"
-            "get_run_error 获取失败现场截图），确认真实原因后再修改；"
-            "若确认是验证码/滑块，改为插入 control.human_takeover 节点而不是修 selector。"
-        ),
-        blocked_node_ids=exhausted,
-    )
-
-
-def _check_repair_autorun_lock(tool_name: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
-    # 同一条规则提示词里也写着，但模型该跑还是跑——这里不是重复保险，是唯一拦得住的那道。
-    # 两边判错的代价差得很远：拦错了，用户补一句「跑一下」；放行错了，就是在用户没点运行的
-    # 情况下拉起浏览器去操作真实站点。所以宁可偏向拦。
-    return _blocked(
-        tool_name,
-        required_action="ask_user",
-        message=(
-            "本轮用户只要求修复，没有要求运行。改完请说明改了什么、为什么，"
-            "然后问用户要不要重新运行——运行会真的打开浏览器操作目标站点，这个决定归用户。"
-            "用户下一句表示要跑时，本限制自动解除。"
-        ),
-    )
-
-
-def _check_pending_repair_gate(tool_name: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
-    gate = state["pending_repair_gate"]
-    missing = []
-    if not gate.get("lint_done"):
-        missing.append("lint_flow")
-    if not gate.get("inspect_done"):
-        missing.append("inspect_page")
-    if not missing:
-        return None
-    return _blocked(
-        tool_name,
-        required_tools=missing,
-        message=(
-            f"修复节点前必须先完成诊断。缺少：{' → '.join(missing)}。"
-            "调用后即可解锁 apply_node_fix / update_flow。"
-        ),
-    )
-
-
 # ── 策略表：顺序即优先级 ──────────────────────────────────────────────────────
 #
-# 排序规则：
+# 这里只剩「这次调用本身不该发生」的判定：凭据外泄、契约被改写、授权边界、能力缺失、
+# 证据通道与执行通道不一致、整页人机验证。它们与失败历史无关，所以判据是当次参数。
+#
+# 「先做 X 再做 Y」和「别再原地打转」不在这张表里——那两件事已经收进
+# [[ai_phases]] 的阶段机与收敛判据。原因是它们摊成十条独立闸门时有两个无症状的坑：
+# 相对优先级只存在于本表的行号里，重排就失效；七个计数器各管一个维度，
+# 模型换个维度就是一份新额度。
+#
+# 剩下这几条的排序规则：
 # 1. 模式级禁令（只读模式）在最前——它是调用方的授权边界，不该被任何业务闸绕过；
-# 2. 意图保全与能力缺失次之——它们判定的是「这次调用本身不该发生」，与失败历史无关；
-# 3. 熔断类按粗到细：repair_cycle 不看改的是哪里，只认「又跑了一次又没成」，
-#    排在按节点/按问题计数的预算之前，否则模型每轮换个节点改就一条都触发不了；
-# 4. 前置诊断门（requires_*、pending_repair_gate）最后——它们是「先做 X 再做 Y」，
-#    在已经熔断的局面下报出来只会把模型引向一个同样被挡住的动作。
+# 2. 意图保全与能力缺失次之；
+# 3. 运行侧 failure budget 最后：它挡的面最宽，放前面会把更具体的判定盖掉。
 
 GUARDS: tuple[Guard, ...] = (
     Guard(
@@ -832,29 +416,11 @@ GUARDS: tuple[Guard, ...] = (
         # 所以没有 contract：写进提示词会让模型以为审查请求下工具会被拦，从而不敢动手。
     ),
     Guard(
-        id="execution_channel_preservation",
-        summary="增量修复不得删除或改写已有浏览器主链路（切换到脚本/HTTP 抓取需用户明确确认）",
-        scope=ToolScope(include=frozenset({"update_flow", "apply_node_fix"})),
-        check=_check_execution_channel,
-        contract=(
-            "用户报局部问题时只能在原流程上追加/微调节点；"
-            "删除浏览器主链路节点、或改写成 script.*/HTTP 抓取，会被直接阻断。"
-        ),
-    ),
-    Guard(
         id="model_no_vision",
         summary="模型不支持图片输入时禁用 inspect_screenshot",
         scope=ToolScope(include=frozenset({"inspect_screenshot"})),
         requires_state=("model_no_vision",),
         check=_check_model_no_vision,
-    ),
-    Guard(
-        id="pre_create_inspect_gate",
-        summary="建流程前必须先 inspect_page，未探测就写入一律阻断",
-        scope=ToolScope(include=FLOW_WRITE_TOOLS),
-        requires_state=("pre_create_inspect_gate",),
-        check=_check_pre_create_inspect_gate,
-        contract="用户给了 URL 时，create_flow/update_flow 之前必须先 inspect_page，selector 只能来自检查结果。",
     ),
     Guard(
         id="static_page_evidence_requires_fetch_flow",
@@ -881,37 +447,6 @@ GUARDS: tuple[Guard, ...] = (
         ),
     ),
     Guard(
-        id="consecutive_inspect_limit",
-        summary=f"连续 inspect_page/inspect_screenshot 达 {MAX_CONSECUTIVE_INSPECT_PAGE} 次后强制转入构建或诊断",
-        scope=ToolScope(include=frozenset({"inspect_page", "inspect_screenshot"})),
-        check=_check_consecutive_inspect,
-    ),
-    Guard(
-        id="repair_cycle_lock",
-        summary=f"「改流程 → 运行 → 仍失败」累计 {MAX_REPAIR_CYCLES} 次后停止修改与运行，转为向用户说明",
-        scope=ToolScope(include=FLOW_WRITE_TOOLS | {"run_flow"}),
-        requires_state=("repair_cycle_lock",),
-        check=_check_repair_cycle_lock,
-        contract=(
-            f"同一轮里「改了再跑」失败 {MAX_REPAIR_CYCLES} 次会被锁死，"
-            "之后只能用文字汇报已试方向与根因判断——所以不要把运行次数当成试错额度。"
-        ),
-    ),
-    Guard(
-        id="quality_budget_lock",
-        summary="同一质量问题连续两次审计不过后，禁止继续 update_flow/run_flow",
-        scope=ToolScope(include=frozenset({"update_flow", "run_flow"})),
-        requires_state=("quality_budget_lock",),
-        check=_check_quality_budget_lock,
-    ),
-    Guard(
-        id="navigation_budget_lock",
-        summary=f"同一节点导航连续失败 {NAV_FAILURE_BUDGET} 次后停止猜菜单 selector，转为向用户要目标 URL",
-        scope=ToolScope(include=frozenset({"update_flow", "run_flow"})),
-        requires_state=("navigation_budget_lock",),
-        check=_check_navigation_budget_lock,
-    ),
-    Guard(
         id="failure_budget_lock",
         # 这道闸只该挡「未定位根因就批量改流程」。纯读工具挡掉等于没收了诊断手段，
         # 模型只能在剩下几个工具间空转（list_node_types 被挡就是这么来的）。
@@ -921,106 +456,6 @@ GUARDS: tuple[Guard, ...] = (
         ),
         requires_state=("failure_budget_lock",),
         check=_check_failure_budget_lock,
-    ),
-    Guard(
-        id="requires_inspect_page",
-        summary="运行错误带 inspect_hint 时，必须先 inspect_page 才能继续修节点或运行",
-        scope=ToolScope(
-            exclude=frozenset({
-                "inspect_page", "inspect_screenshot", "get_run_error",
-                "get_run_logs", "get_flow", "lint_flow",
-            }),
-        ),
-        requires_state=("requires_inspect_page",),
-        check=_check_requires_inspect_page,
-        contract="运行失败若带 inspect_hint，必须先 inspect_page 拿真实 DOM，才能再修节点或重跑。",
-    ),
-    Guard(
-        id="requires_quality_fix",
-        summary="assert_run_output 未通过时禁止重跑，必须先修 repair_plan",
-        scope=ToolScope(include=frozenset({"run_flow"})),
-        requires_state=("requires_quality_fix",),
-        check=_check_requires_quality_fix,
-        contract="assert_run_output 不通过就重跑，只会再得到一次「技术成功但业务不可信」的结果，会被阻断。",
-    ),
-    Guard(
-        id="requires_lint_fix",
-        summary="存在阻断级 lint finding 时禁止运行",
-        scope=ToolScope(include=frozenset({"run_flow"})),
-        requires_state=("requires_lint_fix",),
-        check=_check_requires_lint_fix,
-        contract="lint_flow 报出的阻断级 finding 未修完之前，run_flow 会被阻断。",
-    ),
-    Guard(
-        id="field_oscillation",
-        summary="禁止把 selector/extractMode 改回本流程用过的旧值（跨会话累计）",
-        scope=ToolScope(include=frozenset({"update_flow", "apply_node_fix"})),
-        check=_check_field_oscillation,
-        contract="selector/extractMode 改回以前试过的旧值会被阻断——两个方案都失败过，再翻一次不会有新结果。",
-    ),
-    Guard(
-        id="node_selector_fix_budget",
-        summary=f"同一节点 selector 改满 {NODE_SELECTOR_FIX_BUDGET} 次后，须先取得新页面证据才能再改",
-        scope=ToolScope(include=frozenset({"update_flow", "apply_node_fix"})),
-        check=_check_node_selector_fix_budget,
-        contract=(
-            f"同一节点的 selector 累计改过 {NODE_SELECTOR_FIX_BUDGET} 次（含历史会话）后，"
-            "必须先 inspect_page/inspect_screenshot 取得新证据才能再改。"
-        ),
-    ),
-    Guard(
-        id="repair_autorun_lock",
-        summary="用户只要求修复时，改完不许顺手 run_flow",
-        scope=ToolScope(include=frozenset({"run_flow"})),
-        requires_state=("repair_autorun_lock",),
-        check=_check_repair_autorun_lock,
-        contract="用户只说「修一下 / 报错了」时，改完交回用户，不要顺手 run_flow；要不要重跑由用户决定。",
-    ),
-    Guard(
-        id="pending_repair_gate",
-        summary="修复意图下必须先 lint_flow（必要时加 inspect_page）才能改节点",
-        scope=ToolScope(include=frozenset({"apply_node_fix", "update_flow"})),
-        requires_state=("pending_repair_gate",),
-        check=_check_pending_repair_gate,
-        contract="用户说「修一下」时，先 lint_flow 定位问题再动手；跳过诊断直接改节点会被阻断。",
-    ),
-)
-
-
-# ── 参数改写：不是拦截，但同样必须在工具执行前发生 ────────────────────────────
-
-
-def _mutate_requirement_provenance(tool_name: str, args: dict[str, Any], state: dict[str, Any]) -> None:
-    """assert_run_output 的两个自证入口收归系统。
-
-    requirement_text 和 content_match_confirmed 都由被审计方自己填：模型可以把需求
-    复述成本轮的修复任务，再顺手把确认位置 true，对齐检查就永远命中不了真实需求。
-    确认位只在工具真报过内容不匹配问题之后才作数（表格与文档两条路径的问题名见
-    ai_orchestrator._CONTENT_MISMATCH_ISSUES）。
-    """
-    session_requirement = str(state.get("user_requirement_text") or "").strip()
-    if session_requirement and args.get("requirement_text") != session_requirement:
-        args["requirement_text"] = session_requirement
-        state["requirement_text_overridden"] = True
-    if args.get("content_match_confirmed") and not state.get("content_mismatch_reported"):
-        args["content_match_confirmed"] = False
-        state["content_match_confirm_stripped"] = True
-
-
-@dataclass(frozen=True)
-class ArgMutator:
-    id: str
-    summary: str
-    scope: ToolScope
-    apply: Callable[[str, dict[str, Any], dict[str, Any]], None]
-
-
-ARG_MUTATORS: tuple[ArgMutator, ...] = (
-    ArgMutator(
-        id="requirement_provenance",
-        summary="assert_run_output 的 requirement_text/content_match_confirmed 由系统改写，不采信模型自填",
-        scope=ToolScope(include=frozenset({"assert_run_output"})),
-        apply=_mutate_requirement_provenance,
     ),
 )
 
@@ -1034,10 +469,6 @@ def apply_pre_tool_guards(
     state: dict[str, Any],
 ) -> dict[str, Any] | None:
     """按策略表顺序求值；第一条命中的 guard 即拦截结果，返回 None 表示放行。"""
-    for mutator in ARG_MUTATORS:
-        if mutator.scope.matches(tool_name):
-            mutator.apply(tool_name, args, state)
-
     for guard in GUARDS:
         if not guard.applies(tool_name, state):
             continue

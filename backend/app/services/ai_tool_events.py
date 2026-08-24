@@ -33,14 +33,17 @@ def attach_tool_events(tool_name: str, result: Any) -> Any:
             "status": result.get("status"),
             "definition_digest": result.get("definition_digest"),
         })
-    elif tool_name == "assert_run_output" and "passed" in result:
-        events.append({
-            "type": "audit_completed",
-            "task_id": result.get("task_id"),
-            "flow_revision": result.get("flow_revision"),
-            "passed": result.get("passed"),
-            "definition_digest": result.get("definition_digest"),
-        })
+        # 审计随 run_flow 一起回来，所以两个事件同一轮产出：run_completed 说明「跑到底了」，
+        # audit_completed 说明「产物合格」，证据等级是两级，不能合成一个。
+        audit = result.get("acceptance_audit")
+        if isinstance(audit, dict) and "passed" in audit:
+            events.append({
+                "type": "audit_completed",
+                "task_id": audit.get("task_id") or result.get("task_id"),
+                "flow_revision": audit.get("flow_revision"),
+                "passed": audit.get("passed"),
+                "definition_digest": audit.get("definition_digest"),
+            })
     if events:
         result["events"] = events
     return result

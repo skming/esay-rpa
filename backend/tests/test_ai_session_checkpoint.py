@@ -5,6 +5,8 @@
 以及反面：任务做完之后不许再背着旧熔断。
 """
 
+import ast
+import inspect
 import json
 import time
 from pathlib import Path
@@ -12,7 +14,17 @@ from typing import Any
 
 import pytest
 
+from app.services import ai_orchestrator, ai_phases
 from app.services import ai_session_checkpoint as checkpoint
+from app.services.ai_phases import VERIFY_ATTEMPT_BUDGET
+
+# guard_state 在这两个模块里出现的全部局部名。漏一个名字这条元测试就少扫一批写入点，
+# 于是变成一盏假绿灯——名字要跟着改动一起加。
+_STATE_VAR_NAMES = frozenset({"state", "guard_state", "facts"})
+
+
+def _budget(spent: int, *, attempts: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    return {"spent": spent, "signatures": {}, "attempts": attempts or []}
 
 
 @pytest.fixture(autouse=True)
@@ -22,23 +34,30 @@ def _isolated_ai_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
 def test_budgets_and_obligations_survive_a_round_trip() -> None:
     checkpoint.save("f1", {
-        "failed_run_cycles": 2,
-        "requires_inspect_page": True,
+        "attempt_budget": _budget(2),
+        "audit_findings": {"issues": [{"issue": "mixed_ui_rows"}], "repair_plan": []},
         "page_snapshot": {"huge": "irrelevant"},
     }, rounds=3)
-    assert checkpoint.load("f1") == {"failed_run_cycles": 2, "requires_inspect_page": True}
+    assert checkpoint.load("f1") == {
+        "attempt_budget": _budget(2),
+        "audit_findings": {"issues": [{"issue": "mixed_ui_rows"}], "repair_plan": []},
+    }
 
 
 def test_only_whitelisted_keys_persist() -> None:
     """guard_state 里大部分是本轮请求自带的上下文，存下来只会在下轮变成过期事实。"""
-    checkpoint.save("f1", {"failed_run_cycles": 1, "model_no_vision": True}, rounds=1)
+    checkpoint.save("f1", {"attempt_budget": _budget(1), "model_no_vision": True}, rounds=1)
     assert "model_no_vision" not in checkpoint.load("f1")
 
 
 def test_clean_state_leaves_no_file_behind() -> None:
-    """留一份全空的检查点，只会让之后每次会话都白读一次盘。"""
-    checkpoint.save("f1", {"failed_run_cycles": 3}, rounds=1)
-    checkpoint.save("f1", {"failed_run_cycles": 0}, rounds=2)
+    """留一份全空的检查点，只会让之后每次会话都白读一次盘。
+
+    未动过的预算（spent=0）不算未了结事项：它是「这轮从零开始」的默认值，
+    存一份只会让下一轮白读一次盘。
+    """
+    checkpoint.save("f1", {"attempt_budget": _budget(3)}, rounds=1)
+    checkpoint.save("f1", {"attempt_budget": None}, rounds=2)
     assert checkpoint.load("f1") == {}
 
 
@@ -62,12 +81,12 @@ def test_corrupt_checkpoint_is_ignored_not_raised(tmp_path: Path) -> None:
 
 def test_missing_flow_id_is_a_no_op() -> None:
     """临时流程没有 id，落盘会互相串台。"""
-    checkpoint.save(None, {"failed_run_cycles": 5}, rounds=1)
+    checkpoint.save(None, {"attempt_budget": _budget(5)}, rounds=1)
     assert checkpoint.load(None) == {}
 
 
 def test_clear_removes_the_checkpoint() -> None:
-    checkpoint.save("f1", {"failed_run_cycles": 2}, rounds=1)
+    checkpoint.save("f1", {"attempt_budget": _budget(2)}, rounds=1)
     checkpoint.clear("f1")
     assert checkpoint.load("f1") == {}
 
@@ -92,24 +111,89 @@ def test_summarize_stays_quiet_for_browser_dom_evidence() -> None:
 
 def test_summarize_speaks_only_when_something_is_unfinished() -> None:
     assert checkpoint.summarize({}) is None
-    assert checkpoint.summarize({"navigation_failure_counts": {"a": 1}}) is None
+    assert checkpoint.summarize({"attempt_budget": _budget(0)}) is None
 
 
-def test_summarize_explains_the_lock_instead_of_just_carrying_it() -> None:
+def test_summarize_explains_the_exhausted_budget_instead_of_just_carrying_it() -> None:
     """不解释就等于模型凭空少了额度——它会反复试同一件事然后反复被拦。"""
     note = checkpoint.summarize({
-        "repair_cycle_lock": {"cycles": 3},
-        "requires_lint_fix": True,
+        "attempt_budget": _budget(VERIFY_ATTEMPT_BUDGET),
+        "runtime_escape_findings": [{"issue": "undefined_variable_ref_runtime_escape"}],
     })
     assert note is not None
-    assert "3" in note and "熔断" in note
-    assert "lint" in note
+    assert "额度已经耗尽" in note
+    assert "未定义变量" in note
 
 
-def test_summarize_prefers_the_lock_over_the_raw_count() -> None:
-    note = checkpoint.summarize({"repair_cycle_lock": {"cycles": 2}, "failed_run_cycles": 2})
+def test_summarize_hands_back_the_directions_already_tried() -> None:
+    """只说「额度有限」模型会换一个同类改法再试；把试过的方向交回去才躲得开。"""
+    note = checkpoint.summarize({
+        "attempt_budget": _budget(1, attempts=[{"kind": "run_error", "detail": "改了 tbody tr"}]),
+    })
     assert note is not None
-    assert note.count("- ") == 1
+    assert "改了 tbody tr" in note
+    # 不报剩余数字：报数字等于把上限当额度用
+    assert str(VERIFY_ATTEMPT_BUDGET) not in note
+
+
+def test_summarize_carries_the_pending_dom_evidence_obligation() -> None:
+    """义务本身由阶段机拦，但不解释模型只会撞一次墙才知道；url 要一并交回去。"""
+    note = checkpoint.summarize({
+        "page_evidence_required": {"url": "https://a.test/", "reason": "run_failed_on_page_element"},
+    })
+    assert note is not None
+    assert "inspect_page" in note and "https://a.test/" in note
+
+
+def test_static_diagnostics_are_not_carried_across_sessions() -> None:
+    """静态诊断存下来只会在流程已经修好之后还挡着人：它每轮由状态块重算。
+
+    运行期逃逸必须反过来——静态扫描看不见它，重算永远算不出来，不存就丢。
+    """
+    assert "blocking_diagnostics" not in checkpoint._PERSISTED_KEYS
+    assert "runtime_escape_findings" in checkpoint._PERSISTED_KEYS
+
+
+def test_every_guard_state_key_is_explicitly_decided() -> None:
+    """写入侧唯一的症状来源。
+
+    编排层往 guard_state 里写 29 个键，「这个键要不要跨轮留下」全靠人记得。
+    忘了存 → 中断续跑丢义务；不该存却存了 → 流程已经修好还挡着人。两种都不报错。
+    所以每个被写过的键必须在两张表里表过态，新增一个而没表态就在这里红。
+    """
+    written: set[str] = set()
+    for module in (ai_orchestrator, ai_phases):
+        tree = ast.parse(inspect.getsource(module))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if (
+                        isinstance(target, ast.Subscript)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id in _STATE_VAR_NAMES
+                        and isinstance(target.slice, ast.Constant)
+                        and isinstance(target.slice.value, str)
+                    ):
+                        written.add(target.slice.value)
+            # setdefault 也是写：node_selector_fix_counts 就只经由它建出来
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "setdefault"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in _STATE_VAR_NAMES
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+            ):
+                written.add(node.args[0].value)
+
+    assert written, "取不到任何 state 键，这条元测试会静默通过"
+    undecided = written - set(checkpoint._PERSISTED_KEYS) - checkpoint._PER_ROUND_KEYS
+    assert not undecided, f"以下键没在检查点表过态：{sorted(undecided)}"
+    # 反向：表里写了却没人写这个键，说明键名改过而表没跟上
+    stale = (set(checkpoint._PERSISTED_KEYS) | checkpoint._PER_ROUND_KEYS) - written
+    assert not stale, f"以下键已无人写入，检查点名单过期：{sorted(stale)}"
 
 
 async def test_interrupted_session_keeps_what_the_tools_already_cost(
@@ -129,7 +213,8 @@ async def test_interrupted_session_keeps_what_the_tools_already_cost(
     monkeypatch.setattr(checkpoint, "resolve_ai_dir", lambda: tmp_path)
 
     class _ErrorExecutor:
-        async def execute(self, tool_name: str, args: dict[str, Any], progress_sink: Any = None) -> dict[str, Any]:
+        async def execute(self, tool_name: str, args: dict[str, Any],
+                          progress_sink: Any = None, change_context: Any = None) -> dict[str, Any]:
             # selector 超时：编排层据此立下「必须先 inspect_page」的义务
             return {"status": "ok", "inspect_hint": True, "last_browser_url": "https://a.test"}
 
@@ -150,7 +235,7 @@ async def test_interrupted_session_keeps_what_the_tools_already_cost(
             break
     await stream.aclose()
 
-    assert checkpoint.load("f-int").get("requires_inspect_page"), "中断丢掉义务后，下轮会直接重跑而不是先看 DOM"
+    assert checkpoint.load("f-int").get("page_evidence_required"), "中断丢掉义务后，下轮会直接重跑而不是先看 DOM"
 
 
 async def test_orchestrator_resumes_then_clears_on_completion(
@@ -164,7 +249,7 @@ async def test_orchestrator_resumes_then_clears_on_completion(
     from test_ai_orchestrator import _chunk, _FakeExecutor, _FakeStream  # noqa: F401
 
     monkeypatch.setattr(checkpoint, "resolve_ai_dir", lambda: tmp_path)
-    checkpoint.save("f-ck", {"repair_cycle_lock": {"cycles": 3}}, rounds=4)
+    checkpoint.save("f-ck", {"attempt_budget": _budget(VERIFY_ATTEMPT_BUDGET)}, rounds=4)
 
     captured: list[list[dict[str, Any]]] = []
 

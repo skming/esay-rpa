@@ -212,8 +212,13 @@ RPA 助手（对话面板）通过工具调用（Function Calling）直接操作
 - **诊断错误**：读取失败节点配置和日志，并附带失败瞬间的页面截图供视觉模型直接查看（`get_run_error`、`get_run_logs`）
 - **检查页面事实**：`inspect_page` 优先读取浏览器 DOM；浏览器返回 HTTP 错误或验证墙时，在同一次调用内降级为 Scrapling 静态抓取，并返回正文样本和 selector 候选
 - **识别日期控件并给出交互配方**：`inspect_page` 会返回 `date_controls[].interaction_recipe`——命中 Element UI / Ant Design 时用内置配方；其他组件库（Arco/Vant/iView/自研）按输入框的日期特征推断出 `library:"generic"` 的通用配方，selector 同样取自真实 DOM。两者都以「键入日期文本 + Enter + 回读硬门控」为主路线
-- **校验变量引用**完整性（`validate_flow`）
-- **审计运行质量**：运行成功后检查输出是否可验证、是否混入 UI 行、是否满足日期/枚举等需求约束（`assert_run_output`）。文档型交付（md/html/pdf…）额外比对本次抓取到的数据是否真的出现在正文里（`document_missing_run_data`）——正文整篇由脚本写出，只比需求关键词等于让模型拿自己写的标题自证，这条不接受自证
+- **校验变量引用**完整性、读取流程定义与诊断结论：不再是工具。这些答案由平台每轮重算一份
+  「流程状态块」放在消息尾部（`backend/app/services/ai_flow_state.py`），模型开口就已经拿到，
+  没有可调的工具，也就没有「要不要再确认一遍」这个决定
+- **审计运行质量**：运行结束后由平台自己跑（`backend/app/services/ai_checks.py`），检查输出是否可验证、
+  是否混入 UI 行、是否满足日期/枚举等需求约束，结论随状态块刷新。文档型交付（md/html/pdf…）额外比对
+  本次抓取到的数据是否真的出现在正文里（`document_missing_run_data`）——正文整篇由脚本写出，只比需求
+  关键词等于让模型拿自己写的标题自证，这条不接受自证
 - **发布流程**（`publish_flow`，将状态改为 `active`，使其可被调度和子流程调用）
 
 ### 提示词与工具契约
@@ -221,21 +226,27 @@ RPA 助手（对话面板）通过工具调用（Function Calling）直接操作
 - system prompt 在 `backend/app/services/ai_prompts.py` 分段维护，不接受环境变量切换或旧版本回退。
   页面首轮事实探测使用同一份规则源生成的 `PAGE_DISCOVERY_PROMPT`，DOM 检查完成后切换到完整
   `SYSTEM_PROMPT`；二者是运行阶段，不是可并存的提示词版本。历史内容由 Git 追溯。
-- 当前提示词删除了已由 `lint_flow`、工具返回的 `repair_plan` 和节点目录实时提供的重复诊断内容，
+- 当前提示词删除了已由流程状态块、工具返回的 `repair_plan` 和节点目录实时提供的重复诊断内容，
   避免静态说明与代码行为漂移。新增规则前先判断它属于模型决策偏好还是必须执行的不变量；
-  后者应进入 Guard 或执行器校验，而不是继续堆叠提示词。
+  后者应进入 Guard、阶段准入或执行器校验，而不是继续堆叠提示词。
 - 模型可调用的参数以 `backend/app/services/ai_tools/schemas.py` 的 `TOOL_SCHEMAS` 为唯一公开契约。
   工具描述必须说明返回值能证明什么、不能证明什么；例如 `get_run_output` 只读取产物，不能替代
-  `assert_run_output` 的业务验收。
-- `assert_run_output` 对模型只公开 `task_id`。日期、枚举、数量范围等验收要求来自创建流程时冻结的
-  acceptance contract（验收契约），不能由模型在验收时临时填写或自我确认。
+  平台的业务验收。
+- 验收判据不接受模型提供：日期、枚举、数量范围等要求来自创建流程时冻结的 acceptance contract
+  （验收契约），审计由平台在运行结束后自己发起，模型既没有发起权也没有跳过权。
 
 ### Token 与工具调用成本控制
 
-- **按阶段暴露工具**：创建请求缺少 URL 时不发送 Tool Schema（工具参数定义）；拿到 URL、尚未完成
-  页面检查时只暴露 `inspect_page`。页面检查完成后才开放构建和运行工具。当前 inspect 阶段的
-  只发送单个工具契约，而不是整套工具定义。前端生成的 `local-*` 草稿 ID 直接按空白流程处理，
-  不查询不存在的后端流程，也不会误加载完整提示词和全部工具。
+- **按阶段暴露工具**：工具集由阶段机（`backend/app/services/ai_phases.py`）的准入表算出，
+  暴露与放行是同一个判断——暴露了却会被拦等于故意让模型白花一轮，这条不变量由
+  `tests/test_ai_phases.py::test_schema_exposure_matches_admission_exactly` 钉住。创建请求缺少 URL
+  时不发送 Tool Schema（工具参数定义）；拿到 URL、尚未完成页面检查时只暴露 `inspect_page`。
+  前端生成的 `local-*` 草稿 ID 直接按空白流程处理，不查询不存在的后端流程，也不会误加载完整
+  提示词和全部工具。
+- **状态块替代复检工具**：`get_flow` / `lint_flow` / `validate_flow` / `get_run_status` 已从 schema
+  撤下，改由每轮重算的状态块回答。旧设计在开场注入一次流程定义并用 `protect_prefix` 保护，
+  模型每写一次流程这份注入就过期一次，于是复检占掉了实测全部工具调用的 18%。状态块位于缓存锚点
+  之后，本来每轮都要重发，放这里不额外增加缓存开销。
 - **按阶段加载提示**：页面首轮只需要判断 URL 能否取得真实 DOM，不加载节点格式、脚本、运行审计等
   构建手册。该阶段提示由 26,937 字符降到 1,620 字符，减少 **94.0%**；检查成功后才加载完整规则。
 - **few-shot 按复杂度注入**：20,619 字符的登录/日期/筛选/分页示例只用于确实包含这些复杂特征且
@@ -283,28 +294,43 @@ RPA 助手**无法做到**：
 闸门的判据一律挂在**节点实际做的事**上，不挂节点类型白名单：同一个缺陷换一种脚本语言写、
 换一个等价节点做，必须一样拦得住——否则闸门的宽严取决于模型的写法偏好，而抹平模型差异正是它的目的。
 
-RPA 助手的关键安全规则不只依赖 system prompt，而是在编排层和工具层硬执行。这些护栏登记在
-一张策略表里（`backend/app/services/ai_guards.py`），提示词中的「系统硬约束」段落由该表自动
-生成，因此不存在「规则改了但提示词还写着旧的」这种两份维护。被拦截时返回里带 `guard_id`，
-指明踩到的是哪一条：
+RPA 助手的关键安全规则不只依赖 system prompt，而是在编排层和工具层硬执行。拦截分两层，
+问的是两个不同问题：
+
+1. **`ai_guards.py` 的策略表**——「这个调用本身就不该发生」，与历史无关（凭据带值、契约不绑用户原文、
+   只读模式、非视觉模型看截图、静态证据配动态流程、拦截页已确认）。提示词中的「系统硬约束」段落由该表
+   自动生成，因此不存在「规则改了但提示词还写着旧的」这种两份维护。
+2. **`ai_phases.py` 的阶段机**——「这个调用现在还不到时候」。每轮按事实重算阶段（预算烧完 → REPORT、
+   欠页面证据 → DISCOVER、流程还空 → BUILD、有阻断诊断或审计发现 → FIX、否则 VERIFY），阶段决定
+   哪些工具被准入。它不存状态，所以不存在「阶段标记跟真实情况不同步」这一类 bug。
+
+被拦截时返回里带 `guard_id`，指明踩到的是哪一条：
 
 | 闸门              | 行为                                                                                                                                                                      |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Selector 失败熔断 | `get_run_error` 返回 `inspect_hint` 后，编排层会阻止继续 `run_flow` 或盲目修节点，直到调用 `inspect_page` 获取真实 DOM                                                    |
-| 质量审计熔断      | `assert_run_output.passed=false` 后，未按 `repair_plan` 修复前会阻止再次 `run_flow`                                                                                       |
-| 凭据写入熔断      | `create_flow` 中 credential/sensitive 变量携带非空默认值时直接阻断，要求清空值并改由输入变量面板配置                                                                    |
+| 凭据写入熔断      | `create_flow` 中 credential/sensitive 变量携带非空默认值时直接阻断，要求清空值并改由输入变量面板配置（`credential_values_must_stay_out_of_ai_tools`）                     |
+| 验收契约来源      | 契约必须逐条绑定用户原文，低置信度或未确认的推断先向用户澄清；改契约要带用户新原话（`acceptance_contract_sources_must_match_user`、`acceptance_contract_change_requires_user_quote`） |
 | 页面访问终止      | `inspect_page` 的 Stealth Browser 与 Scrapling 静态抓取均未取得真实业务内容时，才返回 `blocked_page_access` / `blocked_challenge_page` 并收尾；单通道失败不会直接拒绝 |
 | 证据通道一致性    | `inspect_page` 降级到静态抓取（`inspection_source=scrapling_static`）后，证据只能证明纯 HTTP 通道可用：`create_flow` 主链路必须是 `browser.fetch`，且 `fetcher` 只能是 `static`（同属 `static_page_evidence_requires_fetch_flow`）——`dynamic`/`stealthy` 在运行时会走回刚失败的 Playwright，节点类型对了通道仍然是错的。`update_flow` 只改非浏览器节点时不拦，避免正常修复被误判 |
-| 阻断级 lint       | `critical_action_continue_on_error`、`script_uses_browser_dom`、`table_extract_selector_targets_container`、`date_filter_missing_verification`、`submit_key_on_body`、`client_side_filter_masks_page_filter`、`login_without_navigation_to_data_page`、`probe_extract_without_continue_on_error`、`unavailable_artifact_format`、`claimed_semantic_capability_unavailable` 等发现会阻止不可信运行。这类 finding 多数只是 `warn` 级（流程不报错，只是安静地跑出错数据），所以 `create_flow` / `update_flow` / `apply_node_fix` / `lint_flow` 的返回值会逐条标出 `blocks_run`，助手据此先修再跑，而不是撞上阻断才知道 |
-| 修复不顺手重跑    | 用户只说「修一下 / 报错了」时，助手改完必须交回用户，不会自己 `run_flow`——运行会真的打开浏览器操作目标站点，这个决定归用户。用户下一句表示要跑时限制自动解除；本轮自己跑出来的错另算，那次运行是用户点的 |
+| 阻断级 lint       | `critical_action_continue_on_error`、`script_uses_browser_dom`、`table_extract_selector_targets_container`、`date_filter_missing_verification`、`submit_key_on_body`、`client_side_filter_masks_page_filter`、`login_without_navigation_to_data_page`、`probe_extract_without_continue_on_error`、`unavailable_artifact_format`、`claimed_semantic_capability_unavailable` 等发现会阻止不可信运行（`blocking_diagnostics_must_be_fixed`）。这类 finding 多数只是 `warn` 级（流程不报错，只是安静地跑出错数据），所以工具返回值会逐条标出 `blocks_run`，助手据此先修再跑，而不是撞上阻断才知道 |
+| 质量审计熔断      | 平台跑出的审计不通过后，未按 `repair_plan` 修复前会阻止再次 `run_flow`（`audit_findings_must_be_fixed`）                                                                   |
+| 修复不顺手重跑    | 用户只说「修一下 / 报错了」时，助手改完必须交回用户，不会自己 `run_flow`——运行会真的打开浏览器操作目标站点，这个决定归用户（`run_not_authorized`）。用户下一句表示要跑时限制自动解除；本轮自己跑出来的错另算，那次运行是用户点的 |
+| 重复取证去重      | 同一取证调用（同工具同参数）连着来第二次会被拒绝，改动落盘后同一个调用重新合法（`evidence_already_collected`）。`run_flow` 的重复算「又试了一次」，走预算不走这条 |
 | 重复修复去重      | 同一对话中重复提交完全相同的节点 patch 会被拒绝，防止弱模型反复无效尝试                                                                                                   |
+| 单一收敛预算      | 「又试了一次又没成」统一记账（`VERIFY_ATTEMPT_BUDGET=3`）：换个节点改、换个工具调、换个说法都不额外买额度，重复同一个失败签名计两份，所以同一面墙第 3 次撞上就把这一轮交回用户并说明缺什么（`attempt_budget_exhausted`）。前置校验被连拦也走这条账——第一次拦截是可改正的具体错误，免费；第三次相同拦截就是空转 |
 | 节点级修复熔断    | 同一节点的 selector 累计修改 2 次后，第 3 次修改会被阻断，必须先获取新页面证据（`inspect_page` / `inspect_screenshot` / `get_run_error` 失败截图）；疑似验证码时会被引导改插 `control.human_takeover` 而非继续改 selector |
-| 跨会话修复台账    | 上述计数落盘在 `~/.easy-rpa/ai/repairs/flow_<id>.json`，新会话读回后继续累计；开场即把「这些节点改过几次、试过哪些 selector」告知模型，避免用户回一句「还是不行」就重试同一批失败方案。`assert_run_output` 通过即清账 |
-| 会话检查点        | 失败预算与未了结的义务（必须先 `inspect_page`、lint 未修完、审计未通过）落盘在 `~/.easy-rpa/ai/checkpoints/flow_<id>.json`。用户点停止、断流、关窗后重开，这些额度不会归零；拿到最终回复即清账，新任务不背旧熔断。2 小时未更新自动作废 |
+| 字段回摆          | 把某个字段改回这个流程用过的旧值会被拦：两个方案都失败过，再翻一次同样不会成功。解锁条件与 selector 预算同一个——拿到新页面证据 |
+| 跨会话修复台账    | 上述计数落盘在 `~/.easy-rpa/ai/repairs/flow_<id>.json`，新会话读回后继续累计；开场即把「这些节点改过几次、试过哪些 selector」告知模型，避免用户回一句「还是不行」就重试同一批失败方案。审计通过即清账 |
+| 会话检查点        | 失败预算与未了结的义务（欠页面证据、lint 未修完、审计未通过）落盘在 `~/.easy-rpa/ai/checkpoints/flow_<id>.json`。用户点停止、断流、关窗后重开，这些额度不会归零；拿到最终回复即清账，新任务不背旧熔断。2 小时未更新自动作废 |
 | 站点经验档案      | 按域名沉淀在 `~/.easy-rpa/ai/site_knowledge.json`，对话提到同域名时注入。**双向记录**：跑通过的 selector / UI 框架 / 登录探针供直接复用；真实运行中未命中的 selector 列为「已证伪」，避免换个流程抓同一站点时重踩同一个坑。同一 selector 后来跑通即撤销，失败记录 14 天过期 |
 
-`run_flow` 返回 `success` 只代表节点没有抛出运行异常，不代表业务结果可信。抓取、筛选、导出类流程必须继续执行
-`get_run_output` 和 `assert_run_output(task_id)`；后者只使用流程冻结的验收契约。
+**诊断手段永不没收**：`get_run_error` / `get_run_logs` / `get_run_output` / `inspect_page` /
+`inspect_screenshot` 以及节点目录查询在任何阶段都放行。挡掉纯读工具等于让模型在剩下几个工具间空转，
+历史上的「效率优化」正是这么变成死循环的。
+
+`run_flow` 返回 `success` 只代表节点没有抛出运行异常，不代表业务结果可信。抓取、筛选、导出类流程的
+输出可信度由平台在运行结束后自己审计，模型没有跳过权；它宣称「验收通过」而平台没有对应结论时，
+回复会被撤回重写。
 
 ### 已知行为限制
 
@@ -312,7 +338,8 @@ RPA 助手的关键安全规则不只依赖 system prompt，而是在编排层�
 | -------------- | ---------------------------------------------------------------------------------------------------------------------- |
 | 选择器盲猜     | 目标网站 DOM 结构未知时，AI 可能按框架惯例推测选择器；失败后会被要求先 `inspect_page` 再修复                           |
 | 复杂筛选 UI    | 日期选择器、多选下拉等复杂过滤 UI 需要用真实 DOM 和运行输出校验，不能只看节点运行成功                                  |
-| 输出污染       | 抽取范围过宽时可能混入日历、分页、按钮等非业务 UI 行；`assert_run_output` 会返回 `mixed_ui_rows` 并要求收窄范围        |
+| 输出污染       | 抽取范围过宽时可能混入日历、分页、按钮等非业务 UI 行；平台审计会返回 `mixed_ui_rows` 并要求收窄范围        |
+| 假交付         | 弱模型可能在一次写入都没成功的情况下宣称「流程已创建」。编排层按 `_FLOW_SAVED_CLAIM_PHRASES` 与自签 revision 回执识别并撤回整段回复要求重写；评测里同一份短语表作为全套不变量判假绿灯 |
 | 弱模型质量差异 | 能力较弱的模型仍可能效率低、修复路径绕远；硬熔断会减少盲跑，但生产建议使用 Claude Sonnet 5/Opus 4.8、GPT-5.5 等强模型 |
 
 ---

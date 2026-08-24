@@ -74,7 +74,7 @@ def annotate_lint_findings(findings: list[dict[str, Any]]) -> tuple[list[dict[st
     """给每条 finding 标上会不会挡住运行，并给出对应的措辞。
 
     阻断名单只存在于编排层，模型看不见：它读到的是「warn」，据此判断可以先跑一次看看，
-    然后被 requires_lint_fix 拦在 run_flow 上。这一轮既没跑成也没修成，而模型手上
+    然后被 blocking_diagnostics_must_be_fixed 拦在 run_flow 上。这一轮既没跑成也没修成，而模型手上
     没有任何字段能让它提前避开——所以要修的是这里的返回值，不是提示词。
     """
     marked = [{**f, "blocks_run": is_blocking_finding(f)} for f in findings]

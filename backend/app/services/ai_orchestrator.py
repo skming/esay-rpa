@@ -7,28 +7,45 @@ import logging
 import os
 import re
 import time
-from collections.abc import AsyncIterator
-from dataclasses import dataclass, field as dc_field
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 from app.services import ai_repair_ledger as _repair_ledger
 from app.services import ai_session_checkpoint as _session_checkpoint
 from app.services.ai_config_service import AiConfigService
 from app.services.ai_guards import (
-    MAX_REPAIR_CYCLES as _MAX_REPAIR_CYCLES,
-    NAV_FAILURE_BUDGET as _NAV_FAILURE_BUDGET,
     PARALLEL_SAFE_TOOLS as _PARALLEL_SAFE_TOOLS,
+    WRITE_TOOLS,
     apply_pre_tool_guards,
-    node_field_changes as _node_field_changes,
-    selector_change_node_ids as _selector_change_node_ids,
 )
+from app.services.ai_phases import (
+    Phase,
+    admitted_tool_names,
+    apply_phase_gate,
+    initial_facts,
+    note_evidence,
+    note_failed_attempt,
+    note_guard_block,
+    note_progress,
+    note_verified,
+    reclassify_last_attempt,
+    resolve_phase,
+)
+from app.services.ai_tools.lint_diff import ChangeContext as _ChangeContext
 from app.services.ai_prompts import PAGE_DISCOVERY_PROMPT, SYSTEM_PROMPT
+from app.services.ai_flow_state import (
+    FlowState,
+    build_flow_state,
+    is_local_draft_flow_id as _is_local_draft_flow_id,
+    render_flow_state,
+    sync_state_message,
+)
 from app.services.ai_tool_events import attach_tool_events, current_verification_status, reduce_evidence_state
 from app.services.ai_evidence_ledger import load_verification_state, record_events
 from app.services.ai_tools import TOOL_SCHEMAS, RpaToolExecutor
-from app.services.ai_tools.diagnostics import CONTENT_MISMATCH_ISSUES, SELECTOR_DIAGNOSTIC_KINDS
+from app.services.ai_tools.diagnostics import SELECTOR_DIAGNOSTIC_KINDS
 from app.services.node_semantics import TRANSFORM_NODE_TYPES
-from app.services.execution_evidence import definition_digest
 from app.services.ai_tools.lint import is_blocking_finding
 
 logger = logging.getLogger(__name__)
@@ -194,25 +211,39 @@ MAX_TOOL_ROUNDS = 30  # strong 模型的轮次上限；weak/standard 模型用�
 
 # 场景化 guidance，按事件注入，避免每轮携带全量指令
 
-# 创建流程后：lint → validate → (凭据检查) → run
-_GUIDANCE_AFTER_CREATE = (
-    "流程已创建（无需确认）。请勿再调用 create_flow。下一步：\n"
-    "1. 检查上方 lint_findings，用 apply_node_fix/update_flow 修复所有 severity=error 问题。\n"
-    "2. 调用 validate_flow 确认 is_valid=true。\n"
-    "3. 若 input_variables 含空凭据字段（账号/密码）→ 告知用户先填写，不要自动运行。\n"
-    "4. 否则调用 run_flow。"
-)
 
-# 修复节点后：validate → run（lint 已在修复时内联）
-_GUIDANCE_AFTER_FIX = (
-    "变更已写入（无需确认）。下一步：调用 validate_flow 确认变量引用无误，再调用 run_flow。"
-)
+def _after_write_directive(result: dict[str, Any], state: dict[str, Any]) -> str:
+    """写入成功后的下一步，由结果与本轮授权推导，不靠模型记忆一串固定顺序。
 
-# 运行成功后：get_run_output → 抓取类流程须 assert_run_output
+    这里不再复述静态诊断。写入完成后下一轮的状态块就是按新 revision 重算的，
+    在这里再列一遍只是同一份结论的第二个副本——两份一旦不一致（写入返回是写入那一刻的，
+    状态块是下一轮读到的），模型无从判断该信哪个。
+    """
+    revision = result.get("revision")
+    head = f"变更已写入并生效{f'（revision {revision}）' if revision is not None else ''}。"
+    if result.get("connectivity_warning"):
+        # 连通性是写入前后对比才看得出来的（孤儿分支、断掉的 foreach），
+        # 静态诊断读单份定义看不到，所以这条必须在这里讲
+        return (
+            f"{head}但检测到连通性问题：{result.get('connectivity_warning')}\n"
+            "先补连线，再谈运行。"
+        )
+    if not state.get("run_authorized"):
+        return (
+            f"{head}本轮用户只要求修复、没有要求运行：向用户说明改了什么、为什么，"
+            "并问是否要运行验证。不要调用 run_flow。"
+        )
+    return (
+        f"{head}状态块里还有 severity=error 的诊断就先修完；"
+        "已经干净了就调用 run_flow 验证，"
+        "凭据未就绪时按状态块的提示让用户先填，不要编造凭据值。"
+    )
+
+
+# 运行成功后：验收结论已经在返回里，只剩「看产物」和「据实汇报」
 _GUIDANCE_AFTER_RUN_SUCCESS = (
-    "运行成功。调用 get_run_output 查看产物；"
-    "抓取/筛选/导出类流程还须调用 assert_run_output(task_id) 按流程冻结的验收契约审计，"
-    "审计通过后才能向用户汇报完成。"
+    "运行成功，返回里的 acceptance_audit 就是平台按流程冻结的验收契约算出的结论。"
+    "acceptance_audit.passed=true 才能向用户汇报完成；要看产物本身调 get_run_output。"
 )
 
 # 运行失败后：get_run_error → 按错误类型修复
@@ -221,17 +252,20 @@ _GUIDANCE_AFTER_RUN_ERROR = (
     "• inspect_hint 非空 → 编排层已锁定，必须先调 inspect_page(url=last_browser_url)，禁止直接改 selector。\n"
     "• Timeout / selector 定位失败 → 调 inspect_page 取真实 DOM，用 apply_node_fix 更新 selector。\n"
     "• ModuleNotFoundError → 用内置库重写 script 节点 code，删除第三方 import。\n"
-    "• 变量未定义 → validate_flow 确认引用链，apply_node_fix 补填 outputVariable。\n"
+    "• 变量未定义 → 状态块里已列出引用该变量的节点，apply_node_fix 补填 outputVariable。\n"
     "• 其他 → 按错误信息修复后重新 run_flow。"
 )
 
 # 质量审计失败后：按 repair_plan 修复结构
 _GUIDANCE_AFTER_AUDIT_FAIL = (
-    "质量审计未通过（passed=false）。编排层已锁定下次 run_flow。\n"
-    "必须按返回的 repair_plan 修复流程结构，再重新 run_flow → get_run_output → assert_run_output。"
+    "acceptance_audit.passed=false。编排层已锁定下次 run_flow。\n"
+    "必须按 acceptance_audit.repair_plan 修复流程结构后再重新 run_flow；"
+    "审计由平台自己算，你无从「再审一次」，改流程是唯一出路。"
 )
 
-# 这些拦截意味着「工具走不下去了，得让用户拿主意」，与那些只是改道的拦截不同
+# 这些拦截意味着「工具走不下去了，得让用户拿主意」，与那些只是改道的拦截不同。
+# 不含 ask_user：那是「活干完了、只剩一个决定」，走 _GUIDANCE_AFTER_ASK_USER +
+# closing_statement_only，收尾话要由模型自己写，不能套这里的模板。
 _TERMINAL_GUARD_ACTIONS = frozenset({
     "report_to_user_and_stop",
     "needs_user_navigation_target",
@@ -251,14 +285,25 @@ _GUIDANCE_AFTER_TERMINAL_BLOCK = (
     "工具结果里的 user_message 是给用户看的原话，可直接引用或改写。"
 )
 
+# ask_user 与上面那条的区别：这里没有任何东西卡住，修复已经落盘，只是「要不要运行」
+# 这个决定归用户。用同一段文案会让模型去汇报一个不存在的阻塞点。
+_GUIDANCE_AFTER_ASK_USER = (
+    "本轮到此结束：改动已经写入生效，剩下的决定归用户。\n"
+    "接下来只输出面向用户的自然语言收尾，不要再调用任何工具，内容包含：\n"
+    "1. 改了哪些节点的哪些字段、为什么这么改（用工具返回的真实字段值，不要复述意图）；\n"
+    "2. 这次改动还没有经过运行验证，明确说出来；\n"
+    "3. 问用户要不要现在运行一遍验证。\n"
+    "不要下「已修复」「问题已解决」这类结论——没有运行证据支撑。"
+)
+
 # 用户提出修复意图时注入，引导模型走诊断优先路径
 _GUIDANCE_BEFORE_REPAIR = (
     "用户要求修复流程。强制执行顺序：\n"
-    "1. lint_flow → 确认 issue 类型\n"
+    "1. 读状态块里的诊断列表，确认 issue 类型（不必再调工具查，那份就是当前结论）\n"
     "2. inspect_page(scope_selector=相关区域) → 获取 interaction_recipe 和真实 selector\n"
-    "   （若 lint 无 browser/selector 类问题可跳过步骤 2）\n"
+    "   （诊断里没有 browser/selector 类问题时可跳过步骤 2）\n"
     "3. 按 repair_plan + interaction_recipe 修复节点\n"
-    "直接调用 apply_node_fix / update_flow 会被编排层阻断，直到以上诊断步骤完成。\n"
+    "直接调用 apply_node_fix / update_flow 会被编排层阻断，直到页面证据到手。\n"
     "收到 repair_plan 后直接执行修复，不需要向用户解释或等待确认。"
 )
 
@@ -279,6 +324,22 @@ _REPAIR_INTENT_KEYWORDS = frozenset({
     "分页", "多页", "下一页", "翻页", "加载更多", "pagination", "next page", "load more",
     "抓不全", "抓不到", "缺数据", "数据不全", "漏数据", "没抓全",
 })
+
+# 同一句话里给出了运行/验收授权。命中即 run_authorized。
+#
+# 为什么必须有这一条：修复词与验收词天天同时出现（「优化一下然后跑一遍验收」既含"优化"也含"验收"）。
+# 只看修复词就整轮硬禁 run_flow，模型拿不到任何运行证据，只能交「静态检查通过；未做运行验证」，
+# 用户看不到答案就再问一遍——实测同一句「流程审查验收」被重复发过 7 次。
+# 这是"用户已经授权"，不是放宽护栏：没有这类措辞时锁照挂。
+#
+# 收词从严：run_flow 会真的打开浏览器操作目标站点，宁可漏判让用户补一句。
+# 因此不收「试试」「验证」这类兼有别义的词（"试试改成 xpath"、"人机验证"），
+# 也不收单独的「审查」——静态审查本身就能交付结论，它不必然要求运行。
+_RUN_AUTHORIZATION_RE = re.compile(
+    r"(验收|核对|跑一下|跑一次|跑一遍|跑通|跑起来看|运行一下|运行一次|运行看|运行验证|"
+    r"执行一下|重跑|重新运行|再跑|测一下|测试一下|能不能用|是否可用|run it)",
+    re.IGNORECASE,
+)
 
 # 用户显式要求切换执行通道时才不触发"保留浏览器主链路"guard——因为这次是用户主动
 # 要求换方案，不是 AI 自行决定。
@@ -302,15 +363,7 @@ def _is_explicit_channel_switch_request(user_text_lower: str) -> bool:
         and _CHANNEL_SWITCH_TARGET_PATTERN.search(user_text_lower)
     )
 
-# 判定"当前流程已有浏览器采集主链路"的节点类型
-_BROWSER_MAIN_CHAIN_TYPES = frozenset({
-    "browser.open", "browser.extract", "ui.extract", "browser.fetch",
-})
-
-# 画布骨架节点：只有这两种节点的流程等同于空流程
-_SCAFFOLD_NODE_TYPES = frozenset({"start", "end"})
-
-# 用户消息中表明创建新流程意图的关键字（配合 URL 检测激活 pre_create_inspect_gate）
+# 用户消息中表明创建新流程意图的关键字（配合 URL 检测要求先看页面）
 _CREATE_INTENT_KEYWORDS = frozenset({
     "创建", "新建", "生成流程", "生成一个", "帮我做", "做一个", "建一个", "写一个",
     "帮我创", "帮我生成", "自动化", "爬取", "抓取", "登录", "流程",
@@ -516,25 +569,20 @@ def _build_few_shot_messages() -> list[dict[str, Any]]:
         }],
     }
     _create_result   = json.dumps({"flow_id": _flow_id, "name": "项目列表抓取-筛选", "status": "draft", "revision": 1, "acceptance_contract": _contract, "lint_findings": []}, ensure_ascii=False)
-    _validate_result = json.dumps({
-        "flow_id": _flow_id, "flow_name": "项目列表抓取-筛选",
-        "input_variables": ["username", "password", "date_start", "date_end"],
-        "defined_variables": ["login_status", "captcha", "selected_start_date", "selected_end_date", "project_data", "project_page_count", "project_table_count"],
-        "issues": [], "is_valid": True, "fix_hint": None,
-    }, ensure_ascii=False)
-    _run_result    = json.dumps({"task_id": _task_id, "status": "success", "flow_id": _flow_id, "flow_revision": 1, "progress": {"current_step": 26, "total_steps": 26, "percent": 100, "elapsed_ms": 41200}}, ensure_ascii=False)
+    # 验收结论跟着 run_flow 一起回来，示例里也必须是这个形状：模型没有审计工具可调，
+    # 样例若还演示「再调一次审计」，它就会去找一个不存在的工具。
+    _audit = {
+        "task_id": _task_id, "passed": True, "flow_revision": 1,
+        "deliverables": [{"id": "project-list", "variable": "project_data", "kind": "table"}],
+        "issues": [], "warnings": [],
+        "message": "运行产物满足验收契约。",
+    }
+    _run_result    = json.dumps({"task_id": _task_id, "status": "success", "flow_id": _flow_id, "flow_revision": 1, "progress": {"current_step": 26, "total_steps": 26, "percent": 100, "elapsed_ms": 41200}, "acceptance_audit": _audit}, ensure_ascii=False)
     _output_result = json.dumps({
         "task_id": _task_id, "status": "success",
         "summary": "运行成功，共输出 6 个变量、1 个产物文件。",
         "variables": {"login_status": "logged_in", "selected_start_date": "2026-06-01", "selected_end_date": "2026-06-24", "project_page_count": 2, "project_table_count": 6, "project_data": _rows},
         "artifacts": [{"filename": "project-list-20260624-101500.json", "type": "json"}],
-    }, ensure_ascii=False)
-    _assert_result = json.dumps({
-        "task_id": _task_id, "passed": True,
-        "flow_revision": 1,
-        "deliverables": [{"id": "project-list", "variable": "project_data", "kind": "table"}],
-        "issues": [], "warnings": [],
-        "message": "运行产物满足验收契约。",
     }, ensure_ascii=False)
 
     return [
@@ -548,16 +596,14 @@ def _build_few_shot_messages() -> list[dict[str, Any]]:
         # 不写明出处的话，模型会把它们当成通用模板抄到 Arco/Vant/自研站点上去。
         {"role": "assistant", "content": "`page_classes` 里是 el- 前缀，说明这个站点用的是 Element UI，所以下面的表格/下拉/翻页 selector 按 Element UI 的类名取。换一个站点这些类名一律不成立，必须重新 `inspect_page` 拿它自己的 `page_classes` 和 `tables[].row_selector`。", "tool_calls": [{"id": "fs_t3", "type": "function", "function": {"name": "create_flow", "arguments": json.dumps({"name": "项目列表抓取-筛选", "description": "登录后筛选日期范围+项目进度，翻页提取项目列表", "input_variables": _ivs, "nodes": _nodes, "edges": _edges, "acceptance_contract": _contract}, ensure_ascii=False)}}]},
         {"role": "tool", "tool_call_id": "fs_t3", "content": _create_result},
-        {"role": "assistant", "content": None, "tool_calls": [{"id": "fs_t4", "type": "function", "function": {"name": "validate_flow", "arguments": json.dumps({"flow_id": _flow_id})}}]},
-        {"role": "tool", "tool_call_id": "fs_t4", "content": _validate_result},
-        {"role": "assistant", "content": "流程已创建并通过静态检查。请先在右侧「输入变量」面板配置账号和密码；运行到验证码步骤时会弹出输入框。"},
+        # 写完不复检：下一轮开头的状态块已经带着这份定义的诊断结果，再调一次读取工具
+        # 只会拿回同一个答案。
+        {"role": "assistant", "content": "流程已创建，状态块显示静态检查无阻断项。请先在右侧「输入变量」面板配置账号和密码；运行到验证码步骤时会弹出输入框。"},
         {"role": "user", "content": "我已在输入变量面板配置好账号和密码，请继续运行并验收。"},
         {"role": "assistant", "content": None, "tool_calls": [{"id": "fs_t5", "type": "function", "function": {"name": "run_flow", "arguments": json.dumps({"flow_id": _flow_id})}}]},
         {"role": "tool", "tool_call_id": "fs_t5", "content": _run_result},
         {"role": "assistant", "content": None, "tool_calls": [{"id": "fs_t6", "type": "function", "function": {"name": "get_run_output", "arguments": json.dumps({"task_id": _task_id})}}]},
         {"role": "tool", "tool_call_id": "fs_t6", "content": _output_result},
-        {"role": "assistant", "content": None, "tool_calls": [{"id": "fs_t7", "type": "function", "function": {"name": "assert_run_output", "arguments": json.dumps({"task_id": _task_id}, ensure_ascii=False)}}]},
-        {"role": "tool", "tool_call_id": "fs_t7", "content": _assert_result},
         {"role": "assistant", "content": "已创建并验证通过。翻页抓取 2 页共 6 条项目记录，创建时间均落在 2026-06-01 至今天，项目进度全部为「项目通过」或「待尽调」；结果已写入 project-list-20260624-101500.json。"},
     ]
 
@@ -603,8 +649,8 @@ _WEAK_MODEL_PREAMBLE = (
     "【精简模式·轮次有限】严格按顺序操作，不要跳步或重复调用同一工具：\n"
     "① inspect_page 获取真实 selector\n"
     "② create_flow / update_flow 构建或修改流程\n"
-    "③ lint_flow + validate_flow 修复所有 error\n"
-    "④ run_flow → get_run_output → assert_run_output\n"
+    "③ 按状态块的诊断列表修完所有阻断项（不要调工具去复查，状态块每轮都是最新的）\n"
+    "④ run_flow，看返回里的 acceptance_audit.passed 再汇报\n"
     "字段不确定时用 list_node_types(types=[...]) 只查所需节点；selector 失效时调用 inspect_page。禁止盲猜。"
 )
 
@@ -739,7 +785,7 @@ async def _resolve_relay_model(model: str, base_url: str, api_key: str) -> str:
     return f"openai/{sorted(chat_models, reverse=True)[0]}"
 
 
-# 多轮工具循环里 inspect_page / get_flow 等结果动辄上万字符，旧结果对后续决策
+# 多轮工具循环里 inspect_page / get_run_output 等结果动辄上万字符，旧结果对后续决策
 # 只剩摘要价值。每轮请求前压缩「除最近 N 条外」的大体积 tool 消息，避免长会话
 # 撑爆上下文窗口或拖慢每轮请求。
 _KEEP_FULL_TOOL_RESULTS = 2          # 最近 N 条 tool 消息保留完整内容
@@ -1010,8 +1056,7 @@ def _elide_repeated_result(
     """
     payload = json.dumps(result, ensure_ascii=False)
     key = (tool_name, arguments)
-    previous = seen.get(key)
-    if previous is not None and previous == payload and len(payload) >= _ELIDE_MIN_CHARS:
+    if seen.get(key) == payload and len(payload) >= _ELIDE_MIN_CHARS:
         return json.dumps({
             "_unchanged": True,
             "message": f"本次 {tool_name} 的返回与上一次同参数调用逐字相同，内容见上文，未重复输出。",
@@ -1195,20 +1240,14 @@ _ROUND_STATUS_BY_TOOL: dict[str, str] = {
     "create_flow": "正在规划流程结构…",
     "update_flow": "正在验证变更方案…",
     "apply_node_fix": "正在验证节点修复…",
-    "lint_flow": "正在处理静态检查结果…",
-    "validate_flow": "正在处理变量校验结果…",
     "run_flow": "正在分析运行结果…",
-    "get_run_status": "正在等待运行完成…",
     "get_run_error": "正在定位失败原因…",
     "get_run_output": "正在核对运行产物…",
     "get_run_logs": "正在阅读运行日志…",
-    "assert_run_output": "正在核对业务质量…",
     "inspect_page": "正在解读页面结构…",
     "inspect_screenshot": "正在查看页面截图…",
     "publish_flow": "正在完成发布…",
-    "list_flows": "正在整理流程列表…",
     "list_node_types": "正在查询可用节点…",
-    "get_flow": "正在读取流程结构…",
 }
 
 
@@ -1224,14 +1263,11 @@ _EXECUTING_STATUS_BY_TOOL: dict[str, str] = {
     "run_flow": "正在运行流程（浏览器已启动，通常需要 1–3 分钟）…",
     "inspect_page": "正在打开页面抓取真实结构…",
     "inspect_screenshot": "正在截取页面…",
-    "assert_run_output": "正在读取运行产物做质量审计…",
     "get_run_output": "正在读取输出变量与产物…",
     "get_run_logs": "正在拉取运行日志…",
     "create_flow": "正在写入流程…",
     "update_flow": "正在写入变更…",
     "apply_node_fix": "正在修改节点…",
-    "lint_flow": "正在做静态检查…",
-    "validate_flow": "正在校验变量引用…",
     "publish_flow": "正在发布…",
 }
 
@@ -1292,85 +1328,18 @@ class _ThinkTagFilter:
         return events
 
 
-@dataclass
-class _FlowContext:
-    """本轮开始时当前流程的形态，供意图判断与 guard 使用。"""
-
-    context_message: dict[str, Any] | None = None
-    # 已有浏览器主链路 → 需要"保留执行通道"guard
-    browser_chain_node_ids: set[str] = dc_field(default_factory=set)
-    # Studio 里"新建流程"一落地就带 flow_id 存库、画布只有 start→end，需与存量流程区分
-    is_blank: bool = False
-    # edge_id -> (source, target)，用于识别"改边绕过"：AI 可能保留受保护节点本身，
-    # 却通过 remove_edge_ids/add_edges 切断其所有连接使其静默孤立
-    edges_by_id: dict[str, tuple[str, str]] = dc_field(default_factory=dict)
-    revision: int | None = None
-    definition_digest: str | None = None
-
-    @property
-    def has_browser_chain(self) -> bool:
-        return bool(self.browser_chain_node_ids)
-
-
-_STRIP_NODE_FIELDS = frozenset({"position", "status", "kind"})
-
-
-def _is_local_draft_flow_id(flow_id: str | None) -> bool:
-    return bool(flow_id and flow_id.startswith("local-"))
-
-
-async def _load_flow_context(executor: RpaToolExecutor, flow_id: str) -> _FlowContext:
-    """读取当前流程并剥离 position/status/kind 等画布字段降低 token 开销。"""
-    if _is_local_draft_flow_id(flow_id):
-        # local-* 只是前端在首次保存前的草稿标识；拿它查后端只会注入一份错误结果，
-        # 还会把新建任务误路由到完整提示词和全部工具。
-        return _FlowContext(is_blank=True)
-    ctx = _FlowContext()
-    try:
-        flow = await executor.execute("get_flow", {"flow_id": flow_id})
-        if isinstance(flow.get("revision"), int):
-            ctx.revision = flow["revision"]
-        if isinstance(flow.get("definition"), dict):
-            ctx.definition_digest = definition_digest(flow["definition"])
-            raw_nodes = flow["definition"].get("nodes", [])
-            raw_edges = flow["definition"].get("edges", [])
-            ctx.browser_chain_node_ids = {
-                str(n["id"]) for n in raw_nodes
-                if isinstance(n, dict) and n.get("type") in _BROWSER_MAIN_CHAIN_TYPES and "id" in n
-            }
-            ctx.is_blank = not any(
-                isinstance(n, dict) and n.get("type") not in _SCAFFOLD_NODE_TYPES
-                for n in raw_nodes
-            )
-            ctx.edges_by_id = {
-                str(e["id"]): (str(e["source"]), str(e["target"])) for e in raw_edges
-                if isinstance(e, dict) and "id" in e and "source" in e and "target" in e
-            }
-            flow["definition"]["nodes"] = [
-                {k: v for k, v in n.items() if k not in _STRIP_NODE_FIELDS}
-                if isinstance(n, dict) else n
-                for n in raw_nodes
-            ]
-        ctx.context_message = {
-            "role": "system",
-            "content": f"当前打开的流程：\n```json\n{json.dumps(flow, ensure_ascii=False, indent=2)}\n```",
-        }
-    except Exception:
-        # 注入失败不阻断对话，但必须留痕——否则"AI 看不到当前流程"完全无法排查。
-        logger.warning("流程上下文注入失败（flow_id=%s），本轮对话将没有当前流程信息", flow_id, exc_info=True)
-    return ctx
-
-
 def _site_knowledge_message(
-    messages: list[dict[str, Any]], flow_ctx: _FlowContext
+    messages: list[dict[str, Any]], flow_state: FlowState
 ) -> dict[str, Any] | None:
     """用户消息或当前流程含已知域名时，注入该站点沉淀的 selector/框架/登录特征与已证伪的写法。"""
     try:
         from app.services.site_knowledge import get_site_knowledge_store
         store = get_site_knowledge_store()
         text = "\n".join(str(m.get("content") or "") for m in messages if m.get("role") == "user")
-        if flow_ctx.context_message:
-            text += "\n" + str(flow_ctx.context_message["content"])
+        if flow_state.nodes:
+            # 节点配置里的 targetUrl / selector 是域名的另一处来源：用户这句话里可能
+            # 只说了「修一下」，站点是谁全靠流程本身告诉我们。
+            text += "\n" + json.dumps(flow_state.nodes, ensure_ascii=False)
         profiles = store.match_text(text)
         if not profiles:
             return None
@@ -1389,6 +1358,8 @@ class _TurnIntents:
     create_requested: bool = False
     # 非 None 即检测到创建意图，值为需求里的首个 URL
     create_url: str | None = None
+    # 用户这一句里已经授权运行（验收/跑一下/核对…）
+    run_authorized: bool = False
 
 
 @dataclass
@@ -1447,7 +1418,7 @@ def _latest_page_inspection(
 def _resolve_resumable_task_state(
     messages: list[dict[str, Any]],
     flow_id: str | None,
-    flow_ctx: _FlowContext,
+    flow_state: FlowState,
 ) -> _ResumableTaskState:
     latest = _latest_user_message(messages)
     state = _ResumableTaskState(
@@ -1463,7 +1434,7 @@ def _resolve_resumable_task_state(
     # 这轮自带新 URL 就不认：那条通道结论说的是上一个站点。
     if not current_urls:
         state.last_inspection_source = inspected_source
-    if flow_id and not flow_ctx.is_blank:
+    if flow_id and not flow_state.is_blank:
         return state
 
     if current_urls:
@@ -1526,7 +1497,7 @@ def _task_state_message(state: _ResumableTaskState) -> dict[str, Any] | None:
 def _detect_turn_intents(
     messages: list[dict[str, Any]],
     flow_id: str | None,
-    flow_ctx: _FlowContext,
+    flow_state: FlowState,
     task_state: _ResumableTaskState | None = None,
 ) -> _TurnIntents:
     intents = _TurnIntents()
@@ -1538,13 +1509,19 @@ def _detect_turn_intents(
 
     if flow_id and any(kw in user_text_lower for kw in _REPAIR_INTENT_KEYWORDS):
         intents.repair = True
+    # 用户明确说了要跑/要验收就是授权，即使同一句里还带着修复词。
+    # 显式的「不要运行」优先级最高：它是撤回授权，不是没给授权。
+    intents.run_authorized = bool(
+        _RUN_AUTHORIZATION_RE.search(user_text)
+        and not any(phrase in user_text for phrase in _NO_RUN_REQUEST_PHRASES)
+    )
     # 结构性 guard，故意不靠关键字门控：用户描述问题的措辞（"抓不全"/"内容少了一半"等）
     # 是关键字列表永远无法穷举的集合。
-    if flow_id and flow_ctx.has_browser_chain and not _is_explicit_channel_switch_request(user_text_lower):
+    if flow_id and flow_state.has_browser_chain and not _is_explicit_channel_switch_request(user_text_lower):
         intents.preserve_execution_channel = True
     # 只看 `not flow_id` 会漏掉「Studio 新建流程后再对 AI 提需求」这个最常见入口。
-    if (not flow_id or flow_ctx.is_blank) and not intents.repair:
-        resolved = task_state or _resolve_resumable_task_state(messages, flow_id, flow_ctx)
+    if (not flow_id or flow_state.is_blank) and not intents.repair:
+        resolved = task_state or _resolve_resumable_task_state(messages, flow_id, flow_state)
         intents.create_requested = (
             any(kw in user_text_lower for kw in _CREATE_INTENT_KEYWORDS)
             or (resolved.resume_requested and resolved.target_url is not None)
@@ -1560,24 +1537,55 @@ def _detect_turn_intents(
 def _tool_schemas_for_round(
     state: dict[str, Any], intents: _TurnIntents
 ) -> list[dict[str, Any]]:
-    """只暴露当前阶段能推进任务的工具，减少 schema tokens 并消除无效并行调用。"""
-    if state.get("terminal_response_only"):
+    """只暴露当前阶段与当前能力下能推进任务的工具。
+
+    两类扣除，来源不同：
+    - 阶段准入由 ai_phases 唯一持有（暴露了却会被拦，等于故意让模型白花一轮）；
+    - 能力扣除是调用方授权（read_only）和模型自身能力（无视觉）——它们整轮固定，
+      不随阶段变化。这两条原来只有拦截没有隐藏，于是每轮都要先被模型试一次：
+      只读模式下它交出 update_flow，无视觉模型交出 inspect_screenshot，各烧一整轮。
+      能力缺失不是模型该去发现的事实，schema 里不出现就不会被调用。
+
+    拦截仍然保留在 `ai_guards`：只读是调用方给的授权边界，不能只靠"没暴露"来守
+    （工具名是模型能凭记忆猜出来的，schema 之外的调用也照样会到达执行器）。
+    """
+    if state.get("terminal_response_only") or state.get("closing_statement_only"):
         return []
     if intents.create_requested and not intents.create_url:
         return []
-    gate = state.get("pre_create_inspect_gate")
-    if isinstance(gate, dict) and not gate.get("inspect_done"):
-        return [
-            schema for schema in TOOL_SCHEMAS
-            if schema.get("function", {}).get("name") == "inspect_page"
-        ]
-    return TOOL_SCHEMAS
+    available = [
+        schema for schema in TOOL_SCHEMAS
+        if str(schema.get("function", {}).get("name") or "") not in _unavailable_tools(state)
+    ]
+    all_names = frozenset(
+        str(schema.get("function", {}).get("name") or "") for schema in available
+    )
+    admitted = admitted_tool_names(all_names, state)
+    if admitted == all_names:
+        return available
+    return [
+        schema for schema in available
+        if schema.get("function", {}).get("name") in admitted
+    ]
+
+
+def _unavailable_tools(state: dict[str, Any]) -> frozenset[str]:
+    """本轮从头到尾都用不了的工具，与阶段无关。"""
+    unavailable: set[str] = set()
+    if state.get("read_only_tools"):
+        unavailable |= WRITE_TOOLS
+    if state.get("model_no_vision"):
+        unavailable.add("inspect_screenshot")
+    return frozenset(unavailable)
 
 
 def _system_prompt_for_round(state: dict[str, Any]) -> str:
-    """页面探测完成前只加载探测契约；DOM 到手后再加载完整构建规则。"""
-    gate = state.get("pre_create_inspect_gate")
-    if isinstance(gate, dict) and not gate.get("inspect_done"):
+    """页面探测完成前只加载探测契约；DOM 到手后再加载完整构建规则。
+
+    只对「从零建流程」这条路生效。修复路径上的取证阶段仍需完整规则：模型看完 DOM
+    紧接着就要改节点，换成探测契约等于把构建规则从它手上拿走。
+    """
+    if resolve_phase(state) is Phase.DISCOVER and not state.get("flow_has_nodes"):
         return PAGE_DISCOVERY_PROMPT
     return SYSTEM_PROMPT
 
@@ -1596,10 +1604,15 @@ def _terminal_tool_response(tool_name: str, result: Any) -> str | None:
     return f"**当前无法继续。** {detail}" if detail else "**当前无法继续，需要用户处理后再试。**"
 
 
-def _after_tool_guidance(tool_name: str, result: Any) -> tuple[str | None, bool]:
+def _after_tool_guidance(
+    tool_name: str, result: Any, state: dict[str, Any] | None = None
+) -> tuple[str | None, bool]:
     """返回 (要注入的系统引导, 是否跳过本轮剩余的并行调用)。"""
     if not isinstance(result, dict):
         return None, False
+    state = state or {}
+    if result.get("required_action") == "ask_user":
+        return _GUIDANCE_AFTER_ASK_USER, True
     if (
         result.get("required_action") in _TERMINAL_GUARD_ACTIONS
         or result.get("status") in _TERMINAL_TOOL_STATUSES
@@ -1608,19 +1621,20 @@ def _after_tool_guidance(tool_name: str, result: Any) -> tuple[str | None, bool]
         # 用户只看到一个空气泡，既不知道被挡住了也不知道该给什么。
         return _GUIDANCE_AFTER_TERMINAL_BLOCK, True
     if tool_name == "create_flow" and _tool_call_succeeded(result) and result.get("flow_id"):
-        return _GUIDANCE_AFTER_CREATE, True
+        return _after_write_directive(result, state), True
     if tool_name == "update_flow" and _tool_call_succeeded(result):
-        return _GUIDANCE_AFTER_FIX, True
+        return _after_write_directive(result, state), True
     if tool_name == "apply_node_fix" and _tool_call_succeeded(result):
-        return _GUIDANCE_AFTER_FIX, False
+        return _after_write_directive(result, state), False
     if tool_name == "run_flow":
         status = result.get("status")
         if status == "success":
+            audit = result.get("acceptance_audit")
+            if isinstance(audit, dict) and audit.get("passed") is False:
+                return _GUIDANCE_AFTER_AUDIT_FAIL, False
             return _GUIDANCE_AFTER_RUN_SUCCESS, False
         if status == "error":
             return _GUIDANCE_AFTER_RUN_ERROR, False
-    if tool_name == "assert_run_output" and result.get("passed") is False:
-        return _GUIDANCE_AFTER_AUDIT_FAIL, False
     return None, False
 
 
@@ -1691,29 +1705,28 @@ class AiOrchestrator:
         if _should_inject_few_shot(messages):
             full_messages.extend(_build_few_shot_block(model, relayed))
 
-        flow_ctx = _FlowContext()
+        flow_state = FlowState(flow_id=flow_id)
         if flow_id:
             yield {"type": "status", "delta": "正在读取流程…"}
-            flow_ctx = await _load_flow_context(self._executor, flow_id)
-            if flow_ctx.context_message:
-                full_messages.append(flow_ctx.context_message)
+            flow_state = await build_flow_state(self._executor, flow_id)
 
-        task_state = _resolve_resumable_task_state(messages, flow_id, flow_ctx)
+        task_state = _resolve_resumable_task_state(messages, flow_id, flow_state)
         resumable_state_message = _task_state_message(task_state)
         if resumable_state_message:
             full_messages.append(resumable_state_message)
 
-        # 静态前缀边界：超预算丢弃历史时，system/few-shot/流程上下文与恢复状态不能被丢掉
+        # 静态前缀边界：超预算丢弃历史时，system/few-shot 与恢复状态不能被丢掉。
+        # 流程定义刻意不在这里面——它每轮在消息尾部重建，保护一份过期副本毫无意义。
         protect_prefix = len(full_messages)
         context_budget = _context_char_budget(model)
 
         full_messages.extend(_expand_history_tool_calls(messages))
 
-        site_knowledge = _site_knowledge_message(messages, flow_ctx)
+        site_knowledge = _site_knowledge_message(messages, flow_state)
         if site_knowledge:
             full_messages.append(site_knowledge)
 
-        intents = _detect_turn_intents(messages, flow_id, flow_ctx, task_state)
+        intents = _detect_turn_intents(messages, flow_id, flow_state, task_state)
 
         # 按模型分级：weak 模型注入精简开篇提示且轮次更少
         tier = _model_caps(model).tier
@@ -1734,25 +1747,34 @@ class AiOrchestrator:
             full_messages.insert(protect_prefix, {"role": "system", "content": ledger_summary})
             protect_prefix += 1
 
-        evidence_state = load_verification_state(flow_id, flow_ctx.revision, flow_ctx.definition_digest)
+        evidence_state = load_verification_state(flow_id, flow_state.revision, flow_state.definition_digest)
         guard_state: dict[str, Any] = {
             "flow_id": flow_id,
             **evidence_state,
             "repair_sessions": int(ledger.get("sessions") or 0) + 1,
             "node_field_history": dict(ledger.get("node_field_history") or {}),
             "node_selector_fix_counts": dict(ledger.get("node_selector_fix_counts") or {}),
-            "requires_inspect_page": None,
-            "requires_quality_fix": None,
-            "requires_lint_fix": None,
-            "navigation_failure_counts": {},
-            "navigation_budget_lock": None,
+            # 阶段机读的事实（见 ai_phases.initial_facts）。这里给的是「本轮没有特殊意图」
+            # 时的局面：证据不作要求、运行不设限；下面的意图接线才会收紧。
+            # blocking_diagnostics 每轮由状态块的诊断集重算，见主循环。
+            **initial_facts(
+                flow_has_nodes=not flow_state.is_blank,
+                page_evidence_required=None,
+                page_evidence_done=task_state.phase == "page_inspected",
+                run_authorized=True,
+            ),
+            # 静态扫描漏掉、只有运行期才暴露的阻断项（如未定义变量逃逸）。
+            # 状态块重算不出来，所以单独存，由一次成功的结构性修复清除。
+            "runtime_escape_findings": [],
             "challenge_page_lock": None,
             "terminal_response_only": False,
-            "quality_issue_counts": {},
-            "quality_budget_lock": None,
-            "pending_repair_gate": None,   # {lint_done, inspect_done} — set on repair intent
-            "repair_autorun_lock": None,
-            "pre_create_inspect_gate": None,  # {inspect_done, suggested_url} — set on create intent
+            # 只收工具、正文交给模型自己写（改动已落盘，只剩「要不要运行」这个决定）
+            "closing_statement_only": False,
+            # 本轮请求已被判定为「建流程 / 修流程 / 要运行」，即职责范围之内。
+            # 拿拒答模板收尾会被撤回重写（见 _misapplied_refusal）。
+            "turn_intent_actionable": bool(
+                intents.repair or intents.create_requested or intents.run_authorized
+            ),
             "page_evidence_source": task_state.last_inspection_source,
             "read_only_tools": read_only,     # 自愈诊断模式：阻断所有写入类工具
             "model_no_vision": not _model_caps(model).supports_vision,  # 阻断 inspect_screenshot
@@ -1778,25 +1800,33 @@ class AiOrchestrator:
                 protect_prefix += 1
 
         if intents.repair:
-            guard_state["pending_repair_gate"] = {"lint_done": False, "inspect_done": False}
+            # 是否真要页面证据按当前诊断集判：selector/元素类问题必须真去看 DOM，
+            # 纯变量或拓扑问题去抓一次页面纯属浪费。运行期报出 selector 失败时
+            # （get_run_error 的 inspect_hint）会在 _orchestrator_guard_after_tool 里补置位。
+            if any(f.get("issue") in _BROWSER_SELECTOR_ISSUES for f in flow_state.findings):
+                guard_state["page_evidence_required"] = {"reason": "repair_touches_page_elements"}
+                # 修复请求要的是「现在页面长什么样」。历史上探过一次不算——
+                # 上次探测之后流程和站点都可能变了，那份 DOM 支撑不了这次判断。
+                guard_state["page_evidence_done"] = False
             # 刻意不进 _PERSISTED_KEYS：只锁本轮。用户下一句往往就是「跑一下看看」，
             # 那时 repair 关键词不再出现，锁自然不会重新挂上。
-            guard_state["repair_autorun_lock"] = True
+            # 同一句里已给出运行授权时不挂：否则「修完跑一遍验收」这类既报问题又要结论的
+            # 请求会被结构性地判成「不许运行」，模型只能交静态检查，用户拿不到答案。
+            guard_state["run_authorized"] = bool(intents.run_authorized)
             full_messages.append({"role": "system", "content": _GUIDANCE_BEFORE_REPAIR})
         if intents.preserve_execution_channel:
             guard_state["repair_intent"] = "preserve_execution_channel"
-            guard_state["browser_chain_node_ids"] = flow_ctx.browser_chain_node_ids
-            guard_state["browser_chain_edges_by_id"] = flow_ctx.edges_by_id
+            guard_state["browser_chain_node_ids"] = flow_state.browser_chain_node_ids
             full_messages.append({"role": "system", "content": _GUIDANCE_PRESERVE_EXECUTION_CHANNEL})
 
         if intents.create_url:
             # 空白流程已有 flow_id，该走 update_flow 落节点而不是再建一个
             build_tool = "update_flow" if flow_id and not _is_local_draft_flow_id(flow_id) else "create_flow"
-            guard_state["pre_create_inspect_gate"] = {
-                "inspect_done": task_state.phase == "page_inspected",
-                "suggested_url": intents.create_url,
-                "build_tool": build_tool,
+            guard_state["page_evidence_required"] = {
+                "url": intents.create_url,
+                "reason": "build_from_page",
             }
+            guard_state["page_evidence_done"] = task_state.phase == "page_inspected"
             full_messages.append({"role": "system", "content": _build_guidance_before_create(build_tool)})
 
         vision_fallback_done = False
@@ -1806,6 +1836,7 @@ class AiOrchestrator:
         repeated_results: dict[tuple[str, str], str] = {}
         last_verification_status = current_verification_status(guard_state)
         last_verification_revision = guard_state.get("current_flow_revision")
+        last_run: dict[str, Any] | None = None
 
         for round_num in range(effective_max_rounds):
             if round_num == 0:
@@ -1815,6 +1846,17 @@ class AiOrchestrator:
 
             # 每轮请求前压缩旧的大体积工具结果，控制上下文规模。
             _compact_tool_messages(full_messages, context_budget, protect_prefix)
+            # 无条件重建，不做「看起来没变就跳过」的优化：用户可能在画布上直接改了流程，
+            # 运行状态也会自己往前走。任何「我觉得它没变」的判断都是过期状态的复发路径。
+            if round_num > 0 and flow_id:
+                flow_state = await build_flow_state(self._executor, flow_id, last_run)
+            else:
+                flow_state.last_run = last_run
+            sync_state_message(full_messages, render_flow_state(flow_state))
+            # 阶段由事实推导，所以事实必须每轮跟着状态块一起重算：用户可能在画布上
+            # 直接补了节点，也可能把节点删空。存一份「上轮的阶段」就是第二份真相。
+            guard_state["blocking_diagnostics"] = _blocking_diagnostics(flow_state, guard_state)
+            guard_state["flow_has_nodes"] = not flow_state.is_blank
             _mark_history_cache_anchor(full_messages, model, relayed)
             collected_tool_calls: dict[int, dict[str, str]] = {}
             round_usage: Any = None
@@ -1973,14 +2015,26 @@ class AiOrchestrator:
                     # 这段是用户看到的回复，同样要过证据门
                     collected_text.append(thinking_text)
                 final_text = "".join(collected_text)
-                # 先纠越界结论，再补没做的验证：说法不实比交付不全严重
-                claim_correction = _overstated_result_claim(final_text, guard_state) or _unmet_verification_request(final_text, guard_state)
+                # 顺序即优先级：先判「该干的活被推掉了」——模型一旦拿拒答模板收尾，
+                # 后两条会把它误诊成「结论越界」或「没做验证」，给出方向完全错的更正。
+                # 其余两条之间，说法不实比交付不全严重。
+                claim_correction: str | None = None
+                retract_reason = "结论超出已有证据，正在重写"
+                for _checker, _reason in (
+                    (_misapplied_refusal, "该请求在职责范围内，正在重写"),
+                    (_overstated_result_claim, "结论超出已有证据，正在重写"),
+                    (_unmet_verification_request, "结论超出已有证据，正在重写"),
+                ):
+                    claim_correction = _checker(final_text, guard_state)
+                    if claim_correction is not None:
+                        retract_reason = _reason
+                        break
                 if claim_correction is not None:
                     full_messages.append({"role": "assistant", "content": final_text})
                     full_messages.append({"role": "system", "content": claim_correction})
                     # 越界结论已经流式吐给前端了，只追加更正会留下一段自相矛盾的回复，
                     # 让前端丢弃本条已渲染正文，由下一轮重写。
-                    yield {"type": "retract", "reason": "结论超出已有证据，正在重写"}
+                    yield {"type": "retract", "reason": retract_reason}
                     yield {"type": "status", "delta": "正在核对结论依据…"}
                     continue
                 # 拿到了最终回复，这一轮对话就算了结：预算是为「这次任务」设的，
@@ -2077,7 +2131,10 @@ class AiOrchestrator:
                             tool_task = prefetched.pop(stream_idx, None)
                             if tool_task is None:
                                 tool_task = asyncio.create_task(
-                                    self._executor.execute(tool_name, args, progress_sink)
+                                    self._executor.execute(
+                                        tool_name, args, progress_sink,
+                                        _build_change_context(guard_state),
+                                    )
                                 )
                             tool_started_at = time.monotonic()
                             while not tool_task.done():
@@ -2107,6 +2164,9 @@ class AiOrchestrator:
                 last_tool_name = tool_name
                 result = attach_tool_events(tool_name, result)
                 reduce_evidence_state(guard_state, result)
+                if tool_name in _RUN_STATE_TOOLS and _tool_call_succeeded(result):
+                    # 下一轮的状态块要讲「最近一次运行怎么样了」，来源就是这里
+                    last_run = result
                 if isinstance(result, dict):
                     event_flow_id = result.get("flow_id") or guard_state.get("flow_id")
                     if isinstance(event_flow_id, str):
@@ -2143,7 +2203,9 @@ class AiOrchestrator:
                 full_messages.append({
                     "role": "tool",
                     "tool_call_id": tc["id"],
-                    "content": _elide_repeated_result(tool_name, tc["arguments"], result, repeated_results),
+                    "content": _elide_repeated_result(
+                        tool_name, tc["arguments"], result, repeated_results
+                    ),
                 })
 
                 if _image_b64 and not guard_state.get("model_no_vision"):
@@ -2160,7 +2222,7 @@ class AiOrchestrator:
                         ],
                     })
 
-                guidance, stop_round = _after_tool_guidance(tool_name, result)
+                guidance, stop_round = _after_tool_guidance(tool_name, result, guard_state)
                 if guidance:
                     full_messages.append({"role": "system", "content": guidance})
                 if guard_state.get("terminal_response_only"):
@@ -2222,8 +2284,41 @@ def _tool_call_succeeded(result: Any) -> bool:
     return result.get("status") not in _NON_EXECUTED_STATUSES
 
 
-# run_flow 停在这些状态是「轮到用户了」，不是流程没修好
-_RUN_WAITING_STATUSES = frozenset({"paused_for_human", "waiting_for_user_input"})
+# run_flow 停在这些状态是「轮到用户了」，不是流程没修好。
+# stopped 一并算进来：run_flow 是阻塞轮询的，轮询期间任务变成 stopped 只可能是用户
+# 自己按了停止——把它记成一次失败的修复，等于用户每中止一次就替模型花掉三分之一额度。
+_RUN_WAITING_STATUSES = frozenset({"paused_for_human", "waiting_for_user_input", "stopped"})
+
+# 执行器在起跑前就拒掉的返回：流程一行都没跑。收敛额度定价的是「真跑过一次」的代价，
+# 这些一次都不该按运行计价——`blocked_by_failure_budget` 尤其是自我加固：熔断锁自己的
+# 拒绝会花掉产生这把锁的额度，没有新失败、用户也看不到任何症状，只是越锁越死。
+# 判据挂状态名而不是「有没有 error 字段」：起跑前拒绝一律带 message 不带 error，
+# 而真实运行失败带 error，两者在这里必须分开。
+_RUN_NOT_STARTED_STATUSES = frozenset({
+    "blocked_by_failure_budget",
+    "blocked_browser_profile_busy",
+    "extension_not_connected",
+    "empty_credential_variables",
+    "missing_run_variables",
+    "misplaced_call_parameters",
+    "blocking_lint_findings",
+    "undefined_variable_refs",
+    "blocking_acceptance_contract",
+})
+
+# 上面那些里模型自己就能清掉的几条：调用参数写错了、流程还带着阻断问题。
+# 这几条不算「本轮尝试过运行」——不然模型把 run_flow 调错一次、接着写个总结收尾，
+# 「用户要验收却一次没跑」那条撤回重写就被自己的错误调用静默关掉，用户什么都拿不到。
+# 剩下的（凭据为空、扩展未连、profile 被占、熔断锁）确实只能等用户，算尝试过。
+_RUN_REFUSED_MODEL_FIXABLE = frozenset({
+    "misplaced_call_parameters",
+    "blocking_lint_findings",
+    "undefined_variable_refs",
+    "blocking_acceptance_contract",
+})
+
+# 会改变「最近一次运行」这件事实的工具，其返回要进下一轮的状态块
+_RUN_STATE_TOOLS = frozenset({"run_flow", "stop_run"})
 
 
 def _parse_tool_arguments(raw_args: str) -> tuple[dict[str, Any], list[str]]:
@@ -2248,7 +2343,15 @@ def _parse_tool_arguments(raw_args: str) -> tuple[dict[str, Any], list[str]]:
 
 _FLOW_WRITE_TOOLS = ("create_flow", "update_flow", "apply_node_fix", "set_acceptance_contract")
 
-# 承诺「数据质量没问题」——只有 assert_run_output 读过产物才配得上
+# 承诺「流程已经落盘」。这批词是从评测录像里逐字抄回来的：模型一次写入都没成功，
+# 却宣称流程已创建，还顺带报了节点数、验收契约和输出路径——用户打开画布是空的。
+_FLOW_SAVED_CLAIM_PHRASES = (
+    "流程已创建", "已创建流程", "流程创建完成", "已为你创建", "已经创建好",
+    "流程已保存", "已保存流程", "流程已建好", "流程已生成", "已生成流程",
+    "流程已更新", "已更新流程",
+)
+
+# 承诺「数据质量没问题」——只有平台读过产物算出的 acceptance_audit 才配得上
 _ACCEPTANCE_CLAIM_PHRASES = ("验收通过", "通过验收", "可以验收", "已验收", "验收结论：通过", "验收：通过")
 # 承诺「改动确实生效了」——最低要有一次改动之后的成功运行
 _VERIFIED_FIX_CLAIM_PHRASES = (
@@ -2263,12 +2366,22 @@ _DATA_EFFECT_CLAIM_PHRASES = (
 )
 
 
+def _fabricated_write_receipt(text: str) -> bool:
+    """把流程定义连同 revision 一起贴进回复，等于自己签发一张写入回执。
+
+    revision 只由平台在写入成功时下发，模型手上没有这个数：文本里出现它就是编的。
+    单看 flow_id 或 nodes 不算——讲解一段节点配置本来就要贴它们。
+    """
+    return '"revision"' in text and ('"flow_id"' in text or '"nodes"' in text)
+
+
 def _overstated_result_claim(text: str, state: dict[str, Any]) -> str | None:
     """回复承诺的确定性超出了本会话拿到的证据。
 
-    证据分两级：改动后成功运行过（改动生效），以及 assert_run_output 通过（产物内容可信）。
-    两级都由写入工具作废——流程一改，之前那次运行和审计针对的就不是这份定义了。
-    每会话只纠正一次，否则模型改口后的回复会再次命中同一批词。
+    证据分三级，从根本往上：写入有没有落盘（流程是否真的存在），改动后有没有成功运行过
+    （改动生效），运行返回的 acceptance_audit 有没有通过（产物内容可信）。后两级都由写入
+    工具作废——流程一改，之前那次运行和审计针对的就不是这份定义了。每会话只纠正一次，
+    否则模型改口后的回复会再次命中同一批词。
     """
     if state.get("result_claim_corrected"):
         return None
@@ -2281,14 +2394,40 @@ def _overstated_result_claim(text: str, state: dict[str, Any]) -> str | None:
         state.get("current_flow_revision") is None and state.get("run_succeeded")
     )
 
+    # 最根本的一级：写入本身有没有发生。用户看到「流程已创建」却打开一张空画布时，
+    # 下面两级证据谈不谈都没有意义，所以排在最前。
+    #
+    # 判据挂「流程里有没有业务节点」而不只挂「本会话写没写过」：current_flow_revision
+    # 每次请求从零开始，续跑一轮说「流程已更新」指的是上一轮那次写入，那不是假话。
+    # 空画布不同——空流程既没被创建也没被更新过，这句话怎么读都是假的。
+    if (
+        not state.get("flow_has_nodes")
+        and state.get("current_flow_revision") is None
+        and (
+            any(phrase in text for phrase in _FLOW_SAVED_CLAIM_PHRASES)
+            or _fabricated_write_receipt(text)
+        )
+    ):
+        state["result_claim_corrected"] = True
+        return (
+            "你上一条回复已被撤回，用户没有看到，请完整重写整段回复（不要只补一句更正）。\n"
+            "撤回原因：你说流程已经创建/保存好了，但没有任何一次写入成功，当前流程里没有一个业务节点——"
+            "用户打开画布会是空的。你在回复里写的节点、验收契约、输出路径都不存在。\n"
+            "二选一，重新给出回复：\n"
+            "① 现在真的调用 create_flow / update_flow 把流程写进去，拿到返回里的 revision 之后再汇报；\n"
+            "② 写不进去就据实说——工具被反复阻断、或缺少目标 URL、字段这类必要信息，"
+            "就说明流程尚未保存、卡在哪一步、需要用户提供什么，不要描述一份不存在的流程。\n"
+            "流程定义本身不是交付物：把 JSON 或节点清单贴进回复不等于写入，画布只认写入工具的返回。"
+        )
+
     if any(phrase in text for phrase in _ACCEPTANCE_CLAIM_PHRASES) and not audit_verified:
         state["result_claim_corrected"] = True
         return (
             "你上一条回复已被撤回，用户没有看到，请完整重写整段回复（不要只补一句更正）。\n"
-            "撤回原因：你下了验收通过的结论，但当前这份流程定义没有一次通过的 assert_run_output。"
-            "lint_flow 与 validate_flow 只读流程定义，不读运行产物，不能作为验收依据。\n"
+            "撤回原因：你下了验收通过的结论，但当前这份流程定义没有一次 acceptance_audit.passed=true 的运行。"
+            "状态块里的静态诊断只看流程定义，不读运行产物，不能作为验收依据。\n"
             "二选一，重新给出回复：\n"
-            "① 现在调用 run_flow，再用 assert_run_output 审计产物，拿到 passed 后再下结论；\n"
+            "① 现在调用 run_flow，返回里的 acceptance_audit 就是平台算出的验收结论，passed 之后再下结论；\n"
             "② 不运行，就把结论改成「静态检查通过」，并明确写出未做运行验证、实际输出内容未经确认。\n"
             "不要保留「验收通过」这个说法。"
         )
@@ -2316,11 +2455,11 @@ def _overstated_result_claim(text: str, state: dict[str, Any]) -> str | None:
         return (
             "你上一条回复已被撤回，用户没有看到，请完整重写整段回复（不要只补一句更正）。\n"
             "撤回原因：你描述了加工节点对数据的实际效果（去除了什么、留下了什么），"
-            "但当前这份定义没有一次通过的 assert_run_output。加工节点是否真的改变了数据，"
+            "但当前这份定义没有一次 acceptance_audit.passed=true 的运行。加工节点是否真的改变了数据，"
             "只有把输入和输出的实际内容摆在一起才知道——脚本能跑通、变量有值、产物有文件，"
             "和一个字符都没删完全共存。\n"
             "二选一，重新给出回复：\n"
-            "① 先 run_flow，再 get_run_output 读输入与输出的实际内容、assert_run_output 审计，"
+            "① 先 run_flow（返回里带 acceptance_audit），再 get_run_output 读输入与输出的实际内容，"
             "然后用真实的前后体量说话；\n"
             "② 不运行，就只写你改了什么节点、按什么规则处理，并明确说明效果未经运行验证。\n"
             "不要用「已去除」「已清理」这类完成态描述一次没跑过的加工。"
@@ -2362,9 +2501,9 @@ def _unmet_verification_request(text: str, state: dict[str, Any]) -> str | None:
     return (
         "你上一条回复已被撤回，用户没有看到，请完整重写整段回复（不要只补一句更正）。\n"
         "撤回原因：用户要的是「这个流程到底能不能用」这个判断，你本轮一次都没有运行流程，"
-        "只给了 lint_flow / validate_flow 的静态结果。静态检查读不到运行产物，"
+        "只有静态诊断结果。静态检查读不到运行产物，"
         "回答不了用户问的问题；把措辞降级成「未做运行验证」诚实，但用户依然什么都没拿到。\n"
-        "正确做法：现在就调用 run_flow，成功后 get_run_output + assert_run_output，再据实汇报。\n"
+        "正确做法：现在就调用 run_flow，按返回里的 acceptance_audit 据实汇报。\n"
         "只有确实跑不了才可以不跑，且必须写明是哪一条挡住的："
         "用户说了不要运行 / 凭据变量没有值 / 流程含 variable.input 或 control.human_takeover 无法无人值守 / "
         "指定了扩展执行器但扩展未连接。以上都不成立就去运行。"
@@ -2372,6 +2511,35 @@ def _unmet_verification_request(text: str, state: dict[str, Any]) -> str | None:
 
 
 _SESSION_REQUIREMENT_MAX_CHARS = 2000
+
+
+# output_boundary 里那句「无关话题就这么回」的拒答模板。它本身没问题，
+# 问题是模型会拿它去回绝职责范围内的请求：实测同一条「给了 URL 要建抓取流程」的需求，
+# 第一次收到这句回绝、原样重发一次就干了 13 次工具调用的活。
+# 提示词侧已经把这段从页面探测阶段摘掉（ai_prompts.render_page_discovery_prompt），
+# 但完整 SYSTEM_PROMPT 里还留着，所以这里再补一道硬判定。
+_REFUSAL_TEMPLATE_MARKERS = ("我只能协助处理 RPA 流程", "只能协助处理 RPA 流程的创建")
+
+
+def _misapplied_refusal(text: str, state: dict[str, Any]) -> str | None:
+    """用拒答模板回绝了一个已被判定为职责范围内的请求。
+
+    只在本轮识别出建流程/修流程/要运行意图时才判——用户真问天气时这句回绝是对的。
+    """
+    if state.get("refusal_corrected") or not state.get("turn_intent_actionable"):
+        return None
+    if not any(marker in text for marker in _REFUSAL_TEMPLATE_MARKERS):
+        return None
+
+    state["refusal_corrected"] = True
+    return (
+        "你上一条回复已被撤回，用户没有看到，请完整重写整段回复（不要只补一句更正）。\n"
+        "撤回原因：你用「我只能协助处理 RPA 流程…」回绝了这次请求，但编排层已经判定"
+        "本轮请求就是流程的创建/修改/运行/审查——它在你的职责范围之内。那句话只用于话题真的无关时，"
+        "用在这里等于把该干的活推掉。\n"
+        "重写要求：不要再出现那句回绝。直接按需求动手调用工具；"
+        "确实缺关键信息（目标网址、要抓什么）就只问缺的那一项，并说明你已经掌握了什么。"
+    )
 
 
 # 「审查验收」「修复」「继续」这类只是指令，不含任何对数据的要求。
@@ -2424,6 +2592,22 @@ def _latest_user_message(messages: list[dict[str, Any]]) -> str:
     return ""
 
 
+def _blocking_diagnostics(
+    flow_state: FlowState, state: dict[str, Any]
+) -> list[dict[str, Any]] | None:
+    """本轮还挡着 run_flow 的诊断项。每轮开头重算一次，不累积。
+
+    阻断级静态诊断由状态块单点供给：写入工具的返回里也有一份，但那是写入那一刻的，
+    两份一旦不一致就无从判断该信哪个。运行期逃逸只能另算——它的前提正是静态扫描漏了
+    它，等状态块报出来是永远等不到的。
+    """
+    blocking = [f for f in flow_state.findings if is_blocking_finding(f)]
+    blocking += [
+        f for f in (state.get("runtime_escape_findings") or []) if f not in blocking
+    ]
+    return blocking or None
+
+
 def _orchestrator_guard_before_tool(
     tool_name: str,
     args: dict[str, Any],
@@ -2432,28 +2616,440 @@ def _orchestrator_guard_before_tool(
     """硬性护栏：prompt 规则只是建议，这里强制少数不能靠模型记忆遵守的规则
     （违反会导致昂贵或误导性的运行）。
 
-    判定逻辑与优先级都在 ai_guards.GUARDS 里，这里只是编排循环的调用点。
+    两层，顺序有讲究：
+
+    1. `ai_guards.GUARDS` 判「这次调用本身不该发生」——凭据外泄、验收契约被改写、
+       调用方的只读授权边界。这类判定与失败历史无关，任何阶段都不该被绕过。
+    2. `ai_phases` 判「现在还不到做这件事的时候」——缺证据、流程还没建、诊断没修完、
+       额度已耗尽。
+
+    护栏在前：只读模式是调用方给的授权边界，让阶段先报一个「先去看页面」，
+    等于把一个同样会被拒的动作推荐给模型。
+
+    护栏拦截要过一遍 `note_guard_block` 记账：护栏自己不看历史，所以「同一条拦截
+    第几次了」只能在这里数。不数它，护栏就是唯一没有上限的空转形态——
+    实测有会话在同一条契约校验上连撞 11 次。
     """
-    return apply_pre_tool_guards(tool_name, args, state)
+    blocked = apply_pre_tool_guards(tool_name, args, state)
+    if blocked is not None:
+        return note_guard_block(state, tool_name, blocked)
+    return apply_phase_gate(tool_name, args, state)
 
 
-def _count_repair_cycle(state: dict[str, Any], last_error: Any) -> None:
-    """记一次「改了又跑、跑了又没成」，到上限就上锁。
+def _build_change_context(state: dict[str, Any]) -> _ChangeContext:
+    """本轮的写入约束，随每次工具调用传给执行器。
+
+    执行器是全进程单例，这些是每轮才知道的东西，不能挂在它身上。
+    protected_node_ids 只在「保留执行通道」意图下非空：用户没在报原流程的问题时，
+    删改主链路节点属于正常编辑。
+    """
+    protected: set[str] = set()
+    if state.get("repair_intent") == "preserve_execution_channel":
+        protected = {str(nid) for nid in (state.get("browser_chain_node_ids") or set())}
+    return _ChangeContext(
+        protected_node_ids=frozenset(protected),
+        fresh_page_evidence=bool(state.get("fresh_page_evidence")),
+    )
+
+
+def _run_failure_signature(result: dict[str, Any]) -> str:
+    """把一次运行失败压成可比对的签名。
+
+    数字全部折成 `#`：同一个超时每次的毫秒数、task_id、行号都不一样，不折的话
+    「同一个失败又来一次」永远判不出来，重复计价那条规则就等于没有。
+    """
+    import re as _re
+
+    text = str(result.get("error") or result.get("message") or "")
+    normalized = _re.sub(r"\d+", "#", text)[:120]
+    return f"run:{result.get('status') or 'error'}:{normalized}"
+
+
+def _count_repair_cycle(
+    state: dict[str, Any],
+    last_error: Any,
+    *,
+    kind: str,
+    signature: str,
+    charge_only_if_repeated: bool = False,
+) -> None:
+    """记一次「改了又跑、跑了又没成」。
 
     运行报错和质量审计不合格都算：对用户来说两者是同一件事——又白跑了一轮。
+    签名区分「同一个失败又来一次」和「换了个失败」，前者按两份计价（见 ai_phases）。
     """
-    cycles = int(state.get("failed_run_cycles") or 0) + 1
-    state["failed_run_cycles"] = cycles
-    if cycles >= _MAX_REPAIR_CYCLES:
-        state["repair_cycle_lock"] = {
-            "cycles": cycles,
-            "last_error": str(last_error or "")[:400],
+    note_failed_attempt(
+        state,
+        kind=kind,
+        signature=signature,
+        detail=str(last_error or "")[:200] or None,
+        charge_only_if_repeated=charge_only_if_repeated,
+    )
+
+
+# ── 工具返回 → 事实写入 ────────────────────────────────────────────────────────
+#
+# 一个工具一个处理函数。原先是一条 270 行的平铺 if 链，同一个工具的写入散在三四处不
+# 相邻的分支里（run_flow 写在三段，中间隔着别的工具），链中间还夹着两个提前 return：
+# 要回答「这个键会不会被写」，得把整条链从头读到尾。这不只是读起来累——那两个 return
+# 今天之所以没吞掉任何东西，靠的是「只有 inspect_page 会返回 blocked_challenge_page、
+# 只有 run_flow 会返回 blocked_by_failure_budget」这个执行器侧的事实，而链上没有任何
+# 地方写着这个前提；executor 里哪天多一个产出点，被静默跳过的就是别的工具的写入。
+# 按工具分派之后，两个 return 各自缩回自己工具的函数里，作用域一眼可见。
+#
+# 两张表都要能枚举：新增一个工具却没人决定「它写不写事实」，会在元测试里红，
+# 而不是等到线上某条义务凭空消失——写入侧的缺陷历来都是这样，没有任何症状。
+
+
+def _note_page_evidence(tool_name: str, result: dict[str, Any], state: dict[str, Any]) -> None:
+    """inspect_page / inspect_screenshot 探测成功后的共有记账。"""
+    # 取证成功才记指纹：失败的探测没拿到任何东西，重试是正当的。
+    note_evidence(state, tool_name, state.get("_last_tool_args") or {})
+    # 新页面证据到手，解锁节点级 selector 熔断。
+    # 落到登录页的检查看到的是登录表单，对目标页不构成证据，不能解锁。
+    if not result.get("redirected_to_login"):
+        state["fresh_page_evidence"] = True
+
+
+def _after_inspect_page(result: dict[str, Any], state: dict[str, Any]) -> None:
+    if result.get("status") == "blocked_challenge_page":
+        # 刻意不进 _PERSISTED_KEYS：这道锁只在本轮有效。用户下一句往往正是
+        # 「我过完验证了，再跑一次」，跨轮留着会把唯一的出路也锁死。
+        state["challenge_page_lock"] = {
+            "url": result.get("requested_url"),
+            "label": result.get("challenge_label"),
+        }
+        # 拦截页是整页替换，页面上一条业务结构都没有，下面的取证一条也不成立
+        return
+    if result.get("error"):
+        return
+    _note_page_evidence("inspect_page", result, state)
+    state["page_evidence_source"] = result.get("inspection_source") or "browser_dom"
+    # 看过页面就算证据到手，不再区分是否落到了登录页：区分了会造出一个死局——
+    # 站点一直重定向到登录页时，模型既写不了流程也走不到收尾，只能耗完轮次。
+    # 「登录页不算目标页证据」这条判断由上面的 fresh_page_evidence 承担，它管的是
+    # 节点级 selector 熔断，拦错了还有出路。
+    state["page_evidence_done"] = True
+
+
+def _after_inspect_screenshot(result: dict[str, Any], state: dict[str, Any]) -> None:
+    # 刻意不设 page_evidence_done：DOM 取证义务要的是 selector 能落地的结构，看图看不出来
+    if not result.get("error"):
+        _note_page_evidence("inspect_screenshot", result, state)
+
+
+def _note_acceptance_audit(audit: dict[str, Any], state: dict[str, Any]) -> None:
+    if audit.get("passed"):
+        state["audit_passed"] = True
+        # 业务校验通过 = 问题已解决，之前的失败尝试不该再挡住后续正常编辑
+        state["node_selector_fix_counts"] = {}
+        state["node_field_history"] = {}
+        note_verified(state)
+        _repair_ledger.clear(state.get("flow_id"))
+        return
+    # 质量审计不合格是这类空转循环的主要形态：跑得起来但交付不了，
+    # 只盯 run_flow 的失败状态会完全数不到
+    state["audit_findings"] = {
+        "issues": audit.get("issues", []),
+        "repair_plan": audit.get("repair_plan", []),
+    }
+    first = next((i for i in (audit.get("issues") or []) if isinstance(i, dict)), {})
+    _count_repair_cycle(
+        state,
+        first.get("message"),
+        kind="audit",
+        signature=f"audit:{first.get('issue') or 'unknown'}",
+    )
+
+
+def _note_undefined_variable_escape(result: dict[str, Any], state: dict[str, Any]) -> None:
+    """运行期「变量未定义」说明静态检查漏检。
+
+    它不在静态诊断集里（漏网就是它的定义），所以单独记一处：状态块每轮重算，
+    写进 blocking_diagnostics 会被下一轮直接冲掉。
+    """
+    err_msg = str(result.get("error", ""))
+    if "变量未定义" not in err_msg:
+        return
+    escaped_var = (re.search(r"变量未定义[：:]\s*(\S+)", err_msg) or [None, err_msg])[1]
+    escape_finding: dict[str, Any] = {
+        "severity": "error",
+        "issue": "undefined_variable_ref_runtime_escape",
+        "message": (
+            f"运行期捕获到未定义变量 `{escaped_var}`，说明静态扫描存在漏网。"
+            "在节点列表里搜这个变量名定位引用点，再用 apply_node_fix 修复后重试。"
+        ),
+        "fix": (
+            "在 input_variables 中声明该变量，"
+            "或删除节点中对该变量的引用，"
+            "或确认引用拼写与 input_variables 中的 name 完全一致（区分大小写）。"
+        ),
+        "escaped_variable": escaped_var,
+    }
+    state["runtime_escape_findings"] = (state.get("runtime_escape_findings") or []) + [escape_finding]
+
+
+def _after_run_flow(result: dict[str, Any], state: dict[str, Any]) -> None:
+    status = str(result.get("status") or "")
+
+    # acceptance_audit 只在 task.status == "success" 时才挂上（见 executor._run_flow 结尾），
+    # 所以「审计不合格」与下面「运行失败」这两处计价，对同一次运行永远不会同时发生。
+    audit = result.get("acceptance_audit")
+    if isinstance(audit, dict):
+        _note_acceptance_audit(audit, state)
+
+    # 超时/暂停也算尝试过：这些是真拦路条件，不该再催模型去跑。
+    # 起跑前被拒且模型自己能改的那几条不算——见 _RUN_REFUSED_MODEL_FIXABLE。
+    if status not in _RUN_REFUSED_MODEL_FIXABLE:
+        state["run_attempted"] = True
+
+    if status == "success":
+        # 只记跑通，不清零修复计数：质量审计不合格的运行 status 同样是 success，
+        # 在这里清零会让「跑成功 → 审计不过 → 再改」的循环永远攒不满次数
+        state["run_succeeded"] = True
+    elif status not in _RUN_WAITING_STATUSES:
+        # 停下来等人不是一次失败的修复：流程没跑完是因为轮到用户了，
+        # 记进熔断计数会让「等一次人工接管」白白吃掉三分之一的修复预算
+        never_started = status in _RUN_NOT_STARTED_STATUSES
+        _count_repair_cycle(
+            state,
+            result.get("error") or result.get("message"),
+            kind="run_refused" if never_started else "run_error",
+            signature=_run_failure_signature(result),
+            charge_only_if_repeated=never_started,
+        )
+
+    if status == "error":
+        _note_undefined_variable_escape(result, state)
+
+    if status == "blocked_by_failure_budget":
+        state["failure_budget_lock"] = {
+            "flow_id": result.get("flow_id"),
+            "recent_failed_task_ids": result.get("recent_failed_task_ids", []),
+            "recent_failed_nodes": result.get("recent_failed_nodes", []),
+            "recent_failure_kinds": result.get("recent_failure_kinds", []),
+            "message": result.get("message"),
         }
 
 
+def _after_get_run_error(result: dict[str, Any], state: dict[str, Any]) -> None:
+    # 带回失败现场截图也算新证据。
+    if result.get("failure_screenshot_note"):
+        state["fresh_page_evidence"] = True
+    if not result.get("inspect_hint"):
+        return
+
+    last_url = result.get("last_browser_url")
+    suggested: dict[str, Any] = {"reason": "run_failed_on_page_element"}
+    if isinstance(last_url, str) and last_url:
+        suggested["url"] = last_url
+    suggested["wait_selector"] = "table, [role=grid], nav, main"
+    # 报出 selector/可见性错误就要求真去看一次 DOM：静态诊断读不到页面，
+    # 不看就改等于按上一次的想象再猜一遍。
+    state["page_evidence_required"] = suggested
+    state["page_evidence_done"] = False
+
+    failed_node = result.get("failed_node_config") if isinstance(result.get("failed_node_config"), dict) else {}
+    failed_node_id = str(result.get("failed_node_id") or failed_node.get("id") or "")
+    failed_type = str(failed_node.get("type") or "")
+    selector_text = str(failed_node.get("selector") or "")
+    selector_diagnostic = result.get("selector_diagnostic") if isinstance(result.get("selector_diagnostic"), dict) else {}
+    diagnostic_kind = str(selector_diagnostic.get("kind") or "")
+
+    # 失败也要沉淀到站点档案：台账只按 flow 记，换个流程抓同一站点就等于没学过。
+    # 写不进去不影响本轮对话，档案只是先验，不是判据。
+    if selector_text:
+        try:
+            from app.services.site_knowledge import get_site_knowledge_store
+            get_site_knowledge_store().record_selector_failure(
+                last_url if isinstance(last_url, str) else None,
+                selector_text,
+                node_type=failed_type,
+                diagnostic_kind=diagnostic_kind,
+            )
+        except Exception as exc:
+            logger.debug("site_knowledge 失败沉淀跳过：%s", exc)
+
+    is_navigation_failure = failed_type in {"browser.click", "browser.hover"} and (
+        # 四类诊断都算，不做区分：熔断给的出路是「换 browser.open 直达 URL」，
+        # 这条出路对点不动的任何一种成因都成立，反复失败本身就够构成判据。
+        diagnostic_kind in SELECTOR_DIAGNOSTIC_KINDS
+        or any(token in selector_text for token in (
+            ":has-text", "text=", "[role=", "aria-", ".menu", ".nav", "router-link", "a[href"
+        ))
+    )
+    if failed_node_id and is_navigation_failure:
+        # 这次失败的费在 run_flow 那一刻就扣过了，这里只补上归类：
+        # 导航类熔断后给的出路（换 browser.open 直达 URL、或向用户要目标 URL）
+        # 和别的失败完全不同，不归类就丢了这条出路；再扣一次费则是同一次失败算两遍。
+        reclassify_last_attempt(state, kind="navigation")
+        state["navigation_failure_hint"] = {
+            "node_id": failed_node_id,
+            "node_type": failed_type,
+            "selector_diagnostic": selector_diagnostic,
+            "last_browser_url": last_url,
+            "suggested_fix": (
+                "不要继续盲改同一 selector；优先将该节点替换为已验证可达的 browser.open 目标页面 URL。"
+                "目标 URL 可以是 path、query、hash 或站点允许的完整 URL。"
+                "若未知目标 URL，先 inspect_page 当前应用可见导航/按钮结构，再只修复该单个导航节点。"
+            ),
+        }
+
+
+def _after_flow_write(result: dict[str, Any], state: dict[str, Any]) -> None:
+    """四个写工具共有：作废旧证据 + 按写入后那一版 lint 重算闸门。"""
+    # 流程一被改动，之前那次运行和审计就不再针对当前这份定义，证据全部作废。
+    state["run_succeeded"] = False
+    state["audit_passed"] = False
+    # 页面和运行结果都可能因为这次改动而不同，重探同一个目标不再算原地打转
+    note_progress(state)
+    # 取 changed_nodes 而不是调用参数：update_nodes 的 patch 里没有 type，
+    # 只按参数判会漏掉「改的是已有加工节点」这一半
+    flow_event = next((
+        event for event in (result.get("events") or [])
+        if isinstance(event, dict) and event.get("type") == "flow_written"
+    ), None)
+    if flow_event and any(
+        isinstance(item, dict) and item.get("type") in TRANSFORM_NODE_TYPES
+        for item in (flow_event.get("affected_nodes") or [])
+    ):
+        state["transform_node_touched"] = True
+
+    # 写入返回里的 lint 针对的是写入之后那一版，比状态块（本轮开头那一版）更新，所以据它更新闸门。
+    # 不更新的话，「改完接着在同一轮跑」会被上一版的诊断拦住，而拦它的理由已经不存在了——
+    # 交回给模型的是一份已经修好的问题清单。
+    #
+    # 必须区分「lint 跑了且干净」与「这个工具压根不跑 lint」：后者返回里两个键都没有，
+    # 当成干净会把闸门整个抹掉。所以只认 lint_clean 与 lint_findings 这两个显式信号。
+    post_write: list[dict[str, Any]] | None = None
+    if isinstance(result.get("lint_findings"), list):
+        post_write = [f for f in result["lint_findings"] if isinstance(f, dict)]
+    elif result.get("lint_clean") is True:
+        post_write = []
+    if post_write is not None:
+        # 复用 _blocking_diagnostics：与轮次开头那条路径共用同一份判定，
+        # 两边算法一旦分岔，阶段就会随「上次是谁更新的」而变
+        state["blocking_diagnostics"] = _blocking_diagnostics(
+            FlowState(findings=post_write), state
+        )
+
+
+def _after_node_edit(result: dict[str, Any], state: dict[str, Any]) -> None:
+    """update_flow / apply_node_fix 共有：修复台账 + 解除各类失败标记。
+
+    台账记本流程每个受跟踪字段的取值轨迹与 selector 修改次数，跨会话累计。取执行器返回的
+    tracked_field_changes（写入前后的真实差分），不解析调用参数——参数记的是模型「想改成
+    什么」，归一化、字段清理、被拒的写入都会让两者不一致，而写入期差分检查正是拿这份历史
+    去判回摆的：记错一次，之后每一次判定都错。
+    """
+    changes = [c for c in (result.get("tracked_field_changes") or []) if isinstance(c, dict)]
+    field_history: dict[str, list[str]] = state.setdefault("node_field_history", {})
+    for change in changes:
+        trail = field_history.setdefault(f"{change.get('node_id')}.{change.get('field')}", [])
+        value = str(change.get("value"))
+        if not trail or trail[-1] != value:
+            trail.append(value)
+
+    selector_nodes = {
+        str(c.get("node_id")) for c in changes if c.get("field") == "selector"
+    }
+    if selector_nodes:
+        fix_counts = state.setdefault("node_selector_fix_counts", {})
+        for node_id in selector_nodes:
+            fix_counts[node_id] = fix_counts.get(node_id, 0) + 1
+        # 一次页面证据只够支撑一次改动：改完还没重新看过页面，下一次又是盲改
+        state["fresh_page_evidence"] = False
+
+    if changes:
+        _repair_ledger.save(
+            state.get("flow_id"),
+            node_field_history=field_history,
+            node_selector_fix_counts=state.get("node_selector_fix_counts") or {},
+            sessions=int(state.get("repair_sessions") or 1),
+        )
+
+    # 只有真实结构修复才能解除各类失败标记，下一次运行会重新审计。
+    state["audit_findings"] = None
+    state["navigation_failure_hint"] = None
+    state["runtime_escape_findings"] = []
+
+
+def _after_create_flow(result: dict[str, Any], state: dict[str, Any]) -> None:
+    if result.get("error"):
+        return
+    _after_flow_write(result, state)
+    # 本轮内就得脱离 BUILD：不然刚建完的流程在同一轮里仍被判成「还不存在」，
+    # 模型接下来那次 run_flow 会被自己刚满足的前置门挡掉。
+    state["flow_has_nodes"] = True
+
+
+def _after_update_flow(result: dict[str, Any], state: dict[str, Any]) -> None:
+    if result.get("error"):
+        return
+    _after_flow_write(result, state)
+    _after_node_edit(result, state)
+
+
+def _after_apply_node_fix(result: dict[str, Any], state: dict[str, Any]) -> None:
+    if result.get("error"):
+        return
+    _after_flow_write(result, state)
+    _after_node_edit(result, state)
+    # 熔断之后唯一还放行的写工具：它成功落盘说明模型确实定位到了单个节点、不是又一次盲改，
+    # 所以这把锁只能由它解除。update_flow 不行——整流程重写正是这把锁要拦的东西。
+    state["failure_budget_lock"] = None
+
+
+def _after_set_acceptance_contract(result: dict[str, Any], state: dict[str, Any]) -> None:
+    if result.get("error"):
+        return
+    _after_flow_write(result, state)
+
+
+# 工具名 → 写入函数。写工具那四项必须与 _FLOW_WRITE_TOOLS 一致（元测试守）。
+_AFTER_TOOL_HANDLERS: dict[str, Callable[[dict[str, Any], dict[str, Any]], None]] = {
+    "apply_node_fix": _after_apply_node_fix,
+    "create_flow": _after_create_flow,
+    "get_run_error": _after_get_run_error,
+    "inspect_page": _after_inspect_page,
+    "inspect_screenshot": _after_inspect_screenshot,
+    "run_flow": _after_run_flow,
+    "set_acceptance_contract": _after_set_acceptance_contract,
+    "update_flow": _after_update_flow,
+}
+
+# 返回不改变任何事实的工具。要显式列出来，理由跟 GUARDS / _PER_ROUND_KEYS 一样：
+# 新增工具时必须表态，漏一个不会报错，只会让它的返回静默不进 state。
+#
+# get_run_logs / get_run_output 在此列是个既有的不对称：它们同属 EVIDENCE_TOOLS，却从来
+# 没记过取证指纹，于是「重复取同一份日志」这条判据对它们不生效。本次不改动，写在这里
+# 是为了让它是一个明确的决定，而不是一处谁都没注意到的遗漏。
+_AFTER_TOOL_NO_STATE_EFFECT = frozenset({
+    "check_extension_connection",
+    "create_schedule",
+    "get_run_logs",
+    "get_run_output",
+    "list_node_types",
+    "list_schedules",
+    "publish_flow",
+    "stop_run",
+    "toggle_schedule",
+})
+
+
 def _orchestrator_guard_after_tool(tool_name: str, result: Any, state: dict[str, Any]) -> None:
+    """把一次工具返回写进 guard_state。
+
+    与工具无关的三件事在前，且顺序敏感；其余全部按工具分派。
+    """
     if not isinstance(result, dict):
         return
+    # 「改动已落盘，要不要运行归用户定」是编排层自己下的结论，不是工具输出，所以排在
+    # 下面那条「阻断结果不影响 state」之前。只停本轮剩余并行调用不够：下一轮工具全开，
+    # 模型会接着去翻已经看过的东西。这里只收工具，收尾正文仍由模型自己写——换成
+    # terminal_response_only 会走模板回复，把「改了哪个节点的哪个字段」那段顶掉。
+    if result.get("required_action") == "ask_user":
+        state["closing_statement_only"] = True
     # 被阻断的调用不携带真实工具输出，不应影响 state
     if result.get("status") == "blocked_by_orchestrator_guard":
         return
@@ -2464,284 +3060,6 @@ def _orchestrator_guard_after_tool(tool_name: str, result: Any, state: dict[str,
     ):
         state["terminal_response_only"] = True
 
-    if tool_name in {"inspect_page", "inspect_screenshot"}:
-        if result.get("error"):
-            state["consecutive_inspect_page_count"] = 0
-        else:
-            # 截图与 DOM 探测共用连续计数，防止「反复看页面不干活」的循环。
-            state["consecutive_inspect_page_count"] = int(state.get("consecutive_inspect_page_count") or 0) + 1
-            # 新页面证据到手，解锁节点级 selector 熔断。
-            # 落到登录页的检查看到的是登录表单，对目标页不构成证据，不能解锁。
-            if not result.get("redirected_to_login"):
-                state["fresh_page_evidence"] = True
-            if tool_name == "inspect_page":
-                state["page_evidence_source"] = result.get("inspection_source") or "browser_dom"
-            if tool_name == "inspect_page" and state.get("pre_create_inspect_gate") is not None:
-                state["pre_create_inspect_gate"]["inspect_done"] = True
-    elif tool_name in {*_FLOW_WRITE_TOOLS, "run_flow"}:
-        state["consecutive_inspect_page_count"] = 0
-
-    if tool_name == "assert_run_output":
-        if result.get("passed"):
-            state["audit_passed"] = True
-            # 业务校验通过 = 问题已解决，之前的失败尝试不该再挡住后续正常编辑
-            state["node_selector_fix_counts"] = {}
-            state["node_field_history"] = {}
-            state["failed_run_cycles"] = 0
-            _repair_ledger.clear(state.get("flow_id"))
-        else:
-            # 质量审计不合格是这类空转循环的主要形态：跑得起来但交付不了，
-            # 只盯 run_flow 的失败状态会完全数不到
-            first = next((i for i in (result.get("issues") or []) if isinstance(i, dict)), {})
-            _count_repair_cycle(state, first.get("message"))
-        issues = result.get("issues") or []
-        if any(
-            isinstance(item, dict) and item.get("issue") in CONTENT_MISMATCH_ISSUES
-            for item in issues
-        ):
-            state["content_mismatch_reported"] = True
-        if state.pop("requirement_text_overridden", False):
-            result["requirement_text_source"] = (
-                "已用本会话用户原话替换你传入的 requirement_text：需求以用户说的为准，不以你的复述为准。"
-            )
-        if state.pop("content_match_confirm_stripped", False):
-            result["content_match_confirmed_ignored"] = (
-                "content_match_confirmed 已被忽略并按 false 处理："
-                "本会话尚未出现内容不匹配问题，该确认位只在工具报出该问题后才作数。"
-            )
-
-    # get_run_error 带回失败现场截图也算新证据。
-    if tool_name == "get_run_error" and result.get("failure_screenshot_note"):
-        state["fresh_page_evidence"] = True
-
-    # 流程一被改动，之前那次运行和审计就不再针对当前这份定义，证据全部作废。
-    if tool_name in _FLOW_WRITE_TOOLS and not result.get("error"):
-        state["run_succeeded"] = False
-        state["audit_passed"] = False
-        # 取 changed_nodes 而不是调用参数：update_nodes 的 patch 里没有 type，
-        # 只按参数判会漏掉「改的是已有加工节点」这一半
-        flow_event = next((
-            event for event in (result.get("events") or [])
-            if isinstance(event, dict) and event.get("type") == "flow_written"
-        ), None)
-        if flow_event and any(
-            isinstance(item, dict) and item.get("type") in TRANSFORM_NODE_TYPES
-            for item in (flow_event.get("affected_nodes") or [])
-        ):
-            state["transform_node_touched"] = True
-    elif tool_name == "run_flow":
-        # 超时/暂停/扩展未连接也算尝试过：这些是真拦路条件，不该再催模型去跑
-        state["run_attempted"] = True
-        if result.get("status") == "success":
-            # 只记跑通，不清零修复计数：质量审计不合格的运行 status 同样是 success，
-            # 在这里清零会让「跑成功 → 审计不过 → 再改」的循环永远攒不满次数
-            state["run_succeeded"] = True
-        elif result.get("status") not in _RUN_WAITING_STATUSES:
-            # 停下来等人不是一次失败的修复：流程没跑完是因为轮到用户了，
-            # 记进熔断计数会让「等一次人工接管」白白吃掉三分之一的修复预算
-            _count_repair_cycle(state, result.get("error") or result.get("message"))
-
-    # 记录本会话内每个节点的 selector 修改次数；每次修改消耗一次页面证据。
-    if tool_name in {"update_flow", "apply_node_fix"} and not result.get("error"):
-        field_history: dict[str, list[str]] = state.setdefault("node_field_history", {})
-        for node_id, field, value in _node_field_changes(tool_name, state.get("_last_tool_args") or {}):
-            trail = field_history.setdefault(f"{node_id}.{field}", [])
-            if not trail or trail[-1] != value:
-                trail.append(value)
-
-        changed = _selector_change_node_ids(tool_name, state.get("_last_tool_args") or {})
-        if changed:
-            fix_counts = state.setdefault("node_selector_fix_counts", {})
-            for node_id in changed:
-                fix_counts[node_id] = fix_counts.get(node_id, 0) + 1
-            state["fresh_page_evidence"] = False
-
-        _repair_ledger.save(
-            state.get("flow_id"),
-            node_field_history=field_history,
-            node_selector_fix_counts=state.get("node_selector_fix_counts") or {},
-            sessions=int(state.get("repair_sessions") or 1),
-        )
-
-    if tool_name == "create_flow" and not result.get("error"):
-        state["pre_create_inspect_gate"] = None
-
-    # 运行期"变量未定义"说明静态检查漏检，包装成阻断级 lint finding 逼迫先修复再重跑
-    if tool_name == "run_flow" and result.get("status") == "error":
-        err_msg = str(result.get("error", ""))
-        if "变量未定义" in err_msg:
-            import re as _re
-            escaped_var = (_re.search(r"变量未定义[：:]\s*(\S+)", err_msg) or [None, err_msg])[1]
-            escape_finding: dict[str, Any] = {
-                "severity": "error",
-                "issue": "undefined_variable_ref_runtime_escape",
-                "message": (
-                    f"运行期捕获到未定义变量 `{escaped_var}`，说明静态扫描存在漏网。"
-                    "请用 validate_flow 定位引用该变量的节点，再用 apply_node_fix 修复后重试。"
-                ),
-                "fix": (
-                    "在 input_variables 中声明该变量，"
-                    "或删除节点中对该变量的引用，"
-                    "或确认引用拼写与 input_variables 中的 name 完全一致（区分大小写）。"
-                ),
-                "escaped_variable": escaped_var,
-            }
-            existing = state.get("requires_lint_fix") or []
-            state["requires_lint_fix"] = existing + [escape_finding]
-
-    if result.get("status") == "blocked_challenge_page":
-        # 刻意不进 _PERSISTED_KEYS：这道锁只在本轮有效。用户下一句往往正是
-        # 「我过完验证了，再跑一次」，跨轮留着会把唯一的出路也锁死。
-        state["challenge_page_lock"] = {
-            "url": result.get("requested_url"),
-            "label": result.get("challenge_label"),
-        }
-        return
-
-    if result.get("status") == "blocked_by_failure_budget":
-        state["failure_budget_lock"] = {
-            "flow_id": result.get("flow_id"),
-            "recent_failed_task_ids": result.get("recent_failed_task_ids", []),
-            "recent_failed_nodes": result.get("recent_failed_nodes", []),
-            "recent_failure_kinds": result.get("recent_failure_kinds", []),
-            "message": result.get("message"),
-        }
-        return
-
-    if tool_name == "inspect_page" and not result.get("error"):
-        state["requires_inspect_page"] = None
-
-    if tool_name == "get_run_error" and result.get("inspect_hint"):
-        suggested: dict[str, Any] = {}
-        last_url = result.get("last_browser_url")
-        if isinstance(last_url, str) and last_url:
-            suggested["url"] = last_url
-        suggested["wait_selector"] = "table, [role=grid], nav, main"
-        state["requires_inspect_page"] = suggested
-
-        failed_node = result.get("failed_node_config") if isinstance(result.get("failed_node_config"), dict) else {}
-        failed_node_id = str(result.get("failed_node_id") or failed_node.get("id") or "")
-        failed_type = str(failed_node.get("type") or "")
-        selector_text = str(failed_node.get("selector") or "")
-        selector_diagnostic = result.get("selector_diagnostic") if isinstance(result.get("selector_diagnostic"), dict) else {}
-        diagnostic_kind = str(selector_diagnostic.get("kind") or "")
-
-        # 失败也要沉淀到站点档案：台账只按 flow 记，换个流程抓同一站点就等于没学过。
-        # 写不进去不影响本轮对话，档案只是先验，不是判据。
-        if selector_text:
-            try:
-                from app.services.site_knowledge import get_site_knowledge_store
-                get_site_knowledge_store().record_selector_failure(
-                    last_url if isinstance(last_url, str) else None,
-                    selector_text,
-                    node_type=failed_type,
-                    diagnostic_kind=diagnostic_kind,
-                )
-            except Exception as exc:
-                logger.debug("site_knowledge 失败沉淀跳过：%s", exc)
-
-        is_navigation_failure = (
-            failed_type in {"browser.click", "browser.hover"}
-            and bool(result.get("inspect_hint"))
-            and (
-                # 四类诊断都算，不做区分：熔断给的出路是「换 browser.open 直达 URL」，
-                # 这条出路对点不动的任何一种成因都成立，反复失败本身就够构成判据。
-                diagnostic_kind in SELECTOR_DIAGNOSTIC_KINDS
-                or any(token in selector_text for token in (
-                    ":has-text", "text=", "[role=", "aria-", ".menu", ".nav", "router-link", "a[href"
-                ))
-            )
-        )
-        if failed_node_id and is_navigation_failure:
-            key = f"{failed_node_id}:{failed_type}:{diagnostic_kind or 'selector_error'}"
-            counts: dict[str, int] = state.setdefault("navigation_failure_counts", {})
-            counts[key] = counts.get(key, 0) + 1
-            if counts[key] >= _NAV_FAILURE_BUDGET:
-                state["navigation_budget_lock"] = {
-                    "node_id": failed_node_id,
-                    "node_type": failed_type,
-                    "count": counts[key],
-                    "selector_diagnostic": selector_diagnostic,
-                    "last_browser_url": last_url,
-                    "suggested_fix": (
-                        "不要继续盲改同一 selector；优先将该节点替换为已验证可达的 browser.open 目标页面 URL。"
-                        "目标 URL 可以是 path、query、hash 或站点允许的完整 URL。"
-                        "若未知目标 URL，先 inspect_page 当前应用可见导航/按钮结构，再只修复该单个导航节点。"
-                    ),
-                }
-
-    if tool_name == "assert_run_output":
-        if result.get("passed") is False:
-            state["requires_quality_fix"] = {
-                "issues": result.get("issues", []),
-                "repair_plan": result.get("repair_plan", []),
-            }
-            counts: dict[str, int] = state.setdefault("quality_issue_counts", {})
-            for iss in result.get("issues", []):
-                issue_type = str(iss.get("issue", "unknown"))
-                counts[issue_type] = counts.get(issue_type, 0) + 1
-                if counts[issue_type] >= 2 and not state.get("quality_budget_lock"):
-                    state["quality_budget_lock"] = {
-                        "issue": issue_type,
-                        "count": counts[issue_type],
-                    }
-        elif result.get("passed") is True:
-            state["requires_quality_fix"] = None
-            state["quality_issue_counts"] = {}
-            state["quality_budget_lock"] = None
-
-    if tool_name in {"apply_node_fix", "update_flow", "create_flow", "lint_flow"} and not result.get("error"):
-        # lint_flow 交回的键是 findings，写工具（create/update/apply）才叫 lint_findings。
-        # 取错键读到的恒是空列表，于是下面这行把阻断标记清成 None：模型被拦下后随手
-        # 调一次 lint_flow，什么都没修，锁就没了。失败的调用同样不能清——上面的 error
-        # 判断挡的就是「lint 报错 = 流程干净」这个更荒谬的推论。
-        raw = result.get("findings") if tool_name == "lint_flow" else result.get("lint_findings")
-        blocking = _blocking_lint_findings(raw or [])
-        # 运行期逃逸 finding（如 undefined_variable_ref_runtime_escape）存在的前提
-        # 就是静态扫描漏网——一次通过的 lint_flow 不能把它冲掉，
-        # 只有真实的结构性修复（update_flow / apply_node_fix 成功）才允许清除。
-        if tool_name == "lint_flow":
-            escaped = [
-                f for f in (state.get("requires_lint_fix") or [])
-                if isinstance(f, dict) and f.get("issue") == "undefined_variable_ref_runtime_escape"
-            ]
-            blocking = blocking + [f for f in escaped if f not in blocking]
-        state["requires_lint_fix"] = blocking or None
-        if tool_name in {"apply_node_fix", "update_flow"}:
-            # 只有真实结构修复才能解除质量审计失败标记，下次运行会重新审计
-            state["requires_quality_fix"] = None
-            state["quality_issue_counts"] = {}
-            state["quality_budget_lock"] = None
-            state["navigation_failure_counts"] = {}
-            state["navigation_budget_lock"] = None
-        if tool_name == "apply_node_fix":
-            state["failure_budget_lock"] = None
-
-    if state.get("pending_repair_gate") is not None:
-        gate = state["pending_repair_gate"]
-        # get_run_error 报出 selector/可见性错误时打标，防止 lint 自动跳过 inspect_done
-        if tool_name == "get_run_error" and result.get("inspect_hint"):
-            gate["runtime_selector_error"] = True
-        if tool_name == "lint_flow" and not result.get("error"):
-            gate["lint_done"] = True
-            # lint_flow 交回来的键是 findings；写工具（create/update/apply）才叫 lint_findings。
-            # 取错键不会报错，只会让下面这段恒为「没发现问题」，inspect_page 于是无条件被跳过。
-            findings = result.get("findings", [])
-            has_browser_issue = any(
-                f.get("issue") in _BROWSER_SELECTOR_ISSUES
-                for f in findings if isinstance(f, dict)
-            )
-            # 仅当 lint 未发现浏览器/selector 问题且运行错误本身也非 selector 失败时才跳过
-            if not has_browser_issue and not gate.get("runtime_selector_error"):
-                gate["inspect_done"] = True
-        if tool_name == "inspect_page" and not result.get("error"):
-            gate["inspect_done"] = True
-
-    if tool_name in {"apply_node_fix", "update_flow"} and not result.get("error"):
-        state["pending_repair_gate"] = None
-
-
-def _blocking_lint_findings(findings: Any) -> list[dict[str, Any]]:
-    if not isinstance(findings, list):
-        return []
-    return [f for f in findings if is_blocking_finding(f)]
+    handler = _AFTER_TOOL_HANDLERS.get(tool_name)
+    if handler is not None:
+        handler(result, state)

@@ -1,0 +1,255 @@
+{
+  "model": "xai/grok-4.5",
+  "prompt_fingerprint": "cdc6d62c868d",
+  "scenario": "gen_login_then_navigate",
+  "reply": "",
+  "calls": [
+    {
+      "name": "inspect_page",
+      "args": {
+        "url": "https://example.com/admin",
+        "wait_selector": "input, button, form"
+      }
+    },
+    {
+      "name": "create_flow",
+      "args": {
+        "name": "订单列表抓取",
+        "nodes": [
+          {
+            "id": "start",
+            "type": "start",
+            "title": "开始",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 100
+            }
+          },
+          {
+            "id": "n1",
+            "type": "browser.ensureLogin",
+            "title": "探测登录态",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 200
+            },
+            "targetUrl": "https://example.com/admin",
+            "selector": ".data-table, table",
+            "targetSelector": "input[type='password']",
+            "firstValueVariable": "login_status",
+            "delayMs": 3000,
+            "description": "持久 Cookie 有效则跳过登录"
+          },
+          {
+            "id": "n5",
+            "type": "control.condition",
+            "title": "判断是否需要登录",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 300
+            },
+            "inputValue": "login_status == 'login_required'",
+            "description": "需要登录则走登录分支"
+          },
+          {
+            "id": "n6",
+            "type": "browser.fill",
+            "title": "填写账号",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 320,
+              "y": 400
+            },
+            "selector": "input[placeholder='请输入用户名']",
+            "inputValue": "${var.username}",
+            "delayMs": 500,
+            "description": "填入 ${var.username}"
+          },
+          {
+            "id": "n7",
+            "type": "browser.fill",
+            "title": "填写密码",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 320,
+              "y": 500
+            },
+            "selector": "input[type='password']",
+            "inputValue": "${var.password}",
+            "delayMs": 500,
+            "description": "填入 ${var.password}"
+          },
+          {
+            "id": "n8",
+            "type": "browser.click",
+            "title": "点击登录按钮",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 320,
+              "y": 600
+            },
+            "selector": "button:has-text('登录')",
+            "delayMs": 3000,
+            "description": "提交登录表单"
+          },
+          {
+            "id": "n9",
+            "type": "browser.wait",
+            "title": "等待登录后导航",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 320,
+              "y": 700
+            },
+            "selector": ".data-table, table",
+            "timeoutMs": 15000,
+            "description": "等应用壳出现，确认登录成功"
+          },
+          {
+            "id": "n10",
+            "type": "browser.open",
+            "title": "打开订单列表页",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 800
+            },
+            "targetUrl": "https://example.com/list",
+            "delayMs": 3000,
+            "description": "合流后导航到数据页"
+          },
+          {
+            "id": "n11",
+            "type": "browser.wait",
+            "title": "等待表格加载",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 900
+            },
+            "selector": "table, .data-table",
+            "timeoutMs": 10000,
+            "description": "等表格渲染完成"
+          },
+          {
+            "id": "n12",
+            "type": "browser.extract",
+            "title": "提取订单列表",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 1000
+            },
+            "selector": ".data-table tbody tr",
+            "extractMode": "table",
+            "outputVariable": "order_data",
+            "table": {
+              "headers": [
+                "名称",
+                "创建时间",
+                "状态"
+              ],
+              "container_selector": "table",
+              "cls": "data-table",
+              "row_selector": ".data-table tbody tr"
+            },
+            "countVariable": "order_table_count",
+            "timeoutMs": 8000,
+            "description": "表格模式直接按表头结构化提取成 JSON"
+          },
+          {
+            "id": "n13",
+            "type": "file.write",
+            "title": "保存结果",
+            "kind": "file",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 1100
+            },
+            "path": "${var.output_prefix}.json",
+            "content": "${var.order_data}",
+            "description": "写出 JSON 到本次运行目录"
+          },
+          {
+            "id": "end",
+            "type": "end",
+            "title": "结束",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 1200
+            }
+          }
+        ],
+        "acceptance_contract": {
+          "requirements": [
+            {
+              "id": "grab-orders",
+              "description": "登录后抓取订单列表表格存成 JSON",
+              "source_kind": "user",
+              "confidence": 1,
+              "confirmed": true,
+              "source_quote": "创建流程：登录 https://example.com/admin（账号密码会在输入变量面板配置），然后抓取订单列表表格存成 JSON。"
+            }
+          ],
+          "deliverables": [
+            {
+              "id": "order-list",
+              "variable": "order_data",
+              "kind": "table",
+              "requirement_ids": [
+                "grab-orders"
+              ]
+            }
+          ]
+        },
+        "input_variables": [
+          {
+            "name": "username",
+            "type": "String",
+            "value": "",
+            "category": "credential"
+          },
+          {
+            "name": "password",
+            "type": "String",
+            "value": "",
+            "category": "credential",
+            "sensitive": true
+          }
+        ]
+      }
+    }
+  ],
+  "guard_hits": [],
+  "metrics": {
+    "rounds": 2,
+    "max_rounds": 30,
+    "tool_calls": 2,
+    "duplicate_calls": 0,
+    "blocked_calls": 0,
+    "prompt_tokens": 27230,
+    "completion_tokens": 1388,
+    "cached_tokens": 26944,
+    "guard_hits": [],
+    "call_histogram": {
+      "inspect_page": 1,
+      "create_flow": 1
+    }
+  }
+}

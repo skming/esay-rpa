@@ -1,0 +1,105 @@
+{
+  "model": "xai/grok-4.5",
+  "prompt_fingerprint": "cdc6d62c868d",
+  "scenario": "timeout_waiting_input_no_rerun",
+  "reply": "**当前流程已更新（revision 2），但因包含 `variable.input` 节点而暂停等待用户输入。**\n\n请在 RPA 界面底部填写输入变量后点击【继续】，流程将继续运行。",
+  "calls": [
+    {
+      "name": "list_node_types",
+      "args": {
+        "types": [
+          "file.write"
+        ]
+      }
+    },
+    {
+      "name": "list_node_types",
+      "args": {
+        "types": [
+          "browser.open",
+          "browser.extract"
+        ]
+      }
+    },
+    {
+      "name": "list_node_types",
+      "args": {
+        "types": [
+          "control.condition",
+          "control.try"
+        ]
+      }
+    },
+    {
+      "name": "list_node_types",
+      "args": {
+        "types": [
+          "file.write"
+        ]
+      }
+    },
+    {
+      "name": "list_node_types",
+      "args": {
+        "types": [
+          "browser.open",
+          "browser.extract"
+        ]
+      }
+    },
+    {
+      "name": "list_node_types",
+      "args": {
+        "types": [
+          "control.condition",
+          "control.try"
+        ]
+      }
+    },
+    {
+      "name": "inspect_page",
+      "args": {
+        "url": "https://example.com/list",
+        "wait_selector": "table, [role=grid], main"
+      }
+    },
+    {
+      "name": "update_flow",
+      "args": {
+        "flow_id": "eval-flow-0001",
+        "update_nodes": [
+          {
+            "id": "n3",
+            "patch": {
+              "path": "${var.output_prefix}.json"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "run_flow",
+      "args": {
+        "flow_id": "eval-flow-0001"
+      }
+    }
+  ],
+  "guard_hits": [],
+  "metrics": {
+    "rounds": 6,
+    "max_rounds": 30,
+    "tool_calls": 9,
+    "duplicate_calls": 3,
+    "blocked_calls": 0,
+    "prompt_tokens": 106047,
+    "completion_tokens": 4291,
+    "cached_tokens": 50240,
+    "guard_hits": [],
+    "call_histogram": {
+      "list_node_types": 6,
+      "inspect_page": 1,
+      "update_flow": 1,
+      "run_flow": 1
+    }
+  }
+}

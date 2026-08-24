@@ -1,0 +1,40 @@
+{
+  "model": "xai/grok-4.5",
+  "prompt_fingerprint": "cdc6d62c868d",
+  "scenario": "gen_api_to_file",
+  "reply": "**已创建流程**：调用 https://api.example.com/orders 的 GET 接口，并将返回的 JSON 订单数据写入本地文件。\n\n**验收契约**（已冻结）：\n- 交付变量：`orders_json`（JSON 字符串数组，每条订单一个对象）\n- 交付类型：`document`\n- 交付要求：写入本地文件 `orders.json`（或用户指定路径），内容为原始 JSON 字符串；每条订单必须完整保留，无缺失字段，无裁剪\n\n请在运行前到「输入变量」面板配置必要参数（如认证头等，若接口需要）。",
+  "calls": [
+    {
+      "name": "inspect_page",
+      "args": {
+        "url": "https://api.example.com/orders"
+      }
+    },
+    {
+      "name": "list_node_types",
+      "args": {
+        "types": [
+          "http.request",
+          "file.write",
+          "data.json.parse"
+        ]
+      }
+    }
+  ],
+  "guard_hits": [],
+  "metrics": {
+    "rounds": 3,
+    "max_rounds": 30,
+    "tool_calls": 2,
+    "duplicate_calls": 0,
+    "blocked_calls": 0,
+    "prompt_tokens": 36179,
+    "completion_tokens": 1986,
+    "cached_tokens": 33472,
+    "guard_hits": [],
+    "call_histogram": {
+      "inspect_page": 1,
+      "list_node_types": 1
+    }
+  }
+}

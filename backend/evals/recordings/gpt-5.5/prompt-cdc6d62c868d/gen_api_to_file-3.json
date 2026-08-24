@@ -1,0 +1,113 @@
+{
+  "model": "gpt-5.5",
+  "prompt_fingerprint": "cdc6d62c868d",
+  "scenario": "gen_api_to_file",
+  "reply": "​​​",
+  "calls": [
+    {
+      "name": "inspect_page",
+      "args": {
+        "url": "https://api.example.com/orders",
+        "wait_selector": "body"
+      }
+    },
+    {
+      "name": "list_node_types",
+      "args": {
+        "types": [
+          "http.request",
+          "file.write"
+        ]
+      }
+    },
+    {
+      "name": "create_flow",
+      "args": {
+        "name": "获取订单并保存JSON",
+        "description": "调用订单 GET 接口并将返回 JSON 原样写入本地文件。",
+        "input_variables": [],
+        "nodes": [
+          {
+            "id": "n1_http_orders",
+            "type": "http.request",
+            "title": "获取订单JSON",
+            "kind": "http",
+            "status": "pending",
+            "position": {
+              "x": 240,
+              "y": 180
+            },
+            "description": "GET https://api.example.com/orders → orders_response",
+            "url": "https://api.example.com/orders",
+            "method": "GET",
+            "outputVariable": "orders_response"
+          },
+          {
+            "id": "n2_write_orders",
+            "type": "file.write",
+            "title": "保存订单文件",
+            "kind": "file",
+            "status": "pending",
+            "position": {
+              "x": 560,
+              "y": 180
+            },
+            "description": "将订单响应写入 JSON 文件",
+            "path": "${var.output_prefix}.json",
+            "content": "${var.orders_response}"
+          }
+        ],
+        "edges": [
+          {
+            "id": "e_n1_http_orders_n2_write_orders",
+            "source": "n1_http_orders",
+            "target": "n2_write_orders"
+          }
+        ],
+        "acceptance_contract": {
+          "requirements": [
+            {
+              "id": "req_1",
+              "source_kind": "user",
+              "source_quote": "调用 https://api.example.com/orders 这个 GET 接口，把返回的 JSON 里每条订单写进本地文件。",
+              "description": "调用指定订单接口并将返回 JSON 中的订单写入本地文件。",
+              "confirmed": true,
+              "confidence": 1.0
+            }
+          ],
+          "deliverables": [
+            {
+              "id": "orders_file",
+              "variable": "orders_response",
+              "kind": "file",
+              "requirement_ids": [
+                "req_1"
+              ],
+              "extensions": [
+                ".json"
+              ],
+              "min_bytes": 2
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "guard_hits": [],
+  "metrics": {
+    "rounds": 3,
+    "max_rounds": 30,
+    "tool_calls": 3,
+    "duplicate_calls": 0,
+    "blocked_calls": 0,
+    "prompt_tokens": 123902,
+    "completion_tokens": 435,
+    "cached_tokens": 75572,
+    "guard_hits": [],
+    "call_histogram": {
+      "inspect_page": 1,
+      "list_node_types": 1,
+      "create_flow": 1
+    }
+  }
+}

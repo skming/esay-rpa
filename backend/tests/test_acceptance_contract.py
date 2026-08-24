@@ -45,3 +45,55 @@ def test_low_confidence_requirement_cannot_be_frozen() -> None:
     })
 
     assert any("置信度过低" in issue for issue in contract_validation_errors(contract, defined_variables={"order_rows"}))
+
+
+def _document_contract(**deliverable) -> FlowAcceptanceContract:
+    return FlowAcceptanceContract.model_validate({
+        "requirements": [{
+            "id": "summary",
+            "description": "输出帖子总结",
+            "sourceKind": "user",
+            "sourceQuote": "输出帖子的总结",
+            "confidence": 1,
+            "confirmed": True,
+        }],
+        "deliverables": [{
+            "id": "doc",
+            "variable": "summary_md",
+            "kind": "document",
+            "requirementIds": ["summary"],
+            **deliverable,
+        }],
+    })
+
+
+def test_document_deliverable_must_declare_where_its_body_comes_from() -> None:
+    """没有 sourceVariables，「正文里确实有本次抓取的数据」这条判据会被静默跳过。"""
+    errors = contract_validation_errors(_document_contract(), defined_variables={"summary_md", "topic_text"})
+
+    assert any("sourceVariables" in error for error in errors)
+
+
+def test_document_source_variables_must_be_produced_by_the_flow() -> None:
+    errors = contract_validation_errors(
+        _document_contract(sourceVariables=["topic_text"]),
+        defined_variables={"summary_md"},
+    )
+
+    assert any("未由流程节点或输入变量产出" in error for error in errors)
+
+
+def test_document_cannot_cite_itself_as_its_own_source() -> None:
+    errors = contract_validation_errors(
+        _document_contract(sourceVariables=["summary_md"]),
+        defined_variables={"summary_md"},
+    )
+
+    assert any("不能包含它自己" in error for error in errors)
+
+
+def test_document_with_a_real_source_variable_is_accepted() -> None:
+    assert contract_validation_errors(
+        _document_contract(sourceVariables=["topic_text"]),
+        defined_variables={"summary_md", "topic_text"},
+    ) == []

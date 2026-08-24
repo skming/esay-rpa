@@ -1,0 +1,152 @@
+{
+  "model": "xai/grok-4.5",
+  "prompt_fingerprint": "cdc6d62c868d",
+  "scenario": "gen_table_to_json",
+  "reply": "",
+  "calls": [
+    {
+      "name": "inspect_page",
+      "args": {
+        "url": "https://example.com/list",
+        "wait_selector": "table, .table, [role=\"table\"], .el-table"
+      }
+    },
+    {
+      "name": "create_flow",
+      "args": {
+        "name": "示例页面表格抓取 JSON",
+        "nodes": [
+          {
+            "id": "start",
+            "type": "start",
+            "title": "开始",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 100
+            }
+          },
+          {
+            "id": "n1",
+            "type": "browser.open",
+            "title": "打开目标列表页",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 200
+            },
+            "targetUrl": "https://example.com/list",
+            "delayMs": 2000,
+            "description": "直接打开目标页面（无需登录）"
+          },
+          {
+            "id": "n2",
+            "type": "browser.wait",
+            "title": "等待表格加载",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 300
+            },
+            "selector": ".data-table tbody tr",
+            "timeoutMs": 10000,
+            "description": "等表格渲染完成"
+          },
+          {
+            "id": "n3",
+            "type": "browser.extract",
+            "title": "提取表格数据",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 400
+            },
+            "extractMode": "table",
+            "targetSelector": ".data-table tbody tr",
+            "containerSelector": ".data-table",
+            "headers": [
+              "名称",
+              "创建时间",
+              "状态"
+            ],
+            "outputVariable": "list_data",
+            "firstValueVariable": "first_row",
+            "countVariable": "row_count",
+            "description": "按真实 DOM 表头提取表格数据到 JSON 格式"
+          },
+          {
+            "id": "n4",
+            "type": "file.write",
+            "title": "保存 JSON",
+            "kind": "file",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 500
+            },
+            "path": "${var.output_prefix}.json",
+            "content": "${var.list_data}",
+            "description": "将提取的表格数据写入 JSON 文件"
+          },
+          {
+            "id": "end",
+            "type": "end",
+            "title": "结束",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 600
+            }
+          }
+        ],
+        "acceptance_contract": {
+          "requirements": [
+            {
+              "id": "grab-table",
+              "description": "抓取 https://example.com/list 页面的表格数据并保存为 JSON",
+              "source_kind": "user",
+              "confidence": 1,
+              "confirmed": true,
+              "source_quote": "帮我创建一个流程：抓取 https://example.com/list 页面的表格数据，保存为 JSON。该页面无需登录。"
+            }
+          ],
+          "deliverables": [
+            {
+              "id": "table-data",
+              "variable": "list_data",
+              "kind": "table",
+              "requirement_ids": [
+                "grab-table"
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "guard_hits": [
+    "acceptance_contract_sources_must_match_user"
+  ],
+  "metrics": {
+    "rounds": 3,
+    "max_rounds": 30,
+    "tool_calls": 2,
+    "duplicate_calls": 0,
+    "blocked_calls": 1,
+    "prompt_tokens": 49177,
+    "completion_tokens": 1219,
+    "cached_tokens": 44096,
+    "guard_hits": [
+      "acceptance_contract_sources_must_match_user"
+    ],
+    "call_histogram": {
+      "inspect_page": 1,
+      "create_flow": 1
+    }
+  }
+}

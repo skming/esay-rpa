@@ -1,0 +1,190 @@
+{
+  "model": "gpt-5.5",
+  "prompt_fingerprint": "cdc6d62c868d",
+  "scenario": "gen_table_to_json",
+  "reply": "",
+  "calls": [
+    {
+      "name": "inspect_page",
+      "args": {
+        "url": "https://example.com/list",
+        "wait_selector": "main, table, [role=grid], body"
+      }
+    },
+    {
+      "name": "create_flow",
+      "args": {
+        "name": "示例列表表格抓取",
+        "description": "打开 example.com/list，提取页面表格并保存为 JSON",
+        "nodes": [
+          {
+            "id": "start",
+            "type": "start",
+            "title": "开始",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 100
+            },
+            "description": "开始流程"
+          },
+          {
+            "id": "n1_open",
+            "type": "browser.open",
+            "title": "打开列表页",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 220
+            },
+            "targetUrl": "https://example.com/list",
+            "description": "打开目标列表页"
+          },
+          {
+            "id": "n2_wait_table",
+            "type": "browser.wait",
+            "title": "等待表格加载",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 340
+            },
+            "selector": ".data-table tbody tr",
+            "timeoutMs": 15000,
+            "description": "等待数据表格行出现"
+          },
+          {
+            "id": "n3_extract_table",
+            "type": "browser.extract",
+            "title": "提取表格数据",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 460
+            },
+            "selector": ".data-table tbody tr",
+            "extractMode": "table",
+            "outputVariable": "table_data",
+            "countVariable": "table_count",
+            "description": "按表格模式提取名称、创建时间、状态 → table_data"
+          },
+          {
+            "id": "n4_write_json",
+            "type": "file.write",
+            "title": "保存 JSON",
+            "kind": "file",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 580
+            },
+            "path": "${var.output_prefix}.json",
+            "content": "${var.table_data}",
+            "description": "将表格数据保存为本次运行目录下的 JSON 文件"
+          },
+          {
+            "id": "end",
+            "type": "end",
+            "title": "结束",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 700
+            },
+            "description": "结束流程"
+          }
+        ],
+        "edges": [
+          {
+            "id": "e_start_n1_open",
+            "source": "start",
+            "target": "n1_open"
+          },
+          {
+            "id": "e_n1_open_n2_wait_table",
+            "source": "n1_open",
+            "target": "n2_wait_table"
+          },
+          {
+            "id": "e_n2_wait_table_n3_extract_table",
+            "source": "n2_wait_table",
+            "target": "n3_extract_table"
+          },
+          {
+            "id": "e_n3_extract_table_n4_write_json",
+            "source": "n3_extract_table",
+            "target": "n4_write_json"
+          },
+          {
+            "id": "e_n4_write_json_end",
+            "source": "n4_write_json",
+            "target": "end"
+          }
+        ],
+        "acceptance_contract": {
+          "requirements": [
+            {
+              "id": "req_table_json",
+              "description": "抓取 https://example.com/list 页面的表格数据，保存为 JSON；页面无需登录",
+              "confidence": 1,
+              "confirmed": true,
+              "source_kind": "user",
+              "source_quote": "抓取 https://example.com/list 页面的表格数据，保存为 JSON。该页面无需登录。"
+            }
+          ],
+          "deliverables": [
+            {
+              "id": "table_json_data",
+              "variable": "table_data",
+              "kind": "table",
+              "required": true,
+              "min_rows": 1,
+              "required_fields": [
+                "名称",
+                "创建时间",
+                "状态"
+              ],
+              "requirement_ids": [
+                "req_table_json"
+              ]
+            },
+            {
+              "id": "json_file",
+              "variable": "${var.output_prefix}.json",
+              "kind": "file",
+              "required": true,
+              "extensions": [
+                ".json"
+              ],
+              "min_bytes": 2,
+              "requirement_ids": [
+                "req_table_json"
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "guard_hits": [],
+  "metrics": {
+    "rounds": 2,
+    "max_rounds": 30,
+    "tool_calls": 2,
+    "duplicate_calls": 0,
+    "blocked_calls": 0,
+    "prompt_tokens": 27695,
+    "completion_tokens": 884,
+    "cached_tokens": 26624,
+    "guard_hits": [],
+    "call_histogram": {
+      "inspect_page": 1,
+      "create_flow": 1
+    }
+  }
+}

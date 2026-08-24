@@ -1,0 +1,189 @@
+{
+  "model": "gpt-5.5",
+  "prompt_fingerprint": "cdc6d62c868d",
+  "scenario": "gen_table_to_excel",
+  "reply": "",
+  "calls": [
+    {
+      "name": "inspect_page",
+      "args": {
+        "url": "https://example.com/list",
+        "wait_selector": "main, table, [role=grid], body"
+      }
+    },
+    {
+      "name": "list_node_types",
+      "args": {
+        "types": [
+          "browser.open",
+          "browser.extract",
+          "excel.addrow",
+          "excel.save"
+        ]
+      }
+    },
+    {
+      "name": "create_flow",
+      "args": {
+        "name": "示例列表表格导出Excel",
+        "description": "打开 https://example.com/list，提取页面表格并导出为 Excel 文件。",
+        "input_variables": [],
+        "nodes": [
+          {
+            "id": "start",
+            "type": "start",
+            "title": "开始",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 100
+            },
+            "description": "开始执行流程"
+          },
+          {
+            "id": "n1_open_list",
+            "type": "browser.open",
+            "title": "打开列表页",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 220
+            },
+            "targetUrl": "https://example.com/list",
+            "delayMs": 2000,
+            "description": "打开用户指定的列表页"
+          },
+          {
+            "id": "n2_extract_table",
+            "type": "browser.extract",
+            "title": "提取表格数据",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 340
+            },
+            "selector": ".data-table tbody tr",
+            "extractMode": "table",
+            "outputVariable": "table_data",
+            "timeoutMs": 15000,
+            "description": "按真实表格行选择器提取表格数据 → table_data"
+          },
+          {
+            "id": "n3_write_excel",
+            "type": "script.python",
+            "title": "写入Excel文件",
+            "kind": "script",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 460
+            },
+            "inputVariables": [
+              "table_data"
+            ],
+            "outputVariable": "excel_file",
+            "timeoutMs": 30000,
+            "description": "将 table_data 写入 xlsx 文件 → excel_file",
+            "code": "import json, os\nfrom openpyxl import Workbook\n\n_vars = json.loads(os.environ.get('RPA_VARIABLES_JSON', '{}'))\nrows = _vars.get('table_data') or []\noutput_prefix = _vars.get('output_prefix') or os.path.join(_vars.get('output_dir', '.'), 'table_export')\npath = f'{output_prefix}.xlsx'\nos.makedirs(os.path.dirname(path), exist_ok=True)\n\nwb = Workbook()\nws = wb.active\nws.title = '表格数据'\n\nif rows and isinstance(rows[0], dict):\n    headers = list(rows[0].keys())\n    for r in rows[1:]:\n        if isinstance(r, dict):\n            for k in r.keys():\n                if k not in headers:\n                    headers.append(k)\n    ws.append(headers)\n    for r in rows:\n        ws.append([r.get(h, '') if isinstance(r, dict) else '' for h in headers])\nelif rows:\n    for r in rows:\n        ws.append(r if isinstance(r, list) else [str(r)])\nelse:\n    ws.append(['无数据'])\n\nwb.save(path)\nprint(path)\n"
+          },
+          {
+            "id": "end",
+            "type": "end",
+            "title": "结束",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 580
+            },
+            "description": "流程结束"
+          }
+        ],
+        "edges": [
+          {
+            "id": "e_start_n1_open_list",
+            "source": "start",
+            "target": "n1_open_list"
+          },
+          {
+            "id": "e_n1_open_list_n2_extract_table",
+            "source": "n1_open_list",
+            "target": "n2_extract_table"
+          },
+          {
+            "id": "e_n2_extract_table_n3_write_excel",
+            "source": "n2_extract_table",
+            "target": "n3_write_excel"
+          },
+          {
+            "id": "e_n3_write_excel_end",
+            "source": "n3_write_excel",
+            "target": "end"
+          }
+        ],
+        "acceptance_contract": {
+          "requirements": [
+            {
+              "id": "req_export_excel",
+              "description": "打开指定 URL，把表格数据导出成 Excel 文件且无需登录",
+              "confidence": 1,
+              "confirmed": true,
+              "source_kind": "user",
+              "source_quote": "打开 https://example.com/list，把表格数据导出成 Excel 文件。无需登录。"
+            }
+          ],
+          "deliverables": [
+            {
+              "id": "table_data",
+              "variable": "table_data",
+              "kind": "table",
+              "required": true,
+              "min_rows": 1,
+              "required_fields": [
+                "名称",
+                "创建时间",
+                "状态"
+              ],
+              "requirement_ids": [
+                "req_export_excel"
+              ]
+            },
+            {
+              "id": "excel_file",
+              "variable": "excel_file",
+              "kind": "file",
+              "required": true,
+              "extensions": [
+                ".xlsx"
+              ],
+              "min_bytes": 100,
+              "requirement_ids": [
+                "req_export_excel"
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "guard_hits": [],
+  "metrics": {
+    "rounds": 3,
+    "max_rounds": 30,
+    "tool_calls": 3,
+    "duplicate_calls": 0,
+    "blocked_calls": 0,
+    "prompt_tokens": 50041,
+    "completion_tokens": 1630,
+    "cached_tokens": 47616,
+    "guard_hits": [],
+    "call_histogram": {
+      "inspect_page": 1,
+      "list_node_types": 1,
+      "create_flow": 1
+    }
+  }
+}

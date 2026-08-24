@@ -1,0 +1,34 @@
+{
+  "model": "xai/grok-4.5",
+  "prompt_fingerprint": "cdc6d62c868d",
+  "scenario": "gen_table_to_excel",
+  "reply": "请提供目标 URL，并说明要提取/操作的具体内容（如抓取哪些字段）。",
+  "calls": [
+    {
+      "name": "inspect_page",
+      "args": {
+        "url": "https://example.com/list",
+        "wait_selector": "table, .el-table, .data-table"
+      }
+    }
+  ],
+  "guard_hits": [
+    "acceptance_contract_sources_must_match_user"
+  ],
+  "metrics": {
+    "rounds": 3,
+    "max_rounds": 30,
+    "tool_calls": 1,
+    "duplicate_calls": 0,
+    "blocked_calls": 1,
+    "prompt_tokens": 49303,
+    "completion_tokens": 866,
+    "cached_tokens": 38528,
+    "guard_hits": [
+      "acceptance_contract_sources_must_match_user"
+    ],
+    "call_histogram": {
+      "inspect_page": 1
+    }
+  }
+}

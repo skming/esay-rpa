@@ -1,11 +1,25 @@
 from __future__ import annotations
 
+import ast
+import inspect
 import json
+import re
+import textwrap
 from types import SimpleNamespace
 from typing import Any
 
+from app.services.ai_flow_state import (
+    FlowState,
+    build_flow_state,
+    is_local_draft_flow_id,
+    render_flow_state,
+    sync_state_message,
+)
+from app.services.ai_phases import VERIFY_ATTEMPT_BUDGET, initial_facts
 from app.services.ai_orchestrator import (
     AiOrchestrator,
+    _AFTER_TOOL_HANDLERS,
+    _AFTER_TOOL_NO_STATE_EFFECT,
     _after_tool_guidance,
     _compact_tool_messages,
     _build_few_shot_block,
@@ -14,18 +28,19 @@ from app.services.ai_orchestrator import (
     _model_caps,
     _detect_turn_intents,
     _elide_repeated_result,
+    _FLOW_WRITE_TOOLS,
     _ELIDE_MIN_CHARS,
     _expand_history_tool_calls,
     _mark_history_cache_anchor,
+    _misapplied_refusal,
     _stable_prefix_end,
-    _FlowContext,
-    _is_local_draft_flow_id,
-    _load_flow_context,
-    _MAX_REPAIR_CYCLES,
     _OLD_SCREENSHOT_PLACEHOLDER,
     _orchestrator_guard_after_tool,
     _orchestrator_guard_before_tool,
     _resolve_resumable_task_state,
+    _RUN_NOT_STARTED_STATUSES,
+    _RUN_REFUSED_MODEL_FIXABLE,
+    _RUN_WAITING_STATUSES,
     _split_partial_tag_suffix,
     _system_prompt_for_round,
     _task_state_message,
@@ -33,7 +48,27 @@ from app.services.ai_orchestrator import (
     _ThinkTagFilter,
     _tool_schemas_for_round,
     _TurnIntents,
+    _unmet_verification_request,
 )
+from app.services.ai_tools.executor import RpaToolExecutor
+from app.services.ai_tools.schemas import TOOL_SCHEMAS
+
+
+def _ready(**overrides: Any) -> dict[str, Any]:
+    """一个可以直接跑流程的会话：流程已存在、证据到手、诊断干净、用户授权。
+
+    阶段机的事实全部 fail-closed（缺键即最保守），空 dict 会被判成 BUILD 且未授权运行。
+    编排层用例要验的是「钩子有没有把事实改对」，起点必须是一个明确的可运行局面，
+    否则断言到的是缺省值而不是这次改动。
+    """
+    state = initial_facts(
+        flow_has_nodes=True,
+        page_evidence_required=None,
+        page_evidence_done=True,
+        run_authorized=True,
+    )
+    state.update(overrides)
+    return state
 
 
 def test_split_partial_tag_suffix_holds_back_split_tag() -> None:
@@ -82,6 +117,36 @@ def test_blocked_write_gets_no_success_guidance_and_does_not_end_the_round() -> 
     assert guidance and not stop
 
 
+def test_write_directive_points_at_the_state_block_instead_of_relisting_findings() -> None:
+    """诊断只有一份，在状态块里。写入返回里再列一遍就是第二个副本。
+
+    两份副本的时点不同（写入返回是写入那一刻的，状态块是下一轮读到的），一旦不一致，
+    模型无从判断该信哪个。
+    """
+    clean, _ = _after_tool_guidance("update_flow", {"status": "updated", "revision": 4}, _ready())
+    assert "revision 4" in clean
+    assert "run_flow" in clean
+    assert "状态块" in clean
+
+    # 连通性是写入前后对比才看得出来的，状态块读单份定义看不到，这条必须留在写入返回里
+    broken, _ = _after_tool_guidance("update_flow", {
+        "status": "updated",
+        "revision": 5,
+        "connectivity_warning": "n7 成了孤儿节点",
+    }, _ready())
+    assert "n7 成了孤儿节点" in broken
+    assert "run_flow" not in broken
+
+
+def test_write_directive_respects_this_turn_run_authorization() -> None:
+    """用户只说修、没说跑时，写完要交回用户，不能顺手把 run_flow 写进下一步。"""
+    locked, _ = _after_tool_guidance(
+        "update_flow", {"status": "updated", "revision": 7}, _ready(run_authorized=False)
+    )
+    assert "run_flow" in locked and "不要调用 run_flow" in locked
+    assert "问是否要运行验证" in locked
+
+
 def test_terminal_guard_block_forces_a_closing_statement() -> None:
     """要用户拿主意的拦截必须逼出收尾正文，否则用户只看到一个空气泡。"""
     for action in ("report_to_user_and_stop", "needs_user_navigation_target"):
@@ -92,10 +157,25 @@ def test_terminal_guard_block_forces_a_closing_statement() -> None:
         assert guidance and "不要再调用任何工具" in guidance
         assert stop
 
+    # ask_user 也收尾，但措辞不能说"卡住了"——改动已经落盘，只是要不要跑归用户定
+    guidance, stop = _after_tool_guidance("run_flow", {
+        "status": "blocked_by_orchestrator_guard",
+        "required_action": "ask_user",
+    })
+    assert guidance and stop
+    assert "不要再调用任何工具" in guidance
+    assert "卡在哪一步" not in guidance
+    assert "要不要现在运行" in guidance
+
     # 只是改道的拦截仍按原样放行，强行收尾会打断本该继续的诊断
     assert _after_tool_guidance("update_flow", {
         "status": "blocked_by_orchestrator_guard",
         "required_action": "call_inspect_page_first",
+    }) == (None, False)
+    # 修复还没落盘时被 autorun lock 拦住同样不能收尾：那时候一步都还没做
+    assert _after_tool_guidance("run_flow", {
+        "status": "blocked_by_orchestrator_guard",
+        "required_action": "explain_and_wait",
     }) == (None, False)
 
     guidance, stop = _after_tool_guidance("inspect_page", {
@@ -106,31 +186,109 @@ def test_terminal_guard_block_forces_a_closing_statement() -> None:
     assert guidance and stop
 
 
+def test_ask_user_block_closes_the_round_without_a_canned_reply() -> None:
+    """修复落盘后被 autorun lock 拦下：收走工具，但收尾话必须由模型自己写。
+
+    换成 terminal_response_only 会走 _terminal_tool_response 的模板，
+    「改了哪个节点的哪个字段」那段就被顶掉了——那恰好是用户唯一要看的东西。
+    """
+    state: dict[str, Any] = {}
+    blocked = {
+        "status": "blocked_by_orchestrator_guard",
+        "guard_id": "run_not_authorized",
+        "required_action": "ask_user",
+    }
+    _orchestrator_guard_after_tool("run_flow", blocked, state)
+    assert state["closing_statement_only"] is True
+    assert not state.get("terminal_response_only")
+    assert _tool_schemas_for_round(state, _TurnIntents()) == []
+
+    # 其余阻断结果照旧不影响 state
+    other: dict[str, Any] = {}
+    _orchestrator_guard_after_tool("update_flow", {
+        "status": "blocked_by_orchestrator_guard",
+        "required_action": "call_inspect_page_first",
+    }, other)
+    assert not other.get("closing_statement_only")
+
+
 def test_tool_schemas_follow_the_current_phase() -> None:
     no_url = _TurnIntents(create_requested=True)
     assert _tool_schemas_for_round({}, no_url) == []
 
     inspecting = _TurnIntents(create_requested=True, create_url="https://example.com")
-    schemas = _tool_schemas_for_round(
-        {"pre_create_inspect_gate": {"inspect_done": False}}, inspecting
+    discovering = _ready(
+        flow_has_nodes=False,
+        page_evidence_required={"reason": "build_from_url"},
+        page_evidence_done=False,
     )
+    schemas = _tool_schemas_for_round(discovering, inspecting)
     assert [schema["function"]["name"] for schema in schemas] == ["inspect_page"]
 
     assert _tool_schemas_for_round({"terminal_response_only": True}, inspecting) == []
-    all_schemas = _tool_schemas_for_round(
-        {"pre_create_inspect_gate": {"inspect_done": True}}, inspecting
-    )
+    # 改动已落盘、只剩「要不要运行」这个决定时同样收工具，逼出收尾正文
+    assert _tool_schemas_for_round({"closing_statement_only": True}, inspecting) == []
+    all_schemas = _tool_schemas_for_round({**discovering, "page_evidence_done": True}, inspecting)
     assert len(all_schemas) > 1
+
+
+def test_state_reading_tools_are_not_exposed_at_all() -> None:
+    """读当前状态的工具一把都不给：状态块每轮开头已经把答案放在上下文里了。
+
+    留着它们等于让模型花一整轮去问平台已经答完的问题——实测这类复检占了全部
+    工具调用的 18%。删的是那一轮，不是那份能力：executor 里这些方法仍然在，
+    唯一的调用方从模型换成了 ai_flow_state。
+    """
+    names = {s["function"]["name"] for s in _tool_schemas_for_round({}, _TurnIntents())}
+    assert not names & {"get_flow", "lint_flow", "validate_flow", "get_run_status"}
+    # 失败现场（截图 / 导航轨迹 / 节点配置）状态块给不出，这把必须留着
+    assert "get_run_error" in names
+
+
+def test_capability_gaps_are_hidden_not_just_blocked() -> None:
+    """能力缺失不是模型该去发现的事实：暴露一个必被拦的工具就是白烧一轮。
+
+    只读模式和无视觉模型整轮固定，与阶段无关——所以断言的是「schema 里不出现」，
+    而不是「调用时被拦」。拦截仍在（授权边界不能只靠没暴露来守），由 test_ai_guards 证。
+    """
+    from app.services.ai_guards import WRITE_TOOLS
+
+    read_only = {s["function"]["name"] for s in _tool_schemas_for_round(
+        _ready(read_only_tools=True), _TurnIntents(),
+    )}
+    assert not read_only & WRITE_TOOLS
+    # 诊断手段一个都不能收：只读模式的产物就是一份根因分析
+    assert {"get_run_error", "inspect_page", "get_run_logs"} <= read_only
+
+    no_vision = {s["function"]["name"] for s in _tool_schemas_for_round(
+        _ready(model_no_vision=True), _TurnIntents(),
+    )}
+    assert "inspect_screenshot" not in no_vision
+    assert "inspect_page" in no_vision
+
+    both = {s["function"]["name"] for s in _tool_schemas_for_round(
+        _ready(read_only_tools=True, model_no_vision=True), _TurnIntents(),
+    )}
+    assert both and "inspect_screenshot" not in both and not both & WRITE_TOOLS
 
 
 def test_page_discovery_uses_a_compact_phase_prompt() -> None:
     from app.services.ai_prompts import PAGE_DISCOVERY_PROMPT, SYSTEM_PROMPT
 
-    state = {"pre_create_inspect_gate": {"inspect_done": False}}
+    state = _ready(
+        flow_has_nodes=False,
+        page_evidence_required={"reason": "build_from_url"},
+        page_evidence_done=False,
+    )
     assert _system_prompt_for_round(state) == PAGE_DISCOVERY_PROMPT
     assert len(PAGE_DISCOVERY_PROMPT) < len(SYSTEM_PROMPT) // 5
-    state["pre_create_inspect_gate"]["inspect_done"] = True
+    state["page_evidence_done"] = True
     assert _system_prompt_for_round(state) == SYSTEM_PROMPT
+    # 修复路径上的取证阶段仍要完整规则：看完 DOM 紧接着就要改节点
+    assert _system_prompt_for_round(_ready(
+        page_evidence_required={"reason": "repair_touches_page_elements"},
+        page_evidence_done=False,
+    )) == SYSTEM_PROMPT
 
 
 def test_terminal_tool_response_prefers_structured_user_guidance() -> None:
@@ -213,7 +371,9 @@ async def test_terminal_page_block_returns_without_a_second_llm_round(monkeypatc
 
     class _BlockedExecutor(_FakeExecutor):
         async def execute(
-            self, tool_name: str, args: dict[str, Any], progress_sink: dict[str, Any] | None = None
+            self, tool_name: str, args: dict[str, Any],
+            progress_sink: dict[str, Any] | None = None,
+            change_context: Any = None,
         ) -> dict[str, Any]:
             self.calls.append((tool_name, args))
             return {
@@ -240,38 +400,168 @@ async def test_terminal_page_block_returns_without_a_second_llm_round(monkeypatc
 
 
 def test_waiting_for_the_user_does_not_burn_the_repair_budget() -> None:
-    """停下来等人不是一次失败的修复，记进熔断计数等于罚用户操作慢。"""
-    state: dict[str, Any] = {}
-    for _ in range(_MAX_REPAIR_CYCLES + 2):
+    """停下来等人不是一次失败的修复，记进预算等于罚用户操作慢。"""
+    state = _ready()
+    for _ in range(VERIFY_ATTEMPT_BUDGET + 2):
         _orchestrator_guard_after_tool("run_flow", {"status": "paused_for_human"}, state)
         _orchestrator_guard_after_tool("run_flow", {"status": "waiting_for_user_input"}, state)
-    assert not state.get("repair_cycle_lock")
+    assert state["attempt_budget"]["spent"] == 0
     assert _orchestrator_guard_before_tool("run_flow", {}, state) is None
 
-    # 真失败照常计数
-    for _ in range(_MAX_REPAIR_CYCLES):
+    # 真失败照常计价：同一条错误连着两次 = 1 + 2，正好压满额度
+    for _ in range(2):
         _orchestrator_guard_after_tool("run_flow", {"status": "error", "error": "boom"}, state)
     assert _orchestrator_guard_before_tool("run_flow", {}, state) is not None
 
 
+def test_run_refused_before_it_started_does_not_burn_the_repair_budget() -> None:
+    """起跑前被拒的运行一行都没跑，按「又白跑了一轮」计价是错的定价。
+
+    `blocked_by_failure_budget` 最能说明问题：这把锁自己的拒绝在花掉产生它的额度，
+    没有新失败、用户也看不到任何症状，只是越锁越死。但签名照样要记——同一条拒绝
+    再来一次就按一次重复失败计价，否则这类拒绝一条收口都没有。
+    """
+    for status in sorted(_RUN_NOT_STARTED_STATUSES):
+        refusal = {"status": status, "message": f"拒绝：{status}"}
+        state = _ready()
+        _orchestrator_guard_after_tool("run_flow", refusal, state)
+        assert state["attempt_budget"]["spent"] == 0, status
+        # 这条拒绝自己可能另有锁（failure_budget_lock），但收敛额度不该被它花掉
+        first = _orchestrator_guard_before_tool("run_flow", {}, state)
+        assert first is None or first["guard_id"] != "attempt_budget_exhausted", status
+
+        # 撞同一堵墙就是原地打转：第二次起按重复失败计价，第三次压满额度
+        _orchestrator_guard_after_tool("run_flow", refusal, state)
+        assert state["attempt_budget"]["spent"] == 2, status
+        _orchestrator_guard_after_tool("run_flow", refusal, state)
+        blocked = _orchestrator_guard_before_tool("update_flow", {}, state)
+        assert blocked, status
+        # blocked_by_failure_budget 自带一把优先级更高的锁，拦它的是那把锁而不是这份额度；
+        # 其余拒绝没有别的收口，必须由额度接住，否则模型能无限次撞同一堵墙
+        if not state.get("failure_budget_lock"):
+            assert blocked["guard_id"] == "attempt_budget_exhausted", status
+            # 收尾要向用户要的是「清掉那条拒绝」，不是站点登录前提
+            assert any("输入变量" in item for item in blocked["needed_from_user"]), status
+
+
+def test_only_the_model_fixable_refusals_leave_the_run_unattempted() -> None:
+    """撤回重写那条催跑规则唯一的开关是 run_attempted，置错就等于把它关掉。
+
+    模型把 run_flow 的调用参数写错一次、接着写个总结收尾，用户要的验收结论一个字
+    都没有，而催跑被自己的错误调用静默关掉——这条判据挂的是「这条拒绝谁能清掉」。
+    """
+    verification_request = {"latest_user_message": "帮我跑一下看看能不能用"}
+
+    for status in sorted(_RUN_REFUSED_MODEL_FIXABLE):
+        state = _ready(**verification_request)
+        _orchestrator_guard_after_tool("run_flow", {"status": status, "message": "拒"}, state)
+        assert not state.get("run_attempted"), status
+        assert _unmet_verification_request("我已经检查了流程结构。", state) is not None, status
+
+    # 只能等用户的那几条：模型确实跑不了，再催是空转
+    for status in sorted(_RUN_NOT_STARTED_STATUSES - _RUN_REFUSED_MODEL_FIXABLE):
+        state = _ready(**verification_request)
+        _orchestrator_guard_after_tool("run_flow", {"status": status, "message": "拒"}, state)
+        assert state["run_attempted"] is True, status
+        assert _unmet_verification_request("我已经检查了流程结构。", state) is None, status
+
+
+def test_every_run_flow_status_is_classified_as_started_or_not() -> None:
+    """新增一条起跑前拒绝却没归类，就会静默按「跑过一次」计价——本文件其余断言全绿。
+
+    只扫 `_run_flow` 自己返回的 status 字面量：真正跑过之后的状态由 task.status 决定，
+    是另一条路径（success/error/timeout/stopped/paused_*），在下面显式列出。
+    """
+    source = inspect.getsource(RpaToolExecutor._run_flow)
+    literals = set(re.findall(r'"status":\s*"([a-z_]+)"', source))
+    assert literals, "取不到 run_flow 的 status 字面量，这条元测试会静默通过"
+
+    # 起跑前拒绝之外，_run_flow 里出现的 status 只允许是这几个「跑过了」的终态
+    after_the_run = {"success", "error", "timeout", "stopped"} | _RUN_WAITING_STATUSES
+    unclassified = literals - _RUN_NOT_STARTED_STATUSES - after_the_run
+    assert not unclassified, unclassified
+
+
+def test_every_schema_tool_decides_whether_it_writes_facts() -> None:
+    """新增一个工具而没人决定「它的返回写不写事实」，会静默什么都不写。
+
+    这类缺陷没有症状：工具照常返回、对话照常继续，只是某条义务或某个熔断从此立不起来。
+    所以每个暴露给模型的工具都必须在分派表或「不写事实」名单里出现一次，两张表还不许重叠
+    ——同时出现意味着有人两边都加了一遍，谁生效取决于读代码的人先看到哪张。
+    """
+    schema_tools = {
+        str(tool["function"]["name"]) for tool in TOOL_SCHEMAS if isinstance(tool, dict)
+    }
+    assert len(schema_tools) > 10, "取不到工具名，这条元测试会静默通过"
+
+    decided = set(_AFTER_TOOL_HANDLERS) | _AFTER_TOOL_NO_STATE_EFFECT
+    assert not schema_tools - decided, f"以下工具没表态：{sorted(schema_tools - decided)}"
+    assert not decided - schema_tools, f"以下表项已不是工具：{sorted(decided - schema_tools)}"
+    overlap = set(_AFTER_TOOL_HANDLERS) & _AFTER_TOOL_NO_STATE_EFFECT
+    assert not overlap, f"两张表重叠：{sorted(overlap)}"
+    # 写工具必须四个都有处理函数：漏掉一个，那次写入之后旧的运行结果仍被当成有效证据
+    assert not set(_FLOW_WRITE_TOOLS) - set(_AFTER_TOOL_HANDLERS)
+
+
+def test_the_two_lock_statuses_come_from_exactly_one_tool_each() -> None:
+    """按工具分派的等价前提：这两个状态各自只有一个产出方。
+
+    它们原先写成与工具无关的判断，现在收进 inspect_page / run_flow 各自的处理函数里。
+    执行器哪天让别的工具也返回同一个状态，锁就会静默地不再立起来——那时该在这里红，
+    而不是等到线上出现一次「拦截页明明拦到了，下一轮却照旧改流程」。
+    """
+    owners = {
+        "blocked_challenge_page": "_inspect_page",
+        "blocked_by_failure_budget": "_run_flow",
+    }
+    source = inspect.getsource(RpaToolExecutor)
+    tree = ast.parse(textwrap.dedent(source))
+    methods = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+
+    for status, entry_point in owners.items():
+        # 直接产出该状态字面量的方法，可以是入口自己，也可以是它调用的私有辅助方法
+        producers = {
+            m.name for m in methods
+            if any(
+                isinstance(n, ast.Constant) and n.value == status
+                for n in ast.walk(m)
+            )
+        }
+        assert producers, f"{status} 在执行器里已经没有产出点，判据该跟着删"
+        reachable = {entry_point} | {
+            n.func.attr
+            for m in methods if m.name == entry_point
+            for n in ast.walk(m)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        }
+        assert not producers - reachable, (
+            f"{status} 还从 {sorted(producers - reachable)} 产出，"
+            f"不再只属于 {entry_point}，写入侧的分派要跟着改"
+        )
+
+
 def test_failure_budget_lock_still_allows_read_only_diagnosis() -> None:
     """挡掉纯读工具等于没收诊断手段，模型只能在剩下几个工具间空转。"""
-    state: dict[str, Any] = {"failure_budget_lock": {"flow_id": "f1"}}
-    for tool in ("list_node_types", "get_run_output", "validate_flow", "get_flow"):
+    state = _ready(failure_budget_lock={"flow_id": "f1"})
+    for tool in ("list_node_types", "get_run_output", "get_run_logs", "get_run_error"):
         assert _orchestrator_guard_before_tool(tool, {}, state) is None
-    # 写入与运行仍然挡住，这才是这道闸的本职
-    assert _orchestrator_guard_before_tool("update_flow", {}, state) is not None
-    assert _orchestrator_guard_before_tool("run_flow", {}, state) is not None
+    # 写入与运行仍然挡住，这才是这道闸的本职；断言 guard_id 是为了确认拦它的是这道闸
+    for tool in ("update_flow", "run_flow"):
+        blocked = _orchestrator_guard_before_tool(tool, {}, state)
+        assert blocked and blocked["guard_id"] == "failure_budget_lock"
 
 
-def test_repeated_failed_runs_lock_further_repair_attempts() -> None:
-    state: dict[str, Any] = {}
+def test_repeated_failed_runs_exhaust_the_attempt_budget() -> None:
+    """同一条错误再来一次按两份算：这是「换维度不再是换额度」的唯一实现。"""
+    state = _ready()
     failure = {"status": "error", "error": "Page.goto: Timeout 30000ms exceeded"}
-    for _ in range(_MAX_REPAIR_CYCLES - 1):
-        _orchestrator_guard_after_tool("run_flow", failure, state)
+    _orchestrator_guard_after_tool("run_flow", failure, state)
     assert _orchestrator_guard_before_tool("update_flow", {}, state) is None
 
-    _orchestrator_guard_after_tool("run_flow", failure, state)
+    # 毫秒数每次都不同，签名要把数字折掉才认得出是同一个失败
+    _orchestrator_guard_after_tool(
+        "run_flow", {"status": "error", "error": "Page.goto: Timeout 45000ms exceeded"}, state
+    )
     blocked = _orchestrator_guard_before_tool("update_flow", {}, state)
     assert blocked and blocked["required_action"] == "report_to_user_and_stop"
     # 写入和再次运行都得拦住，只放诊断类工具
@@ -279,28 +569,32 @@ def test_repeated_failed_runs_lock_further_repair_attempts() -> None:
     assert _orchestrator_guard_before_tool("get_run_error", {}, state) is None
 
 
-def test_quality_failures_count_as_repair_cycles() -> None:
+def test_quality_failures_charge_the_same_budget_as_run_errors() -> None:
     """跑得起来但审计不合格是这类循环的主要形态，只数 run_flow 失败会完全数不到。"""
-    state: dict[str, Any] = {}
+    state = _ready()
     audit_failed = {"passed": False, "issues": [{"issue": "mixed_ui_rows", "message": "混入 UI 行"}]}
-    for _ in range(_MAX_REPAIR_CYCLES):
-        _orchestrator_guard_after_tool("run_flow", {"status": "success"}, state)
-        _orchestrator_guard_after_tool("assert_run_output", audit_failed, state)
+    for _ in range(2):
+        _orchestrator_guard_after_tool(
+            "run_flow", {"status": "success", "acceptance_audit": audit_failed}, state
+        )
     assert _orchestrator_guard_before_tool("update_flow", {}, state) is not None
 
 
-def test_passing_audit_clears_the_repair_cycle_counter() -> None:
+def test_passing_audit_resets_the_attempt_budget() -> None:
     """审计通过才是一轮闭环，之后提新需求不该背着旧的失败计数。"""
-    state: dict[str, Any] = {}
-    for _ in range(_MAX_REPAIR_CYCLES - 1):
-        _orchestrator_guard_after_tool("run_flow", {"status": "error"}, state)
-    _orchestrator_guard_after_tool("assert_run_output", {"passed": True}, state)
-    _orchestrator_guard_after_tool("run_flow", {"status": "error"}, state)
+    state = _ready()
+    _orchestrator_guard_after_tool("run_flow", {"status": "error", "error": "boom"}, state)
+    _orchestrator_guard_after_tool(
+        "run_flow", {"status": "success", "acceptance_audit": {"passed": True}}, state
+    )
+    assert state["attempt_budget"]["spent"] == 0
+    # 归零后同一条错误只是「第一次」，不该按重复计价
+    _orchestrator_guard_after_tool("run_flow", {"status": "error", "error": "boom"}, state)
     assert _orchestrator_guard_before_tool("update_flow", {}, state) is None
 
 
 def test_create_intent_needs_url_and_is_suppressed_by_repair_intent() -> None:
-    blank = _FlowContext(is_blank=True)
+    blank = FlowState(is_blank=True)
     msgs = [{"role": "user", "content": "帮我抓取 https://example.com 的表格"}]
     detected = _detect_turn_intents(msgs, "flow-1", blank)
     assert detected.create_requested is True
@@ -316,25 +610,84 @@ def test_create_intent_needs_url_and_is_suppressed_by_repair_intent() -> None:
     assert repair.repair and repair.create_url is None
 
 
+def test_run_authorization_is_detected_only_from_an_explicit_ask() -> None:
+    """"审查/验收/跑一下" 是要运行证据；只说"修一下"就不许自作主张跑。
+
+    这个判据决定 run_authorized 给不给——判宽了会背着用户跑生产流程，
+    判窄了则让"帮我验收"这类请求永远交不出运行结果。
+    """
+    blank = FlowState(is_blank=True)
+    for text in ("帮我跑一下看对不对", "运行验证一下", "重跑一次", "这流程能不能用"):
+        assert _detect_turn_intents(
+            [{"role": "user", "content": text}], "flow-1", blank
+        ).run_authorized is True, text
+
+    for text in ("帮我修一下抓不全的问题", "先别运行，只改配置", "优化一下选择器"):
+        assert _detect_turn_intents(
+            [{"role": "user", "content": text}], "flow-1", blank
+        ).run_authorized is False, text
+
+
+def test_misapplied_refusal_is_rewritten_only_when_the_turn_was_actionable() -> None:
+    """拒答模板本身要留着（真无关话题还得用），错的是把它用在职责范围内的请求上。"""
+    refusal = "我只能协助处理 RPA 流程的创建、修复与运行，其他话题请另找途径。"
+    actionable: dict[str, Any] = {"turn_intent_actionable": True}
+    assert _misapplied_refusal(refusal, actionable) is not None
+    # 判定自己记账：同一轮只纠一次，否则重写文本若仍带模板就会无限撤回
+    assert actionable["refusal_corrected"] is True
+    assert _misapplied_refusal(refusal, actionable) is None
+
+    # 本轮确实是闲聊，拒答是正确输出
+    assert _misapplied_refusal(refusal, {"turn_intent_actionable": False}) is None
+    # 正常答复不触发
+    assert _misapplied_refusal(
+        "已把节点 n2 的选择器改成 table.data", {"turn_intent_actionable": True}
+    ) is None
+
+
 async def test_local_draft_flow_uses_blank_creation_context() -> None:
     class _Executor:
         async def execute(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
             raise AssertionError("local draft 不应查询后端流程")
 
-    context = await _load_flow_context(_Executor(), "local-1785390406146")  # type: ignore[arg-type]
-    assert context.is_blank is True
-    assert context.context_message is None
+    state = await build_flow_state(_Executor(), "local-1785390406146")  # type: ignore[arg-type]
+    assert state.is_blank is True
+    assert render_flow_state(state) is None
 
     messages = [{"role": "user", "content": "抓取 https://example.com/posts 的帖子"}]
-    intents = _detect_turn_intents(messages, "local-1785390406146", context)
+    intents = _detect_turn_intents(messages, "local-1785390406146", state)
     assert intents.create_requested is True
     assert intents.create_url == "https://example.com/posts"
-    assert _is_local_draft_flow_id("local-1785390406146") is True
-    assert _is_local_draft_flow_id("flow-1") is False
+    assert is_local_draft_flow_id("local-1785390406146") is True
+    assert is_local_draft_flow_id("flow-1") is False
+
+
+def test_state_block_is_replaced_at_the_tail_not_stacked() -> None:
+    """两份状态块同时在场比没有状态更糟：模型无从判断该信哪一份。
+
+    这里同时钉住位置——必须在消息尾部。状态块是「当前」事实，排在历史工具返回之后
+    才压得住它们；混到中间就成了又一条会被后文覆盖的旧消息。
+    """
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": "改一下这个流程"},
+        {"role": "assistant", "content": "好"},
+    ]
+    sync_state_message(messages, '<flow-state revision="3">\nA\n</flow-state>')
+    sync_state_message(messages, '<flow-state revision="4">\nB\n</flow-state>')
+
+    blocks = [m for m in messages if str(m.get("content", "")).startswith("<flow-state")]
+    assert len(blocks) == 1
+    assert "revision=\"4\"" in blocks[0]["content"]
+    assert messages[-1] is blocks[0]
+    assert len(messages) == 3
+
+    # 这一轮没有状态可讲（本地草稿 / 读取前）：旧的那份也得撤掉，不能留着当最新
+    sync_state_message(messages, None)
+    assert all(not str(m.get("content", "")).startswith("<flow-state") for m in messages)
 
 
 def test_continuation_recovers_the_active_task_from_real_tool_history() -> None:
-    blank = _FlowContext(is_blank=True)
+    blank = FlowState(is_blank=True)
     messages = [
         {"role": "user", "content": "https://example.com/post/1，帖子主题及回帖"},
         {
@@ -371,7 +724,7 @@ def test_continuation_recovers_the_active_task_from_real_tool_history() -> None:
 
 
 def test_new_task_does_not_inherit_the_previous_target() -> None:
-    blank = _FlowContext(is_blank=True)
+    blank = FlowState(is_blank=True)
     messages = [
         {"role": "user", "content": "抓取 https://old.example.com/list"},
         {"role": "assistant", "content": "需要用户处理。"},
@@ -386,7 +739,7 @@ def test_new_task_does_not_inherit_the_previous_target() -> None:
 
 
 def test_explicit_new_url_overrides_the_previous_task_target() -> None:
-    blank = _FlowContext(is_blank=True)
+    blank = FlowState(is_blank=True)
     messages = [
         {"role": "user", "content": "抓取 https://old.example.com/list"},
         {"role": "assistant", "content": "页面不可访问。"},
@@ -425,7 +778,7 @@ def test_static_evidence_channel_outlives_the_flow_being_saved() -> None:
         {"role": "user", "content": "字段少了一个"},
     ]
 
-    built = _resolve_resumable_task_state(messages, "flow-1", _FlowContext(is_blank=False))
+    built = _resolve_resumable_task_state(messages, "flow-1", FlowState(is_blank=False))
     assert built.last_inspection_source == "scrapling_static"
     assert built.target_url is None, "已有流程时不该再改写目标 URL，只取证据通道"
 
@@ -439,12 +792,12 @@ def test_static_evidence_channel_outlives_the_flow_being_saved() -> None:
             "result": {"requested_url": "https://example.com/list", "status": "success"},
         }],
     })
-    recovered = _resolve_resumable_task_state(messages, "flow-1", _FlowContext(is_blank=False))
+    recovered = _resolve_resumable_task_state(messages, "flow-1", FlowState(is_blank=False))
     assert recovered.last_inspection_source is None
 
 
 def test_successful_inspection_resumes_at_build_instead_of_reinspecting() -> None:
-    blank = _FlowContext(is_blank=True)
+    blank = FlowState(is_blank=True)
     messages = [
         {"role": "user", "content": "抓取 https://example.com/list 的标题"},
         {
@@ -469,15 +822,17 @@ def test_successful_inspection_resumes_at_build_instead_of_reinspecting() -> Non
     assert context is not None and "build_flow" in str(context["content"])
 
     intents = _detect_turn_intents(messages, "flow-1", blank, state)
-    guard_state = {
-        "pre_create_inspect_gate": {"inspect_done": state.phase == "page_inspected"},
-    }
+    guard_state = _ready(
+        flow_has_nodes=False,
+        page_evidence_required={"url": "https://example.com/list", "reason": "build_from_page"},
+        page_evidence_done=state.phase == "page_inspected",
+    )
     schemas = _tool_schemas_for_round(guard_state, intents)
     assert len(schemas) > 1
 
 
 def test_existing_browser_chain_is_protected_unless_switch_is_explicit() -> None:
-    ctx = _FlowContext(browser_chain_node_ids={"n1"})
+    ctx = FlowState(browser_chain_node_ids={"n1"})
     msgs = [{"role": "user", "content": "数据少了一半"}]
     assert _detect_turn_intents(msgs, "flow-1", ctx).preserve_execution_channel
     # 无 flow_id 时没有存量链路可保护
@@ -680,17 +1035,22 @@ def test_identical_repeated_tool_result_is_elided_but_a_changed_one_is_not() -> 
 
     assert "_unchanged" not in _elide_repeated_result("inspect_page", args, big, seen)
     assert '"_unchanged": true' in _elide_repeated_result("inspect_page", args, big, seen)
-    assert "_unchanged" not in _elide_repeated_result("inspect_page", args, {"html": "b" * _ELIDE_MIN_CHARS}, seen)
+    changed = _elide_repeated_result(
+        "inspect_page", args, {"html": "b" * _ELIDE_MIN_CHARS}, seen
+    )
+    assert "_unchanged" not in changed
     # 换了参数就是另一个页面，与上一次相同与否无关
-    assert "_unchanged" not in _elide_repeated_result("inspect_page", '{"url":"https://x/2"}', big, seen)
+    other = _elide_repeated_result("inspect_page", '{"url":"https://x/2"}', big, seen)
+    assert "_unchanged" not in other
 
 
 def test_small_repeated_results_are_resent_in_full() -> None:
     """指针本身也占字符，小结果重发比指回去更省。"""
     seen: dict[tuple[str, str], str] = {}
     small = {"ok": True}
-    _elide_repeated_result("get_flow", "{}", small, seen)
-    assert "_unchanged" not in _elide_repeated_result("get_flow", "{}", small, seen)
+    first = _elide_repeated_result("get_run_output", "{}", small, seen)
+    assert _elide_repeated_result("get_run_output", "{}", small, seen) == first
+    assert "_unchanged" not in first
 
 
 def test_chit_chat_does_not_become_a_standing_requirement() -> None:
@@ -705,27 +1065,49 @@ def test_chit_chat_does_not_become_a_standing_requirement() -> None:
     assert not any(str(m.get("content") or "").startswith("【用户此前提出的硬性要求】") for m in messages)
 
 
-def test_navigation_budget_fires_on_every_selector_diagnostic() -> None:
+def test_navigation_failures_are_classified_on_every_selector_diagnostic() -> None:
     """诊断名写错不会报错，只会让这条判据永远不命中，而下面的关键词兜底会替它遮住。
 
-    所以 selector 特意用不含任何导航关键词的写法把兜底那条路堵死：还能熔断，
+    所以 selector 特意用不含任何导航关键词的写法把兜底那条路堵死：还能归类成导航失败，
     就只可能是诊断类型这条判据真的生效了。
+
+    归类而不是再扣一次费：这次失败的费在 run_flow 那一刻就扣过了。归类决定预算见底时
+    向用户要什么——导航类要的是目标 URL，别的类不是。
     """
-    from app.services.ai_guards import NAV_FAILURE_BUDGET
     from app.services.ai_orchestrator import _orchestrator_guard_after_tool
     from app.services.ai_tools.diagnostics import SELECTOR_DIAGNOSTIC_KINDS
 
     for kind in SELECTOR_DIAGNOSTIC_KINDS:
-        state: dict[str, Any] = {}
-        for _ in range(NAV_FAILURE_BUDGET):
-            _orchestrator_guard_after_tool("get_run_error", {
-                "inspect_hint": True,
-                "last_browser_url": "https://x.test/",
-                "failed_node_id": "n_go",
-                "failed_node_config": {"id": "n_go", "type": "browser.click", "selector": ".c1 .c2"},
-                "selector_diagnostic": {"kind": kind},
-            }, state)
-        assert state.get("navigation_budget_lock"), kind
+        state = _ready()
+        _orchestrator_guard_after_tool(
+            "run_flow", {"status": "error", "error": "click timeout"}, state
+        )
+        spent_before = state["attempt_budget"]["spent"]
+        _orchestrator_guard_after_tool("get_run_error", {
+            "inspect_hint": True,
+            "last_browser_url": "https://x.test/",
+            "failed_node_id": "n_go",
+            "failed_node_config": {"id": "n_go", "type": "browser.click", "selector": ".c1 .c2"},
+            "selector_diagnostic": {"kind": kind},
+        }, state)
+        assert state.get("navigation_failure_hint"), kind
+        assert state["attempt_budget"]["attempts"][-1]["kind"] == "navigation", kind
+        assert state["attempt_budget"]["spent"] == spent_before, kind
+
+    # 预算见底后，导航类归类给出的是「向用户要目标 URL」这条出路
+    state = _ready()
+    for error in ("click timeout", "click timeout"):
+        _orchestrator_guard_after_tool("run_flow", {"status": "error", "error": error}, state)
+        _orchestrator_guard_after_tool("get_run_error", {
+            "inspect_hint": True,
+            "last_browser_url": "https://x.test/",
+            "failed_node_id": "n_go",
+            "failed_node_config": {"id": "n_go", "type": "browser.click", "selector": ".c1 .c2"},
+            "selector_diagnostic": {"kind": next(iter(SELECTOR_DIAGNOSTIC_KINDS))},
+        }, state)
+    blocked = _orchestrator_guard_before_tool("update_flow", {}, state)
+    assert blocked and blocked["required_action"] == "needs_user_navigation_target"
+    assert blocked["needed_from_user"]
 
 
 def test_context_budget_follows_the_model_window() -> None:
@@ -823,7 +1205,9 @@ class _FakeExecutor:
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     async def execute(
-        self, tool_name: str, args: dict[str, Any], progress_sink: dict[str, Any] | None = None
+        self, tool_name: str, args: dict[str, Any],
+        progress_sink: dict[str, Any] | None = None,
+        change_context: Any = None,
     ) -> dict[str, Any]:
         self.calls.append((tool_name, args))
         if tool_name == "create_flow":
@@ -833,7 +1217,9 @@ class _FakeExecutor:
 
 class _RevisionFlowExecutor(_FakeExecutor):
     async def execute(
-        self, tool_name: str, args: dict[str, Any], progress_sink: dict[str, Any] | None = None
+        self, tool_name: str, args: dict[str, Any],
+        progress_sink: dict[str, Any] | None = None,
+        change_context: Any = None,
     ) -> dict[str, Any]:
         self.calls.append((tool_name, args))
         if tool_name == "get_flow":
@@ -849,6 +1235,52 @@ class _RevisionFlowExecutor(_FakeExecutor):
                 },
             }
         return {"status": "ok"}
+
+
+async def test_every_round_carries_exactly_one_fresh_state_block(monkeypatch) -> None:
+    """状态块必须真的进到发给模型的那份 messages 里，且每轮只有一份、排在最后。
+
+    这是整套设计唯一的承重点：状态块到不了模型手上，「不必再去查证」就成了空话，而删掉的
+    读取工具让它连查证的路都没有。单测只能证明 sync_state_message 自己对——发给上游的
+    列表是不是同一个列表，只有走完 stream 才知道。
+    """
+    import litellm
+
+    captured: list[dict[str, Any]] = []
+    rounds = iter([
+        _FakeStream([_chunk(
+            tool_calls=[_tool_call_chunk(0, call_id="logs-1", name="get_run_logs", arguments="{}")],
+            finish="tool_calls",
+        )]),
+        _FakeStream([_chunk(content="流程只有 start/end 骨架。", finish="stop")]),
+    ])
+
+    async def fake_acompletion(**kwargs: Any) -> Any:
+        captured.append(kwargs)
+        return next(rounds)
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    orchestrator = AiOrchestrator(tool_executor=_RevisionFlowExecutor())  # type: ignore[arg-type]
+    async for _ in orchestrator.stream(
+        messages=[{"role": "user", "content": "这个流程现在什么状态？把运行日志也看一下"}],
+        model="test-model",
+        flow_id="flow-verified",
+    ):
+        pass
+
+    assert len(captured) == 2
+    for kwargs in captured:
+        blocks = [
+            m for m in kwargs["messages"]
+            if isinstance(m.get("content"), str) and m["content"].startswith("<flow-state")
+        ]
+        assert len(blocks) == 1
+        assert 'revision="7"' in blocks[0]["content"]
+        # 排在最后才压得住历史工具返回里那些已经过期的版本
+        assert kwargs["messages"][-1] is blocks[0]
+        # 状态块答完的问题不该再有对应的工具可调，否则模型仍会花一轮去问
+        offered = {item["function"]["name"] for item in kwargs.get("tools") or []}
+        assert not offered & {"get_flow", "lint_flow", "validate_flow", "get_run_status"}
 
 
 async def test_read_only_reply_does_not_claim_the_assistant_modified_the_flow(monkeypatch) -> None:
@@ -887,10 +1319,10 @@ async def test_parallel_tool_calls_after_create_flow_get_placeholder_responses(m
 
     captured_messages: list[list[dict[str, Any]]] = []
     rounds = iter([
-        # 第 1 轮：并行发出 create_flow + lint_flow，且两个调用都不带 id
+        # 第 1 轮：并行发出 create_flow + list_node_types，且两个调用都不带 id
         _FakeStream([
             _chunk(tool_calls=[_tool_call_chunk(0, name="create_flow", arguments='{"name": "测试"}')]),
-            _chunk(tool_calls=[_tool_call_chunk(1, name="lint_flow", arguments='{"flow_id": "flow-1"}')], finish="tool_calls"),
+            _chunk(tool_calls=[_tool_call_chunk(1, name="list_node_types", arguments='{"category": "browser"}')], finish="tool_calls"),
         ]),
         # 第 2 轮：纯文本收尾
         _FakeStream([_chunk(content="已创建流程。", finish="stop")]),
@@ -908,10 +1340,10 @@ async def test_parallel_tool_calls_after_create_flow_get_placeholder_responses(m
         messages=[{"role": "user", "content": "帮我建一个流程"}], model="test-model",
     )]
 
-    # lint_flow 没有真正执行（create_flow 后 break）……
+    # list_node_types 没有真正执行（create_flow 后 break）……
     assert [c[0] for c in executor.calls] == ["create_flow"]
     # ……但拿到了 skipped 占位结果事件
-    skipped = [e for e in events if e["type"] == "tool_result" and e["tool"] == "lint_flow"]
+    skipped = [e for e in events if e["type"] == "tool_result" and e["tool"] == "list_node_types"]
     assert len(skipped) == 1 and skipped[0]["result"]["status"] == "skipped"
 
     # 第 2 轮请求里：assistant 的每个 tool_call 都有非空 id 和对应的 tool 应答
@@ -988,7 +1420,9 @@ class _BlankFlowExecutor(_FakeExecutor):
     """Studio 里刚新建、已存库但画布只有 start→end 的流程。"""
 
     async def execute(
-        self, tool_name: str, args: dict[str, Any], progress_sink: dict[str, Any] | None = None
+        self, tool_name: str, args: dict[str, Any],
+        progress_sink: dict[str, Any] | None = None,
+        change_context: Any = None,
     ) -> dict[str, Any]:
         self.calls.append((tool_name, args))
         if tool_name == "get_flow":
@@ -1006,7 +1440,7 @@ class _BlankFlowExecutor(_FakeExecutor):
         return {"status": "ok"}
 
 
-async def test_blank_open_flow_still_arms_pre_create_inspect_gate(monkeypatch) -> None:
+async def test_blank_open_flow_still_requires_page_evidence(monkeypatch) -> None:
     """回归：在 Studio 空白流程（已有 flow_id）里提"抓取 <url>"，既不算修复也曾不算创建，
     一条引导都注入不到，模型会拿输出边界那句话当兜底回绝用户。"""
     import litellm
@@ -1047,7 +1481,11 @@ async def test_blank_open_flow_still_arms_pre_create_inspect_gate(monkeypatch) -
         e for e in events
         if e["type"] == "tool_result" and e["result"].get("status") == "blocked_by_orchestrator_guard"
     ]
-    assert len(blocked) == 1 and blocked[0]["result"]["required_tool"] == "inspect_page"
+    assert len(blocked) == 1
+    assert blocked[0]["result"]["guard_id"] == "page_evidence_required"
+    assert blocked[0]["result"]["required_tools"] == ["inspect_page"]
+    # 该看哪个页面得直接给出来，否则模型只知道「要看」不知道看哪
+    assert blocked[0]["result"]["suggested_args"] == {"url": "https://example.com"}
 
     # 拦截结果里没有 error 字段，曾被当成写入成功
     assert not [
@@ -1118,8 +1556,8 @@ async def test_usage_events_report_rounds_tokens_and_blocked_calls(monkeypatch) 
 
     rounds = iter([
         _FakeStream([
-            _chunk(tool_calls=[_tool_call_chunk(0, call_id="c1", name="lint_flow", arguments='{"flow_id": "f1"}')]),
-            # 没先 inspect_page 就建流程会被 pre_create_inspect_gate 拦掉，
+            _chunk(tool_calls=[_tool_call_chunk(0, call_id="c1", name="list_node_types", arguments='{"category": "browser"}')]),
+            # 没先 inspect_page 就建流程会被 DISCOVER 阶段拦掉，
             # 被拦的调用不该从计数里消失——它同样烧了一轮
             _chunk(tool_calls=[_tool_call_chunk(1, call_id="c2", name="create_flow", arguments='{"name": "x"}')],
                    finish="tool_calls"),
@@ -1156,82 +1594,101 @@ async def test_usage_events_report_rounds_tokens_and_blocked_calls(monkeypatch) 
     assert events[first_tool_result + 1]["usage"]["tool_calls"] == 1
 
 
-def test_lint_findings_are_read_from_the_key_lint_flow_actually_returns() -> None:
-    """_lint_flow_tool 交回的键是 findings，只有写工具才叫 lint_findings。
+def test_a_clean_write_unblocks_the_run_within_the_same_round() -> None:
+    """写入返回里的 lint 针对写入之后那一版，比状态块新，闸门必须据它更新。
 
-    取错键不会报错，也不会少一个字段——它让「lint 发现 selector 问题就还得 inspect_page」
-    这半条判据恒为假，模型据此改出来的 selector 从头到尾没见过真实 DOM。
+    否则模型改完想在同一轮接着跑，会被一份已经修好的问题清单拦住——下一轮的状态块要等
+    它下一次说话才到。这跟「不许凭空宣布干净」不矛盾：判据是写入自己重跑出来的结论。
     """
-    from app.services.ai_orchestrator import _BROWSER_SELECTOR_ISSUES, _orchestrator_guard_after_tool
-
-    issue = next(iter(_BROWSER_SELECTOR_ISSUES))
-    state: dict[str, Any] = {"pending_repair_gate": {"lint_done": False, "inspect_done": False}}
+    state = _ready(
+        blocking_diagnostics=[{"severity": "error", "issue": "single_navigation_node"}],
+        runtime_escape_findings=[],
+    )
+    assert _orchestrator_guard_before_tool("run_flow", {}, state) is not None
 
     _orchestrator_guard_after_tool(
-        "lint_flow",
-        {"findings": [{"issue": issue, "severity": "error", "node_id": "n2"}]},
-        state,
+        "update_flow", {"status": "updated", "revision": 2, "lint_clean": True}, state
     )
+    assert _orchestrator_guard_before_tool("run_flow", {}, state) is None
 
-    assert state["pending_repair_gate"]["lint_done"] is True
-    assert state["pending_repair_gate"]["inspect_done"] is False
+    # 写入之后仍有阻断项：闸门换成新那一份，不是清空
+    _orchestrator_guard_after_tool("update_flow", {
+        "status": "updated", "revision": 3,
+        "lint_findings": [{"severity": "error", "issue": "table_extract_selector_targets_container"}],
+    }, state)
+    blocked = _orchestrator_guard_before_tool("run_flow", {}, state)
+    assert blocked is not None
+    assert blocked["lint_findings"][0]["issue"] == "table_extract_selector_targets_container"
+
+    # 压根不跑 lint 的写入工具不能顺手把闸门抹掉：它的返回里两个信号都没有
+    _orchestrator_guard_after_tool(
+        "set_acceptance_contract", {"status": "applied", "revision": 4}, state
+    )
+    assert _orchestrator_guard_before_tool("run_flow", {}, state) is not None
 
 
-def test_clean_lint_still_lets_a_repair_skip_inspect_page() -> None:
-    """没有 selector 问题时仍要放行，否则每个纯变量修复都被硬塞一次 inspect_page。"""
-    from app.services.ai_orchestrator import _orchestrator_guard_after_tool
+def test_runtime_variable_escape_is_booked_separately_from_static_diagnostics() -> None:
+    """静态诊断每轮由状态块重算，运行期逃逸重算不出来——它的前提正是静态扫描漏了它。
 
-    state: dict[str, Any] = {"pending_repair_gate": {"lint_done": False, "inspect_done": False}}
-
-    _orchestrator_guard_after_tool("lint_flow", {"findings": []}, state)
-
-    assert state["pending_repair_gate"]["inspect_done"] is True
-
-
-def test_a_lint_flow_that_finds_nothing_new_does_not_unlock_a_pending_lint_fix() -> None:
-    """阻断标记只能被真实修复解除，不能被"再 lint 一次"解除。
-
-    编排层读 lint_flow 的 lint_findings 键（实际叫 findings）时恒得空列表，于是每次
-    lint_flow 都在清锁：模型被 requires_lint_fix 拦下后，随手复检一次、一个字没改，
-    run_flow 就放行了——护栏在评测里正是这样被绕过去的。
+    写进 blocking_diagnostics 会被下一轮的重算直接冲掉，于是「运行期报出未定义变量」
+    这件事只挡得住一轮，第二轮 run_flow 就放行了。
     """
     from app.services.ai_orchestrator import _orchestrator_guard_after_tool
 
-    issue = "table_extract_selector_targets_container"
-    state: dict[str, Any] = {}
-
+    state = _ready()
     _orchestrator_guard_after_tool(
-        "create_flow",
-        {"lint_findings": [{"issue": issue, "severity": "warn", "node_id": "n2"}]},
-        state,
+        "run_flow", {"status": "error", "error": "节点 n3 执行失败：变量未定义: order_no"}, state
     )
-    assert state["requires_lint_fix"]
+    escapes = state["runtime_escape_findings"]
+    assert len(escapes) == 1
+    assert escapes[0]["issue"] == "undefined_variable_ref_runtime_escape"
+    assert escapes[0]["escaped_variable"] == "order_no"
+    assert escapes[0]["severity"] == "error"
 
-    _orchestrator_guard_after_tool(
-        "lint_flow",
-        {"findings": [{"issue": issue, "severity": "warn", "node_id": "n2"}], "is_clean": False},
-        state,
-    )
-    assert state["requires_lint_fix"]
-
-    _orchestrator_guard_after_tool("apply_node_fix", {"lint_findings": []}, state)
-    assert state["requires_lint_fix"] is None
+    # 只有真实结构修复才解除——再跑一次、再读一次状态都不算
+    _orchestrator_guard_after_tool("run_flow", {"status": "error", "error": "boom"}, state)
+    assert state["runtime_escape_findings"]
+    _orchestrator_guard_after_tool("apply_node_fix", {"status": "ok"}, state)
+    assert state["runtime_escape_findings"] == []
 
 
-def test_a_failed_lint_call_is_not_read_as_a_clean_flow() -> None:
-    """lint_flow 报错时没有 findings 字段，当成"零阻断"就是把工具故障读成流程干净。"""
+def test_a_selector_failure_at_runtime_forces_dom_evidence_even_if_lint_is_clean() -> None:
+    """静态诊断里没有 selector 问题，不等于这次修复不需要看 DOM。
+
+    旧设计用 lint_flow 的返回决定要不要看页面，而 lint 往往先于 get_run_error 到达：
+    lint 干净就把证据位置真，之后运行错误报出 selector 失败也已经放行了。
+    """
     from app.services.ai_orchestrator import _orchestrator_guard_after_tool
 
-    state: dict[str, Any] = {}
+    state = _ready()
     _orchestrator_guard_after_tool(
-        "create_flow",
-        {"lint_findings": [{"issue": "single_navigation_node", "severity": "warn", "node_id": "n1"}]},
+        "get_run_error",
+        {"inspect_hint": True, "failed_node_id": "n2", "last_browser_url": "https://x.test/"},
         state,
     )
+    assert state["page_evidence_required"]["url"] == "https://x.test/"
+    assert state["page_evidence_done"] is False
+    # 证据没到手之前，改节点和重跑都得挡住
+    assert _orchestrator_guard_before_tool("apply_node_fix", {}, state) is not None
+    assert _orchestrator_guard_before_tool("run_flow", {}, state) is not None
 
-    _orchestrator_guard_after_tool("lint_flow", {"error": "流程 x 不存在"}, state)
+    _orchestrator_guard_after_tool(
+        "inspect_page", {"requested_url": "https://x.test/", "page_layout": []}, state
+    )
+    assert state["page_evidence_done"] is True
+    assert _orchestrator_guard_before_tool("apply_node_fix", {}, state) is None
 
-    assert state["requires_lint_fix"]
+
+def test_a_failed_inspection_does_not_count_as_page_evidence() -> None:
+    """探测失败仍然置位就等于「看过了」，模型接着盲改 selector。"""
+    from app.services.ai_orchestrator import _orchestrator_guard_after_tool
+
+    state = _ready(
+        page_evidence_required={"reason": "repair_touches_page_elements"},
+        page_evidence_done=False,
+    )
+    _orchestrator_guard_after_tool("inspect_page", {"error": "页面打不开"}, state)
+    assert state["page_evidence_done"] is False
 
 
 def test_client_rejection_is_not_reported_as_a_bad_api_key() -> None:

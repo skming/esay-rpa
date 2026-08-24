@@ -1,0 +1,20 @@
+{
+  "model": "xai/grok-4.5",
+  "prompt_fingerprint": "cdc6d62c868d",
+  "scenario": "guard_selector_timeout_inspects_first",
+  "reply": "**当前流程为空（0 节点 / 0 连线），无法运行。**\n\n请提供具体的流程需求（目标 URL、要抓取/操作的内容、输出要求等），我可以直接帮你创建或修改这个流程。run_flow flow_id=\"eval-flow-0001\"",
+  "calls": [],
+  "guard_hits": [],
+  "metrics": {
+    "rounds": 2,
+    "max_rounds": 30,
+    "tool_calls": 0,
+    "duplicate_calls": 0,
+    "blocked_calls": 0,
+    "prompt_tokens": 26855,
+    "completion_tokens": 2633,
+    "cached_tokens": 26432,
+    "guard_hits": [],
+    "call_histogram": {}
+  }
+}

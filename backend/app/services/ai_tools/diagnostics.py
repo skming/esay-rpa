@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import json
 import re
-from pathlib import Path
 from typing import Any
 
 from app.services.ai_tools.variables import _RUNTIME_BUILTINS
@@ -35,19 +34,6 @@ SELECTOR_NOT_VISIBLE_KINDS = frozenset({
 })
 
 SELECTOR_DIAGNOSTIC_KINDS = SELECTOR_FALSIFYING_KINDS | SELECTOR_NOT_VISIBLE_KINDS
-
-# 交付内容对不上需求：表格与文档两条审计路径各报各的名字。
-OUTPUT_CONTENT_MISMATCH = "output_content_may_not_match_requirement"
-DOCUMENT_CONTENT_MISMATCH = "document_content_may_not_match_requirement"
-
-# 报出其中任意一条，模型的 content_match_confirmed 才解锁（编排层消费）。漏掉一条，
-# 那条路径上的确认位就永远解不开：照 fix 传 true 会被剥掉，拿回一模一样的失败，
-# 两次即触发质量熔断，流程锁死在一个它无论如何都满足不了的判据上。
-CONTENT_MISMATCH_ISSUES = frozenset({OUTPUT_CONTENT_MISMATCH, DOCUMENT_CONTENT_MISMATCH})
-
-# 文档正文与本次抓取数据无交集：与上面两条不同，这条不接受 content_match_confirmed 自证，
-# 因为它比的就是「模型自己写的字」之外的证据。
-DOCUMENT_MISSING_RUN_DATA = "document_missing_run_data"
 
 # 加工节点的输出与输入无实质差别。名字产在这里、消费在 repair_plan 与编排层的汇报纠偏，
 # 一律引常量：抄成字面量不会报错，只会让依赖它的那半条判据永远不命中
@@ -171,7 +157,7 @@ def _build_run_root_cause_hints(
                 "先用 inspect_page 或截图确认当前真实页面是登录页、应用页还是空白加载页",
                 "默认保留 Cookies/localStorage 复用登录态；只有用户要求重置登录或确认过期 token 卡死时，才临时清理存储",
                 "登录完成后显式 browser.open 到目标数据页，再等待目标表格",
-                "修复前调用 lint_flow 查看 single_navigation_node、登录检测和筛选控件相关警告",
+                "修复前看状态块诊断里的 single_navigation_node、登录检测和筛选控件相关警告",
             ],
         })
 
@@ -248,32 +234,8 @@ def _build_input_variable_defaults(input_variables: list[Any]) -> dict[str, Any]
 
 
 
-def _find_header_variable(variables: dict[str, Any]) -> list[str] | None:
-    for name, value in variables.items():
-        lower = name.lower()
-        if "header" not in lower and "columns" not in lower:
-            continue
-        if isinstance(value, list) and all(isinstance(item, str) for item in value):
-            return [str(item) for item in value]
-    return None
 
 
-def _find_table_candidates(variables: dict[str, Any]) -> list[dict[str, Any]]:
-    candidates: list[dict[str, Any]] = []
-    for name, value in variables.items():
-        rows = _coerce_table_rows(value)
-        if not rows:
-            continue
-        score = 0
-        lower = name.lower()
-        if any(keyword in lower for keyword in ("row", "rows", "table", "data", "list")):
-            score += 10
-        if "header" in lower or "count" in lower:
-            score -= 8
-        score += min(len(rows), 20)
-        candidates.append({"name": name, "rows": rows, "score": score})
-    candidates.sort(key=lambda item: item["score"], reverse=True)
-    return candidates
 
 
 # 需求里出现这些词，说明用户明确要的是按行/按列的结构化数据
@@ -300,17 +262,6 @@ _BINARY_DOCUMENT_FORMATS: dict[str, bytes] = {
 _MIN_BINARY_DOCUMENT_BYTES = 256  # 比最小的合法单页 PDF 还小，只兜空壳文件
 
 
-def _requirement_wants_document(requirement_text: str) -> bool:
-    """需求要的是一篇文档，而不是一张按行结构化的表。
-
-    形态判错的代价是单向的：把文档需求按表格审，助手只能临时造一个 rows 变量
-    去喂审计，用户真正要的那篇文档反而没人验。所以需求里同时出现表格类词就
-    退回按表格审——宁可漏判，不可误判。
-    """
-    text = (requirement_text or "").lower()
-    if any(token in text for token in _TABLE_REQUIREMENT_TOKENS):
-        return False
-    return any(token in text for token in _DOCUMENT_REQUIREMENT_TOKENS)
 
 
 def _looks_like_document_path(value: str) -> bool:
@@ -321,22 +272,6 @@ def _looks_like_document_path(value: str) -> bool:
     )
 
 
-def _find_document_output(variables: dict[str, Any]) -> dict[str, Any] | None:
-    """挑出这次运行最像交付文档的输出：写出去的文件路径，或够长的正文文本。"""
-    best: dict[str, Any] | None = None
-    for name, value in variables.items():
-        if not isinstance(value, str):
-            continue
-        if _looks_like_document_path(value):
-            # 文件路径优先于正文变量：正文往往是中间量，落盘的那份才是交付物
-            candidate = {"name": name, "kind": "file", "value": value, "score": 1000 + len(name)}
-        elif len(value) >= _MIN_DOCUMENT_CHARS:
-            candidate = {"name": name, "kind": "text", "value": value, "score": min(len(value), 20_000)}
-        else:
-            continue
-        if best is None or candidate["score"] > best["score"]:
-            best = candidate
-    return best
 
 
 _WHITESPACE_RUN = re.compile(r"\s+")
@@ -349,30 +284,6 @@ def _collapse(text: str) -> str:
     return _WHITESPACE_RUN.sub(" ", text)
 
 
-def _run_data_fragments(variables: dict[str, Any], document_name: str) -> list[str]:
-    """从本次运行抓到的变量里取若干原文片段，用来验证文档正文确实装了这些数据。
-
-    排除交付物变量自己和运行时内置量（路径、时间戳）：拿产物路径去产物正文里找，
-    找到的只是脚本把路径写进了页脚。
-    """
-    fragments: list[str] = []
-    for name, value in variables.items():
-        if name == document_name or name in _RUNTIME_BUILTINS:
-            continue
-        items = value if isinstance(value, list) else [value]
-        for item in items:
-            if isinstance(item, dict):
-                item = " ".join(str(v) for v in item.values())
-            text = _collapse(str(item)).strip()
-            if len(text) < _PROVENANCE_FRAGMENT or text.startswith(("http://", "https://", "/")):
-                continue
-            fragments.append(text[:_PROVENANCE_FRAGMENT])
-            middle = len(text) // 2
-            if len(text) >= _PROVENANCE_FRAGMENT * 3:
-                fragments.append(text[middle : middle + _PROVENANCE_FRAGMENT])
-            if len(fragments) >= _PROVENANCE_SAMPLE_VALUES * 2:
-                return fragments
-    return fragments
 
 
 # 输入进、输出出，中间由模型写的加工节点。三条脚本通道与列变换节点都算，
@@ -470,7 +381,7 @@ def _find_ineffective_transforms(
                     "若输入是整页文本（导航、页脚、内联样式混在一起、几乎不换行），"
                     "行级黑名单和按行去重必然一条都命不中——出路是回到抽取节点收窄 selector"
                     "（先 inspect_page 找只装目标内容的容器），不是继续加固脚本。\n"
-                    "改完重跑并再次 assert_run_output；在体量真的变化之前，不要向用户汇报已完成清洗。"
+                    "改完重跑，看新一次运行的 acceptance_audit 里这条是否消失；在体量真的变化之前，不要向用户汇报已完成清洗。"
                 ),
                 "output_variable": target,
                 "input_variable": name,
@@ -479,75 +390,8 @@ def _find_ineffective_transforms(
     return findings
 
 
-def _audit_document_provenance(
-    document: dict[str, Any], body: str, variables: dict[str, Any]
-) -> dict[str, Any] | None:
-    """文档正文里是否留下了本次运行抓到的数据。
-
-    需求关键词比对挡不住这一类：文档正文整篇由脚本写出，把需求原话写成标题
-    （「# 帖子内容总结」「## 生成总结」）就能让关键词判据通过，而这比修抽取节点便宜得多——
-    模型上一轮已经明说要这么干。所以文档必须拿抓取值来验，不能拿它自己写的字自证。
-    平台没有语义改写类节点，脚本只能搬运原文，因此逐字找不到就是真没搬进去。
-    """
-    fragments = _run_data_fragments(variables, str(document.get("name") or ""))
-    if not fragments:
-        return None
-    haystack = _collapse(body)
-    if any(fragment in haystack for fragment in fragments):
-        return None
-    return {
-        "issue": DOCUMENT_MISSING_RUN_DATA,
-        "message": (
-            f"文档 `{document['name']}` 里找不到本次运行抓到的任何一段原文"
-            f"（比对了 {len(fragments)} 个片段，例如 {fragments[:3]}）。"
-            "正文是生成节点自己写的固定文案，抓来的数据没有进到交付物里。"
-        ),
-        "fix": (
-            "检查生成节点：确认它读的是抽取节点的输出变量，且写文件时用的是这个变量的内容，"
-            "不是脚本里的示例文本或标题模板。"
-        ),
-    }
 
 
-def _audit_binary_document(document: dict[str, Any], path: Path) -> list[dict[str, Any]]:
-    """二进制产物只验「确实是这个格式、不是空壳」，正文一律不验。
-
-    把 PDF/Office 文件按 UTF-8 读出来的是容器字节，需求关键词逐字比对必然落空：一份内容
-    完全正确的 PDF 会被判成内容不符，助手照 fix 传 content_match_confirmed 也救不回来，
-    同一条失败两次就触发质量熔断，流程锁死在一个它无论如何都满足不了的判据上。
-    验不了就明说验不了——用一个必然失败的判据冒充审计，比不审更坏。
-    """
-    header = _BINARY_DOCUMENT_FORMATS[path.suffix.lower()]
-    size = path.stat().st_size
-    if size < _MIN_BINARY_DOCUMENT_BYTES:
-        return [{
-            "issue": "document_binary_too_small",
-            "message": f"产物 `{document['name']}` 只有 {size} 字节，装不下一篇内容，多半是写文件节点只落了个空壳。",
-            "fix": "检查生成节点：确认正文变量非空、写入过程没有异常被吞掉，再重跑。",
-        }]
-    with path.open("rb") as handle:
-        magic = handle.read(len(header))
-    if magic != header:
-        return [{
-            "issue": "document_binary_header_mismatch",
-            "message": (
-                f"产物 `{document['name']}` 扩展名是 {path.suffix.lower()}，但文件头不是 {header!r}，"
-                "多数查看器会直接打不开。"
-            ),
-            "fix": "检查生成节点是否按该格式的规范写入（自己拼字节流尤其容易漏文件头），或改用成熟的库生成。",
-        }]
-    return [{
-        "severity": "warning",
-        "issue": "document_content_not_text_verifiable",
-        "message": (
-            f"产物 `{document['name']}` 是 {path.suffix.lower()} 二进制文档（{size} 字节），"
-            "本工具读不到它的正文，已跳过与需求的关键词比对——这不代表内容已核对。"
-        ),
-        "fix": (
-            "核对喂给该文档的源变量（正文/摘要变量）与需求是否一致；"
-            "内容是否正确请交给用户过目，不要在没看过正文的情况下宣称验收通过。"
-        ),
-    }]
 
 
 _SWEEP_NODE_TYPES = {"browser.paginateNext", "browser.clickLoadMore"}
@@ -588,31 +432,6 @@ def _find_incomplete_sweeps(nodes: list[Any], variables: dict[str, Any]) -> list
     return findings
 
 
-def _describe_output_variables(variables: dict[str, Any]) -> list[dict[str, Any]]:
-    """如实列出这次运行到底产出了什么，以及每个变量为什么不算表格。
-
-    只说「没有表格型变量」而不说有什么，模型除了换个写法再试一次别无选择，
-    重复调用拿回的还是同一句话——空转就是这么烧出来的。
-    """
-    described: list[dict[str, Any]] = []
-    for name, value in variables.items():
-        item: dict[str, Any] = {"name": name}
-        if isinstance(value, list):
-            item["kind"] = f"list（{len(value)} 项）"
-            item["sample"] = [str(v)[:60] for v in value[:2]]
-            if value and not _coerce_table_rows(value):
-                item["why_not_table"] = "元素是纯文本，不是 dict/list，无法按行结构化"
-        elif isinstance(value, dict):
-            item["kind"] = f"dict（{len(value)} 键）"
-            item["sample"] = list(value)[:8]
-            item["why_not_table"] = "单个对象不是行集合；要成表需要 list[dict]"
-        else:
-            text = str(value)
-            item["kind"] = f"text（{len(text)} 字符）"
-            item["sample"] = text[:80]
-            item["why_not_table"] = "标量文本不是行集合"
-        described.append(item)
-    return described[:20]
 
 
 def _coerce_table_rows(value: Any) -> list[Any]:
@@ -629,7 +448,13 @@ def _coerce_table_rows(value: Any) -> list[Any]:
     return []
 
 
-def _check_structured_rows(rows: list[Any], headers: list[str] | None) -> dict[str, Any] | None:
+def _check_structured_rows(rows: list[Any]) -> dict[str, Any] | None:
+    """契约条款之外的「行本身就是垃圾」。
+
+    表头被当成数据行、半空行、整表被摊平成一个数组、分页按钮混进结果——这些在验收契约里
+    没有对应条款也无法有：字段齐、行数够、日期合法，四项全过，交上来的还是一堆没法用的行。
+    判据只看行的形状，不猜哪个变量是表头（那属于旧的启发式审计，已随它一起删掉）。
+    """
     if not rows:
         return {"issue": "empty_rows", "message": "结果行为空。"}
     if all(isinstance(row, dict) for row in rows):
@@ -642,10 +467,7 @@ def _check_structured_rows(rows: list[Any], headers: list[str] | None) -> dict[s
         sparse_issue = _detect_sparse_rows(rows)
         if sparse_issue is not None:
             return sparse_issue
-        shell_issue = _detect_single_column_text_shell(rows)
-        if shell_issue is not None:
-            return shell_issue
-        return None
+        return _detect_single_column_text_shell(rows)
     if not all(isinstance(row, list) for row in rows):
         return {"issue": "unstructured_rows", "message": "结果不是 list[dict] 或 list[list]，无法稳定校验字段。"}
     lengths = [len(row) for row in rows if isinstance(row, list)]
@@ -654,31 +476,6 @@ def _check_structured_rows(rows: list[Any], headers: list[str] | None) -> dict[s
     mixed_issue = _detect_mixed_ui_rows(rows)
     if mixed_issue is not None:
         return mixed_issue
-    if headers:
-        mismatched = [
-            {"row_index": index, "column_count": length}
-            for index, length in enumerate(lengths)
-            if length != len(headers)
-        ]
-        if mismatched:
-            return {
-                "issue": "header_row_length_mismatch",
-                "message": (
-                    f"表头列数为 {len(headers)}，但存在 {len(mismatched)} 行数据列数不一致。"
-                    "这会导致 Excel 表头和值错位或只写出部分列。"
-                ),
-                "headers_count": len(headers),
-                "sample_mismatched_rows": mismatched[:5],
-            }
-        if max(lengths) > len(headers) * 2:
-            return {
-                "issue": "whole_table_flattened",
-                "message": (
-                    f"检测到单行列数 {max(lengths)} 远大于表头列数 {len(headers)}，"
-                    "疑似把整张表抽成一个扁平文本数组，而不是逐行抽取。"
-                ),
-            }
-        return None
     if len(rows) == 1 and lengths[0] > 30:
         return {
             "issue": "whole_table_flattened",
@@ -896,93 +693,12 @@ def _row_get(row: Any, headers: list[str] | None, field: str) -> Any:
     return None
 
 
-def _assert_date_range(
-    rows: list[Any],
-    headers: list[str] | None,
-    field: str,
-    start_date: str | None,
-    end_date: str | None,
-) -> list[dict[str, Any]]:
-    from datetime import date
-
-    issues: list[dict[str, Any]] = []
-    start = date.fromisoformat(start_date) if start_date else None
-    end = date.fromisoformat(end_date) if end_date else None
-    bad: list[dict[str, Any]] = []
-    missing = 0
-    for index, row in enumerate(rows):
-        raw = _row_get(row, headers, field)
-        if raw is None:
-            missing += 1
-            continue
-        match = re.search(r"\d{4}-\d{2}-\d{2}", str(raw))
-        if not match:
-            bad.append({"row": index + 1, "value": raw, "reason": "无法解析日期"})
-            continue
-        current = date.fromisoformat(match.group(0))
-        if (start and current < start) or (end and current > end):
-            bad.append({"row": index + 1, "value": raw, "reason": "日期超出范围"})
-    if missing == len(rows):
-        issues.append({"issue": "date_field_missing", "message": f"所有行都找不到日期字段 `{field}`。"})
-    elif bad:
-        issues.append({
-            "issue": "date_range_violation",
-            "message": f"字段 `{field}` 存在 {len(bad)} 行不在日期范围内。",
-            "examples": bad[:5],
-        })
-    return issues
 
 
-def _assert_allowed_values(
-    rows: list[Any],
-    headers: list[str] | None,
-    field: str,
-    allowed_values: list[str],
-) -> list[dict[str, Any]]:
-    allowed = {str(value).strip() for value in allowed_values}
-    bad: list[dict[str, Any]] = []
-    missing = 0
-    for index, row in enumerate(rows):
-        raw = _row_get(row, headers, field)
-        if raw is None:
-            missing += 1
-            continue
-        if str(raw).strip() not in allowed:
-            bad.append({"row": index + 1, "value": raw})
-    if missing == len(rows):
-        return [{"issue": "enum_field_missing", "message": f"所有行都找不到枚举字段 `{field}`。"}]
-    if bad:
-        return [{
-            "issue": "enum_value_violation",
-            "message": f"字段 `{field}` 存在 {len(bad)} 行不属于允许值 {sorted(allowed)}。",
-            "examples": bad[:5],
-        }]
-    return []
 
 
-def _guess_date_field(headers: list[str] | None, rows: list[Any]) -> str | None:
-    if not headers:
-        return None
-    preferred = [header for header in headers if any(keyword in str(header) for keyword in ("日期", "时间", "date", "time"))]
-    for header in preferred + headers:
-        values = [_row_get(row, headers, str(header)) for row in rows[:10]]
-        parseable = sum(1 for value in values if value is not None and re.search(r"\d{4}-\d{2}-\d{2}", str(value)))
-        if parseable:
-            return str(header)
-    return None
 
 
-def _guess_enum_field(headers: list[str] | None, rows: list[Any], allowed_values: list[str] | None) -> str | None:
-    if not headers or not allowed_values:
-        return None
-    allowed = {value.strip() for value in allowed_values}
-    best: tuple[int, str] | None = None
-    for header in headers:
-        values = [_row_get(row, headers, str(header)) for row in rows[:20]]
-        hits = sum(1 for value in values if str(value).strip() in allowed)
-        if hits and (best is None or hits > best[0]):
-            best = (hits, str(header))
-    return best[1] if best else None
 
 
 _REQUIREMENT_ACTION_PREFIXES = ("抓取", "采集", "提取", "获取", "爬取", "导出", "下载", "统计", "收集")
@@ -994,53 +710,8 @@ _REQUIREMENT_STOP_TERMS = frozenset({
 })
 
 
-def _extract_requirement_targets(requirement_text: str) -> list[str]:
-    """从需求文本里取出「要抓的是什么」的业务名词。"""
-    # \S+ 会把 URL 后面紧跟的中文一起吃掉（中文不是空白），只截 URL 合法的 ASCII
-    text = re.sub(r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+", " ", requirement_text or "")
-    targets: list[str] = []
-    for segment in re.split(r"[，,。；;：:、\n\r]+", text):
-        term = segment.strip()
-        for prefix in _REQUIREMENT_ACTION_PREFIXES:
-            if term.startswith(prefix):
-                term = term[len(prefix):].strip()
-        # 「核心业务指标模块数据」要连剥两层才露出业务名
-        changed = True
-        while changed:
-            changed = False
-            for suffix in _REQUIREMENT_GENERIC_SUFFIXES:
-                if len(term) > len(suffix) and term.endswith(suffix):
-                    term = term[: -len(suffix)].strip()
-                    changed = True
-        if len(term) >= 2 and term not in _REQUIREMENT_STOP_TERMS and term not in targets:
-            targets.append(term)
-    return targets[:6]
 
 
-def _check_requirement_alignment(
-    targets: list[str],
-    rows: list[Any],
-    headers: list[str] | None,
-) -> dict[str, Any] | None:
-    """需求里的业务名词在实际输出里是否留下了痕迹。
-
-    只比对真实数据（表头 / 字段名 / 单元格值），不看变量名和节点标题——那些是 AI
-    自己起的名字，用需求词命名再拿来自证，正好会掩盖抽错表这类错误。
-    """
-    if not targets:
-        return None
-    surface: list[str] = [str(h) for h in (headers or [])]
-    for row in rows[:60]:
-        if isinstance(row, dict):
-            surface.extend(str(k) for k in row)
-            surface.extend(str(v) for v in row.values())
-        elif isinstance(row, list):
-            surface.extend(str(cell) for cell in row)
-        else:
-            surface.append(str(row))
-    haystack = " ".join(surface)
-    matched = [t for t in targets if _shares_substring(t, haystack)]
-    return {"targets": targets, "matched": matched, "aligned": bool(matched)}
 
 
 _CJK_IDEOGRAPHS = re.compile("[\\u4e00-\\u9fff]")  # CJK 统一汉字区块 U+4E00..U+9FFF
@@ -1059,51 +730,60 @@ def _shares_substring(term: str, haystack: str) -> bool:
     )
 
 
-def _infer_constraints_from_requirement(requirement_text: str) -> dict[str, Any]:
-    """从用户原始需求里提取通用约束，不绑定任何页面或字段名。"""
-    text = requirement_text.strip()
-    if not text:
-        return {}
-    inferred: dict[str, Any] = {}
-    dates = re.findall(r"(\d{4})[年/-](\d{1,2})[月/-](\d{1,2})", text)
-    if dates:
-        normalized = [f"{int(y):04d}-{int(m):02d}-{int(d):02d}" for y, m, d in dates]
-        inferred["start_date"] = normalized[0]
-        if len(normalized) > 1:
-            inferred["end_date"] = normalized[1]
-        elif "今天" in text or "今日" in text:
-            from datetime import datetime
-            inferred["end_date"] = datetime.now().strftime("%Y-%m-%d")
-
-    enum_match = re.search(r"(?:多选|状态|进度|类型|类别|分类)[：:]\s*([^，。,；;\n]+)", text)
-    if enum_match:
-        raw = enum_match.group(1)
-        raw = re.sub(r"[（(]\s*多选\s*[）)]", "", raw)
-        values = [part.strip() for part in re.split(r"[/、,，|]", raw) if part.strip()]
-        if len(values) >= 2:
-            inferred["allowed_values"] = values
-    return inferred
 
 
 def _build_quality_repair_plan(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    # 把 assert_run_output 发现的业务质量问题（如整表被摊平、字段缺失）翻译成
-    # AI 可执行的结构化修复步骤，避免模型只收到问题描述却不知道该改哪个节点。
+    """把验收审计的 issue 翻译成「该动哪个节点」的可执行步骤。
+
+    审计只说交付物哪里不合格。模型据此仍要自己猜动哪个节点，而猜错的代价是再跑一次完整
+    运行（常以分钟计）。这里只补这一层：issue 名 → 该动的节点 + 判定改对了的依据。
+    lint 已经随 finding 一起给出 fix 的问题不在这里重复一遍：同一条建议出现两处，
+    改了一处就会长期不一致。
+    """
     plan: list[dict[str, Any]] = []
     issue_names = {str(issue.get("issue", "")) for issue in issues}
-    if any(
-        "whole_table_flattened" in name
-        or "table_extract_selector_targets_container" in name
-        or "table_extract_selector_not_table_like" in name
-        for name in issue_names
-    ):
+
+    # 证据本身不成立：流程可能完全没坏，是这份产物不能代表当前定义，出路只有重跑。
+    if issue_names & {"stale_run_evidence", "definition_digest_mismatch", "orphaned_run_evidence"}:
+        plan.append({
+            "action": "rerun_current_revision",
+            "reason": "这份运行产物不对应当前流程定义，不能作为验收依据。",
+            "steps": [
+                "不要改流程结构：本条不是流程缺陷，改一次只会让证据再作废一次。",
+                "直接对当前 flow_id 重新调用 run_flow，按新任务返回的 acceptance_audit 汇报。",
+            ],
+        })
+    if "acceptance_contract_missing" in issue_names:
+        plan.append({
+            "action": "freeze_acceptance_contract",
+            "reason": "这次运行没有携带交付验收契约，审计无从判断该验哪个变量、哪些业务条件。",
+            "steps": [
+                "调用 set_acceptance_contract：requirements 逐条记用户原话，deliverables 逐个声明交付变量与后置条件。",
+                "契约齐了再重新运行；不要为了让审计通过而少写条款。",
+            ],
+        })
+    if "whole_table_flattened" in issue_names:
         plan.append({
             "action": "fix_table_extraction_selector",
-            "reason": "输出不是按行结构化表格，通常是 extract selector 指向表格容器而不是数据行。",
+            "reason": "整张表被抽成了一个扁平数组，通常是 extract selector 指向表格容器而不是数据行。",
             "steps": [
-                "调用 get_flow 找到 browser.extract 表格节点。",
+                "在状态块的节点列表里找到 browser.extract 表格节点。",
                 "将 selector 改为真实数据行选择器；标准表格优先 tbody tr，Element UI/Ant Design 从 inspect_page/page_layout 中找行 class。",
                 "保持 extractMode='table'，补充 outputVariable 和 countVariable。",
-                "重新运行后再次调用 assert_run_output。",
+                "重跑后看 acceptance_audit：行数应当与页面上的记录条数同量级，而不是 1 行。",
+            ],
+        })
+    if issue_names & {"deliverable_not_table", "unstructured_rows", "rows_not_objects"}:
+        plan.append({
+            "action": "produce_structured_rows",
+            "reason": "交付变量不是按行结构化的数据，字段级验收无从进行。",
+            "steps": [
+                "先 get_run_output 看这个变量的实际形态：是纯文本、单层字符串数组，还是 list[list]。",
+                "改抽取节点 extractMode='table' 让它直接产出 list[dict]，"
+                "不要再加一个脚本节点把文本二次拼成表——那只是把同一个问题往后挪一格。",
+                "契约要求具名字段时，字段名必须来自同一行的结构，不能把表头和行分开猜测拼接。",
+                "若这次交付物本来就该是一篇文档而不是表格，直接向用户确认交付形态，"
+                "不要造一个 rows 变量来迎合契约。",
             ],
         })
     if SINGLE_COLUMN_TEXT_SHELL in issue_names:
@@ -1117,102 +797,62 @@ def _build_quality_repair_plan(issues: list[dict[str, Any]]) -> list[dict[str, A
                 "把 browser.extract 改成按记录抽取：一条记录一行，每个字段一列；"
                 "字段各自有 selector 时用多个抽取节点，整块结构规整时用 extractMode='table'。",
                 "字段确实无法从页面拆出来时，如实告诉用户这个站点只能拿到整段文本，让用户决定，不要用序号列凑数。",
-                "重新运行后再次调用 assert_run_output。",
             ],
         })
-    if any("header_row_length_mismatch" in name for name in issue_names):
+    if "required_fields_missing" in issue_names:
         plan.append({
-            "action": "fix_header_row_alignment",
-            "reason": "表头列数和数据行列数不一致，写 Excel 时会造成表头和值错位。",
+            "action": "extract_the_missing_fields",
+            "reason": "契约点名的字段在数据行里不存在，抽取节点没把这一列拆出来。",
             "steps": [
-                "优先让抽取节点直接输出 list[dict]，字段名来自同一行结构，不要把 headers 和 rows 分开猜测拼接。",
-                "如果必须使用 headers + list[list]，确保每一行长度都与 headers 完全一致；缺失值用空字符串占位，多余 UI 列要在写入前剔除。",
-                "检查 table/extract selector 是否混入表头、分页、按钮或展开行；必要时收窄到业务数据行。",
-                "重新运行后调用 assert_run_output，确认不再出现 header_row_length_mismatch。",
+                "先 get_run_output 看行里实际有哪些键：是字段名对不上（列名被改写），还是这一列压根没抽。",
+                "列名对不上就改抽取节点的字段命名，让它与契约里的 required_fields 逐字一致。",
+                "整列缺失时调用 inspect_page 确认页面上有没有这个字段；有就补进抽取范围，"
+                "确实没有就如实告诉用户这个站点拿不到该字段，不要造一列空值。",
             ],
         })
-    if any("date_range_violation" in name for name in issue_names):
+    if "header_row_as_data" in issue_names:
+        plan.append({
+            "action": "filter_header_rows",
+            "reason": "表头行被当成数据行抓了进来（每个字段的值等于自己的列名）。",
+            "steps": [
+                "将 selector 改为 tbody tr；若已是 tbody tr 仍出现表头，改用 extractMode='table'（自动过滤表头）。",
+                "表头/表体分离渲染的组件库表格，从 inspect_page 的 tables[].row_selector 取该站点真实的表体 class，不要套用其他站点的类名。",
+            ],
+        })
+    if "allowed_values_violation" in issue_names:
+        plan.append({
+            "action": "make_the_filter_actually_requery",
+            "reason": "字段出现了契约允许范围外的值，多数是下拉筛选选中了但没重新拉数据。",
+            "steps": [
+                "issue.message 已列出实际非法值，直接据此判断是筛选没生效还是抓的列不对（无需再调 get_run_output）。",
+                "检查下拉筛选链路：点击选项之后必须点查询/确认按钮，否则前端只是选中了选项，页面数据没变。",
+                "查询按钮点击后补 browser.wait 等待表格更新（waitForSelector 或 delayMs 2000），再执行 extract。",
+                "非法值恰好等于列名时属于表头混入，按 filter_header_rows 处理。",
+            ],
+        })
+    if "date_range_violation" in issue_names:
         plan.append({
             "action": "verify_date_filter_applied",
             "reason": "输出数据包含日期范围外的记录，说明筛选条件填入 UI 但未真实生效（组件内部状态未更新）。",
             "steps": [
                 "**禁止只改日期 selector 后再跑一遍**——这只会重复得到未生效筛选的结果。",
-                "上方 issue.examples 已包含实际越界的行和日期值（无需再调 get_run_output），直接判断筛选是否真实生效。",
-                "调用 get_flow 找到日期筛选相关节点；如果存在 browser.fill 日期输入框，或日期 click 节点 selector 过宽，必须重建日期链路。",
+                "在状态块的节点列表里找到日期筛选相关节点；如果存在 browser.fill 日期输入框，或日期 click 节点 selector 过宽，必须重建日期链路。",
                 "调用 inspect_page(scope_selector=筛选区域容器)。**若返回 date_controls[].interaction_recipe，按 steps 重建节点（selector 直接用，日期文本和节点数量按本次任务改写）；若 date_controls 为空**，按同样思路自己搭：写日期 → 提交 → 回读 → 校验。",
                 "优先键入日期文本（browser.fill fillMode='type' + browser.press Enter），它与运行当天无关；点日历格要求面板正好停在目标月份，且翻月次数绝不能写死。",
                 "点日历格时单元格 selector 必须排除上/下月的单元格（Element UI 的 prev-month/next-month、Ant Design 的非 cell-in-view）。",
                 "在查询按钮点击后增加 browser.wait 等待表格数据更新（waitForSelector 或 delayMs 2000），再执行 extract。",
-                "重新运行后调用 assert_run_output，用 start_date/end_date 参数确认第一行和最后一行日期均在范围内。",
+                "回读校验（抽取输入框 value + 脚本比对）是这条的硬门控：没有它，下一次运行同样无法自证筛选生效。",
             ],
         })
-    if any("enum_value_violation" in name for name in issue_names):
-        plan.append({
-            "action": "filter_header_rows_and_fix_enum_extraction",
-            "reason": "输出中出现枚举字段值等于字段名（表头行被混入数据），或枚举值不在允许列表中。",
-            "steps": [
-                "上方 issue.examples 已包含实际不合法的行和枚举值，直接据此判断是表头混入还是枚举筛选未生效（无需再调 get_run_output）。",
-                "首先确认是否混入了表头行：若 issue.examples 中行值等于字段名（如 '项目进度'），则 selector 覆盖了 thead。",
-                "修复表头混入：将 selector 改为 tbody tr 或 tbody tr:not(:first-child)；"
-                "若已是 tbody tr 仍出现表头，改用 extractMode='table'（自动过滤表头）。",
-                "若是枚举筛选未生效（数据含'项目通过'以外的枚举值）：检查下拉筛选控件是否真实触发了查询——"
-                "点击下拉选项后必须点击查询/确认按钮，否则前端只是选中了选项但未重新拉数据。",
-                "重新运行后调用 assert_run_output 并传入 allowed_values 参数，确认枚举列所有值均合法。",
-            ],
-        })
-    if any("mixed_ui_rows" in name for name in issue_names):
+    if issue_names & {"mixed_ui_rows", "sparse_rows"}:
         plan.append({
             "action": "narrow_extraction_scope",
-            "reason": "输出中混入日期面板、分页、按钮等非业务 UI 行，说明抽取范围过宽。",
+            "reason": "输出中混入日期面板、分页、按钮等非业务行，或大量近空行，说明抽取范围过宽。",
             "steps": [
                 "调用 inspect_page 查看业务数据区域与浮层/筛选控件的 DOM 边界。",
                 "将抽取 selector 或 scope 收窄到业务数据容器内的真实数据项/数据行。",
                 "避免使用 tbody tr、[role=row] 等全页面宽泛 selector，除非已经限定父容器。",
-                "重新运行后调用 assert_run_output，确认 sample_rows 不再包含星期、日历数字、分页或按钮文本。",
-            ],
-        })
-    if any("date_filter_missing_verification" in name for name in issue_names):
-        plan.append({
-            "action": "add_date_filter_verification_gate",
-            "reason": "日期筛选没有回读校验：写入没真正提交给组件时，页面会返回全量数据，流程却成功结束。",
-            "steps": [
-                "调用 get_flow 找到日期写入节点（fill 或点日历格）及其后续节点。",
-                "在写入之后补 browser.extract（extractMode='attribute'、attribute='value'、includeInResult=false）回读开始/结束日期输入框到变量。",
-                "再补一个 script.python 节点比对回读值与目标日期，不一致时 raise SystemExit；日期段节点不要设 continueOnError=true。",
-                "回读值确实没落下时才动交互方式：调用 inspect_page(scope_selector=筛选区域容器) 取 date_controls[].interaction_recipe，"
-                "按 steps（键入日期文本 + Enter）重建；键入在扩展执行器下可能不提交组件模型，可改走 fallback_steps 或把流程切到 playwright 执行器。",
-                "走点日历格路线时：单元格 selector 排除上/下月单元格，且必须先读面板标题定位当前年月，翻月次数不能写死。",
-                "不要只增加 delayMs 或重复写同一个输入框。",
-            ],
-        })
-    if any("date_trigger_selector_too_broad" in name for name in issue_names):
-        plan.append({
-            "action": "narrow_date_trigger_selector",
-            "reason": "日期触发 selector 过宽，可能打开错误控件或错误日期面板，导致后续日期点击链路偏移。",
-            "steps": [
-                "调用 inspect_page(scope_selector=筛选区域容器)。**若返回 date_controls[].interaction_recipe，直接用 recipe.trigger 替换当前过宽的触发节点 selector，其余 selector 也按 recipe 更新。若 date_controls 为空**，从 inputs 字段选取唯一精确输入框替换，不要使用逗号候选、`placeholder*=` 或 `first-of-type`。",
-                "修复后运行并调用 assert_run_output(start_date/end_date)，确认输出日期范围真实生效。",
-            ],
-        })
-    if any("critical_action_continue_on_error" in name for name in issue_names):
-        plan.append({
-            "action": "stop_swallowing_critical_action_failures",
-            "reason": "关键筛选/提交/导航动作失败后继续执行，会把根因伪装成后续等待或抽取失败。",
-            "steps": [
-                "调用 lint_flow 找到 issue=critical_action_continue_on_error 的节点。",
-                "移除关键业务动作上的 continueOnError；仅保留在可选弹窗、登录检测、Cookie 横幅等可缺失节点上。",
-                "若确实需要容错，必须在后续增加可验证校验节点，并让校验失败中断流程。",
-                "重新运行失败时先看 get_run_error.swallowed_critical_failures，再决定修复前置动作还是末端抽取。",
-            ],
-        })
-    if any("constraint_not_verifiable" in name or "field_missing" in name for name in issue_names):
-        plan.append({
-            "action": "make_output_verifiable",
-            "reason": "用户约束无法在输出中定位字段，说明抽取结构或字段命名不足以验证业务正确性。",
-            "steps": [
-                "确保表头和数据行被结构化输出；必要时单独抽取表头并设置 includeInResult=false。",
-                "使用 table 模式输出 list[list] 或 list[dict]，避免纯文本拼接。",
-                "重新运行 assert_run_output，让工具自动从表头/行值匹配约束字段。",
+                "重跑后看 acceptance_audit：行数会随噪声行被剔除而下降，这是修对了而不是抓少了。",
             ],
         })
     if "sweep_never_advanced" in issue_names:
@@ -1226,16 +866,14 @@ def _build_quality_repair_plan(issues: list[dict[str, Any]]) -> list[dict[str, A
                 "重跑后看节点 detail 里的 `N 页 · [每页条数] · stop=…`，确认页数大于 1 再谈验收。",
             ],
         })
-    if "no_table_like_output" in issue_names:
+    if issue_names & {"empty_rows", "too_few_rows", "coverage_ratio_violation"}:
         plan.append({
-            "action": "produce_structured_rows",
-            "reason": "整次运行没有任何可按行读取的变量，抓取结果无法验证。",
+            "action": "collect_all_the_rows",
+            "reason": "运行成功但行数不够，数据没抓全。",
             "steps": [
-                "先看本次返回的 observed_variables：那是实际产出，含每个变量不算表格的原因。",
-                "若已有一个 list 里装的是纯文本，改抽取节点 extractMode='table' 让它直接产出 list[dict]，"
-                "不要再加一个脚本节点把文本二次拼成表——那只是把同一个问题往后挪一格。",
-                "若这次交付物本来就该是一篇文档，说明需求文本没体现出这一点："
-                "直接向用户确认交付形态，不要造 rows 变量来迎合本条检查。",
+                "先看抽取节点前有没有等待：表格异步渲染时 extract 会在空表上成功返回 0 行。",
+                "确认翻页是否真的翻完：循环存在时看 countVariable 的实际值，只有第 1 页按 fix_pagination_trigger 处理。",
+                "页面本身就只有这些数据时，不要改契约来迁就——如实告诉用户实际条数与页面声明总数的差距，让用户判断。",
             ],
         })
     if TRANSFORM_HAD_NO_EFFECT in issue_names:
@@ -1245,37 +883,46 @@ def _build_quality_repair_plan(issues: list[dict[str, Any]]) -> list[dict[str, A
             "steps": [
                 "先 get_run_output 读输入变量的真实内容，确认噪声的实际形态（是独立成行，还是和正文连在一段里）。",
                 "噪声不成行时，加固脚本无解：回到抽取节点，用 inspect_page 找只装目标内容的容器并收窄 selector。",
-                "重跑后再次 assert_run_output，确认这条不再出现——体量没变就是没做成，不要改口径汇报成功。",
+                "重跑后看 acceptance_audit 里这条是否消失——体量没变就是没做成，不要改口径汇报成功。",
             ],
         })
-    if DOCUMENT_MISSING_RUN_DATA in issue_names:
+    if issue_names & {"document_missing_source_data", "source_variable_missing"}:
         plan.append({
             "action": "wire_document_to_extracted_data",
-            "reason": "文档写出来了，但正文里没有本次抓取到的任何原文，生成节点用的不是抽取节点的输出。",
+            "reason": "文档写出来了，但正文里没有本次抓取到的原文，生成节点用的不是抽取节点的输出。",
             "steps": [
-                "用 get_run_output 看抽取变量的实际值：先确认它非空、装的是正文而不是标题或计数。",
-                "读生成节点的代码：它读的变量名是否就是那个抽取变量，写文件时写进去的是不是这个变量的内容。",
-                "把需求原话写成文档标题对这条判据无效——它比的是抓取值，不是需求关键词。",
-                "改完重跑，再调用本工具。",
+                "用 get_run_output 看契约里 sourceVariables 点名的变量：先确认它非空、装的是正文而不是标题或计数。",
+                "读生成节点的代码：它读的变量名是否就是那个来源变量，写文件时写进去的是不是这个变量的内容。",
+                "把需求原话写成文档标题对这条判据无效——它比的是本次抓取值，不是需求关键词。",
             ],
         })
-    # 上一条的出路不是自证：content_match_confirmed 解不开「正文里没有抓取数据」
-    if any(name.startswith("document_") and name != DOCUMENT_MISSING_RUN_DATA for name in issue_names):
+    if issue_names & {"document_too_short", "document_unreadable", "document_binary_too_small", "document_binary_header_mismatch"}:
         plan.append({
-            "action": "fix_document_content",
-            "reason": "文档型交付物已写出，但内容量或内容本身对不上需求。",
+            "action": "fix_document_output",
+            "reason": "文档型交付物没有正常写出：正文为空、读不出来，或文件是个打不开的空壳。",
             "steps": [
-                "用 inspect_page 确认正文容器 selector 抓的是整篇内容，而非单个标题元素。",
-                "分页/展开类内容确认循环真的翻完了，检查 countVariable 的实际值。",
-                "确认文档内容确实是用户要的之后，传 content_match_confirmed=true 重新调用本工具。",
+                "先确认交付变量存的是什么：正文文本，还是写文件节点返回的路径——契约按哪一种声明就按哪一种产出。",
+                "写文件节点必须真的把内容写进去并 flush/close；只创建文件不落内容会得到一个几百字节的空壳。",
+                "正文确实偏短时回到抽取节点：用 inspect_page 确认正文容器 selector 抓的是整篇内容，而非单个标题元素；"
+                "分页/展开类内容检查循环是否翻完（看 countVariable 实际值）。",
+            ],
+        })
+    if issue_names & {"file_missing", "file_too_small", "file_extension_mismatch", "file_path_invalid", "file_path_outside_workspace", "file_unreadable"}:
+        plan.append({
+            "action": "fix_file_deliverable",
+            "reason": "文件型交付物的路径、扩展名或体积不符合契约声明。",
+            "steps": [
+                "让写文件节点把最终路径写回契约点名的交付变量：变量里存别的东西（内容、目录、None）都会判不通过。",
+                "路径必须落在 RPA 工作区内，扩展名与契约声明一致；改扩展名之前先确认写出的确实是那个格式。",
+                "文件过小时按 fix_document_output 检查内容有没有真的写进去。",
             ],
         })
     if not plan and issues:
         plan.append({
             "action": "inspect_and_repair_flow_structure",
-            "reason": "运行质量审计失败，但没有匹配到专门修复模板。",
+            "reason": "验收审计不通过，但没有匹配到专门修复模板。",
             "steps": [
-                "调用 get_flow 和 lint_flow 查看结构风险。",
+                "对照状态块的节点列表与诊断段查看结构风险。",
                 "调用 get_run_output 查看实际变量形态。",
                 "根据 issues 修复最靠前的结构性问题后重新运行。",
             ],

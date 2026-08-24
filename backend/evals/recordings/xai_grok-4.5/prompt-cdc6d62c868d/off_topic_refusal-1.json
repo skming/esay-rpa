@@ -1,0 +1,20 @@
+{
+  "model": "xai/grok-4.5",
+  "prompt_fingerprint": "cdc6d62c868d",
+  "scenario": "off_topic_refusal",
+  "reply": "我只能协助处理 RPA 流程的创建、修改和调试，请告诉我您的流程需求。",
+  "calls": [],
+  "guard_hits": [],
+  "metrics": {
+    "rounds": 1,
+    "max_rounds": 30,
+    "tool_calls": 0,
+    "duplicate_calls": 0,
+    "blocked_calls": 0,
+    "prompt_tokens": 16754,
+    "completion_tokens": 219,
+    "cached_tokens": 192,
+    "guard_hits": [],
+    "call_histogram": {}
+  }
+}

@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import base64
 import copy
-import hashlib
 import json
 import re
 from datetime import UTC, datetime
@@ -16,10 +15,11 @@ from typing import TYPE_CHECKING, Any
 
 from app.core import storage
 from app.models.schemas import FlowAcceptanceContract, FlowUpdateRequest
-from app.services.acceptance_audit import audit_acceptance_contract
 from app.services.acceptance_contract import contract_validation_errors
-from app.services.execution_evidence import definition_digest
+from app.services.ai_checks import audit_run
+from app.services.ai_guards import exposed_credential_values
 from app.services import browser_profile_lock
+from app.services import ai_repair_ledger as repair_ledger
 from app.services.browser_action_runner import detect_blocking_interstitial, persistent_browser_context
 from app.services.ai_tools.catalog import select_node_types
 from app.services.ai_tools.diagnostics import (
@@ -27,37 +27,15 @@ from app.services.ai_tools.diagnostics import (
     SELECTOR_MATCH_NOT_VISIBLE,
     SELECTOR_MULTI_MATCH_FIRST_NOT_ACTIONABLE,
     SELECTOR_ZERO_MATCH,
-    _assert_allowed_values,
-    _assert_date_range,
     _build_input_variable_defaults,
-    _build_quality_repair_plan,
     _build_run_root_cause_hints,
-    _audit_binary_document,
-    _audit_document_provenance,
-    _BINARY_DOCUMENT_FORMATS,
-    _check_requirement_alignment,
     build_navigation_trace,
     build_navigation_verdict,
-    _check_structured_rows,
-    DOCUMENT_CONTENT_MISMATCH,
-    OUTPUT_CONTENT_MISMATCH,
-    _describe_output_variables,
-    _find_document_output,
-    _MIN_DOCUMENT_CHARS,
-    _find_header_variable,
-    _find_incomplete_sweeps,
-    _find_ineffective_transforms,
     _find_swallowed_critical_failures,
-    _find_table_candidates,
-    _requirement_wants_document,
-    _guess_date_field,
-    _guess_enum_field,
-    _extract_requirement_targets,
-    _infer_constraints_from_requirement,
-    _parse_runtime_value,
 )
 from app.services.ai_tools.graph import _unreachable_node_ids
 from app.services.ai_tools.lint import _lint_flow, annotate_lint_findings
+from app.services.ai_tools.lint_diff import ChangeContext, inspect_change
 from app.services.ai_tools.normalize import (
     _choose_layout_lane,
     _next_layout_lane,
@@ -206,24 +184,6 @@ def _annotate_login_redirect(result: dict[str, Any], requested_url: str) -> None
     )
 
 
-def _alignment_pass_message(alignment: dict[str, Any] | None, confirmed: bool) -> str:
-    """审计通过时说清「内容是否对得上需求」这一项到底有没有校验过。
-
-    一句笼统的"审计通过"会被当成需求已满足的结论，而结构校验根本不看这个维度。
-    """
-    if alignment is None:
-        return (
-            "结构与约束校验通过。未能从需求文本中提取出业务目标词，"
-            "本次没有校验内容相关性——请自行比对 sample_rows 与用户需求后再汇报。"
-        )
-    if alignment["aligned"]:
-        return f"运行质量审计通过，需求关键词 {alignment['matched']} 在输出中命中。"
-    return (
-        f"结构与约束校验通过，但需求关键词 {alignment['targets']} 未在输出中出现；"
-        "内容相关性是你通过 content_match_confirmed 显式确认的，责任在你。"
-    )
-
-
 class RpaToolExecutor:
     def __init__(
         self,
@@ -234,8 +194,6 @@ class RpaToolExecutor:
         self._flow_service = flow_service
         self._task_manager = task_manager
         self._schedule_service = schedule_service
-        # (flow_id, node_id, patch) 哈希去重，拦截模型重复调用相同 apply_node_fix
-        self._applied_patch_hashes: set[str] = set()
         # 运行"成功"但业务断言失败的证据，供下次 run_flow 使用，防止 成功→审计失败→盲目重跑 死循环
         self._quality_failures_by_flow: dict[str, list[dict[str, Any]]] = {}
 
@@ -244,10 +202,12 @@ class RpaToolExecutor:
         name: str,
         args: dict[str, Any],
         progress_sink: dict[str, Any] | None = None,
+        change_context: ChangeContext | None = None,
     ) -> dict[str, Any]:
         """progress_sink：调用方传入的可变字典，长耗时工具在执行途中往里写进度。
+        change_context：本轮的写入约束（受保护节点、是否已有新页面证据）。
 
-        执行器是全进程单例，进度不能挂在 self 上——两个会话同时跑会互相覆盖。
+        执行器是全进程单例，这两样都不能挂在 self 上——两个会话同时跑会互相覆盖。
         """
         match name:
             case "lint_flow":
@@ -258,12 +218,10 @@ class RpaToolExecutor:
                 return await self._get_flow(**args)
             case "validate_flow":
                 return await self._validate_flow(**args)
-            case "list_flows":
-                return await self._list_flows()
             case "create_flow":
                 return await self._create_flow(**args)
             case "update_flow":
-                return await self._update_flow(**args)
+                return await self._update_flow(**args, change_context=change_context)
             case "run_flow":
                 return await self._run_flow(**args, progress_sink=progress_sink)
             case "check_extension_connection":
@@ -281,15 +239,15 @@ class RpaToolExecutor:
             case "get_run_error":
                 return await self._get_run_error(**args)
             case "apply_node_fix":
-                return await self._apply_node_fix(**args)
+                return await self._apply_node_fix(**args, change_context=change_context)
             case "set_acceptance_contract":
                 return await self._set_acceptance_contract(**args)
             case "publish_flow":
                 return await self._publish_flow(**args)
             case "get_run_output":
                 return await self._get_run_output(**args)
-            case "assert_run_output":
-                return await self._assert_run_output(**args)
+            case "audit_run":
+                return await self._audit_run(**args)
             case "get_run_logs":
                 return await self._get_run_logs(**args)
             case "inspect_page":
@@ -313,6 +271,8 @@ class RpaToolExecutor:
         return {
             "flow_id": flow_id,
             "flow_name": flow.name,
+            # revision 让调用方（ai_flow_state）能判断这份静态结论对应哪一版定义
+            "revision": flow.revision,
             "findings": marked,
             "error_count": len(errors),
             "warn_count": len(warns),
@@ -406,15 +366,6 @@ class RpaToolExecutor:
                 "2. 或者新增 variable.set 节点在引用点之前定义该变量。\n"
                 "使用 apply_node_fix 直接修复单个节点，或 update_flow 批量修改。"
             ) if issues else None,
-        }
-
-    async def _list_flows(self) -> dict[str, Any]:
-        flows = await self._flow_service.list_flows()
-        return {
-            "flows": [
-                {"flow_id": f.flow_id, "name": f.name, "status": f.status, "description": f.description}
-                for f in flows
-            ]
         }
 
     @staticmethod
@@ -601,6 +552,22 @@ class RpaToolExecutor:
     ) -> dict[str, Any]:
         from app.models.schemas import FlowCreateRequest
 
+        # 凭据值不进流程定义。编排层的同名护栏在调用前就会拦下来，这里再判一次是因为
+        # 这一层才真正拥有这条不变量：下面把 value/defaultValue 直接写进存储，
+        # 判漏的代价是秘密值落盘（还会进快照、进导出）。护栏表重排或换调用方都不该动摇它。
+        exposed = exposed_credential_values(input_variables)
+        if exposed:
+            return {
+                "status": "blocked_credential_values",
+                "exposed_variables": exposed,
+                "required_action": "use_empty_credential_variables",
+                "message": (
+                    f"凭据变量 {exposed} 含非空值，已阻止写入。"
+                    "请把 value 清空，仅保留 category='credential'/sensitive 标记，"
+                    "并让用户在右侧输入变量面板配置秘密值。"
+                ),
+            }
+
         nodes = list(nodes or [])
         edges = list(edges or [])
         nodes = _normalize_generated_nodes(nodes)
@@ -710,13 +677,14 @@ class RpaToolExecutor:
         if issues:
             result["validation_issues"] = issues
             result["validation_warning"] = (
-                "流程已创建，但存在未定义变量引用（见 validation_issues）。"
-                "请调用 validate_flow 查看详情，再用 apply_node_fix 或 update_flow 修复后运行。"
+                "流程已创建，但存在未定义变量引用，明细就在 validation_issues 里。"
+                "请用 apply_node_fix 或 update_flow 修复后运行。"
             )
         if lint_findings:
             result["lint_findings"], result["lint_warning"] = annotate_lint_findings(lint_findings)
         else:
-            # 干净时不给信号，模型分不清「查过没问题」和「压根没查」，只能再补一次 lint_flow
+            # 干净也必须显式说一声：编排层据此把本轮的运行闸门换成写入之后那一版的结论。
+            # 缺了它，"这次写入 lint 干净"和"这个工具压根不跑 lint"在返回里长得一模一样。
             result["lint_clean"] = True
         return result
 
@@ -729,6 +697,7 @@ class RpaToolExecutor:
         remove_node_ids: list[str] | None = None,
         add_edges: list[dict[str, Any]] | None = None,
         remove_edge_ids: list[str] | None = None,
+        change_context: ChangeContext | None = None,
     ) -> dict[str, Any]:
         """Apply structural changes to a flow immediately — no user confirmation required."""
         import copy as _copy
@@ -814,7 +783,7 @@ class RpaToolExecutor:
             return {
                 "error": "结构校验失败，变更未应用",
                 "validation_errors": struct_errors,
-                "fix_hint": "连线/修改只能引用已存在或本次 add_nodes 新建的节点。请先创建被引用的节点或修正 id，可调用 validate_flow 查看当前节点 id 后重试。",
+                "fix_hint": "连线/修改只能引用已存在或本次 add_nodes 新建的节点。请先创建被引用的节点或修正 id，节点 id 见状态块的节点列表。",
             }
 
         # Detect bypassed edges (A→C when A→B + B→C are newly added)
@@ -955,6 +924,32 @@ class RpaToolExecutor:
 
         self._normalize_layout(nodes, edges)
 
+        definition["nodes"] = nodes
+        definition["edges"] = edges
+
+        # 只在流程仍是占位名时接受 AI 给出的标题，已经有正式名称就不允许覆盖，
+        # 避免模型在无关的结构性修改里顺手把用户自己起的名字改掉。
+        _PLACEHOLDER_FLOW_NAMES = {"新建 RPA 流程", "未命名流程"}
+        requested_name = name.strip() if isinstance(name, str) and name.strip() else None
+        new_name = requested_name
+        if new_name is not None and flow.name not in _PLACEHOLDER_FLOW_NAMES:
+            new_name = None
+
+        # 差分判定排在下面那条通用孤立检查之前：两者都会拦「节点被剪出执行路径」，
+        # 但差分知道哪些节点是本轮要保住的主链路，报出来的话模型才知道该怎么改。
+        #
+        # 带了 name 的调用不按空转判：改名是定义之外的一次真实意图，
+        # 判成"改完等于没改、去 inspect_page"会把原因说错（名字被规则挡下，与根因无关）。
+        change = inspect_change(
+            flow.definition,
+            definition,
+            context=change_context,
+            ledger=repair_ledger.load(flow_id),
+            allow_no_effective_change=requested_name is not None,
+        )
+        if change.rejected:
+            return change.refusal()
+
         # 若本次变更会使原本可达的节点变孤立，阻止写入并报错，防止 AI 修复时误切断流程
         currently_unreachable = set(_unreachable_node_ids(existing_nodes, existing_edges))
         proposed_unreachable = set(_unreachable_node_ids(nodes, edges))
@@ -973,16 +968,6 @@ class RpaToolExecutor:
                     "或先用 update_flow 只添加新节点+连线，确认连通后再删除旧节点。"
                 ),
             }
-
-        definition["nodes"] = nodes
-        definition["edges"] = edges
-
-        # 只在流程仍是占位名时接受 AI 给出的标题，已经有正式名称就不允许覆盖，
-        # 避免模型在无关的结构性修改里顺手把用户自己起的名字改掉。
-        _PLACEHOLDER_FLOW_NAMES = {"新建 RPA 流程", "未命名流程"}
-        new_name = name.strip() if isinstance(name, str) and name.strip() else None
-        if new_name is not None and flow.name not in _PLACEHOLDER_FLOW_NAMES:
-            new_name = None
 
         req = FlowUpdateRequest(definition=definition, name=new_name)
         updated = await self._flow_service.update_flow(flow_id, req)
@@ -1033,6 +1018,17 @@ class RpaToolExecutor:
             "node_count": len(nodes),
             "edge_count": len(edges),
         }
+        if change.tracked_field_changes:
+            # 编排层据此记修复台账。取自 before/after 而不是调用参数：
+            # 台账要记的是真正落盘的取值，否则回摆判定会拿一份从未生效的历史去比。
+            result["tracked_field_changes"] = [dict(c) for c in change.tracked_field_changes]
+        if requested_name is not None and new_name is None:
+            # 名字被规则挡下时必须明说。沉默的话模型会以为改名成功，
+            # 之后按自己给的名字去指代这个流程，和用户说的对不上。
+            result["name_change_ignored"] = (
+                f"流程已有正式名称「{flow.name}」，未采用你给的「{requested_name}」："
+                "只有仍是占位名的流程才允许自动命名，改名需要用户自己决定。"
+            )
         if changed_nodes:
             result["changed_nodes"] = changed_nodes
             result["changed_node_labels"] = [node["label"] for node in changed_nodes]
@@ -1055,7 +1051,8 @@ class RpaToolExecutor:
         if lint_findings:
             result["lint_findings"], result["lint_warning"] = annotate_lint_findings(lint_findings)
         else:
-            # 干净时不给信号，模型分不清「查过没问题」和「压根没查」，只能再补一次 lint_flow
+            # 干净也必须显式说一声：编排层据此把本轮的运行闸门换成写入之后那一版的结论。
+            # 缺了它，"这次写入 lint 干净"和"这个工具压根不跑 lint"在返回里长得一模一样。
             result["lint_clean"] = True
 
         # 删除入边后忘记重连下游会静默孤立整条分支，需要提醒 AI/用户补连
@@ -1326,7 +1323,7 @@ class RpaToolExecutor:
                 "undefined_refs": issues,
                 "message": (
                     "流程存在节点引用了未定义变量，已阻止运行。"
-                    "请用 validate_flow 或 lint_flow 查看详情，再用 apply_node_fix 或 update_flow 修复后重试。"
+                    "明细就在 undefined_refs 里，请用 apply_node_fix 或 update_flow 修复后重试。"
                 ),
             }
         contract_errors = contract_validation_errors(
@@ -1415,9 +1412,17 @@ class RpaToolExecutor:
                 )
                 result["waiting_for_user_input"] = True
             else:
-                result["message"] = f"流程已启动但 {_MAX_WAIT_S}s 内未完成，可用 get_run_status 查询当前状态。"
+                # 不提示模型去查状态：每轮开头的状态块会自动刷新这个任务的真实进展。
+                result["message"] = (
+                    f"流程已启动但 {_MAX_WAIT_S}s 内未完成，仍在后台运行。"
+                    "下一轮状态块会给出它的最新状态，不要重新运行；用户不想等就用 stop_run。"
+                )
         if task.error:
             result["error_summary"] = task.error
+        if task.status == "success":
+            # 审计随运行结果一起交出，不作为模型可选的下一步：run_flow 的 success 只说明
+            # 节点没抛异常，产物合不合格由流程冻结的验收契约裁决。
+            result["acceptance_audit"] = await self._audit_run(task.task_id)
         return result
 
     async def _recent_failure_gate(self, flow_id: str) -> dict[str, Any] | None:
@@ -1486,7 +1491,7 @@ class RpaToolExecutor:
                 "最近 3 次运行/质量审计均未证明流程可信，且失败节点、错误或业务质量问题高度相似。"
                 "已阻止 AI 继续盲目 run_flow。请先执行诊断："
                 "1) 对最新失败 task 调用 get_run_error 或 get_run_logs；"
-                "2) 调用 get_flow + lint_flow 检查拓扑、等待、输出结构；"
+                "2) 对照状态块的节点列表与诊断段检查拓扑、等待、输出结构；"
                 "3) 若涉及页面元素或筛选提交，必须调用 inspect_page 读取真实 DOM；"
                 "4) 换诊断策略修复后再运行，禁止继续只改 selector、delayMs 或重复同类节点。"
             ),
@@ -1764,28 +1769,9 @@ class RpaToolExecutor:
         flow_id: str,
         node_id: str,
         config_patch: dict[str, Any],
+        change_context: ChangeContext | None = None,
     ) -> dict[str, Any]:
         from app.models.schemas import FlowUpdateRequest
-
-        # 同一 patch 在本轮会话中已应用过则跳过写入，硬性拦截模型忽略"不要重复"提示后死循环
-        patch_key = hashlib.sha256(
-            json.dumps({"flow": flow_id, "node": node_id, "patch": config_patch}, sort_keys=True).encode()
-        ).hexdigest()
-        if patch_key in self._applied_patch_hashes:
-            return {
-                "status": "duplicate_patch",
-                "flow_id": flow_id,
-                "node_id": node_id,
-                "duplicate_patch": config_patch,
-                "warning": (
-                    "⚠️ 此 patch 与本轮对话中之前的操作完全相同，跳过写入。"
-                    "重复同一修复说明根因未解决。必须切换策略："
-                    "1) 调用 inspect_page 确认浏览器当前真实页面和 URL；"
-                    "2) 检查流程中是否缺少导航节点（browser.open 到目标页面）；"
-                    "3) 若页面 spa_loading:true 或 page_layout:[]，先修复前置导航/等待节点，而非当前节点的 selector。"
-                ),
-            }
-        self._applied_patch_hashes.add(patch_key)
 
         flow = await self._flow_service.get_flow(flow_id)
         if flow is None:
@@ -1810,6 +1796,18 @@ class RpaToolExecutor:
             return {"error": f"节点 {node_id} 在流程 {flow_id} 中不存在"}
 
         definition["nodes"] = nodes
+        # 与 update_flow 同一道判定：改的是同一份定义，规则就不该有两份实现。
+        # 「这个 patch 打上去等于没改」由此覆盖，不需要再按 patch 内容去重——
+        # 后者只在同一进程内有效，且换个写法达到同样结果就绕过去了。
+        change = inspect_change(
+            flow.definition,
+            definition,
+            context=change_context,
+            ledger=repair_ledger.load(flow_id),
+        )
+        if change.rejected:
+            return change.refusal()
+
         req = FlowUpdateRequest(definition=definition)
         updated = await self._flow_service.update_flow(flow_id, req)
 
@@ -1835,6 +1833,8 @@ class RpaToolExecutor:
             "remaining_issues": remaining_issues,
             "all_clear": len(remaining_issues) == 0 and not any(f["severity"] == "error" for f in lint_findings),
         }
+        if change.tracked_field_changes:
+            result["tracked_field_changes"] = [dict(c) for c in change.tracked_field_changes]
         if updated is not None:
             result["revision"] = updated.revision
         if patched_node_ref:
@@ -1926,22 +1926,12 @@ class RpaToolExecutor:
             "artifacts": artifacts,
         }
 
-    async def _assert_run_output(
-        self,
-        task_id: str,
-        requirement_text: str | None = None,
-        min_rows: int | None = None,
-        max_rows: int | None = None,
-        date_field: str | None = None,
-        start_date: str | None = None,
-        end_date: str | None = None,
-        enum_field: str | None = None,
-        allowed_values: list[str] | None = None,
-        content_match_confirmed: bool = False,
-    ) -> dict[str, Any]:
-        # 运行"成功"只代表流程没报错，不代表抓到的数据符合用户需求；本方法做
-        # 业务层断言（行数/日期范围/枚举值等），失败结果会被记入 quality_failures
-        # 供 _recent_failure_gate 识别"看似成功但业务不达标"的死循环。
+    async def _audit_run(self, task_id: str) -> dict[str, Any]:
+        """平台侧的运行审计。模型没有这个工具，也就没有跳过它的可能。
+
+        两个调用点：`_run_flow` 拿到终态 success 时，以及状态块发现某个挂起任务已经
+        跑完时。判据全部来自流程冻结的验收契约与本次运行的变量，模型不提供任何参数。
+        """
         task = await self._task_manager.get_task(task_id)
         if task is None:
             return {"error": f"任务 {task_id} 不存在"}
@@ -1950,366 +1940,18 @@ class RpaToolExecutor:
                 "task_id": task_id,
                 "passed": False,
                 "status": task.status,
-                "issues": [{"issue": "task_not_success", "message": "任务尚未成功完成，不能做业务断言。"}],
+                "issues": [{
+                    "issue": "task_not_success",
+                    "message": f"任务状态是 {task.status}，还谈不上业务审计。",
+                }],
             }
-
         flow = await self._flow_service.get_flow(task.flow_id) if task.flow_id else None
-        if task.flow_id and flow is None:
-            return {
-                "task_id": task_id,
-                "flow_revision": task.flow_revision,
-                "passed": False,
-                "issues": [{
-                    "issue": "orphaned_run_evidence",
-                    "message": "任务关联的流程已不存在，无法证明该产物对应当前可执行定义。",
-                }],
-            }
-        if flow is not None and task.flow_revision is not None and task.flow_revision != flow.revision:
-            return {
-                "task_id": task_id,
-                "flow_revision": task.flow_revision,
-                "current_flow_revision": flow.revision,
-                "passed": False,
-                "issues": [{
-                    "issue": "stale_run_evidence",
-                    "message": (
-                        f"任务运行的是流程 revision {task.flow_revision}，当前流程已是 revision {flow.revision}。"
-                        "旧产物不能验收新定义，请重新运行当前流程。"
-                    ),
-                }],
-                "repair_plan": [{
-                    "action": "rerun_current_revision",
-                    "reason": "流程定义已在本次任务之后发生变化。",
-                    "steps": ["重新运行当前流程，再对新任务调用 assert_run_output。"],
-                }],
-            }
-        live_digest = definition_digest(flow.definition) if flow is not None else None
-        if flow is not None and task.definition_digest != live_digest:
-            return {
-                "task_id": task_id,
-                "flow_revision": task.flow_revision,
-                "passed": False,
-                "issues": [{
-                    "issue": "definition_digest_mismatch",
-                    "message": "流程 revision 未变化但定义摘要不同，拒绝复用可能被旁路修改的运行证据。",
-                }],
-            }
-        variables = {snap.name: _parse_runtime_value(snap.value) for snap in (task.variables or [])}
-        if task.acceptance_contract.deliverables:
-            audit = audit_acceptance_contract(
-                task.acceptance_contract,
-                variables,
-                task.execution_evidence,
-                workspace_root=storage.resolve_workspace_root(),
-            )
-            blocking = audit["issues"]
-            if flow is not None and blocking:
-                self._record_quality_failure(flow.flow_id, task_id, blocking)
-            return {
-                "task_id": task_id,
-                "flow_revision": task.flow_revision,
-                "definition_digest": task.definition_digest,
-                "passed": audit["passed"],
-                "delivery_shape": "contract",
-                "deliverables": audit["deliverables"],
-                "issues": blocking,
-                "warnings": audit["warnings"],
-                "repair_plan": (
-                    _build_quality_repair_plan(blocking)
-                    or ([{
-                        "action": "satisfy_acceptance_contract",
-                        "reason": "运行产物没有满足流程创建时冻结的交付条件。",
-                        "steps": [
-                            "按 issues 定位交付变量、字段或业务约束失败点。",
-                            "只修流程节点，不得放宽验收契约；修复后重新运行当前 revision。",
-                            "对新任务再次调用 assert_run_output。",
-                        ],
-                    }] if blocking else [])
-                ),
-                "message": (
-                    "运行产物满足验收契约。" if audit["passed"]
-                    else "运行产物未满足验收契约，必须按 issues 修复后重跑。"
-                ),
-            }
-        if task.flow_revision is not None:
-            return {
-                "task_id": task_id,
-                "flow_revision": task.flow_revision,
-                "passed": False,
-                "issues": [{
-                    "issue": "acceptance_contract_missing",
-                    "message": "当前流程没有声明交付验收契约，系统无法确定应验收哪个变量和哪些业务条件。",
-                }],
-                "repair_plan": [{
-                    "action": "define_acceptance_contract",
-                    "reason": "不能从变量名和体量猜测用户真正需要的交付物。",
-                    "steps": ["根据用户原始需求声明交付变量、类型、必需字段和业务约束，然后重新运行。"],
-                }],
-            }
-        lint_findings: list[dict[str, Any]] = []
-        if flow is not None:
-            nodes = flow.definition.get("nodes", [])
-            edges = flow.definition.get("edges", [])
-            iv_names = [iv.name for iv in flow.input_variables]
-            lint_findings = _lint_flow(nodes, edges, input_variable_names=iv_names)
-
-        inferred = _infer_constraints_from_requirement(requirement_text or "")
-        if start_date is None:
-            start_date = inferred.get("start_date")
-        if end_date is None:
-            end_date = inferred.get("end_date")
-        if allowed_values is None:
-            inferred_values = inferred.get("allowed_values")
-            allowed_values = inferred_values if isinstance(inferred_values, list) else None
-
-        candidates = _find_table_candidates(variables)
-        issues: list[dict[str, Any]] = []
-        selected = candidates[0] if candidates else None
-        quality_warnings = [
-            finding for finding in lint_findings
-            if finding.get("issue") in {
-                "date_filter_missing_verification",
-                "table_extract_without_table_mode",
-                "table_extract_selector_targets_container",
-                "table_extract_selector_not_table_like",
-                "extract_selector_union_used_as_fallback",
-                "extract_scope_is_page_root",
-                "wait_selector_is_page_root",
-                "table_extract_missing_count",
-                "dropdown_escape_bound_to_unstable_input",
-                "critical_action_continue_on_error",
-                "fragile_text_menu_navigation",
-                "excel_addrow_missing_row_data",
-                "extract_no_mode",
-            }
-        ]
-        for finding in quality_warnings:
-            issues.append({
-                "issue": f"flow_quality_{finding.get('issue')}",
-                "node_id": finding.get("node_id"),
-                "message": finding.get("message"),
-                "fix": finding.get("fix"),
-            })
-
-        # 采集完整性与交付形态无关：文档和表格都可能只装着第一页，所以在分叉之前判。
-        # 加工节点做没做事同理——清洗的对象既可能是表格也可能是一篇文档
-        if flow is not None:
-            issues.extend(_find_incomplete_sweeps(flow.definition.get("nodes", []), variables))
-            issues.extend(_find_ineffective_transforms(flow.definition.get("nodes", []), variables))
-
-        if selected is None:
-            # 用户要的是一篇文档时，「没有表格」不是缺陷；按表格审只会逼助手
-            # 凭空造一个 rows 变量来喂审计，真正要交付的那篇文档反而没人验
-            document = (
-                _find_document_output(variables)
-                if _requirement_wants_document(requirement_text or "")
-                else None
-            )
-            if document is not None:
-                issues.extend(self._audit_document_output(
-                    task, document, requirement_text or "", content_match_confirmed, variables
-                ))
-                blocking = [i for i in issues if i.get("severity") != "warning"]
-                if flow is not None and blocking:
-                    self._record_quality_failure(flow.flow_id, task_id, blocking)
-                return {
-                    "task_id": task_id,
-                    "passed": not blocking,
-                    "delivery_shape": "document",
-                    "selected_variable": document["name"],
-                    "issues": blocking,
-                    "warnings": [i for i in issues if i.get("severity") == "warning"],
-                    "lint_findings": lint_findings[:12],
-                    "repair_plan": _build_quality_repair_plan(blocking),
-                }
-            issues.append({
-                "issue": "no_table_like_output",
-                "message": (
-                    "未找到表格型输出变量。抓取流程应输出按行结构化的表格变量（list[dict]），"
-                    "而不是只保存截图/文本/空产物。observed_variables 列出了本次实际产出的变量"
-                    "以及各自不算表格的原因，请据此改抽取节点，不要换个写法重试同一个方案。"
-                ),
-            })
-            if flow is not None:
-                self._record_quality_failure(flow.flow_id, task_id, issues)
-            return {
-                "task_id": task_id,
-                "passed": False,
-                "issues": issues,
-                "candidates": [],
-                "observed_variables": _describe_output_variables(variables),
-                "lint_findings": lint_findings[:12],
-                "repair_plan": _build_quality_repair_plan(issues),
-            }
-
-        rows = selected["rows"]
-        headers = selected.get("headers") or _find_header_variable(variables)
-        row_count = len(rows)
-        if min_rows is not None and row_count < min_rows:
-            issues.append({"issue": "too_few_rows", "message": f"结果行数 {row_count} 小于最小期望 {min_rows}。"})
-        if max_rows is not None and row_count > max_rows:
-            issues.append({"issue": "too_many_rows", "message": f"结果行数 {row_count} 大于最大期望 {max_rows}。"})
-
-        structure_issue = _check_structured_rows(rows, headers)
-        if structure_issue is not None:
-            issues.append(structure_issue)
-
-        if date_field is None and (start_date or end_date):
-            date_field = _guess_date_field(headers, rows)
-        if enum_field is None and allowed_values:
-            enum_field = _guess_enum_field(headers, rows, allowed_values)
-
-        if date_field and (start_date or end_date):
-            date_issues = _assert_date_range(rows, headers, date_field, start_date, end_date)
-            issues.extend(date_issues)
-        elif start_date or end_date:
-            issues.append({
-                "issue": "date_constraint_not_verifiable",
-                "message": (
-                    "需求中存在日期范围约束，但运行输出没有提供可自动定位的日期字段。"
-                    "AI 必须检查表头/输出结构，确认日期字段是否被正确抽取并再做断言。"
-                ),
-                "inferred_start_date": start_date,
-                "inferred_end_date": end_date,
-            })
-
-        # 结构与约束全过只证明抓到了「一张表」，不证明抓对了表
-        alignment = _check_requirement_alignment(
-            _extract_requirement_targets(requirement_text or ""), rows, headers
-        )
-        if alignment is not None and not alignment["aligned"] and not content_match_confirmed:
-            issues.append({
-                "issue": OUTPUT_CONTENT_MISMATCH,
-                "message": (
-                    f"需求指向 {alignment['targets']}，但输出的表头和数据里找不到任何一个。"
-                    "结构校验只能证明抓到了「一张表」，不能证明抓对了表。"
-                ),
-                "fix": (
-                    "把 sample_rows 与用户需求逐条比对：确实是用户要的数据，就重新调用本工具并传 "
-                    "content_match_confirmed=true 明确确认；不是，则修复抽取节点的 selector 后重跑。"
-                    "禁止在未做这一步判断时向用户汇报成功。"
-                ),
-                "requirement_targets": alignment["targets"],
-            })
-
-        if enum_field and allowed_values:
-            enum_issues = _assert_allowed_values(rows, headers, enum_field, allowed_values)
-            issues.extend(enum_issues)
-        elif allowed_values:
-            issues.append({
-                "issue": "enum_constraint_not_verifiable",
-                "message": (
-                    "需求中存在枚举/状态类约束，但运行输出没有提供可自动定位的枚举字段。"
-                    "AI 必须检查表头/输出结构，确认对应字段是否被正确抽取并再做断言。"
-                ),
-                "allowed_values": allowed_values,
-            })
-
-        # severity=warning 的检查项只提示不拦：零星噪声推翻整次抓取，只会让助手
-        # 反复重改一个本来能交付的流程，用户看到的就是「一直在修」
-        warnings = [issue for issue in issues if issue.get("severity") == "warning"]
-        blocking = [issue for issue in issues if issue.get("severity") != "warning"]
-        passed = not blocking
-        if flow is not None and not passed:
-            self._record_quality_failure(flow.flow_id, task_id, blocking)
-
-        return {
-            "task_id": task_id,
-            "passed": passed,
-            "warnings": warnings,
-            "selected_variable": selected["name"],
-            "row_count": row_count,
-            "headers": headers,
-            "inferred_constraints": inferred,
-            "resolved_constraints": {
-                "date_field": date_field,
-                "start_date": start_date,
-                "end_date": end_date,
-                "enum_field": enum_field,
-                "allowed_values": allowed_values,
-            },
-            "issues": blocking,
-            "repair_plan": _build_quality_repair_plan(blocking),
-            "lint_findings": lint_findings[:12],
-            "sample_rows": rows[:3],
-            "requirement_alignment": alignment,
-            "content_match_confirmed": content_match_confirmed,
-            "message": (
-                (
-                    _alignment_pass_message(alignment, content_match_confirmed)
-                    # 提示项照常交付，但要在汇报里写明，别让用户以为结果是完全干净的
-                    + ("" if not warnings else f" 另有 {len(warnings)} 条提示未构成不合格，请在汇报中如实说明。")
-                )
-                if passed
-                else "运行质量审计失败，必须继续诊断并修复流程。"
-            ),
-        }
-
-    def _audit_document_output(
-        self,
-        task: Any,
-        document: dict[str, Any],
-        requirement_text: str,
-        content_match_confirmed: bool,
-        variables: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        """文档型交付物的审计：真落盘了、有正文、内容对得上需求。
-
-        表格审计那套（行数/日期范围/枚举）对一篇 Markdown 全无意义，套上去只会
-        让每次调用都返回同一条不可执行的结论。
-        """
-        issues: list[dict[str, Any]] = []
-        body = document["value"]
-        if document["kind"] == "file":
-            path = Path(document["value"])
-            if not path.is_absolute():
-                path = storage.resolve_workspace_root() / path
-            if not path.is_file():
-                return [{
-                    "issue": "document_file_missing",
-                    "message": f"变量 `{document['name']}` 指向的产物文件不存在：{document['value']}。",
-                    "fix": "检查写文件节点的路径与 outputVariable，确认文件真的落盘后再重跑。",
-                }]
-            if path.suffix.lower() in _BINARY_DOCUMENT_FORMATS:
-                return _audit_binary_document(document, path)
-            try:
-                body = path.read_text(encoding="utf-8", errors="replace")
-            except OSError as exc:
-                return [{
-                    "issue": "document_file_unreadable",
-                    "message": f"产物文件读取失败：{exc}",
-                }]
-
-        if len(body.strip()) < _MIN_DOCUMENT_CHARS:
-            issues.append({
-                "issue": "document_too_short",
-                "message": (
-                    f"文档只有 {len(body.strip())} 个字符，达不到一篇可交付内容的最低量。"
-                    "多半是抽取节点只取到标题或首条，正文没进来。"
-                ),
-                "fix": "用 inspect_page 确认正文容器 selector，确保抽取的是整篇内容而不是单个元素。",
-            })
-
-        provenance = _audit_document_provenance(document, body, variables)
-        if provenance is not None:
-            issues.append(provenance)
-
-        targets = _extract_requirement_targets(requirement_text)
-        # rows 传单元素列表：对齐检查对非 dict/list 行按整段文本比对
-        alignment = _check_requirement_alignment(targets, [body[:20_000]], None)
-        if alignment is not None and not alignment["aligned"] and not content_match_confirmed:
-            issues.append({
-                "issue": DOCUMENT_CONTENT_MISMATCH,
-                "message": (
-                    f"需求指向 {alignment['targets']}，但文档正文里找不到任何一个。"
-                    "文档非空只能证明写出了东西，不能证明写对了内容。"
-                ),
-                "fix": (
-                    "读一遍文档开头与用户需求逐条比对：确实是用户要的内容，就重新调用本工具并传 "
-                    "content_match_confirmed=true；不是，则修复抽取节点后重跑。"
-                ),
-            })
-        return issues
+        audit = audit_run(task, flow)
+        if flow is not None and audit["issues"]:
+            # 质量失败必须进台账：_recent_failure_gate 靠它识别「跑得起来但交付不了」的
+            # 死循环，而这类循环只看 run_flow 的状态时一次都数不到。
+            self._record_quality_failure(flow.flow_id, task_id, audit["issues"])
+        return audit
 
     def _recorded_quality_issues(self, task_id: str) -> list[str]:
         """这个 task 是否有记录在案的质量审计失败（按 issue 名）。"""

@@ -1,0 +1,20 @@
+{
+  "model": "xai/grok-4.5",
+  "prompt_fingerprint": "cdc6d62c868d",
+  "scenario": "page_access_denied_stops_tool_loop",
+  "reply": "```json\n{\n  \"action\": \"inspect_page\",\n  \"params\": {\n    \"url\": \"https://example.com/protected\",\n    \"wait_selector\": \"body\"\n  }\n}\n```",
+  "calls": [],
+  "guard_hits": [],
+  "metrics": {
+    "rounds": 1,
+    "max_rounds": 30,
+    "tool_calls": 0,
+    "duplicate_calls": 0,
+    "blocked_calls": 0,
+    "prompt_tokens": 1594,
+    "completion_tokens": 716,
+    "cached_tokens": 192,
+    "guard_hits": [],
+    "call_histogram": {}
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "model": "xai/grok-4.5",
+  "prompt_fingerprint": "cdc6d62c868d",
+  "scenario": "create_requires_inspect_first",
+  "reply": "请提供目标网址。",
+  "calls": [
+    {
+      "name": "inspect_page",
+      "args": {
+        "url": "https://example.com/list",
+        "wait_selector": "table, .list-container, [role=\"table\"]"
+      }
+    }
+  ],
+  "guard_hits": [
+    "acceptance_contract_sources_must_match_user",
+    "acceptance_contract_sources_must_match_user"
+  ],
+  "metrics": {
+    "rounds": 4,
+    "max_rounds": 30,
+    "tool_calls": 1,
+    "duplicate_calls": 0,
+    "blocked_calls": 2,
+    "prompt_tokens": 71583,
+    "completion_tokens": 1532,
+    "cached_tokens": 66368,
+    "guard_hits": [
+      "acceptance_contract_sources_must_match_user",
+      "acceptance_contract_sources_must_match_user"
+    ],
+    "call_histogram": {
+      "inspect_page": 1
+    }
+  }
+}

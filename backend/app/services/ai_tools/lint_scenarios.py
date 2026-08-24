@@ -386,7 +386,7 @@ def _lint_filter_control_risks(nodes: list[dict[str, Any]]) -> list[dict[str, An
                 "若返回 date_controls[].interaction_recipe：用 recipe.trigger 替换当前过宽的触发 selector，"
                 "其余节点 selector 也按 recipe 更新。"
                 "若 date_controls 为空：从 inputs 字段选取唯一精确输入框，不要使用逗号候选、placeholder*= 或 first-of-type。"
-                "修复后运行并调 assert_run_output(start_date/end_date) 确认生效。"
+                "修复后重新运行，看 acceptance_audit 里日期字段不再出现范围外的值，才算生效。"
             ),
         })
 
@@ -709,7 +709,7 @@ _ROW_PRODUCING_TYPES = frozenset({
 def _lint_scrape_flow_without_table_output(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """抓取型流程没有任何按行结构化的输出。
 
-    assert_run_output 本来就会以 no_table_like_output 判失败，但那是跑完之后——
+    运行后的验收审计本来就会判它不合格（交付变量不是按行结构化的数据），但那是跑完之后——
     等于白跑一次浏览器再回来重建抽取链路。这条规则把同一道门挪到运行前。
     """
     extract_nodes = [
@@ -737,7 +737,7 @@ def _lint_scrape_flow_without_table_output(nodes: list[dict[str, Any]]) -> list[
         "message": (
             "流程有抽取节点，但没有任何节点产出按行结构化的表格变量："
             f"{first.get('extractMode') or '未声明'} 模式只会得到文本数组。"
-            "运行后 assert_run_output 会以 no_table_like_output 判定不合格。"
+            "运行后验收审计会判交付变量不是按行结构化的数据。"
         ),
         "fix": (
             "把抽取节点改为 extractMode='table'（selector 指向数据行）；"

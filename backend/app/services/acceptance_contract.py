@@ -48,6 +48,27 @@ def contract_validation_errors(
         ))
         if deliverable.kind != "table" and table_only:
             errors.append(f"交付物 {deliverable.id} 使用了仅适用于 table 的断言")
+        if deliverable.kind == "document":
+            errors.extend(_document_provenance_errors(deliverable, defined_variables))
+    return errors
+
+
+def _document_provenance_errors(deliverable, defined_variables: set[str] | None) -> list[str]:
+    """文档型交付必须声明正文取自哪些运行变量。
+
+    没有这层声明，审计只能拿文档正文比对需求关键词——那等于让模型用自己写的标题自证。
+    `source_variables` 是唯一能让「正文里确实有本次抓取的数据」成为可验证判据的入口，
+    缺了它，document_missing_source_data 会被静默跳过，审计看起来通过了但什么也没验。
+    """
+    errors: list[str] = []
+    if not deliverable.source_variables:
+        errors.append(f"文档交付物 {deliverable.id} 必须用 sourceVariables 声明正文取自哪些运行变量")
+    if deliverable.variable in deliverable.source_variables:
+        errors.append(f"文档交付物 {deliverable.id} 的 sourceVariables 不能包含它自己，拿文档比对自己证明不了任何事")
+    if defined_variables is not None:
+        unknown = sorted({name for name in deliverable.source_variables if name not in defined_variables})
+        if unknown:
+            errors.append(f"文档交付物 {deliverable.id} 的来源变量 {unknown} 未由流程节点或输入变量产出")
     return errors
 
 

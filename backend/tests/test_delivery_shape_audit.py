@@ -1,65 +1,77 @@
 from __future__ import annotations
 
-from app.services.ai_tools.diagnostics import (
-    _build_quality_repair_plan,
-    _describe_output_variables,
-    _find_document_output,
-    _requirement_wants_document,
-)
+from pathlib import Path
 
-# 8e38be17 会话的原始需求：34 次工具调用里有 25 次在给一个「表格」审计造数据
-_MARKDOWN_REQUIREMENT = "https://www.v2ex.com/t/1225889 输出帖子的总结，markdown形式，无需登录，帖子存在分页"
+from app.models.schemas import FlowAcceptanceContract
+from app.services.acceptance_audit import audit_acceptance_contract
+from app.services.ai_tools.diagnostics import _build_quality_repair_plan
 
-
-def test_markdown_summary_requirement_is_not_audited_as_a_table() -> None:
-    assert _requirement_wants_document(_MARKDOWN_REQUIREMENT)
+# 8e38be17 会话的原始需求：34 次工具调用里有 25 次在给一个「表格」审计造数据。
+# 交付形态当时靠扫需求文本猜（出现「markdown」当文档、出现「表格」当表格），
+# 猜错就把一篇总结按表格审，助手只能反复造 rows 去迎合。
+# 现在形态由契约的 kind 声明，这一整类失败不再可能发生——本文件验的就是「由声明决定」。
+_MARKDOWN_SUMMARY = "# 帖子总结\n\n楼主问考编与就业的取舍，回帖普遍认为稳定性值得一部分收入。\n" * 20
 
 
-def test_explicit_table_words_win_over_document_words() -> None:
-    """既说了报告又说了表格时按表格审：形态判错的代价是单向的。"""
-    assert not _requirement_wants_document("生成销售报告，导出成 excel 表格")
-    assert not _requirement_wants_document("抓取订单清单并总结每一行的状态")
-
-
-def test_pure_scrape_requirement_stays_on_the_table_path() -> None:
-    assert not _requirement_wants_document("抓取该页面所有商品的名称和价格")
-
-
-def test_document_output_prefers_the_written_file_over_intermediate_text() -> None:
-    doc = _find_document_output({
-        "topic_text": "正文" * 500,
-        "markdown_file": "runs/8e38be17/t_71d2fde2/20260724_164902.md",
-        "topic_texts_count": 104,
+def _document_contract() -> FlowAcceptanceContract:
+    return FlowAcceptanceContract.model_validate({
+        "deliverables": [{
+            "id": "summary",
+            "variable": "summary_md",
+            "kind": "document",
+            "minChars": 200,
+            "sourceVariables": ["topic_text"],
+        }],
     })
 
-    assert doc is not None
-    assert doc["name"] == "markdown_file"
-    assert doc["kind"] == "file"
+
+def test_document_deliverable_is_not_audited_by_table_clauses(tmp_path: Path) -> None:
+    result = audit_acceptance_contract(
+        _document_contract(),
+        {"summary_md": _MARKDOWN_SUMMARY, "topic_text": "楼主问考编与就业的取舍"},
+        [],
+        workspace_root=tmp_path,
+    )
+
+    assert result["passed"] is True
+    assert result["deliverables"] == [{"id": "summary", "variable": "summary_md", "kind": "document"}]
 
 
-def test_short_strings_are_not_mistaken_for_documents() -> None:
-    assert _find_document_output({"status": "ok", "count": 3}) is None
-
-
-def test_observed_variables_say_why_each_one_is_not_a_table() -> None:
-    """只说「没有表格型变量」不说有什么，模型只能换个写法重试——空转就是这么烧的。"""
-    described = _describe_output_variables({
-        "paged_topic_texts": ["第一页正文", "第二页正文"],
-        "topic_text": "正文",
+def test_the_declared_kind_decides_the_audit_path_not_the_text(tmp_path: Path) -> None:
+    """同一个值，声明成 table 就按表格审——判据是契约，不是文本里出现了哪个词。"""
+    contract = FlowAcceptanceContract.model_validate({
+        "deliverables": [{"id": "summary", "variable": "summary_md", "kind": "table", "minRows": 1}],
     })
 
-    by_name = {item["name"]: item for item in described}
-    assert "纯文本" in by_name["paged_topic_texts"]["why_not_table"]
-    assert by_name["topic_text"]["why_not_table"]
+    result = audit_acceptance_contract(
+        contract,
+        {"summary_md": _MARKDOWN_SUMMARY},
+        [],
+        workspace_root=tmp_path,
+    )
+
+    assert result["passed"] is False
+    assert [issue["issue"] for issue in result["issues"]] == ["deliverable_not_table"]
 
 
-def test_no_table_like_output_now_carries_an_executable_plan() -> None:
-    """原来这条 issue 没有任何 repair_plan 模板，助手拿回的是一句无处下手的结论。"""
-    plan = _build_quality_repair_plan([{"issue": "no_table_like_output"}])
+def test_document_missing_run_data_is_reported_against_the_declared_source(tmp_path: Path) -> None:
+    """文档正文与本次抓取无交集：判据是契约点名的来源变量，不是需求关键词。"""
+    result = audit_acceptance_contract(
+        _document_contract(),
+        {"summary_md": _MARKDOWN_SUMMARY, "topic_text": "另一个站点抓来的完全无关的一段正文内容"},
+        [],
+        workspace_root=tmp_path,
+    )
+
+    assert result["passed"] is False
+    assert [issue["issue"] for issue in result["issues"]] == ["document_missing_source_data"]
+
+
+def test_unstructured_delivery_carries_an_executable_plan() -> None:
+    """「交付物不是按行数据」这条 issue 必须带出可执行步骤，否则助手拿回的是一句无处下手的结论。"""
+    plan = _build_quality_repair_plan([{"issue": "deliverable_not_table"}])
 
     assert plan
     assert plan[0]["action"] == "produce_structured_rows"
-    # 出路必须是问用户，不能是「换个 requirement_text 再调一次」——
-    # requirement_text 由 _enforce_requirement_provenance 强制覆盖，重调必然同样结果
+    # 形态本身可能声明错了，出路是问用户，不是造一个 rows 变量迎合契约
     assert any("向用户确认交付形态" in step for step in plan[0]["steps"])
-    assert not any("requirement_text" in step for step in plan[0]["steps"])

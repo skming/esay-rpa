@@ -1,0 +1,252 @@
+{
+  "model": "gpt-5.5",
+  "prompt_fingerprint": "cdc6d62c868d",
+  "scenario": "gen_table_to_excel",
+  "reply": "",
+  "calls": [
+    {
+      "name": "inspect_page",
+      "args": {
+        "url": "https://example.com/list",
+        "wait_selector": "main, table, [role=grid], body"
+      }
+    },
+    {
+      "name": "list_node_types",
+      "args": {
+        "types": [
+          "browser.open",
+          "browser.extract",
+          "excel.addrow",
+          "excel.save"
+        ]
+      }
+    },
+    {
+      "name": "list_node_types",
+      "args": {
+        "types": [
+          "control.foreach"
+        ]
+      }
+    },
+    {
+      "name": "create_flow",
+      "args": {
+        "name": "Example表格导出Excel",
+        "description": "打开指定列表页，提取表格并导出为 Excel 文件。",
+        "input_variables": [],
+        "nodes": [
+          {
+            "id": "start",
+            "type": "start",
+            "title": "开始",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 100
+            },
+            "description": "流程开始"
+          },
+          {
+            "id": "n1_open_list",
+            "type": "browser.open",
+            "title": "打开列表页",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 220
+            },
+            "targetUrl": "https://example.com/list",
+            "delayMs": 2000,
+            "description": "打开 https://example.com/list"
+          },
+          {
+            "id": "n2_extract_table",
+            "type": "browser.extract",
+            "title": "提取表格数据",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 340
+            },
+            "selector": ".data-table tbody tr",
+            "extractMode": "table",
+            "outputVariable": "table_data",
+            "timeoutMs": 15000,
+            "description": "按检查到的表格行选择器提取表格 → table_data"
+          },
+          {
+            "id": "n3_loop_rows",
+            "type": "control.foreach",
+            "title": "逐行写入Excel",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 460
+            },
+            "itemsVariable": "table_data",
+            "itemVariable": "current_row",
+            "description": "遍历 table_data 的每一行"
+          },
+          {
+            "id": "n4_add_row",
+            "type": "excel.addrow",
+            "title": "追加Excel行",
+            "kind": "excel",
+            "status": "pending",
+            "position": {
+              "x": 320,
+              "y": 580
+            },
+            "path": "${var.output_prefix}.xlsx",
+            "sheetName": "表格数据",
+            "rowData": "${var.current_row}",
+            "description": "将当前行追加到 Excel"
+          },
+          {
+            "id": "n5_save_excel",
+            "type": "excel.save",
+            "title": "保存Excel文件",
+            "kind": "excel",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 700
+            },
+            "path": "${var.output_prefix}.xlsx",
+            "description": "保存 Excel 文件"
+          },
+          {
+            "id": "end",
+            "type": "end",
+            "title": "结束",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 820
+            },
+            "description": "流程结束"
+          }
+        ],
+        "edges": [
+          {
+            "id": "e_start_n1_open_list",
+            "source": "start",
+            "target": "n1_open_list"
+          },
+          {
+            "id": "e_n1_open_list_n2_extract_table",
+            "source": "n1_open_list",
+            "target": "n2_extract_table"
+          },
+          {
+            "id": "e_n2_extract_table_n3_loop_rows",
+            "source": "n2_extract_table",
+            "target": "n3_loop_rows"
+          },
+          {
+            "id": "e_n3_loop_rows_n4_add_row",
+            "source": "n3_loop_rows",
+            "target": "n4_add_row",
+            "label": "body"
+          },
+          {
+            "id": "e_n3_loop_rows_n5_save_excel",
+            "source": "n3_loop_rows",
+            "target": "n5_save_excel",
+            "label": "exit"
+          },
+          {
+            "id": "e_n4_add_row_n5_save_excel",
+            "source": "n4_add_row",
+            "target": "n5_save_excel"
+          },
+          {
+            "id": "e_n5_save_excel_end",
+            "source": "n5_save_excel",
+            "target": "end"
+          }
+        ],
+        "acceptance_contract": {
+          "requirements": [
+            {
+              "id": "r1",
+              "description": "打开指定 URL",
+              "confidence": 1,
+              "confirmed": true,
+              "source_kind": "user",
+              "source_quote": "打开 https://example.com/list"
+            },
+            {
+              "id": "r2",
+              "description": "把表格数据导出成 Excel 文件",
+              "confidence": 1,
+              "confirmed": true,
+              "source_kind": "user",
+              "source_quote": "把表格数据导出成 Excel 文件"
+            },
+            {
+              "id": "r3",
+              "description": "无需登录",
+              "confidence": 1,
+              "confirmed": true,
+              "source_kind": "user",
+              "source_quote": "无需登录"
+            }
+          ],
+          "deliverables": [
+            {
+              "id": "d1_excel",
+              "variable": "${var.output_prefix}.xlsx",
+              "kind": "file",
+              "requirement_ids": [
+                "r2"
+              ],
+              "extensions": [
+                ".xlsx"
+              ],
+              "required": true
+            },
+            {
+              "id": "d2_table",
+              "variable": "table_data",
+              "kind": "table",
+              "requirement_ids": [
+                "r2"
+              ],
+              "required_fields": [
+                "名称",
+                "创建时间",
+                "状态"
+              ],
+              "min_rows": 1
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "guard_hits": [],
+  "metrics": {
+    "rounds": 4,
+    "max_rounds": 30,
+    "tool_calls": 4,
+    "duplicate_calls": 0,
+    "blocked_calls": 0,
+    "prompt_tokens": 72557,
+    "completion_tokens": 1206,
+    "cached_tokens": 70656,
+    "guard_hits": [],
+    "call_histogram": {
+      "list_node_types": 2,
+      "inspect_page": 1,
+      "create_flow": 1
+    }
+  }
+}

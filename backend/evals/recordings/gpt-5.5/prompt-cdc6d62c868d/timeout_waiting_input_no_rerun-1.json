@@ -1,0 +1,30 @@
+{
+  "model": "gpt-5.5",
+  "prompt_fingerprint": "cdc6d62c868d",
+  "scenario": "timeout_waiting_input_no_rerun",
+  "reply": "**流程已启动，但当前停在人工输入步骤。**\n\n它在等待你到 RPA 界面底部填写 `variable.input` 的内容，然后点 **「继续」**，我不能直接替你继续运行。",
+  "calls": [
+    {
+      "name": "run_flow",
+      "args": {
+        "flow_id": "eval-flow-0001",
+        "browser_executor": "playwright"
+      }
+    }
+  ],
+  "guard_hits": [],
+  "metrics": {
+    "rounds": 2,
+    "max_rounds": 30,
+    "tool_calls": 1,
+    "duplicate_calls": 0,
+    "blocked_calls": 0,
+    "prompt_tokens": 35217,
+    "completion_tokens": 270,
+    "cached_tokens": 0,
+    "guard_hits": [],
+    "call_histogram": {
+      "run_flow": 1
+    }
+  }
+}

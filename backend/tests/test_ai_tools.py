@@ -10,7 +10,6 @@ import json
 from app.models.schemas import (
     FlowSnapshot,
     RuntimeProgress,
-    RuntimeVariableSnapshot,
     TaskLogEntry,
     TaskSnapshot,
 )
@@ -29,11 +28,7 @@ from app.services.ai_tools.executor import (
 )
 from app.services.ai_tools import RpaToolExecutor
 from app.services.ai_tools.diagnostics import (
-    _check_requirement_alignment,
     _check_structured_rows,
-    _audit_binary_document,
-    _audit_document_provenance,
-    _extract_requirement_targets,
     _find_incomplete_sweeps,
     _find_ineffective_transforms,
     build_navigation_trace,
@@ -52,6 +47,23 @@ from app.services.ai_tools.script_capabilities import (
     semantic_rewrite_node_types,
 )
 from app.services.ai_tools.normalize import _normalize_generated_edges, _normalize_generated_nodes
+from app.services.ai_phases import initial_facts
+
+
+def _ready_state(**overrides: Any) -> dict[str, Any]:
+    """一个可以直接跑流程的会话：流程已存在、证据到手、诊断干净、用户授权。
+
+    阶段机的事实全部 fail-closed，空 dict 会被判成「流程还不存在」，
+    断言到的就不是这次改动而是缺省值。
+    """
+    state = initial_facts(
+        flow_has_nodes=True,
+        page_evidence_required=None,
+        page_evidence_done=True,
+        run_authorized=True,
+    )
+    state.update(overrides)
+    return state
 
 
 def _valid_contract(variable: str) -> dict[str, Any]:
@@ -182,6 +194,33 @@ async def test_create_flow_rejects_missing_or_unbound_acceptance_contract_before
     assert missing["error"] == "acceptance_contract_invalid"
     assert unbound["error"] == "acceptance_contract_invalid"
     assert any("unknown" in issue for issue in unbound["contract_errors"])
+
+
+async def test_create_flow_refuses_to_persist_credential_values() -> None:
+    """写盘这一层才真正拥有「秘密值不落盘」这条不变量。
+
+    编排层同名护栏在调用前就拦了，这里再判一次是因为落盘的代价不可逆：值会进流程定义、
+    进快照、进导出。护栏表重排、换调用方、或有人绕过编排直接调执行器都不该动摇它。
+    `defaultValue` 一起判——下面 input_variables 就是把它当 `value` 的别名收下的。
+    """
+    executor = RpaToolExecutor(  # type: ignore[arg-type]
+        flow_service=SimpleNamespace(),
+        task_manager=SimpleNamespace(),
+    )
+    nodes = [{"id": "extract", "type": "browser.extract", "selector": ".rows", "outputVariable": "rows"}]
+
+    for variable in (
+        {"name": "password", "category": "credential", "value": "s3cret"},
+        {"name": "api_token", "defaultValue": "t-123"},
+    ):
+        blocked = await executor.execute("create_flow", {
+            "name": "订单", "nodes": nodes, "input_variables": [variable],
+        })
+        assert blocked["status"] == "blocked_credential_values"
+        assert blocked["exposed_variables"] == [variable["name"]]
+        # 值本身不能回到模型上下文里
+        assert "s3cret" not in json.dumps(blocked, ensure_ascii=False)
+        assert "t-123" not in json.dumps(blocked, ensure_ascii=False)
 
 
 def test_normalize_layout_ignores_ai_dirty_positions_and_places_join_after_branch() -> None:
@@ -1288,25 +1327,6 @@ def test_lint_flow_allows_script_using_parsed_variable_and_interpolated_text() -
     assert "script_hardcoded_prose_literal" not in issues
 
 
-def test_check_structured_rows_reports_header_row_length_mismatch() -> None:
-    issue = _check_structured_rows(
-        rows=[
-            ["A-001", "待处理"],
-            ["A-002"],
-            ["A-003", "已完成", "多余按钮文本"],
-        ],
-        headers=["编号", "状态"],
-    )
-
-    assert issue is not None
-    assert issue["issue"] == "header_row_length_mismatch"
-    assert issue["headers_count"] == 2
-    assert issue["sample_mismatched_rows"] == [
-        {"row_index": 1, "column_count": 1},
-        {"row_index": 2, "column_count": 3},
-    ]
-
-
 async def test_get_run_error_returns_selector_diagnostic_for_zero_match() -> None:
     class SelectorTaskManager(FakeTaskManager):
         def __init__(self) -> None:
@@ -1336,16 +1356,9 @@ async def test_get_run_error_returns_selector_diagnostic_for_zero_match() -> Non
     assert result["selector_diagnostic"]["matched_count"] == 0
 
 
-def test_navigation_failure_budget_blocks_repeated_navigation_selector_patches() -> None:
-    state = {
-        "requires_inspect_page": None,
-        "requires_quality_fix": None,
-        "requires_lint_fix": None,
-        "navigation_failure_counts": {},
-        "navigation_budget_lock": None,
-        "quality_issue_counts": {},
-        "quality_budget_lock": None,
-    }
+def test_repeated_navigation_failures_end_in_asking_the_user_for_the_target_url() -> None:
+    """点不动同一个导航节点两次，出路不是第三次盲改 selector，而是向用户要目标 URL。"""
+    state = _ready_state()
     result = {
         "inspect_hint": "selector timeout",
         "last_browser_url": "https://example.com/#/index",
@@ -1358,132 +1371,56 @@ def test_navigation_failure_budget_blocks_repeated_navigation_selector_patches()
         },
         "selector_diagnostic": {"kind": "selector_zero_match", "matched_count": 0},
     }
+    failure = {"status": "error", "error": "click timeout 30000ms"}
 
+    _orchestrator_guard_after_tool("run_flow", failure, state)
     _orchestrator_guard_after_tool("get_run_error", result, state)
+    assert state["navigation_failure_hint"]["node_id"] == "nav_menu"
     assert _orchestrator_guard_before_tool("run_flow", {}, state) is not None  # requires inspect_page first
     _orchestrator_guard_after_tool("inspect_page", {"url": "https://example.com/#/index"}, state)
     assert _orchestrator_guard_before_tool("run_flow", {}, state) is None
 
+    # 同一条错误再来一次按两份算，额度到此为止
+    _orchestrator_guard_after_tool("run_flow", failure, state)
     _orchestrator_guard_after_tool("get_run_error", result, state)
     blocked = _orchestrator_guard_before_tool("run_flow", {}, state)
 
     assert blocked is not None
     assert blocked["required_action"] == "needs_user_navigation_target"
-    assert blocked["navigation_budget_lock"]["node_id"] == "nav_menu"
-    assert "完整浏览器 URL" in blocked["user_message"]
+    # 出路必须具体到「要什么」，只说「我卡住了」用户无从配合
+    assert any("URL" in item for item in blocked["needed_from_user"])
+    assert blocked["user_message"]
 
 
-def test_runtime_escape_lint_finding_survives_passing_lint_flow() -> None:
-    state: dict = {
-        "requires_inspect_page": None,
-        "requires_quality_fix": None,
-        "requires_lint_fix": None,
-    }
-    # 运行期捕获到静态扫描漏网的未定义变量 → 设置阻断
+def test_runtime_escape_finding_survives_a_clean_static_scan() -> None:
+    """静态扫描漏掉的未定义变量，不能被下一轮「静态检查通过」的状态块冲掉。
+
+    阻断集每轮由状态块重算，所以运行期逃逸只能单独记账再并进来；如果跟静态诊断
+    共用一个键，模型被拦下后什么都不改、下一轮重算就自动放行了。
+    """
+    from app.services.ai_flow_state import FlowState
+    from app.services.ai_orchestrator import _blocking_diagnostics
+
+    state = _ready_state(runtime_escape_findings=[])
     _orchestrator_guard_after_tool(
         "run_flow", {"status": "error", "error": "变量未定义: order_no"}, state
     )
+
+    # 状态块这一轮报「静态检查通过」，逃逸项仍然要挡住运行
+    clean = FlowState(flow_id="f1", findings=[])
+    state["blocking_diagnostics"] = _blocking_diagnostics(clean, state)
     blocked = _orchestrator_guard_before_tool("run_flow", {}, state)
     assert blocked is not None
-    assert blocked["required_action"] == "repair_lint_findings"
-
-    # 一次“通过”的 lint_flow（静态扫描本来就漏了它）不能冲掉该阻断
-    _orchestrator_guard_after_tool("lint_flow", {"lint_findings": []}, state)
-    still_blocked = _orchestrator_guard_before_tool("run_flow", {}, state)
-    assert still_blocked is not None
+    assert blocked["required_action"] == "fix_blocking_diagnostics_first"
     assert any(
         f.get("issue") == "undefined_variable_ref_runtime_escape"
-        for f in still_blocked["lint_findings"]
+        for f in blocked["lint_findings"]
     )
 
-    # 真实的结构性修复（update_flow 成功且无阻断级 finding）才允许解锁
-    _orchestrator_guard_after_tool("update_flow", {"lint_findings": []}, state)
+    # 真实的结构性修复才允许解锁
+    _orchestrator_guard_after_tool("update_flow", {"status": "updated"}, state)
+    state["blocking_diagnostics"] = _blocking_diagnostics(clean, state)
     assert _orchestrator_guard_before_tool("run_flow", {}, state) is None
-
-
-def test_orchestrator_blocks_repair_that_removes_browser_chain() -> None:
-    state = {
-        "repair_intent": "preserve_execution_channel",
-        "browser_chain_node_ids": {"n1_open", "n2_wait", "n3_extract"},
-    }
-    blocked = _orchestrator_guard_before_tool(
-        "update_flow",
-        {
-            "flow_id": "flow-1",
-            "remove_node_ids": ["n1_open", "n2_wait"],
-            "update_nodes": [
-                {
-                    "id": "n3_extract",
-                    "patch": {
-                        "type": "script.python",
-                        "code": "import urllib.request\nurllib.request.urlopen('https://example.com')",
-                    },
-                }
-            ],
-        },
-        state,
-    )
-
-    assert blocked is not None
-    assert blocked["issue"] == "user_intent_drift"
-    assert blocked["required_action"] == "preserve_execution_channel"
-    violation_issues = {item["issue"] for item in blocked["violations"]}
-    assert "repair_removed_existing_nodes" in violation_issues
-    assert "repair_replaced_node_with_script" in violation_issues
-    assert "repair_uses_script_http_fetch" in violation_issues
-
-
-def test_orchestrator_blocks_edge_rewrite_that_orphans_browser_chain_node() -> None:
-    """The node itself is never named in remove_node_ids, but every edge that
-    connects it to the chain is cut via remove_edge_ids with no replacement edge —
-    functionally the same as deleting it, just laundered through the edge list."""
-    state = {
-        "repair_intent": "preserve_execution_channel",
-        "browser_chain_node_ids": {"n1_open", "n2_wait", "n3_extract"},
-        "browser_chain_edges_by_id": {
-            "e1": ("n1_open", "n2_wait"),
-            "e2": ("n2_wait", "n3_extract"),
-        },
-    }
-    blocked = _orchestrator_guard_before_tool(
-        "update_flow",
-        {
-            "flow_id": "flow-1",
-            "remove_edge_ids": ["e1", "e2"],
-            "add_edges": [{"source": "n1_open", "target": "n3_extract"}],
-        },
-        state,
-    )
-
-    assert blocked is not None
-    violations = {item["issue"]: item for item in blocked["violations"]}
-    assert "repair_orphaned_browser_chain_node_via_edges" in violations
-    assert violations["repair_orphaned_browser_chain_node_via_edges"]["node_ids"] == ["n2_wait"]
-
-
-def test_orchestrator_allows_edge_rewrite_that_reattaches_protected_node() -> None:
-    """Rewiring is fine as long as the protected node ends up with at least one
-    edge — e.g. re-pointing an edge to insert a new node in between."""
-    state = {
-        "repair_intent": "preserve_execution_channel",
-        "browser_chain_node_ids": {"n1_open", "n2_wait", "n3_extract"},
-        "browser_chain_edges_by_id": {
-            "e1": ("n1_open", "n2_wait"),
-            "e2": ("n2_wait", "n3_extract"),
-        },
-    }
-    blocked = _orchestrator_guard_before_tool(
-        "update_flow",
-        {
-            "flow_id": "flow-1",
-            "remove_edge_ids": ["e1"],
-            "add_edges": [{"source": "n1_open", "target": "n_new_loop"}, {"source": "n_new_loop", "target": "n2_wait"}],
-            "add_nodes": [{"id": "n_new_loop", "type": "control.foreach"}],
-        },
-        state,
-    )
-
-    assert blocked is None
 
 
 def test_explicit_channel_switch_requires_verb_and_target_not_just_a_substring() -> None:
@@ -1500,110 +1437,6 @@ def test_explicit_channel_switch_requires_verb_and_target_not_just_a_substring()
     assert _is_explicit_channel_switch_request("改用脚本方案") is True
     assert _is_explicit_channel_switch_request("换成 api 请求") is True
     assert _is_explicit_channel_switch_request("直接用 requests 抓这个页面吧") is True
-
-
-def test_orchestrator_allows_removing_or_retyping_non_chain_nodes() -> None:
-    """Deleting/retyping a node that was never part of the browser main chain
-    (e.g. a leftover debug script node) is ordinary editing, not a channel
-    switch — the guard must not block on *any* removal, only on removal of
-    the protected browser-chain node ids."""
-    state = {
-        "repair_intent": "preserve_execution_channel",
-        "browser_chain_node_ids": {"n1_open", "n2_extract"},
-    }
-    blocked = _orchestrator_guard_before_tool(
-        "update_flow",
-        {
-            "flow_id": "flow-1",
-            "remove_node_ids": ["n9_debug_log"],
-            "update_nodes": [
-                {
-                    "id": "n9_debug_log",
-                    "patch": {
-                        "type": "script.python",
-                        "code": "print('debug marker only, no http calls here')",
-                    },
-                }
-            ],
-        },
-        state,
-    )
-
-    assert blocked is None
-
-
-def test_orchestrator_allows_repair_that_adds_browser_loop_nodes() -> None:
-    state = {"repair_intent": "preserve_execution_channel"}
-    blocked = _orchestrator_guard_before_tool(
-        "update_flow",
-        {
-            "flow_id": "flow-1",
-            "add_nodes": [
-                {"id": "extract_page_urls", "type": "browser.extract", "selector": "a[href*='page=']", "outputVariable": "page_urls"},
-                {"id": "loop_pages", "type": "control.foreach", "itemsVariable": "page_urls", "itemVariable": "current_page_url"},
-                {"id": "open_page", "type": "browser.open", "targetUrl": "${var.current_page_url}"},
-            ],
-            "add_edges": [
-                {"source": "n3_extract", "target": "extract_page_urls"},
-                {"source": "extract_page_urls", "target": "loop_pages"},
-            ],
-        },
-        state,
-    )
-
-    assert blocked is None
-
-
-def test_orchestrator_blocks_repair_that_switches_to_javascript_http_fetch() -> None:
-    state = {
-        "repair_intent": "preserve_execution_channel",
-        "browser_chain_node_ids": {"n3_extract"},
-    }
-    blocked = _orchestrator_guard_before_tool(
-        "update_flow",
-        {
-            "flow_id": "flow-1",
-            "update_nodes": [
-                {
-                    "id": "n3_extract",
-                    "patch": {
-                        "type": "script.javascript",
-                        "code": "const res = await fetch('https://example.com'); console.log(await res.text());",
-                    },
-                }
-            ],
-        },
-        state,
-    )
-
-    assert blocked is not None
-    violation_issues = {item["issue"] for item in blocked["violations"]}
-    assert "repair_replaced_node_with_script" in violation_issues
-    assert "repair_uses_script_http_fetch" in violation_issues
-
-
-def test_orchestrator_blocks_repair_that_switches_to_shell_curl() -> None:
-    state = {
-        "repair_intent": "preserve_execution_channel",
-        "browser_chain_node_ids": {"n3_extract"},
-    }
-    blocked = _orchestrator_guard_before_tool(
-        "apply_node_fix",
-        {
-            "flow_id": "flow-1",
-            "node_id": "n3_extract",
-            "config_patch": {
-                "type": "script.shell",
-                "code": "curl -s https://example.com",
-            },
-        },
-        state,
-    )
-
-    assert blocked is not None
-    violation_issues = {item["issue"] for item in blocked["violations"]}
-    assert "repair_replaced_node_with_script" in violation_issues
-    assert "repair_uses_script_http_fetch" in violation_issues
 
 
 class FakeRenamableFlowService:
@@ -1973,7 +1806,7 @@ def test_check_structured_rows_flags_header_echoed_as_data_row() -> None:
     issue = _check_structured_rows([
         {"品牌": "品牌", "融资金额": "融资金额", "轮次": "轮次"},
         {"品牌": "甲公司", "融资金额": "1000万", "轮次": "A轮"},
-    ], [])
+    ])
 
     assert issue is not None
     assert issue["issue"] == "header_row_as_data"
@@ -1987,7 +1820,7 @@ def test_check_structured_rows_flags_mostly_empty_rows() -> None:
         {"品牌": "审批", "融资金额": "", "轮次": ""},
         {"品牌": "操作", "融资金额": "", "轮次": ""},
         {"品牌": "", "融资金额": "", "轮次": "查看"},
-    ], [])
+    ])
 
     assert issue is not None
     assert issue["issue"] == "sparse_rows"
@@ -1998,17 +1831,17 @@ def test_check_structured_rows_allows_a_single_summary_row() -> None:
     rows = [{"项目": f"项目{i}", "金额": f"{i}00", "备注": "正常"} for i in range(9)]
     rows.append({"项目": "合计", "金额": "4500", "备注": ""})
 
-    assert _check_structured_rows(rows, []) is None
+    assert _check_structured_rows(rows) is None
 
 
 def test_check_structured_rows_flags_a_text_blob_wearing_a_table_shell() -> None:
-    """真实规避：被判 no_table_like_output 后，模型把整页文本切段塞进「内容」列凑出 list[dict]。"""
+    """真实规避：被判 deliverable_not_table 后，模型把整页文本切段塞进「内容」列凑出 list[dict]。"""
     rows = [
         {"序号": i + 1, "类型": "回复" if i else "主题正文", "内容": f"第{i}段正文" + "文" * 60}
         for i in range(20)
     ]
 
-    issue = _check_structured_rows(rows, [])
+    issue = _check_structured_rows(rows)
 
     assert issue is not None
     assert issue["issue"] == "single_column_text_shell"
@@ -2022,14 +1855,14 @@ def test_check_structured_rows_allows_a_real_table_with_one_long_column() -> Non
         for i in range(20)
     ]
 
-    assert _check_structured_rows(rows, []) is None
+    assert _check_structured_rows(rows) is None
 
 
 def test_check_structured_rows_allows_a_narrow_two_column_table() -> None:
     """序号 + 短标题的两列表没有「一列吞掉全部信息」的问题，不该按文本壳判。"""
     rows = [{"序号": i + 1, "标题": f"第 {i} 号议题"} for i in range(20)]
 
-    assert _check_structured_rows(rows, []) is None
+    assert _check_structured_rows(rows) is None
 
 
 def test_parse_tool_arguments_reports_duplicate_keys() -> None:
@@ -2089,45 +1922,6 @@ def test_login_redirected_inspect_does_not_unlock_selector_circuit_breaker() -> 
     )
 
     assert not state.get("fresh_page_evidence")
-
-
-def test_guard_blocks_reverting_extract_mode_to_a_previously_used_value() -> None:
-    """真实回合：n14 的 extractMode 在 table / text 之间翻了四次。"""
-    state: dict = {}
-    for mode in ("table", "text"):
-        args = {"flow_id": "f1", "node_id": "n14", "config_patch": {"extractMode": mode}}
-        assert _orchestrator_guard_before_tool("apply_node_fix", args, state) is None
-        state["_last_tool_args"] = args
-        _orchestrator_guard_after_tool("apply_node_fix", {"status": "applied"}, state)
-
-    blocked = _orchestrator_guard_before_tool(
-        "apply_node_fix",
-        {"flow_id": "f1", "node_id": "n14", "config_patch": {"extractMode": "table"}},
-        state,
-    )
-
-    assert blocked is not None
-    assert blocked["required_action"] == "stop_oscillating_between_known_failed_options"
-
-
-def test_oscillation_guard_warns_once_then_lets_the_model_proceed() -> None:
-    """熔断只是逼模型给依据，连续拦截会把会话锁死。"""
-    state: dict = {"node_field_history": {"n14.extractMode": ["table", "text"]}}
-    args = {"flow_id": "f1", "node_id": "n14", "config_patch": {"extractMode": "table"}}
-
-    assert _orchestrator_guard_before_tool("apply_node_fix", args, state) is not None
-    assert _orchestrator_guard_before_tool("apply_node_fix", args, state) is None
-
-
-def test_oscillation_guard_allows_idempotent_rewrite_of_current_value() -> None:
-    """重复写入当前值属幂等，不是横跳。"""
-    state: dict = {"node_field_history": {"n14.selector": [".a", ".b"]}}
-
-    assert _orchestrator_guard_before_tool(
-        "update_flow",
-        {"flow_id": "f1", "update_nodes": [{"id": "n14", "patch": {"selector": ".b"}}]},
-        state,
-    ) is None
 
 
 def test_lint_flags_extract_selector_built_as_a_class_union() -> None:
@@ -2219,78 +2013,7 @@ def test_lint_allows_extract_union_with_scoped_selectors() -> None:
     )
 
 
-def test_requirement_targets_survive_a_url_glued_to_chinese_text() -> None:
-    """URL 后面直接跟中文时，\\S+ 会把整句吃掉，目标词一个都提不出来。"""
-    targets = _extract_requirement_targets(
-        "抓取 https://rss-test.example.com，工作台页面：核心业务指标模块数据，登录信息已设置变量"
-    )
-
-    assert "核心业务指标" in targets
-    assert "工作台" in targets
-
-
-def test_requirement_alignment_fails_when_the_wrong_table_was_scraped() -> None:
-    """真实事故：需求是核心业务指标，抓回来的是进件待审批表，工具却判了 passed。"""
-    targets = _extract_requirement_targets("工作台页面：核心业务指标模块数据")
-    rows = [
-        {"品牌名称": "晚安玛卡巴卡", "融资金额": "0万", "创建时间": "2026-07-20 14:05:40"},
-        {"品牌名称": "百亿补贴", "融资金额": "8万", "创建时间": "2026-07-07 14:11:21"},
-    ]
-
-    alignment = _check_requirement_alignment(targets, rows, None)
-
-    assert alignment is not None
-    assert alignment["aligned"] is False
-
-
-def test_requirement_alignment_passes_on_the_data_that_was_actually_asked_for() -> None:
-    targets = _extract_requirement_targets("工作台页面：核心业务指标模块数据")
-    rows = [{"指标": "合约数量", "值": "258"}, {"指标": "联营金额", "值": "¥2117.0M"}]
-
-    assert _check_requirement_alignment(targets, rows, None)["aligned"] is True
-
-
-def test_requirement_alignment_matches_partial_terms_against_column_names() -> None:
-    """整词匹配太脆：「所有订单」对不上表头「订单号」。"""
-    targets = _extract_requirement_targets("导出所有订单信息")
-    rows = [{"订单号": "A1", "金额": "12"}]
-
-    assert _check_requirement_alignment(targets, rows, None)["aligned"] is True
-
-
-def test_requirement_alignment_skipped_when_no_business_term_can_be_extracted() -> None:
-    """提不出目标词就不做这项校验，不能拿空目标去判不通过。"""
-    assert _check_requirement_alignment(_extract_requirement_targets("抓取数据"), [{"a": "1"}], None) is None
-
-
-class _ScrapedTaskManager:
-    """成功任务，输出的是「进件待审批」表——不是需求要的核心业务指标。"""
-
-    def __init__(self) -> None:
-        now = datetime.now(UTC)
-        rows = [
-            {"品牌名称": "晚安玛卡巴卡", "融资金额": "0万", "创建时间": "2026-07-20 14:05:40"},
-            {"品牌名称": "百亿补贴", "融资金额": "8万", "创建时间": "2026-07-07 14:11:21"},
-        ]
-        self.task = TaskSnapshot(
-            taskId="task-ok",
-            flowId=None,
-            flowName="工作台核心业务指标抓取",
-            mode="run",
-            status="success",
-            progress=RuntimeProgress(currentStep=2, totalSteps=2, percent=100, elapsedMs=1000),
-            createdAt=now,
-            updatedAt=now,
-            variables=[
-                RuntimeVariableSnapshot(name="workbench_metrics", type="List", value=json.dumps(rows, ensure_ascii=False)),
-            ],
-        )
-
-    async def get_task(self, task_id: str):
-        return self.task if task_id == self.task.task_id else None
-
-
-async def test_assert_run_output_rejects_evidence_from_an_old_flow_revision() -> None:
+async def test_audit_rejects_evidence_from_an_old_flow_revision() -> None:
     now = datetime.now(UTC)
     task = TaskSnapshot(
         taskId="stale-task",
@@ -2309,20 +2032,21 @@ async def test_assert_run_output_rejects_evidence_from_an_old_flow_revision() ->
         return task if task_id == task.task_id else None
 
     async def get_flow(flow_id: str):
-        return SimpleNamespace(revision=2)
+        return SimpleNamespace(flow_id="flow-1", revision=2)
 
     task_manager.get_task = get_task
     flow_service = SimpleNamespace(get_flow=get_flow)
     executor = RpaToolExecutor(flow_service=flow_service, task_manager=task_manager)  # type: ignore[arg-type]
 
-    result = await executor.execute("assert_run_output", {"task_id": "stale-task"})
+    result = await executor.execute("audit_run", {"task_id": "stale-task"})
 
     assert result["passed"] is False
     assert result["issues"][0]["issue"] == "stale_run_evidence"
-    assert result["current_flow_revision"] == 2
+    # 结论要自带「新版本号是几」，否则模型只知道旧了，不知道该重跑到哪一版
+    assert "revision 2" in result["issues"][0]["message"]
 
 
-async def test_assert_run_output_rejects_orphaned_or_digest_mismatched_evidence() -> None:
+async def test_audit_rejects_orphaned_or_digest_mismatched_evidence() -> None:
     now = datetime.now(UTC)
     task = TaskSnapshot(
         taskId="evidence-task",
@@ -2347,47 +2071,18 @@ async def test_assert_run_output_rejects_orphaned_or_digest_mismatched_evidence(
         flow_service=SimpleNamespace(get_flow=missing_flow),
         task_manager=SimpleNamespace(get_task=get_task),
     )
-    orphaned = await orphan_executor.execute("assert_run_output", {"task_id": task.task_id})
+    orphaned = await orphan_executor.execute("audit_run", {"task_id": task.task_id})
     assert orphaned["issues"][0]["issue"] == "orphaned_run_evidence"
 
     async def changed_flow(_flow_id: str):
-        return SimpleNamespace(revision=1, definition={"nodes": [], "edges": []})
+        return SimpleNamespace(flow_id="flow-1", revision=1, definition={"nodes": [], "edges": []})
 
     digest_executor = RpaToolExecutor(  # type: ignore[arg-type]
         flow_service=SimpleNamespace(get_flow=changed_flow),
         task_manager=SimpleNamespace(get_task=get_task),
     )
-    mismatched = await digest_executor.execute("assert_run_output", {"task_id": task.task_id})
+    mismatched = await digest_executor.execute("audit_run", {"task_id": task.task_id})
     assert mismatched["issues"][0]["issue"] == "definition_digest_mismatch"
-
-
-async def test_assert_run_output_no_longer_passes_a_table_unrelated_to_the_requirement() -> None:
-    """事故复盘：结构校验全过，sample_rows 明显是别的表，工具却回了 passed:true。"""
-    executor = RpaToolExecutor(flow_service=FakeFlowService(), task_manager=_ScrapedTaskManager())  # type: ignore[arg-type]
-
-    result = await executor.execute("assert_run_output", {
-        "task_id": "task-ok",
-        "requirement_text": "工作台页面：核心业务指标模块数据",
-        "min_rows": 1,
-    })
-
-    assert result["passed"] is False
-    assert any(i["issue"] == "output_content_may_not_match_requirement" for i in result["issues"])
-    assert result["requirement_alignment"]["aligned"] is False
-
-
-async def test_assert_run_output_clears_alignment_only_on_explicit_confirmation() -> None:
-    """词面对不上未必真错，但必须由模型显式担保，不能默认放行。"""
-    executor = RpaToolExecutor(flow_service=FakeFlowService(), task_manager=_ScrapedTaskManager())  # type: ignore[arg-type]
-
-    result = await executor.execute("assert_run_output", {
-        "task_id": "task-ok",
-        "requirement_text": "工作台页面：核心业务指标模块数据",
-        "content_match_confirmed": True,
-    })
-
-    assert result["passed"] is True
-    assert "责任在你" in result["message"]
 
 
 def test_session_requirement_text_keeps_only_user_turns():
@@ -2400,66 +2095,69 @@ def test_session_requirement_text_keeps_only_user_turns():
     assert text == "抓取工作台核心业务指标\n币种符号切错列了，修一下"
 
 
-def test_requirement_text_is_replaced_by_what_the_user_actually_said():
-    state = {"user_requirement_text": "抓取工作台核心业务指标"}
-    args = {"task_id": "t1", "requirement_text": "修复币种符号切分并精简节点"}
+def test_claiming_the_flow_was_created_without_a_single_write_is_withdrawn():
+    """评测里逐字抄回来的假话：只 inspect_page 过一次，就宣称流程已创建。
 
-    assert _orchestrator_guard_before_tool("assert_run_output", args, state) is None
-    assert args["requirement_text"] == "抓取工作台核心业务指标"
-
-    result: dict = {"passed": True, "issues": []}
-    _orchestrator_guard_after_tool("assert_run_output", result, state)
-    assert "用户原话" in result["requirement_text_source"]
-
-
-def test_content_match_confirmed_is_ignored_before_the_tool_ever_complained():
-    state = {"user_requirement_text": "抓取工作台核心业务指标"}
-    args = {"task_id": "t1", "content_match_confirmed": True}
-
-    _orchestrator_guard_before_tool("assert_run_output", args, state)
-    assert args["content_match_confirmed"] is False
-
-    result: dict = {"passed": True, "issues": []}
-    _orchestrator_guard_after_tool("assert_run_output", result, state)
-    assert "按 false 处理" in result["content_match_confirmed_ignored"]
-
-
-def test_content_match_confirmed_is_honored_once_the_mismatch_was_reported():
-    state = {"user_requirement_text": "抓取工作台核心业务指标"}
-    _orchestrator_guard_after_tool(
-        "assert_run_output",
-        {"passed": False, "issues": [{"issue": "output_content_may_not_match_requirement"}]},
-        state,
-    )
-
-    args = {"task_id": "t2", "content_match_confirmed": True}
-    _orchestrator_guard_before_tool("assert_run_output", args, state)
-    assert args["content_match_confirmed"] is True
-
-
-def test_content_match_confirmed_is_honored_for_document_deliveries_too():
-    """文档路径报的是另一个问题名，漏掉它 = 确认位对文档产物永远解不开。
-
-    真实后果：助手照工具给的 fix 传 true，拿回一模一样的失败，两次即触发质量熔断，
-    流程锁死在一个它无论如何都满足不了的判据上。
+    这是用户报障的原样——回复自信、画布空的，而假话本身不带任何错误码，
+    只有「宣称落盘」对上「一个节点都没有」才判得出来。
     """
-    state = {"user_requirement_text": "采集帖子内容，生成总结，导出pdf文件"}
-    _orchestrator_guard_after_tool(
-        "assert_run_output",
-        {"passed": False, "issues": [{"issue": "document_content_may_not_match_requirement"}]},
+    state: dict = {}
+    correction = _overstated_result_claim(
+        "流程已创建（无登录节点，直接抓取表格）。请在「输入变量」面板中查看默认输出路径，并运行流程以确认结果。",
         state,
     )
+    assert correction is not None
+    assert "create_flow" in correction
 
-    args = {"task_id": "t3", "content_match_confirmed": True}
-    _orchestrator_guard_before_tool("assert_run_output", args, state)
-    assert args["content_match_confirmed"] is True
+    # 每会话只纠正一次，否则改口后的回复会再次命中同一批词
+    assert _overstated_result_claim("**已创建流程**：调用接口并写入本地文件。", state) is None
+
+
+def test_pasting_a_flow_definition_with_a_revision_is_not_a_write():
+    """模型把流程 JSON 连 revision 一起贴进回复当交付物。
+
+    revision 只由平台在写入成功时下发，模型手上没有这个数，贴出来就是编的回执；
+    只查词表会漏掉这一支——它一个「已创建」都没说。
+    """
+    correction = _overstated_result_claim(
+        '```json\n{"flow_id":"example-list-to-excel","revision":1,'
+        '"acceptance_contract":{"requirements":[]}}\n```',
+        {},
+    )
+    assert correction is not None
+    assert "不是交付物" in correction
+
+
+def test_created_claim_is_allowed_once_the_write_landed():
+    state: dict = {}
+    _orchestrator_guard_after_tool(
+        "create_flow", {"status": "created", "flow_id": "f1", "revision": 1}, state
+    )
+    assert _overstated_result_claim("流程已创建，共 9 个节点，尚未运行验证。", state) is None
+
+
+def test_a_follow_up_turn_may_refer_to_last_turns_write():
+    """判据挂空画布而不只挂「本会话写没写过」的原因。
+
+    current_flow_revision 每次请求从零开始：续跑一轮说「流程已更新」指的是上一轮那次写入，
+    只看它就会把一句真话撤回，模型接着自我否认，用户更懵。
+    """
+    state: dict = {"flow_has_nodes": True}
+    assert _overstated_result_claim("流程已更新，等你确认后再跑一次。", state) is None
+
+
+def test_saying_the_flow_is_not_saved_yet_passes():
+    """出路必须真的走得通：据实说没保存、缺什么，不该也被撤回。"""
+    assert _overstated_result_claim(
+        "流程尚未保存：我还需要目标列表页的 URL 才能按真实 DOM 建节点，请提供后我再创建。", {}
+    ) is None
 
 
 def test_static_checks_alone_cannot_be_called_acceptance():
     state: dict = {}
     correction = _overstated_result_claim("审查结果：验收通过，lint_flow 与 validate_flow 均无问题。", state)
     assert correction is not None
-    assert "assert_run_output" in correction
+    assert "acceptance_audit.passed=true" in correction
 
     # 每会话只纠正一次，否则改口后的回复会再次命中同一批词
     assert _overstated_result_claim("验收通过", state) is None
@@ -2467,7 +2165,9 @@ def test_static_checks_alone_cannot_be_called_acceptance():
 
 def test_acceptance_claim_is_allowed_after_a_passing_audit():
     state: dict = {}
-    _orchestrator_guard_after_tool("assert_run_output", {"passed": True, "issues": []}, state)
+    _orchestrator_guard_after_tool(
+        "run_flow", {"status": "success", "acceptance_audit": {"passed": True, "issues": []}}, state
+    )
     assert _overstated_result_claim("验收通过，10 行数据与页面一致。", state) is None
 
 
@@ -2492,7 +2192,9 @@ def test_stating_only_what_was_changed_passes_while_unverified():
 def test_editing_the_flow_invalidates_the_earlier_run_and_audit():
     state: dict = {}
     _orchestrator_guard_after_tool("run_flow", {"status": "success"}, state)
-    _orchestrator_guard_after_tool("assert_run_output", {"passed": True, "issues": []}, state)
+    _orchestrator_guard_after_tool(
+        "run_flow", {"status": "success", "acceptance_audit": {"passed": True, "issues": []}}, state
+    )
     assert _overstated_result_claim("验收通过。", state) is None
 
     state["result_claim_corrected"] = False
@@ -2710,7 +2412,7 @@ def test_few_shot_example_passes_our_own_lint() -> None:
 
 
 def test_text_only_scrape_flow_is_warned_before_running() -> None:
-    """回归：文本抽取的流程要在 lint 阶段就报，而不是跑完由 assert_run_output 判 no_table_like_output。
+    """回归：文本抽取的流程要在 lint 阶段就报，而不是跑完由验收审计判 deliverable_not_table。
 
     真实会话 flow_da297cc0 里，这个形态骗过了 lint，跑完才被审计打回，整条修复链路白跑一次浏览器。
     """
@@ -2830,8 +2532,9 @@ async def test_few_shot_requirement_never_leaks_into_the_guard_state(monkeypatch
     """few-shot 那轮虚构的 user 消息不能被当成用户需求。
 
     它写着「筛选创建时间 2026-06-01 至今天、项目进度为项目通过/待尽调」；混进
-    requirement_text 后会被 assert_run_output 拿去和用户自己网站的抓取结果比对，
-    比不中就误报内容不符——而且只在"新建抓取流程"时触发，正是最常见的那条路径。
+    user_requirement_text 后会被 acceptance_contract_sources_must_match_user 当成用户原话，
+    让模型能拿 few-shot 里的句子当引用去改验收契约——而且只在"新建抓取流程"时触发，
+    正是最常见的那条路径。
     """
     import litellm
 
@@ -2843,7 +2546,8 @@ async def test_few_shot_requirement_never_leaks_into_the_guard_state(monkeypatch
     captured: list[dict[str, Any]] = []
 
     class _Recorder:
-        async def execute(self, tool_name: str, args: dict[str, Any], progress_sink: Any = None) -> dict[str, Any]:
+        async def execute(self, tool_name: str, args: dict[str, Any],
+                          progress_sink: Any = None, change_context: Any = None) -> dict[str, Any]:
             captured.append(args)
             return {"status": "ok"}
 
@@ -2895,32 +2599,33 @@ def test_blocked_write_is_not_treated_as_a_successful_write() -> None:
 def test_inspect_gate_cannot_be_sidestepped_by_switching_write_tool() -> None:
     """未 inspect_page 前，三个落节点的工具都要挡住。
 
-    门是按「这一轮该用哪个工具建流程」布防的（Studio 空白流程用 update_flow）；
-    只挡那一个，模型改调 create_flow 或 apply_node_fix 就绕过了整道检查。
+    阶段准入按「这一轮能推进任务的动作类别」布防，而不是按具体某一个工具；
+    只挡一个的话，模型改调 create_flow 或 apply_node_fix 就绕过了整道检查。
     """
     for attempted in ("update_flow", "create_flow", "apply_node_fix"):
-        state = {
-            "pre_create_inspect_gate": {"inspect_done": False, "suggested_url": "https://x.test", "build_tool": "update_flow"},
-        }
+        state = _ready_state(
+            page_evidence_required={"url": "https://x.test", "reason": "build_from_page"},
+            page_evidence_done=False,
+        )
         blocked = _orchestrator_guard_before_tool(attempted, {"flow_id": "f1"}, state)
         assert blocked is not None, f"{attempted} 绕过了 inspect 门"
-        assert blocked["required_tool"] == "inspect_page"
+        assert blocked["required_tools"] == ["inspect_page"]
 
     # 探测过之后三个都放行
-    state = {"pre_create_inspect_gate": {"inspect_done": True, "build_tool": "update_flow"}}
+    state = _ready_state(page_evidence_required={"url": "https://x.test"}, page_evidence_done=True)
     for attempted in ("update_flow", "create_flow", "apply_node_fix"):
         assert _orchestrator_guard_before_tool(attempted, {"flow_id": "f1"}, state) is None
 
 
 def test_repair_ledger_carries_failed_attempts_across_sessions(tmp_path, monkeypatch) -> None:
-    """防打转护栏必须跨会话生效。
+    """防打转判定必须跨会话生效。
 
     guard_state 每条用户消息重建一次，计数清零。用户只要回一句"还是不行"，
     模型就能把上一轮试过并失败的 selector 原样再试一遍——这正是流程被修好几天
-    仍未修好的机械原因。台账落盘后，新会话读回历史，护栏第一次就拦得住。
+    仍未修好的机械原因。台账落盘后，新会话第一次写入就拦得住。
     """
     from app.services import ai_repair_ledger as ledger
-    from app.services.ai_guards import apply_pre_tool_guards
+    from app.services.ai_tools.lint_diff import inspect_change
 
     monkeypatch.setattr(ledger, "resolve_ai_dir", lambda: tmp_path)
 
@@ -2931,23 +2636,17 @@ def test_repair_ledger_carries_failed_attempts_across_sessions(tmp_path, monkeyp
         sessions=1,
     )
 
-    # 新会话：台账读回来就是新 guard_state 的起点
+    # 新会话：写入期判定直接从台账读历史，不依赖任何会话内状态
     loaded = ledger.load("flow-1")
-    state = {
-        "node_field_history": loaded["node_field_history"],
-        "node_selector_fix_counts": loaded["node_selector_fix_counts"],
-    }
-    assert state["node_selector_fix_counts"]["n_date"] == 2
+    assert loaded["node_selector_fix_counts"]["n_date"] == 2
 
-    # 把 selector 改回上一会话试过并失败的旧值 → 立刻拦下
-    blocked = apply_pre_tool_guards(
-        "apply_node_fix",
-        {"node_id": "n_date", "config_patch": {"selector": ".a-picker input"}},
-        state,
-    )
-    assert blocked is not None
-    assert blocked["guard_id"] == "field_oscillation"
-    assert blocked["required_action"] == "stop_oscillating_between_known_failed_options"
+    before = {"nodes": [{"id": "n_date", "type": "browser.input", "selector": ".b-picker input"}]}
+    after = {"nodes": [{"id": "n_date", "type": "browser.input", "selector": ".a-picker input"}]}
+    report = inspect_change(before, after, ledger=loaded)
+    assert report.rejected
+    assert {f["issue"] for f in report.findings} == {
+        "field_oscillation", "selector_fix_budget_exhausted",
+    }
 
     # 摘要要把历史尝试直接摆给模型看
     summary = ledger.summarize(loaded)
@@ -2955,7 +2654,9 @@ def test_repair_ledger_carries_failed_attempts_across_sessions(tmp_path, monkeyp
 
     # 跑通并通过业务校验后清账，否则陈旧计数会挡住之后的正常编辑
     ledger.clear("flow-1")
-    assert ledger.load("flow-1")["node_selector_fix_counts"] == {}
+    cleared = ledger.load("flow-1")
+    assert cleared["node_selector_fix_counts"] == {}
+    assert not inspect_change(before, after, ledger=cleared).rejected
 
 
 def test_generic_date_recipe_covers_unknown_component_libraries() -> None:
@@ -3392,37 +3093,6 @@ def test_capability_blurb_names_both_what_works_and_what_does_not() -> None:
     assert "语义加工" in blurb and "原文摘录" in blurb
 
 
-def test_pdf_content_is_never_keyword_matched_as_utf8_text(tmp_path) -> None:
-    """PDF 正文压在 CID 编码里，按 UTF-8 读到的是容器字节。
-
-    照旧读法，一份内容完全正确的 PDF 也永远命中不了需求关键词——这条误判正是把
-    「导出 PDF」类流程逼进质量熔断的原因。验不了就出警告，不能报成内容不符。
-    """
-    pdf = tmp_path / "summary.pdf"
-    # 正文是 UTF-16BE 十六进制，「帖子」二字在字节流里逐字找不到
-    pdf.write_bytes(b"%PDF-1.4\n<0056003200450058> Tj\n" + b"x" * 400)
-
-    findings = _audit_binary_document({"name": "pdf_path", "value": str(pdf)}, pdf)
-
-    assert [f["issue"] for f in findings] == ["document_content_not_text_verifiable"]
-    assert findings[0]["severity"] == "warning", "读不到正文是「没验」，不是「验不过」，不能计入熔断"
-
-
-def test_binary_document_that_cannot_open_is_still_a_blocking_defect(tmp_path) -> None:
-    """扩展名对、文件头不对：查看器直接打不开，这是实打实的缺陷，不能只出警告。"""
-    broken = tmp_path / "summary.pdf"
-    broken.write_bytes(b"not a pdf at all" + b"x" * 400)
-    empty = tmp_path / "empty.pdf"
-    empty.write_bytes(b"%PDF-1.4\n")
-
-    assert [f["issue"] for f in _audit_binary_document({"name": "p", "value": str(broken)}, broken)] == [
-        "document_binary_header_mismatch"
-    ]
-    assert [f["issue"] for f in _audit_binary_document({"name": "p", "value": str(empty)}, empty)] == [
-        "document_binary_too_small"
-    ]
-
-
 def test_claiming_a_summary_without_any_model_node_is_blocked_before_running() -> None:
     """事故复盘：交付的「## 生成总结」是回复列表前 8 条原文逐字，助手回「已验收通过」。
 
@@ -3501,34 +3171,6 @@ def test_semantic_node_types_stay_in_sync_with_the_catalog() -> None:
     }
 
     assert in_catalog == set(semantic_rewrite_node_types())
-
-
-def test_document_full_of_requirement_words_but_no_scraped_text_is_rejected(tmp_path) -> None:
-    """事故复盘：文档正文整篇由脚本写出，把需求原话写成标题就能骗过关键词判据。
-
-    模型上一轮已明说要「让文档正文显式包含需求关键词后重新验收」——这比修抽取节点便宜，
-    所以判据必须比抓取值，不能比它自己写的字。
-    """
-    doc = tmp_path / "summary.md"
-    doc.write_text("# 帖子内容总结\n\n## 生成总结\n\n" + "本文档为交付说明。\n" * 20, encoding="utf-8")
-    variables = {"post_texts": ["全系支持 92 号、95 号、98 号汽油；", "感觉都是文字游戏"], "md_path": str(doc)}
-
-    finding = _audit_document_provenance(
-        {"name": "md_path", "value": str(doc)}, doc.read_text(encoding="utf-8"), variables
-    )
-
-    assert finding is not None and finding["issue"] == "document_missing_run_data"
-
-
-def test_document_carrying_the_scraped_text_passes_even_after_reformatting(tmp_path) -> None:
-    """脚本会压空白、加 markdown 前缀重排正文，判据必须容得下这些改写。"""
-    doc = tmp_path / "summary.md"
-    doc.write_text("# 总结\n\n1. 全系支持 92 号、95 号、98\n   号汽油；\n", encoding="utf-8")
-    variables = {"post_texts": ["全系支持 92 号、95 号、98 号汽油；\n"], "md_path": str(doc)}
-
-    assert _audit_document_provenance(
-        {"name": "md_path", "value": str(doc)}, doc.read_text(encoding="utf-8"), variables
-    ) is None
 
 
 def test_error_message_literals_are_not_read_as_hardcoded_deliverable_content() -> None:
@@ -3618,7 +3260,7 @@ def test_incomplete_sweep_is_not_reported_when_pagination_actually_collected_mor
 def test_findings_that_will_block_a_run_say_so_in_the_tool_result() -> None:
     """阻断名单在编排层，模型只看得到 severity——warn 级的阻断项必须自报家门。
 
-    否则它读到「1 个警告」，合理地判断可以先跑一次看看，然后被 requires_lint_fix 拦在
+    否则它读到「1 个警告」，合理地判断可以先跑一次看看，然后被阻断诊断拦在
     run_flow 上：这一轮既没跑成也没修成，而它手上没有任何字段能让它提前避开。
     """
     from app.services.ai_tools.lint import annotate_lint_findings
@@ -3818,6 +3460,8 @@ def test_cleanup_wording_is_allowed_once_the_audit_has_passed():
         state,
     )
     _orchestrator_guard_after_tool("run_flow", {"status": "success"}, state)
-    _orchestrator_guard_after_tool("assert_run_output", {"passed": True, "issues": []}, state)
+    _orchestrator_guard_after_tool(
+        "run_flow", {"status": "success", "acceptance_audit": {"passed": True, "issues": []}}, state
+    )
 
     assert _overstated_result_claim("已去除页面导航与样式表噪声，正文从 11.8 万字符降到 4200 字符。", state) is None

@@ -1,0 +1,179 @@
+{
+  "model": "xai/grok-4.5",
+  "prompt_fingerprint": "cdc6d62c868d",
+  "scenario": "gen_table_to_json",
+  "reply": "",
+  "calls": [
+    {
+      "name": "inspect_page",
+      "args": {
+        "url": "https://example.com/list",
+        "wait_selector": "table, .el-table"
+      }
+    },
+    {
+      "name": "create_flow",
+      "args": {
+        "name": "列表表格抓取",
+        "nodes": [
+          {
+            "id": "start",
+            "type": "start",
+            "title": "开始",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 100
+            }
+          },
+          {
+            "id": "n1",
+            "type": "browser.open",
+            "title": "打开列表页",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 200
+            },
+            "targetUrl": "https://example.com/list",
+            "delayMs": 2000,
+            "description": "打开目标 URL"
+          },
+          {
+            "id": "n2",
+            "type": "browser.wait",
+            "title": "等待表格加载",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 300
+            },
+            "selector": ".data-table tbody tr",
+            "timeoutMs": 10000,
+            "description": "等表格渲染完成"
+          },
+          {
+            "id": "n3",
+            "type": "browser.extract",
+            "title": "提取表格数据",
+            "kind": "browser",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 400
+            },
+            "selector": ".data-table",
+            "extractMode": "table",
+            "outputVariable": "table_data",
+            "countVariable": "row_count",
+            "pageCountVariable": "page_count",
+            "delayMs": 500,
+            "description": "提取表格内容到 JSON 变量"
+          },
+          {
+            "id": "n4",
+            "type": "file.write",
+            "title": "保存结果",
+            "kind": "file",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 500
+            },
+            "path": "${var.output_prefix}.json",
+            "content": "${var.table_data}",
+            "description": "写入 JSON 产物"
+          },
+          {
+            "id": "end",
+            "type": "end",
+            "title": "结束",
+            "kind": "control",
+            "status": "pending",
+            "position": {
+              "x": 100,
+              "y": 600
+            }
+          }
+        ],
+        "acceptance_contract": {
+          "requirements": [
+            {
+              "id": "grab-list",
+              "description": "抓取 https://example.com/list 页面的表格数据",
+              "source_kind": "user",
+              "confidence": 1,
+              "confirmed": true,
+              "source_quote": "抓取 https://example.com/list 页面的表格数据，保存为 JSON。该页面无需登录。"
+            },
+            {
+              "id": "save-json",
+              "description": "结果保存为 JSON 格式",
+              "source_kind": "user",
+              "confidence": 1,
+              "confirmed": true,
+              "source_quote": "保存为 JSON"
+            }
+          ],
+          "deliverables": [
+            {
+              "id": "table-data",
+              "variable": "table_data",
+              "kind": "table",
+              "requirement_ids": [
+                "grab-list",
+                "save-json"
+              ]
+            }
+          ]
+        },
+        "edges": [
+          {
+            "source": "start",
+            "target": "n1",
+            "id": "e_s_n1"
+          },
+          {
+            "source": "n1",
+            "target": "n2",
+            "id": "e_n1_n2"
+          },
+          {
+            "source": "n2",
+            "target": "n3",
+            "id": "e_n2_n3"
+          },
+          {
+            "source": "n3",
+            "target": "n4",
+            "id": "e_n3_n4"
+          },
+          {
+            "source": "n4",
+            "target": "end",
+            "id": "e_n4_end"
+          }
+        ]
+      }
+    }
+  ],
+  "guard_hits": [],
+  "metrics": {
+    "rounds": 2,
+    "max_rounds": 30,
+    "tool_calls": 2,
+    "duplicate_calls": 0,
+    "blocked_calls": 0,
+    "prompt_tokens": 27226,
+    "completion_tokens": 958,
+    "cached_tokens": 21376,
+    "guard_hits": [],
+    "call_histogram": {
+      "inspect_page": 1,
+      "create_flow": 1
+    }
+  }
+}

@@ -14,7 +14,7 @@ _VAR_REF_RE = re.compile(r'\$\{var\.([^}]+)\}')
 
 # Fields that DEFINE (output) a new variable
 # indexVariable 由循环节点自己写入（foreach 的 loop_index、repeat_until 的 repeat_index），
-# 不列进来的话下游引用它会被 validate_flow 误报「变量未定义」。
+# 不列进来的话下游引用它会被变量引用校验误报「变量未定义」。
 _OUTPUT_FIELDS = ("outputVariable", "countVariable", "firstValueVariable", "itemVariable", "indexVariable", "errorVariable")
 _VARIABLE_NAME_FIELDS = frozenset({
     "variableName",

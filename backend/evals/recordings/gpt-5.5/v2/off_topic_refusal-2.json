@@ -1,8 +1,0 @@
-{
-  "model": "gpt-5.5",
-  "prompt_version": "v2",
-  "scenario": "off_topic_refusal",
-  "reply": "我只能协助处理 RPA 流程的创建、修改和调试，请告诉我您的流程需求。",
-  "calls": [],
-  "guard_hits": []
-}

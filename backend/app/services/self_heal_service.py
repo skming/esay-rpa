@@ -30,7 +30,7 @@ _DIAGNOSIS_PROMPT = (
     "定时任务「{schedule_name}」运行失败（task_id=`{task_id}`）。\n"
     "请诊断失败根因并给出具体修复提案。要求：\n"
     "1. 先用 get_run_error / get_run_logs 获取失败节点与错误信息\n"
-    "2. 必要时用 get_flow / lint_flow / inspect_page 做拓扑和 DOM 诊断\n"
+    "2. 拓扑与静态诊断看状态块；需要 DOM 时用 inspect_page\n"
     "3. 最终用文字输出：根因结论 + 修复提案（写明节点 id、字段、建议值）\n"
     "注意：当前为只读诊断模式，不要尝试修改流程或重新运行——修复方案由用户确认后执行。"
 )
