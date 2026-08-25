@@ -15,10 +15,15 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.core.storage import resolve_ai_dir
 from app.services.ai_phases import VERIFY_ATTEMPT_BUDGET
+
+if TYPE_CHECKING:
+    # 只用于类型标注：save() 只 getattr 读字段，from __future__ 让标注变惰性字符串，
+    # 运行期不必真导入 GuardState。
+    from app.services.ai_guard_state import GuardState
 
 # 只有「重来一次要再付一次代价」的状态值得存。
 # 页面探测结果、消息、requirement 文本都不在此列：它们随下一轮请求重新给。
@@ -95,11 +100,19 @@ def load(flow_id: str | None) -> dict[str, Any]:
     return {k: v for k, v in state.items() if k in _PERSISTED_KEYS}
 
 
-def save(flow_id: str | None, state: dict[str, Any], *, rounds: int) -> None:
+def save(flow_id: str | None, state: GuardState, *, rounds: int) -> None:
     """每轮结束调一次。全空就删文件——留一份全 0 的检查点只会让 load 白读一次。"""
     if not flow_id:
         return
-    snapshot = {k: state.get(k) for k in _PERSISTED_KEYS if state.get(k)}
+    snapshot = {k: v for k in _PERSISTED_KEYS if (v := getattr(state, k, None))}
+    # attempt_budget 默认就是一份真值 dict（new_budget()），不滤掉它 snapshot 永不为空，
+    # 下面的「全空即删」就成了死码、每轮都白写一份检查点。只有真花过额度、记过签名（首次
+    # 拦截不计价但要留签名）、或攒下尝试记录的预算才算「重来要再付的代价」，值得存。
+    budget = snapshot.get("attempt_budget")
+    if isinstance(budget, dict) and not (
+        budget.get("spent") or budget.get("signatures") or budget.get("attempts")
+    ):
+        snapshot.pop("attempt_budget", None)
     if not snapshot:
         clear(flow_id)
         return

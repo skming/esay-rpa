@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.services.ai_guard_state import GuardState
 from app.services.ai_phases import (
     EVIDENCE_TOOLS,
     PHASE_GATED_TOOLS,
@@ -39,7 +40,7 @@ _ALL_TOOLS = frozenset({
 })
 
 
-def _ready(**overrides: Any) -> dict[str, Any]:
+def _ready(**overrides: Any) -> GuardState:
     """一个可以直接跑流程的会话：流程已存在、证据到手、诊断干净、用户授权。"""
     state = initial_facts(
         flow_has_nodes=True,
@@ -47,11 +48,12 @@ def _ready(**overrides: Any) -> dict[str, Any]:
         page_evidence_done=True,
         run_authorized=True,
     )
-    state.update(overrides)
+    for key, value in overrides.items():
+        setattr(state, key, value)
     return state
 
 
-def _blocked_by(tool: str, state: dict[str, Any], args: dict[str, Any] | None = None) -> dict[str, Any]:
+def _blocked_by(tool: str, state: GuardState, args: dict[str, Any] | None = None) -> dict[str, Any]:
     result = apply_phase_gate(tool, args or {}, state)
     assert result is not None, f"{tool} 本应被拦截"
     assert result["status"] == "blocked_by_orchestrator_guard"
@@ -78,7 +80,7 @@ def test_missing_page_evidence_puts_the_session_in_discover() -> None:
         assert blocked["suggested_args"]["url"] == "https://example.com/list"
         assert blocked["required_tools"] == ["inspect_page"]
 
-    state["page_evidence_done"] = True
+    state.page_evidence_done = True
     assert apply_phase_gate("create_flow", {}, state) is None
 
 
@@ -383,7 +385,7 @@ def test_schema_exposure_matches_admission_exactly() -> None:
         exposed = admitted_tool_names(_ALL_TOOLS, state)
         for tool in sorted(exposed):
             # run_flow 的授权是用户意图，不是阶段——它可以被暴露却仍需用户点头
-            if tool == "run_flow" and not state.get("run_authorized"):
+            if tool == "run_flow" and not state.run_authorized:
                 continue
             assert apply_phase_gate(tool, {}, state) is None, (resolve_phase(state), tool)
 

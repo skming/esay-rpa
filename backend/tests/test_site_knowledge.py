@@ -100,6 +100,7 @@ def test_orchestrator_sediments_the_real_failure_scene(
 ) -> None:
     """光有 record_selector_failure 没人调用，等于这层根本不存在。"""
     from app.services import site_knowledge
+    from app.services.ai_guard_state import GuardState
     from app.services.ai_orchestrator import _orchestrator_guard_after_tool
 
     monkeypatch.setattr(site_knowledge, "_default_store", store)
@@ -110,7 +111,7 @@ def test_orchestrator_sediments_the_real_failure_scene(
         "failed_node_id": "n2",
         "failed_node_config": {"id": "n2", "type": "browser.click", "selector": ".btn-export"},
         "selector_diagnostic": {"kind": "selector_zero_match"},
-    }, {})
+    }, GuardState())
 
     assert store.get_profile("shop.test")["failed_selectors"][0]["selector"] == ".btn-export"
 

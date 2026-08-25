@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from app.services.ai_guard_state import GuardState
 from app.services.ai_guards import (
     GUARDS,
     apply_pre_tool_guards,
@@ -22,7 +23,7 @@ from app.services.ai_guards import (
 )
 
 
-def _blocked_by(tool: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+def _blocked_by(tool: str, args: dict[str, Any], state: GuardState) -> dict[str, Any]:
     result = apply_pre_tool_guards(tool, args, state)
     assert result is not None, f"{tool} 本应被拦截"
     assert result["status"] == "blocked_by_orchestrator_guard"
@@ -31,7 +32,7 @@ def _blocked_by(tool: str, args: dict[str, Any], state: dict[str, Any]) -> dict[
 
 
 def test_read_only_mode_blocks_every_write_but_no_diagnosis() -> None:
-    state = {"read_only_tools": True}
+    state = GuardState(read_only_tools=True)
     for tool in ("create_flow", "update_flow", "apply_node_fix", "run_flow", "publish_flow"):
         assert _blocked_by(tool, {}, state)["guard_id"] == "read_only_mode"
     # 诊断手段一个都不能收——只读模式的产物就是一份根因分析
@@ -40,12 +41,14 @@ def test_read_only_mode_blocks_every_write_but_no_diagnosis() -> None:
 
 
 def test_screenshot_is_blocked_only_for_models_without_vision() -> None:
-    assert _blocked_by("inspect_screenshot", {}, {"model_no_vision": True})["required_tool"] == "inspect_page"
-    assert apply_pre_tool_guards("inspect_screenshot", {}, {"model_no_vision": False}) is None
+    blocked = _blocked_by("inspect_screenshot", {}, GuardState(model_no_vision=True))
+    assert blocked["guard_id"] == "model_no_vision"
+    assert blocked["required_tool"] == "inspect_page"
+    assert apply_pre_tool_guards("inspect_screenshot", {}, GuardState(model_no_vision=False)) is None
 
 
 def test_static_page_evidence_only_allows_fetch_flow() -> None:
-    state = {"page_evidence_source": "scrapling_static"}
+    state = GuardState(page_evidence_source="scrapling_static")
     blocked = _blocked_by("create_flow", {
         "nodes": [
             {"id": "open", "type": "browser.open"},
@@ -82,11 +85,11 @@ def test_static_page_evidence_only_allows_fetch_flow() -> None:
     }, state) is None
     assert apply_pre_tool_guards("create_flow", {
         "nodes": [{"id": "fetch", "type": "browser.fetch"}],
-    }, {"page_evidence_source": "browser_dom"}) is None
+    }, GuardState(page_evidence_source="browser_dom")) is None
 
 
 def test_static_page_evidence_enforces_static_fetcher() -> None:
-    state = {"page_evidence_source": "scrapling_static"}
+    state = GuardState(page_evidence_source="scrapling_static")
     blocked = _blocked_by("create_flow", {
         "nodes": [
             {"id": "fetch", "type": "browser.fetch", "fetcher": "dynamic"},
@@ -112,7 +115,7 @@ def test_static_page_evidence_enforces_static_fetcher() -> None:
 
 
 def test_challenge_page_lock_stops_edits_and_reruns_against_the_same_wall() -> None:
-    state = {"challenge_page_lock": {"url": "https://site.example/post-1", "label": "人机验证拦截页"}}
+    state = GuardState(challenge_page_lock={"url": "https://site.example/post-1", "label": "人机验证拦截页"})
     for tool in ("create_flow", "update_flow", "apply_node_fix", "run_flow"):
         assert _blocked_by(tool, {}, state)["guard_id"] == "challenge_page_lock"
     # 重探同一个 URL 就是撞同一堵墙，第一轮丢节点正是这么循环出来的
@@ -124,7 +127,7 @@ def test_challenge_page_lock_stops_edits_and_reruns_against_the_same_wall() -> N
 
 def test_failure_budget_lock_keeps_every_read_only_tool_available() -> None:
     """挡掉纯读工具等于没收诊断手段，模型只能在剩下几个工具间空转。"""
-    state = {"failure_budget_lock": {"flow_id": "f1"}}
+    state = GuardState(failure_budget_lock={"flow_id": "f1"})
     for tool in ("list_node_types", "get_run_output", "get_run_logs",
                  "get_run_error", "inspect_page", "inspect_screenshot", "apply_node_fix"):
         assert apply_pre_tool_guards(tool, {}, state) is None
@@ -156,7 +159,7 @@ def test_guards_never_rewrite_the_models_arguments() -> None:
         "get_run_output": {"task_id": "t1"},
         "set_acceptance_contract": {"flow_id": "f1", "requirement_change_quote": "改成 Excel"},
     }
-    state = {"latest_user_message": "改成 Excel", "user_requirement_text": "抓 2024 年的订单"}
+    state = GuardState(latest_user_message="改成 Excel", user_requirement_text="抓 2024 年的订单")
     for tool, args in samples.items():
         before = json.loads(json.dumps(args))
         apply_pre_tool_guards(tool, args, state)
@@ -165,7 +168,7 @@ def test_guards_never_rewrite_the_models_arguments() -> None:
 
 def test_acceptance_contract_change_requires_an_exact_user_quote() -> None:
     """普通修复不能靠模型自己复述一句需求来降低验收标准。"""
-    state = {"latest_user_message": "请把交付格式改成 Excel，并保留原始日期字段"}
+    state = GuardState(latest_user_message="请把交付格式改成 Excel，并保留原始日期字段")
 
     blocked = _blocked_by(
         "set_acceptance_contract",
@@ -183,7 +186,7 @@ def test_acceptance_contract_change_requires_an_exact_user_quote() -> None:
 
 
 def test_acceptance_contract_sources_must_match_user_requirement_text() -> None:
-    state = {"user_requirement_text": "抓取全部订单并导出 Excel"}
+    state = GuardState(user_requirement_text="抓取全部订单并导出 Excel")
     invalid = {
         "acceptance_contract": {
             "requirements": [{
@@ -213,7 +216,7 @@ def test_credential_values_must_stay_out_of_ai_tools() -> None:
             {"name": "username", "category": "credential", "value": "alice"},
             {"name": "password", "sensitive": True, "value": "secret"},
         ],
-    }, {})
+    }, GuardState())
     assert blocked["guard_id"] == "credential_values_must_stay_out_of_ai_tools"
     assert blocked["exposed_variables"] == ["username", "password"]
 
@@ -222,14 +225,14 @@ def test_credential_values_must_stay_out_of_ai_tools() -> None:
             {"name": "username", "category": "credential", "value": ""},
             {"name": "date_start", "category": "flow", "value": "2026-01-01"},
         ],
-    }, {}) is None
+    }, GuardState()) is None
 
 
 def test_credential_check_covers_the_default_value_alias() -> None:
     """执行器把 defaultValue 当 value 的输入别名收下，只看 value 就留了一条同样能落盘的路。"""
     blocked = _blocked_by("create_flow", {
         "input_variables": [{"name": "api_token", "defaultValue": "t-123"}],
-    }, {})
+    }, GuardState())
     assert blocked["exposed_variables"] == ["api_token"]
 
 
@@ -238,11 +241,11 @@ def test_read_only_mode_wins_over_every_business_guard() -> None:
 
     「先做 X 再做 Y」那半边的优先级已经不在这张表里判了，见 test_ai_phases.py。
     """
-    state = {
-        "read_only_tools": True,
-        "page_evidence_source": "scrapling_static",
-        "failure_budget_lock": {"flow_id": "f1"},
-    }
+    state = GuardState(
+        read_only_tools=True,
+        page_evidence_source="scrapling_static",
+        failure_budget_lock={"flow_id": "f1"},
+    )
     assert _blocked_by("update_flow", {}, state)["guard_id"] == "read_only_mode"
 
 

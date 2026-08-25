@@ -213,12 +213,12 @@ def _tracked_changes(
         if old_node is None:
             continue
         for field_name in OSCILLATION_TRACKED_FIELDS:
-            if field_name not in node:
+            # 值为 None（字段没写、或 patch 显式写 null 把它清掉）都不是「换一个取值再试」，
+            # 没有可回摆的对象。记成一次改动会往历史里塞进 "None"，还会虚耗一格 selector 预算。
+            if node.get(field_name) is None:
                 continue
             new_value = str(node.get(field_name))
-            if node_id in before_nodes and field_name in old_node and str(old_node.get(field_name)) == new_value:
-                continue
-            if field_name not in old_node and node.get(field_name) is None:
+            if field_name in old_node and str(old_node.get(field_name)) == new_value:
                 continue
             changes.append({"node_id": node_id, "field": field_name, "value": new_value})
     return changes

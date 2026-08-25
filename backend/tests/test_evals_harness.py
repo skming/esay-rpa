@@ -48,9 +48,10 @@ def test_expect_guard_triggered_catches_an_unreachable_guard() -> None:
 
 def test_observe_guards_records_guard_id_and_restores_the_original() -> None:
     from app.services import ai_orchestrator
+    from app.services.ai_guard_state import GuardState
 
     original = ai_orchestrator._orchestrator_guard_before_tool
-    state = {"read_only_tools": True}
+    state = GuardState(read_only_tools=True)
     with _observe_guards() as hits:
         blocked = ai_orchestrator._orchestrator_guard_before_tool("run_flow", {}, state)
         assert blocked is not None
@@ -166,6 +167,6 @@ async def _fixture_phase(
         page_evidence_done=True,
         run_authorized=True,
     )
-    state["blocking_diagnostics"] = _blocking_diagnostics(flow_state, state)
-    issues = [f.get("issue") for f in state["blocking_diagnostics"] or []]
+    state.blocking_diagnostics = _blocking_diagnostics(flow_state, state)
+    issues = [f.get("issue") for f in state.blocking_diagnostics or []]
     return resolve_phase(state), issues

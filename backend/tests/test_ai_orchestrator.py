@@ -5,6 +5,7 @@ import inspect
 import json
 import re
 import textwrap
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -15,26 +16,29 @@ from app.services.ai_flow_state import (
     render_flow_state,
     sync_state_message,
 )
+from app.services.ai_guard_state import GuardState
 from app.services.ai_phases import VERIFY_ATTEMPT_BUDGET, initial_facts
+from app.services.ai_model_caps import _model_caps
+from app.services.ai_context_window import (
+    _compact_tool_messages,
+    _context_char_budget,
+    _elide_repeated_result,
+    _ELIDE_MIN_CHARS,
+    _expand_history_tool_calls,
+    _mark_history_cache_anchor,
+    _OLD_SCREENSHOT_PLACEHOLDER,
+    _stable_prefix_end,
+)
 from app.services.ai_orchestrator import (
     AiOrchestrator,
     _AFTER_TOOL_HANDLERS,
     _AFTER_TOOL_NO_STATE_EFFECT,
     _after_tool_guidance,
-    _compact_tool_messages,
     _build_few_shot_block,
     _build_system_message,
-    _context_char_budget,
-    _model_caps,
     _detect_turn_intents,
-    _elide_repeated_result,
     _FLOW_WRITE_TOOLS,
-    _ELIDE_MIN_CHARS,
-    _expand_history_tool_calls,
-    _mark_history_cache_anchor,
     _misapplied_refusal,
-    _stable_prefix_end,
-    _OLD_SCREENSHOT_PLACEHOLDER,
     _orchestrator_guard_after_tool,
     _orchestrator_guard_before_tool,
     _resolve_resumable_task_state,
@@ -54,10 +58,10 @@ from app.services.ai_tools.executor import RpaToolExecutor
 from app.services.ai_tools.schemas import TOOL_SCHEMAS
 
 
-def _ready(**overrides: Any) -> dict[str, Any]:
+def _ready(**overrides: Any) -> GuardState:
     """一个可以直接跑流程的会话：流程已存在、证据到手、诊断干净、用户授权。
 
-    阶段机的事实全部 fail-closed（缺键即最保守），空 dict 会被判成 BUILD 且未授权运行。
+    阶段机的事实全部 fail-closed（缺键即最保守），空 GuardState 会被判成 BUILD 且未授权运行。
     编排层用例要验的是「钩子有没有把事实改对」，起点必须是一个明确的可运行局面，
     否则断言到的是缺省值而不是这次改动。
     """
@@ -67,7 +71,8 @@ def _ready(**overrides: Any) -> dict[str, Any]:
         page_evidence_done=True,
         run_authorized=True,
     )
-    state.update(overrides)
+    for key, value in overrides.items():
+        setattr(state, key, value)
     return state
 
 
@@ -192,29 +197,29 @@ def test_ask_user_block_closes_the_round_without_a_canned_reply() -> None:
     换成 terminal_response_only 会走 _terminal_tool_response 的模板，
     「改了哪个节点的哪个字段」那段就被顶掉了——那恰好是用户唯一要看的东西。
     """
-    state: dict[str, Any] = {}
+    state = GuardState()
     blocked = {
         "status": "blocked_by_orchestrator_guard",
         "guard_id": "run_not_authorized",
         "required_action": "ask_user",
     }
     _orchestrator_guard_after_tool("run_flow", blocked, state)
-    assert state["closing_statement_only"] is True
-    assert not state.get("terminal_response_only")
+    assert state.closing_statement_only is True
+    assert not state.terminal_response_only
     assert _tool_schemas_for_round(state, _TurnIntents()) == []
 
     # 其余阻断结果照旧不影响 state
-    other: dict[str, Any] = {}
+    other = GuardState()
     _orchestrator_guard_after_tool("update_flow", {
         "status": "blocked_by_orchestrator_guard",
         "required_action": "call_inspect_page_first",
     }, other)
-    assert not other.get("closing_statement_only")
+    assert not other.closing_statement_only
 
 
 def test_tool_schemas_follow_the_current_phase() -> None:
     no_url = _TurnIntents(create_requested=True)
-    assert _tool_schemas_for_round({}, no_url) == []
+    assert _tool_schemas_for_round(GuardState(), no_url) == []
 
     inspecting = _TurnIntents(create_requested=True, create_url="https://example.com")
     discovering = _ready(
@@ -225,10 +230,10 @@ def test_tool_schemas_follow_the_current_phase() -> None:
     schemas = _tool_schemas_for_round(discovering, inspecting)
     assert [schema["function"]["name"] for schema in schemas] == ["inspect_page"]
 
-    assert _tool_schemas_for_round({"terminal_response_only": True}, inspecting) == []
+    assert _tool_schemas_for_round(GuardState(terminal_response_only=True), inspecting) == []
     # 改动已落盘、只剩「要不要运行」这个决定时同样收工具，逼出收尾正文
-    assert _tool_schemas_for_round({"closing_statement_only": True}, inspecting) == []
-    all_schemas = _tool_schemas_for_round({**discovering, "page_evidence_done": True}, inspecting)
+    assert _tool_schemas_for_round(GuardState(closing_statement_only=True), inspecting) == []
+    all_schemas = _tool_schemas_for_round(replace(discovering, page_evidence_done=True), inspecting)
     assert len(all_schemas) > 1
 
 
@@ -239,7 +244,7 @@ def test_state_reading_tools_are_not_exposed_at_all() -> None:
     工具调用的 18%。删的是那一轮，不是那份能力：executor 里这些方法仍然在，
     唯一的调用方从模型换成了 ai_flow_state。
     """
-    names = {s["function"]["name"] for s in _tool_schemas_for_round({}, _TurnIntents())}
+    names = {s["function"]["name"] for s in _tool_schemas_for_round(GuardState(), _TurnIntents())}
     assert not names & {"get_flow", "lint_flow", "validate_flow", "get_run_status"}
     # 失败现场（截图 / 导航轨迹 / 节点配置）状态块给不出，这把必须留着
     assert "get_run_error" in names
@@ -282,7 +287,7 @@ def test_page_discovery_uses_a_compact_phase_prompt() -> None:
     )
     assert _system_prompt_for_round(state) == PAGE_DISCOVERY_PROMPT
     assert len(PAGE_DISCOVERY_PROMPT) < len(SYSTEM_PROMPT) // 5
-    state["page_evidence_done"] = True
+    state.page_evidence_done = True
     assert _system_prompt_for_round(state) == SYSTEM_PROMPT
     # 修复路径上的取证阶段仍要完整规则：看完 DOM 紧接着就要改节点
     assert _system_prompt_for_round(_ready(
@@ -405,7 +410,7 @@ def test_waiting_for_the_user_does_not_burn_the_repair_budget() -> None:
     for _ in range(VERIFY_ATTEMPT_BUDGET + 2):
         _orchestrator_guard_after_tool("run_flow", {"status": "paused_for_human"}, state)
         _orchestrator_guard_after_tool("run_flow", {"status": "waiting_for_user_input"}, state)
-    assert state["attempt_budget"]["spent"] == 0
+    assert state.attempt_budget["spent"] == 0
     assert _orchestrator_guard_before_tool("run_flow", {}, state) is None
 
     # 真失败照常计价：同一条错误连着两次 = 1 + 2，正好压满额度
@@ -425,20 +430,20 @@ def test_run_refused_before_it_started_does_not_burn_the_repair_budget() -> None
         refusal = {"status": status, "message": f"拒绝：{status}"}
         state = _ready()
         _orchestrator_guard_after_tool("run_flow", refusal, state)
-        assert state["attempt_budget"]["spent"] == 0, status
+        assert state.attempt_budget["spent"] == 0, status
         # 这条拒绝自己可能另有锁（failure_budget_lock），但收敛额度不该被它花掉
         first = _orchestrator_guard_before_tool("run_flow", {}, state)
         assert first is None or first["guard_id"] != "attempt_budget_exhausted", status
 
         # 撞同一堵墙就是原地打转：第二次起按重复失败计价，第三次压满额度
         _orchestrator_guard_after_tool("run_flow", refusal, state)
-        assert state["attempt_budget"]["spent"] == 2, status
+        assert state.attempt_budget["spent"] == 2, status
         _orchestrator_guard_after_tool("run_flow", refusal, state)
         blocked = _orchestrator_guard_before_tool("update_flow", {}, state)
         assert blocked, status
         # blocked_by_failure_budget 自带一把优先级更高的锁，拦它的是那把锁而不是这份额度；
         # 其余拒绝没有别的收口，必须由额度接住，否则模型能无限次撞同一堵墙
-        if not state.get("failure_budget_lock"):
+        if not state.failure_budget_lock:
             assert blocked["guard_id"] == "attempt_budget_exhausted", status
             # 收尾要向用户要的是「清掉那条拒绝」，不是站点登录前提
             assert any("输入变量" in item for item in blocked["needed_from_user"]), status
@@ -455,14 +460,14 @@ def test_only_the_model_fixable_refusals_leave_the_run_unattempted() -> None:
     for status in sorted(_RUN_REFUSED_MODEL_FIXABLE):
         state = _ready(**verification_request)
         _orchestrator_guard_after_tool("run_flow", {"status": status, "message": "拒"}, state)
-        assert not state.get("run_attempted"), status
+        assert not state.run_attempted, status
         assert _unmet_verification_request("我已经检查了流程结构。", state) is not None, status
 
     # 只能等用户的那几条：模型确实跑不了，再催是空转
     for status in sorted(_RUN_NOT_STARTED_STATUSES - _RUN_REFUSED_MODEL_FIXABLE):
         state = _ready(**verification_request)
         _orchestrator_guard_after_tool("run_flow", {"status": status, "message": "拒"}, state)
-        assert state["run_attempted"] is True, status
+        assert state.run_attempted is True, status
         assert _unmet_verification_request("我已经检查了流程结构。", state) is None, status
 
 
@@ -587,7 +592,7 @@ def test_passing_audit_resets_the_attempt_budget() -> None:
     _orchestrator_guard_after_tool(
         "run_flow", {"status": "success", "acceptance_audit": {"passed": True}}, state
     )
-    assert state["attempt_budget"]["spent"] == 0
+    assert state.attempt_budget["spent"] == 0
     # 归零后同一条错误只是「第一次」，不该按重复计价
     _orchestrator_guard_after_tool("run_flow", {"status": "error", "error": "boom"}, state)
     assert _orchestrator_guard_before_tool("update_flow", {}, state) is None
@@ -631,17 +636,17 @@ def test_run_authorization_is_detected_only_from_an_explicit_ask() -> None:
 def test_misapplied_refusal_is_rewritten_only_when_the_turn_was_actionable() -> None:
     """拒答模板本身要留着（真无关话题还得用），错的是把它用在职责范围内的请求上。"""
     refusal = "我只能协助处理 RPA 流程的创建、修复与运行，其他话题请另找途径。"
-    actionable: dict[str, Any] = {"turn_intent_actionable": True}
+    actionable = GuardState(turn_intent_actionable=True)
     assert _misapplied_refusal(refusal, actionable) is not None
     # 判定自己记账：同一轮只纠一次，否则重写文本若仍带模板就会无限撤回
-    assert actionable["refusal_corrected"] is True
+    assert actionable.refusal_corrected is True
     assert _misapplied_refusal(refusal, actionable) is None
 
     # 本轮确实是闲聊，拒答是正确输出
-    assert _misapplied_refusal(refusal, {"turn_intent_actionable": False}) is None
+    assert _misapplied_refusal(refusal, GuardState(turn_intent_actionable=False)) is None
     # 正常答复不触发
     assert _misapplied_refusal(
-        "已把节点 n2 的选择器改成 table.data", {"turn_intent_actionable": True}
+        "已把节点 n2 的选择器改成 table.data", GuardState(turn_intent_actionable=True)
     ) is None
 
 
@@ -1082,7 +1087,7 @@ def test_navigation_failures_are_classified_on_every_selector_diagnostic() -> No
         _orchestrator_guard_after_tool(
             "run_flow", {"status": "error", "error": "click timeout"}, state
         )
-        spent_before = state["attempt_budget"]["spent"]
+        spent_before = state.attempt_budget["spent"]
         _orchestrator_guard_after_tool("get_run_error", {
             "inspect_hint": True,
             "last_browser_url": "https://x.test/",
@@ -1090,9 +1095,9 @@ def test_navigation_failures_are_classified_on_every_selector_diagnostic() -> No
             "failed_node_config": {"id": "n_go", "type": "browser.click", "selector": ".c1 .c2"},
             "selector_diagnostic": {"kind": kind},
         }, state)
-        assert state.get("navigation_failure_hint"), kind
-        assert state["attempt_budget"]["attempts"][-1]["kind"] == "navigation", kind
-        assert state["attempt_budget"]["spent"] == spent_before, kind
+        assert state.navigation_failure_hint, kind
+        assert state.attempt_budget["attempts"][-1]["kind"] == "navigation", kind
+        assert state.attempt_budget["spent"] == spent_before, kind
 
     # 预算见底后，导航类归类给出的是「向用户要目标 URL」这条出路
     state = _ready()
@@ -1639,7 +1644,7 @@ def test_runtime_variable_escape_is_booked_separately_from_static_diagnostics() 
     _orchestrator_guard_after_tool(
         "run_flow", {"status": "error", "error": "节点 n3 执行失败：变量未定义: order_no"}, state
     )
-    escapes = state["runtime_escape_findings"]
+    escapes = state.runtime_escape_findings
     assert len(escapes) == 1
     assert escapes[0]["issue"] == "undefined_variable_ref_runtime_escape"
     assert escapes[0]["escaped_variable"] == "order_no"
@@ -1647,9 +1652,9 @@ def test_runtime_variable_escape_is_booked_separately_from_static_diagnostics() 
 
     # 只有真实结构修复才解除——再跑一次、再读一次状态都不算
     _orchestrator_guard_after_tool("run_flow", {"status": "error", "error": "boom"}, state)
-    assert state["runtime_escape_findings"]
+    assert state.runtime_escape_findings
     _orchestrator_guard_after_tool("apply_node_fix", {"status": "ok"}, state)
-    assert state["runtime_escape_findings"] == []
+    assert state.runtime_escape_findings == []
 
 
 def test_a_selector_failure_at_runtime_forces_dom_evidence_even_if_lint_is_clean() -> None:
@@ -1666,8 +1671,8 @@ def test_a_selector_failure_at_runtime_forces_dom_evidence_even_if_lint_is_clean
         {"inspect_hint": True, "failed_node_id": "n2", "last_browser_url": "https://x.test/"},
         state,
     )
-    assert state["page_evidence_required"]["url"] == "https://x.test/"
-    assert state["page_evidence_done"] is False
+    assert state.page_evidence_required["url"] == "https://x.test/"
+    assert state.page_evidence_done is False
     # 证据没到手之前，改节点和重跑都得挡住
     assert _orchestrator_guard_before_tool("apply_node_fix", {}, state) is not None
     assert _orchestrator_guard_before_tool("run_flow", {}, state) is not None
@@ -1675,7 +1680,7 @@ def test_a_selector_failure_at_runtime_forces_dom_evidence_even_if_lint_is_clean
     _orchestrator_guard_after_tool(
         "inspect_page", {"requested_url": "https://x.test/", "page_layout": []}, state
     )
-    assert state["page_evidence_done"] is True
+    assert state.page_evidence_done is True
     assert _orchestrator_guard_before_tool("apply_node_fix", {}, state) is None
 
 
@@ -1688,7 +1693,7 @@ def test_a_failed_inspection_does_not_count_as_page_evidence() -> None:
         page_evidence_done=False,
     )
     _orchestrator_guard_after_tool("inspect_page", {"error": "页面打不开"}, state)
-    assert state["page_evidence_done"] is False
+    assert state.page_evidence_done is False
 
 
 def test_client_rejection_is_not_reported_as_a_bad_api_key() -> None:
@@ -1697,15 +1702,15 @@ def test_client_rejection_is_not_reported_as_a_bad_api_key() -> None:
     密钥是好的、模型也在中转上，用户照提示重填密钥永远修不好——同一把密钥换模型照样被拒。
     这条挂在判据顺序上：客户端被拒必须先于鉴权判，谁往关键词表里再加词都不能让它回到鉴权分支。
     """
-    from app.services.ai_orchestrator import _clean_litellm_error
+    from app.services.ai_relay_errors import clean_litellm_error
 
     raw = ("unauthorized client detected, contact support for assistance "
            "at https://discord.gg/aYq5B4RW3")
-    cleaned = _clean_litellm_error(raw)
+    cleaned = clean_litellm_error(raw)
 
     assert "无效或已过期" not in cleaned, "客户端被拒被归进了鉴权类"
     # 上游原话带着申诉入口，换成自己的措辞等于把用户的出路删掉
     assert "discord.gg" in cleaned
 
     # 真正的鉴权失败仍然要翻译，别为了修上面那条把整条分支废掉
-    assert "无效或已过期" in _clean_litellm_error("Invalid API key provided")
+    assert "无效或已过期" in clean_litellm_error("Invalid API key provided")

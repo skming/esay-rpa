@@ -9,6 +9,7 @@ import ast
 import inspect
 import json
 import time
+from dataclasses import fields
 from pathlib import Path
 from typing import Any
 
@@ -16,11 +17,15 @@ import pytest
 
 from app.services import ai_orchestrator, ai_phases
 from app.services import ai_session_checkpoint as checkpoint
+from app.services.ai_guard_state import GuardState
 from app.services.ai_phases import VERIFY_ATTEMPT_BUDGET
 
 # guard_state 在这两个模块里出现的全部局部名。漏一个名字这条元测试就少扫一批写入点，
-# 于是变成一盏假绿灯——名字要跟着改动一起加。
+# 于是变成一盏假绿灯——名字要跟着改动一起加。_resolve_resumable_task_state 的局部
+# 变量也叫 state，但它是 _ResumableTaskState、字段名各不相同：写入点按「属性名是不是
+# GuardState 的字段」二次过滤，才不会把它的 target_url/phase 当成 guard_state 的键。
 _STATE_VAR_NAMES = frozenset({"state", "guard_state", "facts"})
+_GUARD_STATE_FIELDS = frozenset(f.name for f in fields(GuardState))
 
 
 def _budget(spent: int, *, attempts: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -33,11 +38,10 @@ def _isolated_ai_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
 
 def test_budgets_and_obligations_survive_a_round_trip() -> None:
-    checkpoint.save("f1", {
-        "attempt_budget": _budget(2),
-        "audit_findings": {"issues": [{"issue": "mixed_ui_rows"}], "repair_plan": []},
-        "page_snapshot": {"huge": "irrelevant"},
-    }, rounds=3)
+    checkpoint.save("f1", GuardState(
+        attempt_budget=_budget(2),
+        audit_findings={"issues": [{"issue": "mixed_ui_rows"}], "repair_plan": []},
+    ), rounds=3)
     assert checkpoint.load("f1") == {
         "attempt_budget": _budget(2),
         "audit_findings": {"issues": [{"issue": "mixed_ui_rows"}], "repair_plan": []},
@@ -46,24 +50,35 @@ def test_budgets_and_obligations_survive_a_round_trip() -> None:
 
 def test_only_whitelisted_keys_persist() -> None:
     """guard_state 里大部分是本轮请求自带的上下文，存下来只会在下轮变成过期事实。"""
-    checkpoint.save("f1", {"attempt_budget": _budget(1), "model_no_vision": True}, rounds=1)
+    checkpoint.save("f1", GuardState(attempt_budget=_budget(1), model_no_vision=True), rounds=1)
     assert "model_no_vision" not in checkpoint.load("f1")
 
 
 def test_clean_state_leaves_no_file_behind() -> None:
     """留一份全空的检查点，只会让之后每次会话都白读一次盘。
 
-    未动过的预算（spent=0）不算未了结事项：它是「这轮从零开始」的默认值，
-    存一份只会让下一轮白读一次盘。
+    未动过的预算不算未了结事项——但它的默认值 new_budget() 本身是一份真值 dict，
+    save() 若不专门把这份「零花销、零签名、零尝试」的预算滤掉，「全空即删」就永不触发、
+    每轮都白写一份检查点。所以这里用默认 GuardState()（而非人造的 None）钉住这条。
     """
-    checkpoint.save("f1", {"attempt_budget": _budget(3)}, rounds=1)
-    checkpoint.save("f1", {"attempt_budget": None}, rounds=2)
+    checkpoint.save("f1", GuardState(attempt_budget=_budget(3)), rounds=1)
+    checkpoint.save("f1", GuardState(), rounds=2)
     assert checkpoint.load("f1") == {}
+
+
+def test_a_recorded_but_uncharged_budget_is_still_persisted() -> None:
+    """首次触发护栏 spent 仍是 0，却已经记下签名/尝试——重来要再付的代价，必须留。
+
+    只按 spent 判空会把这份历史当成「从零开始」丢掉，下一轮模型就重新领一份完整额度。
+    """
+    budget = {"spent": 0, "signatures": {"guard:x": 1}, "attempts": [{"kind": "guard_refused"}]}
+    checkpoint.save("f1", GuardState(attempt_budget=budget), rounds=1)
+    assert checkpoint.load("f1").get("attempt_budget") == budget
 
 
 def test_stale_checkpoint_is_ignored(tmp_path: Path) -> None:
     """隔了几小时再回来，页面和流程多半都变了，旧熔断不该继续挡人。"""
-    checkpoint.save("f1", {"failure_budget_lock": True}, rounds=1)
+    checkpoint.save("f1", GuardState(failure_budget_lock={"flow_id": "f1"}), rounds=1)
     path = tmp_path / "checkpoints" / "flow_f1.json"
     data = json.loads(path.read_text(encoding="utf-8"))
     data["updated_at"] = time.time() - 3 * 3600
@@ -81,19 +96,19 @@ def test_corrupt_checkpoint_is_ignored_not_raised(tmp_path: Path) -> None:
 
 def test_missing_flow_id_is_a_no_op() -> None:
     """临时流程没有 id，落盘会互相串台。"""
-    checkpoint.save(None, {"attempt_budget": _budget(5)}, rounds=1)
+    checkpoint.save(None, GuardState(attempt_budget=_budget(5)), rounds=1)
     assert checkpoint.load(None) == {}
 
 
 def test_clear_removes_the_checkpoint() -> None:
-    checkpoint.save("f1", {"attempt_budget": _budget(2)}, rounds=1)
+    checkpoint.save("f1", GuardState(attempt_budget=_budget(2)), rounds=1)
     checkpoint.clear("f1")
     assert checkpoint.load("f1") == {}
 
 
 def test_static_page_evidence_survives_into_the_next_turn() -> None:
     """流程存下来之后，下一轮不再回读探测历史——不持久化这条，第二轮护栏就凭空消失。"""
-    checkpoint.save("f1", {"page_evidence_source": "scrapling_static"}, rounds=1)
+    checkpoint.save("f1", GuardState(page_evidence_source="scrapling_static"), rounds=1)
     assert checkpoint.load("f1").get("page_evidence_source") == "scrapling_static"
 
 
@@ -165,28 +180,19 @@ def test_every_guard_state_key_is_explicitly_decided() -> None:
     for module in (ai_orchestrator, ai_phases):
         tree = ast.parse(inspect.getsource(module))
         for node in ast.walk(tree):
+            targets: list[ast.expr] = []
             if isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if (
-                        isinstance(target, ast.Subscript)
-                        and isinstance(target.value, ast.Name)
-                        and target.value.id in _STATE_VAR_NAMES
-                        and isinstance(target.slice, ast.Constant)
-                        and isinstance(target.slice.value, str)
-                    ):
-                        written.add(target.slice.value)
-            # setdefault 也是写：node_selector_fix_counts 就只经由它建出来
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "setdefault"
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id in _STATE_VAR_NAMES
-                and node.args
-                and isinstance(node.args[0], ast.Constant)
-                and isinstance(node.args[0].value, str)
-            ):
-                written.add(node.args[0].value)
+                targets = list(node.targets)
+            elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+                targets = [node.target]
+            for target in targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in _STATE_VAR_NAMES
+                    and target.attr in _GUARD_STATE_FIELDS
+                ):
+                    written.add(target.attr)
 
     assert written, "取不到任何 state 键，这条元测试会静默通过"
     undecided = written - set(checkpoint._PERSISTED_KEYS) - checkpoint._PER_ROUND_KEYS
@@ -249,7 +255,7 @@ async def test_orchestrator_resumes_then_clears_on_completion(
     from test_ai_orchestrator import _chunk, _FakeExecutor, _FakeStream  # noqa: F401
 
     monkeypatch.setattr(checkpoint, "resolve_ai_dir", lambda: tmp_path)
-    checkpoint.save("f-ck", {"attempt_budget": _budget(VERIFY_ATTEMPT_BUDGET)}, rounds=4)
+    checkpoint.save("f-ck", GuardState(attempt_budget=_budget(VERIFY_ATTEMPT_BUDGET)), rounds=4)
 
     captured: list[list[dict[str, Any]]] = []
 

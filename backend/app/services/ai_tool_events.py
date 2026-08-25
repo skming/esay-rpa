@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    # 只在类型检查期引用：本模块运行期保持零 ai_* 依赖，属性读写不需要这个类。
+    from app.services.ai_guard_state import GuardState
 
 
 def attach_tool_events(tool_name: str, result: Any) -> Any:
@@ -49,7 +53,7 @@ def attach_tool_events(tool_name: str, result: Any) -> Any:
     return result
 
 
-def reduce_evidence_state(state: dict[str, Any], result: Any) -> None:
+def reduce_evidence_state(state: GuardState, result: Any) -> None:
     if not isinstance(result, dict):
         return
     events = [event for event in (result.get("events") or []) if isinstance(event, dict)]
@@ -60,22 +64,22 @@ def reduce_evidence_state(state: dict[str, Any], result: Any) -> None:
         if event_type == "flow_written":
             revision = event.get("revision")
             if isinstance(revision, int):
-                state["current_flow_revision"] = revision
-            state["run_verified_revision"] = None
-            state["accepted_revision"] = None
+                state.current_flow_revision = revision
+            state.run_verified_revision = None
+            state.accepted_revision = None
         elif event_type == "run_completed" and event.get("status") == "success":
             revision = event.get("flow_revision")
-            state["run_verified_revision"] = revision
+            state.run_verified_revision = revision
         elif event_type == "audit_completed" and event.get("passed") is True:
             revision = event.get("flow_revision")
-            state["accepted_revision"] = revision
+            state.accepted_revision = revision
     result["verification_status"] = current_verification_status(state)
 
 
-def current_verification_status(state: dict[str, Any]) -> str:
-    current = state.get("current_flow_revision")
-    if current is not None and state.get("accepted_revision") == current:
+def current_verification_status(state: GuardState) -> str:
+    current = state.current_flow_revision
+    if current is not None and state.accepted_revision == current:
         return "accepted"
-    if current is not None and state.get("run_verified_revision") == current:
+    if current is not None and state.run_verified_revision == current:
         return "run_verified"
     return "modified_unverified"

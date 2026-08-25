@@ -38,6 +38,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
+from app.services.ai_guard_state import GuardState, new_budget
 from app.services.ai_guards import FLOW_WRITE_TOOLS, call_fingerprint
 
 # 「改流程 → 跑 → 又失败」的总额度。重复签名计两份，见模块 docstring 的计价说明。
@@ -172,52 +173,44 @@ def initial_facts(
     page_evidence_required: dict[str, Any] | None,
     page_evidence_done: bool,
     run_authorized: bool,
-) -> dict[str, Any]:
-    """阶段机读的那几个 state 键。
+) -> GuardState:
+    """阶段机读的那几个事实，其余字段走 GuardState 的默认值（事实未知、不设限）。
 
     分开一个函数而不是让编排层手写字面量，是为了让「阶段读哪些事实」可枚举——
-    漏掉一个键时阶段会静默地退回 VERIFY，而 VERIFY 是唯一放行 run_flow 的阶段。
+    漏掉一个键时阶段会静默地退回 BUILD，而只有 VERIFY 放行 run_flow。
     """
-    return {
-        "flow_has_nodes": bool(flow_has_nodes),
-        "page_evidence_required": page_evidence_required,
-        "page_evidence_done": bool(page_evidence_done),
-        "run_authorized": bool(run_authorized),
-        "blocking_diagnostics": [],
-        "audit_findings": None,
-        "attempt_budget": new_budget(),
-        "evidence_collected": [],
-    }
-
-
-def new_budget() -> dict[str, Any]:
-    return {"spent": 0, "signatures": {}, "attempts": []}
+    return GuardState(
+        flow_has_nodes=bool(flow_has_nodes),
+        page_evidence_required=page_evidence_required,
+        page_evidence_done=bool(page_evidence_done),
+        run_authorized=bool(run_authorized),
+    )
 
 
 # ── 阶段推导 ──────────────────────────────────────────────────────────────────
 
 
-def resolve_phase(state: dict[str, Any]) -> Phase:
+def resolve_phase(state: GuardState) -> Phase:
     """从 state 里的事实推出当前阶段。不缓存、不存盘、每次重算。"""
-    budget = state.get("attempt_budget") or {}
+    budget = state.attempt_budget or {}
     if int(budget.get("spent") or 0) >= VERIFY_ATTEMPT_BUDGET:
         return Phase.REPORT
-    if state.get("page_evidence_required") and not state.get("page_evidence_done"):
+    if state.page_evidence_required and not state.page_evidence_done:
         return Phase.DISCOVER
-    if not state.get("flow_has_nodes"):
+    if not state.flow_has_nodes:
         return Phase.BUILD
-    if state.get("blocking_diagnostics") or state.get("audit_findings"):
+    if state.blocking_diagnostics or state.audit_findings:
         return Phase.FIX
     return Phase.VERIFY
 
 
-def admitted_tool_names(all_names: frozenset[str], state: dict[str, Any]) -> frozenset[str]:
+def admitted_tool_names(all_names: frozenset[str], state: GuardState) -> frozenset[str]:
     """本轮该暴露给模型的工具名。
 
     与 `apply_phase_gate` 用同一张准入表：暴露了却会被拦，等于故意让模型白花一轮。
     """
     phase = resolve_phase(state)
-    if phase is Phase.DISCOVER and not state.get("flow_has_nodes"):
+    if phase is Phase.DISCOVER and not state.flow_has_nodes:
         # 流程还不存在时，除了「去看页面」没有任何别的动作能推进——
         # 连 get_run_error 都没有 run 可读。窄到一个工具是为了省 schema token。
         return all_names & frozenset({"inspect_page"})
@@ -242,7 +235,7 @@ def _blocked(tool_name: str, guard_id: str, phase: Phase, **payload: Any) -> dic
 def apply_phase_gate(
     tool_name: str,
     args: dict[str, Any],
-    state: dict[str, Any],
+    state: GuardState,
 ) -> dict[str, Any] | None:
     """阶段与收敛判据的统一入口；返回 None 表示放行。
 
@@ -258,7 +251,7 @@ def apply_phase_gate(
     if tool_name in PHASE_GATED_TOOLS and tool_name not in _ADMISSION[phase]:
         return _refuse_for_phase(tool_name, state, phase)
 
-    if tool_name == "run_flow" and not state.get("run_authorized"):
+    if tool_name == "run_flow" and not state.run_authorized:
         return _refuse_unauthorized_run(tool_name, state, phase)
 
     return None
@@ -267,7 +260,7 @@ def apply_phase_gate(
 def _check_repeated_evidence(
     tool_name: str,
     args: dict[str, Any],
-    state: dict[str, Any],
+    state: GuardState,
     phase: Phase,
 ) -> dict[str, Any] | None:
     """同一次取证重复调用：证据已经在上下文里，再取一次只会拿到同一份。
@@ -279,7 +272,7 @@ def _check_repeated_evidence(
     """
     if tool_name not in EVIDENCE_TOOLS:
         return None
-    seen = state.get("evidence_collected") or []
+    seen = state.evidence_collected or []
     fingerprint = call_fingerprint(tool_name, args)
     if fingerprint not in seen:
         return None
@@ -299,13 +292,13 @@ def _check_repeated_evidence(
 
 def _refuse_for_phase(
     tool_name: str,
-    state: dict[str, Any],
+    state: GuardState,
     phase: Phase,
 ) -> dict[str, Any]:
     if phase is Phase.REPORT:
         return _refuse_exhausted(tool_name, state, phase)
     if phase is Phase.DISCOVER:
-        required = state.get("page_evidence_required")
+        required = state.page_evidence_required
         required = required if isinstance(required, dict) else {}
         payload: dict[str, Any] = {
             "required_tools": ["inspect_page"],
@@ -333,7 +326,7 @@ def _refuse_for_phase(
             message="流程还没有任何节点，先把流程建出来再谈运行。",
         )
     # FIX：阻断诊断优先报，它是模型手上真正能改的东西；审计问题次之。
-    diagnostics = state.get("blocking_diagnostics") or []
+    diagnostics = state.blocking_diagnostics or []
     if diagnostics:
         return _blocked(
             tool_name,
@@ -346,7 +339,7 @@ def _refuse_for_phase(
                 "只会再拿一次同样的失败。"
             ),
         )
-    audit = state.get("audit_findings")
+    audit = state.audit_findings
     audit = audit if isinstance(audit, dict) else {}
     return _blocked(
         tool_name,
@@ -364,10 +357,10 @@ def _refuse_for_phase(
 
 def _refuse_exhausted(
     tool_name: str,
-    state: dict[str, Any],
+    state: GuardState,
     phase: Phase,
 ) -> dict[str, Any]:
-    budget = state.get("attempt_budget") or {}
+    budget = state.attempt_budget or {}
     attempts = list(budget.get("attempts") or [])
     kind = attempts[-1].get("kind") if attempts else None
     tried = [a.get("detail") for a in attempts if a.get("detail")]
@@ -391,7 +384,7 @@ def _refuse_exhausted(
 
 def _refuse_unauthorized_run(
     tool_name: str,
-    state: dict[str, Any],
+    state: GuardState,
     phase: Phase,
 ) -> dict[str, Any]:
     """用户只要求修复时，改完不许顺手把流程跑起来。
@@ -402,7 +395,7 @@ def _refuse_unauthorized_run(
     修复是否已经落盘决定这轮该不该收尾：落了盘，剩下的只是「要不要跑」这一个决定，
     交给用户（ask_user 会让编排层进收尾态）；还没落盘，这轮活没干完，不能收尾。
     """
-    landed = state.get("current_flow_revision") is not None
+    landed = state.current_flow_revision is not None
     return _blocked(
         tool_name,
         "run_not_authorized",
@@ -419,7 +412,7 @@ def _refuse_unauthorized_run(
 
 
 def note_failed_attempt(
-    state: dict[str, Any],
+    state: GuardState,
     *,
     kind: str,
     signature: str,
@@ -436,10 +429,9 @@ def note_failed_attempt(
     变成自我加固——拒绝在花掉产生这条拒绝的额度。但仍然要记签名：同一条拒绝再来一次
     就是原地打转，从第二次起按普通重复失败计价，否则这类拒绝一条收口都没有。
     """
-    budget = state.get("attempt_budget")
+    budget = state.attempt_budget
     if not isinstance(budget, dict):
-        budget = new_budget()
-        state["attempt_budget"] = budget
+        budget = state.attempt_budget = new_budget()
     signatures: dict[str, int] = budget.setdefault("signatures", {})
     repeat = signature in signatures
     if repeat:
@@ -458,7 +450,7 @@ def note_failed_attempt(
 
 
 def note_guard_block(
-    state: dict[str, Any],
+    state: GuardState,
     tool_name: str,
     blocked: dict[str, Any],
 ) -> dict[str, Any]:
@@ -484,7 +476,7 @@ def note_guard_block(
         detail=str(blocked.get("message") or guard_id)[:200],
         charge_only_if_repeated=True,
     )
-    budget = state.get("attempt_budget") or {}
+    budget = state.attempt_budget or {}
     if int(budget.get("spent") or 0) < VERIFY_ATTEMPT_BUDGET:
         return blocked
     # 额度见底后不能再返回护栏那条「改对就能过」的提示：模型已经照它改过三次了。
@@ -492,7 +484,7 @@ def note_guard_block(
     return _refuse_exhausted(tool_name, state, Phase.REPORT)
 
 
-def reclassify_last_attempt(state: dict[str, Any], *, kind: str) -> None:
+def reclassify_last_attempt(state: GuardState, *, kind: str) -> None:
     """把最近一次失败重新归类，不动额度。
 
     一次失败的运行只能扣一次费，但「是哪一类失败」往往要等 get_run_error 读完现场
@@ -502,7 +494,7 @@ def reclassify_last_attempt(state: dict[str, Any], *, kind: str) -> None:
     只覆盖 run_error 这个默认归类：audit / navigation 都是已经判明的类别，
     后来的读取不该把它们冲掉。
     """
-    budget = state.get("attempt_budget")
+    budget = state.attempt_budget
     if not isinstance(budget, dict):
         return
     attempts = budget.get("attempts") or []
@@ -513,33 +505,29 @@ def reclassify_last_attempt(state: dict[str, Any], *, kind: str) -> None:
     attempts[-1]["kind"] = kind
 
 
-def note_verified(state: dict[str, Any]) -> None:
+def note_verified(state: GuardState) -> None:
     """流程跑通且审计合格：额度归零，未了结的义务一并清掉。"""
-    state["attempt_budget"] = new_budget()
-    state["blocking_diagnostics"] = []
-    state["audit_findings"] = None
+    state.attempt_budget = new_budget()
+    state.blocking_diagnostics = []
+    state.audit_findings = None
     note_progress(state)
 
 
-def note_evidence(state: dict[str, Any], tool_name: str, args: dict[str, Any]) -> None:
+def note_evidence(state: GuardState, tool_name: str, args: dict[str, Any]) -> None:
     """记下一次已经拿到的取证调用，供重复取证判据比对。"""
     if tool_name not in EVIDENCE_TOOLS:
         return
-    seen = state.get("evidence_collected")
-    if not isinstance(seen, list):
-        seen = []
-        state["evidence_collected"] = seen
     fingerprint = call_fingerprint(tool_name, args)
-    if fingerprint not in seen:
-        seen.append(fingerprint)
+    if fingerprint not in state.evidence_collected:
+        state.evidence_collected.append(fingerprint)
 
 
-def note_progress(state: dict[str, Any]) -> None:
+def note_progress(state: GuardState) -> None:
     """流程真的变了（写入落盘或跑了一次）：旧证据不再算「已经有了」。
 
     页面和运行结果都可能因为这次改动而不同，此时重探同一个目标是正当动作。
     """
-    state["evidence_collected"] = []
+    state.evidence_collected = []
 
 
 # ── 提示词与自省 ──────────────────────────────────────────────────────────────

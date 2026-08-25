@@ -61,6 +61,9 @@ _LOGIN_URL_TOKENS = ("login", "signin", "sign-in", "auth", "sso", "passport")
 
 _CONDITION_NODE_TYPES = ("control.condition",)
 
+# 只在流程仍是占位名时才接受 AI 给出的新标题，已有正式名称不许被无关的结构性修改顺手改掉
+_PLACEHOLDER_FLOW_NAMES = frozenset({"新建 RPA 流程", "未命名流程"})
+
 # run_flow 的调用参数名。塞进 variables 既不报错也不生效，是最难自查的一类静默失效
 _RUN_CALL_PARAM_NAMES = frozenset({"browser_executor", "flow_id", "task_id"})
 
@@ -700,9 +703,6 @@ class RpaToolExecutor:
         change_context: ChangeContext | None = None,
     ) -> dict[str, Any]:
         """Apply structural changes to a flow immediately — no user confirmation required."""
-        import copy as _copy
-        from app.models.schemas import FlowUpdateRequest
-
         flow = await self._flow_service.get_flow(flow_id)
         if flow is None:
             return {"error": f"流程 {flow_id} 不存在"}
@@ -741,12 +741,149 @@ class RpaToolExecutor:
             normalized_add_edges.append(e)
         add_edges = normalized_add_edges
 
-        # Pre-mutation structural validation
-        # Reject references to nodes that won't exist *before* touching the flow,
-        # so a hallucinated node id (e.g. an edge to a node never created) surfaces
-        # as an actionable error instead of being silently swallowed by the
-        # dangling-edge prune below — which would otherwise report "applied" while
-        # leaving the flow broken.
+        # Pre-mutation structural validation：抢在下面悬空边自动剪除之前拒绝幻觉引用
+        struct_errors = self._validate_update_structure(
+            existing_nodes, add_nodes, add_edges, update_nodes, remove_set
+        )
+        if struct_errors:
+            return {
+                "error": "结构校验失败，变更未应用",
+                "validation_errors": struct_errors,
+                "fix_hint": "连线/修改只能引用已存在或本次 add_nodes 新建的节点。请先创建被引用的节点或修正 id，节点 id 见状态块的节点列表。",
+            }
+
+        new_node_ids = {n.get("id") for n in (add_nodes or []) if isinstance(n, dict) and n.get("id")}
+        final_remove_edge_ids = self._collect_removed_edge_ids(
+            existing_edges, add_edges, new_node_ids, remove_set, explicit_remove_edge_ids
+        )
+
+        definition, nodes, edges, spliced_noop_ids = self._apply_structural_changes(
+            flow.definition, add_nodes, update_nodes, add_edges,
+            remove_set, final_remove_edge_ids, new_node_ids,
+        )
+
+        # 只在流程仍是占位名时接受 AI 给出的标题，已经有正式名称就不允许覆盖，
+        # 避免模型在无关的结构性修改里顺手把用户自己起的名字改掉。
+        requested_name = name.strip() if isinstance(name, str) and name.strip() else None
+        new_name = requested_name
+        if new_name is not None and flow.name not in _PLACEHOLDER_FLOW_NAMES:
+            new_name = None
+
+        # 差分判定排在下面那条通用孤立检查之前：两者都会拦「节点被剪出执行路径」，
+        # 但差分知道哪些节点是本轮要保住的主链路，报出来的话模型才知道该怎么改。
+        #
+        # 带了 name 的调用不按空转判：改名是定义之外的一次真实意图，
+        # 判成"改完等于没改、去 inspect_page"会把原因说错（名字被规则挡下，与根因无关）。
+        change = inspect_change(
+            flow.definition,
+            definition,
+            context=change_context,
+            ledger=repair_ledger.load(flow_id),
+            allow_no_effective_change=requested_name is not None,
+        )
+        if change.rejected:
+            return change.refusal()
+
+        # 若本次变更会使原本可达的节点变孤立，阻止写入并报错，防止 AI 修复时误切断流程
+        currently_unreachable = set(_unreachable_node_ids(existing_nodes, existing_edges))
+        proposed_unreachable = set(_unreachable_node_ids(nodes, edges))
+        newly_orphaned = proposed_unreachable - currently_unreachable
+        # Exclude nodes that were explicitly removed (they're expected to disappear)
+        newly_orphaned -= remove_set
+        if newly_orphaned:
+            return {
+                "error": (
+                    f"变更被阻止：以下节点在修改后将失去连通性（孤立）：{', '.join(sorted(newly_orphaned))}。"
+                    "通常是漏接了入边，或删除了某个节点但未重连其上下游。"
+                ),
+                "newly_orphaned": sorted(newly_orphaned),
+                "fix_hint": (
+                    "请同时在 add_edges 中补全受影响节点的入边，"
+                    "或先用 update_flow 只添加新节点+连线，确认连通后再删除旧节点。"
+                ),
+            }
+
+        req = FlowUpdateRequest(definition=definition, name=new_name)
+        updated = await self._flow_service.update_flow(flow_id, req)
+        if updated is None:
+            return {"error": "流程更新失败，未找到对应流程"}
+
+        # Post-change validation (informational only — changes are already applied)
+        input_var_names = [iv.name for iv in flow.input_variables]
+        issues = _validate_variable_refs(nodes, input_var_names)
+        lint_findings = _lint_flow(nodes, edges, input_variable_names=input_var_names)
+        changed_nodes, updated_node_snapshots = self._summarize_changed_nodes(
+            add_nodes, update_nodes, remove_node_ids, nodes, existing_node_refs
+        )
+
+        result: dict[str, Any] = {
+            "status": "applied",
+            "flow_id": flow_id,
+            "flow_name": updated.name,
+            "revision": updated.revision,
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+        }
+        if change.tracked_field_changes:
+            # 编排层据此记修复台账。取自 before/after 而不是调用参数：
+            # 台账要记的是真正落盘的取值，否则回摆判定会拿一份从未生效的历史去比。
+            result["tracked_field_changes"] = [dict(c) for c in change.tracked_field_changes]
+        if requested_name is not None and new_name is None:
+            # 名字被规则挡下时必须明说。沉默的话模型会以为改名成功，
+            # 之后按自己给的名字去指代这个流程，和用户说的对不上。
+            result["name_change_ignored"] = (
+                f"流程已有正式名称「{flow.name}」，未采用你给的「{requested_name}」："
+                "只有仍是占位名的流程才允许自动命名，改名需要用户自己决定。"
+            )
+        if changed_nodes:
+            result["changed_nodes"] = changed_nodes
+            result["changed_node_labels"] = [node["label"] for node in changed_nodes]
+        if spliced_noop_ids:
+            result["spliced_placeholder_nodes"] = spliced_noop_ids
+            result["spliced_placeholder_note"] = (
+                f"已摘除直通的 control.noop 占位节点 {spliced_noop_ids} 并把入边直接连到其下游："
+                "条件节点的分支边可以直接指向汇合节点，不需要占位。"
+            )
+        if updated_node_snapshots:
+            result["updated_node_snapshots"] = updated_node_snapshots
+            result["verify_hint"] = (
+                "请核查 updated_node_snapshots 中每个节点的 patched_fields，"
+                "确认字段值与你的修改意图一致后再运行流程。"
+            )
+        if issues:
+            result["validation_issues"] = issues
+            result["validation_warning"] = "变更已应用，但仍存在未定义变量引用，建议继续修复。"
+
+        if lint_findings:
+            result["lint_findings"], result["lint_warning"] = annotate_lint_findings(lint_findings)
+        else:
+            # 干净也必须显式说一声：编排层据此把本轮的运行闸门换成写入之后那一版的结论。
+            # 缺了它，"这次写入 lint 干净"和"这个工具压根不跑 lint"在返回里长得一模一样。
+            result["lint_clean"] = True
+
+        # 删除入边后忘记重连下游会静默孤立整条分支，需要提醒 AI/用户补连
+        unreachable = _unreachable_node_ids(nodes, edges)
+        if unreachable:
+            result["connectivity_warning"] = (
+                f"以下节点无法从流程起点到达，运行时会被跳过：{', '.join(unreachable)}。"
+                "通常是连线缺失或被误删，请补连后再确认完成。"
+            )
+            result["unreachable_nodes"] = unreachable
+        return result
+
+    @staticmethod
+    def _validate_update_structure(
+        existing_nodes: list[Any],
+        add_nodes: list[dict[str, Any]],
+        add_edges: list[dict[str, Any]],
+        update_nodes: list[dict[str, Any]] | None,
+        remove_set: set[str],
+    ) -> list[str]:
+        """在触碰流程前拒绝引用了不存在节点的连线/修改。
+
+        必须抢在下面那轮悬空边自动剪除之前：否则一个幻觉 node id 会被静默吞掉、
+        仍报「applied」，留下一个断掉的流程。
+        """
         existing_ids = {n.get("id") for n in existing_nodes if isinstance(n, dict) and n.get("id")}
         final_ids = (existing_ids - remove_set) | {
             n.get("id") for n in (add_nodes or []) if isinstance(n, dict) and n.get("id")
@@ -779,20 +916,24 @@ class RpaToolExecutor:
             uid = u.get("id") if isinstance(u, dict) else None
             if uid not in final_ids:
                 struct_errors.append(f"要修改的节点 {uid!r} 不存在")
-        if struct_errors:
-            return {
-                "error": "结构校验失败，变更未应用",
-                "validation_errors": struct_errors,
-                "fix_hint": "连线/修改只能引用已存在或本次 add_nodes 新建的节点。请先创建被引用的节点或修正 id，节点 id 见状态块的节点列表。",
-            }
+        return struct_errors
 
-        # Detect bypassed edges (A→C when A→B + B→C are newly added)
+    @staticmethod
+    def _collect_removed_edge_ids(
+        existing_edges: list[Any],
+        add_edges: list[dict[str, Any]],
+        new_node_ids: set[str],
+        remove_set: set[str],
+        explicit_remove_edge_ids: set[str],
+    ) -> set[str]:
+        """要删的边 = 显式指定的 + 连着被删节点的 + 被新链路旁路掉的。
+
+        旁路：新增了 A→M 与 M→C 时，原来的 A→C 就该让位给经过 M 的新路径。
+        """
         new_edge_pairs: set[tuple[str, str]] = set()
         for e in (add_edges or []):
             if isinstance(e, dict) and e.get("source") and e.get("target"):
                 new_edge_pairs.add((e["source"], e["target"]))
-
-        new_node_ids = {n.get("id") for n in (add_nodes or []) if isinstance(n, dict) and n.get("id")}
 
         auto_remove_edge_ids: set[str] = set()
         for e in existing_edges:
@@ -807,10 +948,23 @@ class RpaToolExecutor:
                 if (src, mid) in new_edge_pairs and (mid, tgt) in new_edge_pairs:
                     auto_remove_edge_ids.add(eid)
                     break
+        return explicit_remove_edge_ids | auto_remove_edge_ids
 
-        final_remove_edge_ids = explicit_remove_edge_ids | auto_remove_edge_ids
+    def _apply_structural_changes(
+        self,
+        flow_definition: dict[str, Any],
+        add_nodes: list[dict[str, Any]],
+        update_nodes: list[dict[str, Any]] | None,
+        add_edges: list[dict[str, Any]],
+        remove_set: set[str],
+        final_remove_edge_ids: set[str],
+        new_node_ids: set[str],
+    ) -> tuple[dict[str, Any], list, list, list[str]]:
+        """把增删改落成新的 nodes/edges 并做布局/去重/骨架清理。
 
-        definition = _copy.deepcopy(dict(flow.definition))
+        返回 (definition, nodes, edges, spliced_noop_ids)。
+        """
+        definition = copy.deepcopy(dict(flow_definition))
         nodes: list = [n for n in definition.get("nodes", []) if isinstance(n, dict) and n.get("id") not in remove_set]
         edges: list = [e for e in definition.get("edges", []) if isinstance(e, dict) and e.get("id") not in final_remove_edge_ids]
 
@@ -926,58 +1080,21 @@ class RpaToolExecutor:
 
         definition["nodes"] = nodes
         definition["edges"] = edges
+        return definition, nodes, edges, spliced_noop_ids
 
-        # 只在流程仍是占位名时接受 AI 给出的标题，已经有正式名称就不允许覆盖，
-        # 避免模型在无关的结构性修改里顺手把用户自己起的名字改掉。
-        _PLACEHOLDER_FLOW_NAMES = {"新建 RPA 流程", "未命名流程"}
-        requested_name = name.strip() if isinstance(name, str) and name.strip() else None
-        new_name = requested_name
-        if new_name is not None and flow.name not in _PLACEHOLDER_FLOW_NAMES:
-            new_name = None
+    @staticmethod
+    def _summarize_changed_nodes(
+        add_nodes: list[dict[str, Any]],
+        update_nodes: list[dict[str, Any]] | None,
+        remove_node_ids: list[str] | None,
+        nodes: list,
+        existing_node_refs: dict[str, Any],
+    ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+        """汇总本轮改动的节点摘要，并回读被 patch 字段的实际落盘值。
 
-        # 差分判定排在下面那条通用孤立检查之前：两者都会拦「节点被剪出执行路径」，
-        # 但差分知道哪些节点是本轮要保住的主链路，报出来的话模型才知道该怎么改。
-        #
-        # 带了 name 的调用不按空转判：改名是定义之外的一次真实意图，
-        # 判成"改完等于没改、去 inspect_page"会把原因说错（名字被规则挡下，与根因无关）。
-        change = inspect_change(
-            flow.definition,
-            definition,
-            context=change_context,
-            ledger=repair_ledger.load(flow_id),
-            allow_no_effective_change=requested_name is not None,
-        )
-        if change.rejected:
-            return change.refusal()
-
-        # 若本次变更会使原本可达的节点变孤立，阻止写入并报错，防止 AI 修复时误切断流程
-        currently_unreachable = set(_unreachable_node_ids(existing_nodes, existing_edges))
-        proposed_unreachable = set(_unreachable_node_ids(nodes, edges))
-        newly_orphaned = proposed_unreachable - currently_unreachable
-        # Exclude nodes that were explicitly removed (they're expected to disappear)
-        newly_orphaned -= remove_set
-        if newly_orphaned:
-            return {
-                "error": (
-                    f"变更被阻止：以下节点在修改后将失去连通性（孤立）：{', '.join(sorted(newly_orphaned))}。"
-                    "通常是漏接了入边，或删除了某个节点但未重连其上下游。"
-                ),
-                "newly_orphaned": sorted(newly_orphaned),
-                "fix_hint": (
-                    "请同时在 add_edges 中补全受影响节点的入边，"
-                    "或先用 update_flow 只添加新节点+连线，确认连通后再删除旧节点。"
-                ),
-            }
-
-        req = FlowUpdateRequest(definition=definition, name=new_name)
-        updated = await self._flow_service.update_flow(flow_id, req)
-        if updated is None:
-            return {"error": "流程更新失败，未找到对应流程"}
-
-        # Post-change validation (informational only — changes are already applied)
-        input_var_names = [iv.name for iv in flow.input_variables]
-        issues = _validate_variable_refs(nodes, input_var_names)
-        lint_findings = _lint_flow(nodes, edges, input_variable_names=input_var_names)
+        updated_node_snapshots 让模型能核对修改是否真的生效，避免「说改了但同一个错误又来一遍」
+        （update_nodes 静默无效）的循环。
+        """
         final_node_refs = {
             ref["id"]: ref
             for ref in (_node_ref(node) for node in nodes)
@@ -995,9 +1112,6 @@ class RpaToolExecutor:
                 ref = final_node_refs.get(uid) or existing_node_refs.get(uid)
                 if ref:
                     changed_nodes.append({**ref, "change": "updated"})
-                # Emit a snapshot of the patched fields so the AI can verify
-                # the change actually landed (prevents "AI said fixed but same
-                # error repeated" loops where update_nodes silently had no effect).
                 patch_keys = list((item.get("patch") or {}).keys())
                 actual_node = next((n for n in nodes if isinstance(n, dict) and n.get("id") == uid), None)
                 if actual_node and patch_keys:
@@ -1009,61 +1123,7 @@ class RpaToolExecutor:
             ref = existing_node_refs.get(node_id)
             if ref:
                 changed_nodes.append({**ref, "change": "removed"})
-
-        result: dict[str, Any] = {
-            "status": "applied",
-            "flow_id": flow_id,
-            "flow_name": updated.name,
-            "revision": updated.revision,
-            "node_count": len(nodes),
-            "edge_count": len(edges),
-        }
-        if change.tracked_field_changes:
-            # 编排层据此记修复台账。取自 before/after 而不是调用参数：
-            # 台账要记的是真正落盘的取值，否则回摆判定会拿一份从未生效的历史去比。
-            result["tracked_field_changes"] = [dict(c) for c in change.tracked_field_changes]
-        if requested_name is not None and new_name is None:
-            # 名字被规则挡下时必须明说。沉默的话模型会以为改名成功，
-            # 之后按自己给的名字去指代这个流程，和用户说的对不上。
-            result["name_change_ignored"] = (
-                f"流程已有正式名称「{flow.name}」，未采用你给的「{requested_name}」："
-                "只有仍是占位名的流程才允许自动命名，改名需要用户自己决定。"
-            )
-        if changed_nodes:
-            result["changed_nodes"] = changed_nodes
-            result["changed_node_labels"] = [node["label"] for node in changed_nodes]
-        if spliced_noop_ids:
-            result["spliced_placeholder_nodes"] = spliced_noop_ids
-            result["spliced_placeholder_note"] = (
-                f"已摘除直通的 control.noop 占位节点 {spliced_noop_ids} 并把入边直接连到其下游："
-                "条件节点的分支边可以直接指向汇合节点，不需要占位。"
-            )
-        if updated_node_snapshots:
-            result["updated_node_snapshots"] = updated_node_snapshots
-            result["verify_hint"] = (
-                "请核查 updated_node_snapshots 中每个节点的 patched_fields，"
-                "确认字段值与你的修改意图一致后再运行流程。"
-            )
-        if issues:
-            result["validation_issues"] = issues
-            result["validation_warning"] = "变更已应用，但仍存在未定义变量引用，建议继续修复。"
-
-        if lint_findings:
-            result["lint_findings"], result["lint_warning"] = annotate_lint_findings(lint_findings)
-        else:
-            # 干净也必须显式说一声：编排层据此把本轮的运行闸门换成写入之后那一版的结论。
-            # 缺了它，"这次写入 lint 干净"和"这个工具压根不跑 lint"在返回里长得一模一样。
-            result["lint_clean"] = True
-
-        # 删除入边后忘记重连下游会静默孤立整条分支，需要提醒 AI/用户补连
-        unreachable = _unreachable_node_ids(nodes, edges)
-        if unreachable:
-            result["connectivity_warning"] = (
-                f"以下节点无法从流程起点到达，运行时会被跳过：{', '.join(unreachable)}。"
-                "通常是连线缺失或被误删，请补连后再确认完成。"
-            )
-            result["unreachable_nodes"] = unreachable
-        return result
+        return changed_nodes, updated_node_snapshots
 
     async def _check_extension_connection(self) -> dict[str, Any]:
         connected = self._task_manager.is_extension_connected()
@@ -1544,12 +1604,6 @@ class RpaToolExecutor:
 
         error_text = task.error or ""
         error_lower = error_text.lower()
-        is_selector_error = (
-            ("timeout" in error_lower or "locator" in error_lower)
-            and ("wait_for_selector" in error_lower or "locator(" in error_lower
-                 or "page.fill" in error_lower or "page.click" in error_lower
-                 or "page.press" in error_lower or "page.wait" in error_lower)
-        )
 
         last_browser_url: str | None = None
         for log in reversed(all_logs):
@@ -1560,41 +1614,9 @@ class RpaToolExecutor:
 
         # 成功运行返回精简结果，不带 error_logs，避免诱使 AI 去"修复"本就按预期工作的 continueOnError 节点
         if is_success:
-            tolerated = [entry.node_id for entry in error_logs if entry.node_id]
-            # 质量审计不合格的任务 task.status 仍是 success：照直说"无需修复"会和
-            # failure budget 「先 get_run_error 再修」的指令正面矛盾，模型只能瞎猜
-            quality_issues = self._recorded_quality_issues(task_id)
-            result: dict[str, Any] = {
-                "task_id": task_id,
-                "status": "success",
-                "run_error": None,
-                "failed_node_id": None,
-                "failed_node_config": None,
-                "message": (
-                    (
-                        "流程执行本身没有报错，但这次运行的质量审计未通过："
-                        f"{'、'.join(quality_issues)}。"
-                        "根因在输出结构或抽取范围，不在节点报错，请据此修复后重跑。"
-                        if quality_issues
-                        else "流程整体运行成功，无需修复。"
-                    )
-                    + (
-                        f"节点 {list(dict.fromkeys(tolerated))} 启用了 continueOnError，"
-                        "其局部失败已被容忍——这是预期行为，请勿修改这些节点。"
-                        if tolerated else ""
-                    )
-                ),
-            }
-            if quality_issues:
-                result["quality_audit"] = {"passed": False, "issues": quality_issues}
-            if last_browser_url:
-                result["last_browser_url"] = last_browser_url
-            # 成功运行也可能一路停在错误页面上（取到的是别的页的数据），照样给出证据
-            verdict = build_navigation_verdict(navigation_trace)
-            if verdict:
-                result["navigation_trace"] = navigation_trace
-                result["navigation_verdict"] = verdict
-            return result
+            return self._build_success_run_result(
+                task_id, error_logs, last_browser_url, navigation_trace
+            )
 
         result: dict[str, Any] = {
             "task_id": task_id,
@@ -1633,81 +1655,7 @@ class RpaToolExecutor:
                 ),
             ]
 
-        if is_selector_error:
-            selector_diagnostic: dict[str, Any] | None = None
-            count_match = re.search(r"页面匹配\s*(\d+)\s*个元素", error_text)
-            selector_count = int(count_match.group(1)) if count_match else None
-            element_not_visible = "element is not visible" in error_lower or "not visible" in error_lower
-            if selector_count == 0:
-                selector_diagnostic = {
-                    "kind": SELECTOR_ZERO_MATCH,
-                    "matched_count": 0,
-                    "message": "selector 在当前页面没有命中任何元素，需要修正 selector 或检查页面导航是否正确。",
-                    "repair_directions": [
-                        "调用 inspect_page 获取真实 DOM，从返回的 inputs/buttons/links.selector 取精确 selector",
-                        "检查流程拓扑：失败节点前是否缺少 browser.open（目标页 URL）",
-                    ],
-                }
-            elif selector_count is not None and selector_count >= 1 and element_not_visible:
-                # Element(s) found but not clickable due to non-display CSS hiding.
-                # Changing the selector is almost never the right fix here.
-                selector_diagnostic = {
-                    "kind": SELECTOR_MATCH_NOT_VISIBLE,
-                    "matched_count": selector_count,
-                    "message": (
-                        f"selector 命中了 {selector_count} 个元素，但元素对 Playwright 仍不可见/不可点击。"
-                        "这不是 selector 错误——改 selector 无法解决此问题。"
-                        "元素不可见的常见原因：CSS visibility:hidden / opacity:0 / 尺寸为零 / 被其他元素遮挡 / 尚未滚动到视口。"
-                    ),
-                    "repair_directions": [
-                        "① 若该操作可选，直接对该节点设 continueOnError:true——"
-                        "不要再改 selector，继续改只会浪费运行次数",
-                        "② 若该操作必须执行且元素确实被 CSS 隐藏（visibility:hidden/opacity:0 而非 display:none）："
-                        "对该 browser.click 节点添加 force:true，Playwright 会绕过可见性检查直接触发点击",
-                        "③ 若不确定该操作是否可选，向用户询问：「这个步骤是必须完成的还是可以跳过？」",
-                        "④ 检查节点执行时机：元素可能在前序操作完成后才变为可见，可在前一节点加 delayMs 等待",
-                    ],
-                }
-            elif selector_count is not None and selector_count > 1:
-                selector_diagnostic = {
-                    "kind": SELECTOR_MULTI_MATCH_FIRST_NOT_ACTIONABLE,
-                    "matched_count": selector_count,
-                    "message": (
-                        f"selector 命中了 {selector_count} 个元素，Playwright 尝试第一个但其不可操作。"
-                        "需要缩小 selector 精确度或过滤到真正可交互的元素。"
-                    ),
-                    "repair_directions": [
-                        "调用 inspect_page(scope_selector=失败节点父容器) 查看 DOM 结构，找到可操作的精确元素",
-                        "若操作可选，设 continueOnError:true",
-                    ],
-                }
-            elif element_not_visible:
-                selector_diagnostic = {
-                    "kind": SELECTOR_MATCH_HIDDEN_OR_NOT_VISIBLE,
-                    "matched_count": None,
-                    "message": (
-                        "selector 命中的元素不可见（Playwright 未能从错误信息中解析出匹配数量）。"
-                        "若该操作可选，设 continueOnError:true；否则调用 inspect_page 查看元素状态。"
-                    ),
-                }
-            if selector_diagnostic is not None:
-                result["selector_diagnostic"] = selector_diagnostic
-
-            url_part = f"，建议 URL：{last_browser_url}" if last_browser_url else ""
-            result["inspect_hint"] = (
-                "⚠️ 这是 selector 定位超时。"
-                + (
-                    "元素已找到但不可见——不要再改 selector，"
-                    "正确方向见 selector_diagnostic.repair_directions。"
-                    if (selector_count is not None and selector_count >= 1 and element_not_visible)
-                    else
-                    f"修复前必须先调用 inspect_page(url='<当前页 URL>'{url_part}) 检查真实 DOM——"
-                    "直接猜测修改 selector 后重新运行大概率仍会失败。"
-                )
-                + "截图节点对非视觉模型无效，不要用截图取证。"
-            )
-            if last_browser_url:
-                result["last_browser_url"] = last_browser_url
+        result.update(self._selector_error_annotations(error_text, error_lower, last_browser_url))
         if "document is not defined" in error_lower or "window is not defined" in error_lower:
             result["script_environment_hint"] = (
                 "脚本节点运行在本地 Node/Python/Shell 环境，不在浏览器页面上下文。"
@@ -1719,6 +1667,146 @@ class RpaToolExecutor:
         self._attach_failure_evidence(result, task, failed_node_id)
 
         return result
+
+    def _build_success_run_result(
+        self,
+        task_id: str,
+        error_logs: list[Any],
+        last_browser_url: str | None,
+        navigation_trace: Any,
+    ) -> dict[str, Any]:
+        """成功任务返回精简结果，不带 error_logs，避免诱使 AI 去「修复」按预期工作的 continueOnError 节点。"""
+        tolerated = [entry.node_id for entry in error_logs if entry.node_id]
+        # 质量审计不合格的任务 task.status 仍是 success：照直说「无需修复」会和
+        # failure budget 「先 get_run_error 再修」的指令正面矛盾，模型只能瞎猜
+        quality_issues = self._recorded_quality_issues(task_id)
+        result: dict[str, Any] = {
+            "task_id": task_id,
+            "status": "success",
+            "run_error": None,
+            "failed_node_id": None,
+            "failed_node_config": None,
+            "message": (
+                (
+                    "流程执行本身没有报错，但这次运行的质量审计未通过："
+                    f"{'、'.join(quality_issues)}。"
+                    "根因在输出结构或抽取范围，不在节点报错，请据此修复后重跑。"
+                    if quality_issues
+                    else "流程整体运行成功，无需修复。"
+                )
+                + (
+                    f"节点 {list(dict.fromkeys(tolerated))} 启用了 continueOnError，"
+                    "其局部失败已被容忍——这是预期行为，请勿修改这些节点。"
+                    if tolerated else ""
+                )
+            ),
+        }
+        if quality_issues:
+            result["quality_audit"] = {"passed": False, "issues": quality_issues}
+        if last_browser_url:
+            result["last_browser_url"] = last_browser_url
+        # 成功运行也可能一路停在错误页面上（取到的是别的页的数据），照样给出证据
+        verdict = build_navigation_verdict(navigation_trace)
+        if verdict:
+            result["navigation_trace"] = navigation_trace
+            result["navigation_verdict"] = verdict
+        return result
+
+    @staticmethod
+    def _selector_error_annotations(
+        error_text: str, error_lower: str, last_browser_url: str | None
+    ) -> dict[str, Any]:
+        """selector 定位超时时，产出诊断（命中数×可见性四象限）与取证指引，合并进 result。
+
+        非 selector 超时返回空 dict。分四象限是因为四种情形的修法互斥：0 命中改 selector；
+        命中但不可见改 selector 是白费（该设 continueOnError 或 force）；多命中要缩小精度；
+        解析不出数量则退回让模型 inspect_page。混成一类模型只会盲改 selector 空转。
+        """
+        is_selector_error = (
+            ("timeout" in error_lower or "locator" in error_lower)
+            and ("wait_for_selector" in error_lower or "locator(" in error_lower
+                 or "page.fill" in error_lower or "page.click" in error_lower
+                 or "page.press" in error_lower or "page.wait" in error_lower)
+        )
+        if not is_selector_error:
+            return {}
+
+        annotations: dict[str, Any] = {}
+        selector_diagnostic: dict[str, Any] | None = None
+        count_match = re.search(r"页面匹配\s*(\d+)\s*个元素", error_text)
+        selector_count = int(count_match.group(1)) if count_match else None
+        element_not_visible = "element is not visible" in error_lower or "not visible" in error_lower
+        if selector_count == 0:
+            selector_diagnostic = {
+                "kind": SELECTOR_ZERO_MATCH,
+                "matched_count": 0,
+                "message": "selector 在当前页面没有命中任何元素，需要修正 selector 或检查页面导航是否正确。",
+                "repair_directions": [
+                    "调用 inspect_page 获取真实 DOM，从返回的 inputs/buttons/links.selector 取精确 selector",
+                    "检查流程拓扑：失败节点前是否缺少 browser.open（目标页 URL）",
+                ],
+            }
+        elif selector_count is not None and selector_count >= 1 and element_not_visible:
+            # Element(s) found but not clickable due to non-display CSS hiding.
+            # Changing the selector is almost never the right fix here.
+            selector_diagnostic = {
+                "kind": SELECTOR_MATCH_NOT_VISIBLE,
+                "matched_count": selector_count,
+                "message": (
+                    f"selector 命中了 {selector_count} 个元素，但元素对 Playwright 仍不可见/不可点击。"
+                    "这不是 selector 错误——改 selector 无法解决此问题。"
+                    "元素不可见的常见原因：CSS visibility:hidden / opacity:0 / 尺寸为零 / 被其他元素遮挡 / 尚未滚动到视口。"
+                ),
+                "repair_directions": [
+                    "① 若该操作可选，直接对该节点设 continueOnError:true——"
+                    "不要再改 selector，继续改只会浪费运行次数",
+                    "② 若该操作必须执行且元素确实被 CSS 隐藏（visibility:hidden/opacity:0 而非 display:none）："
+                    "对该 browser.click 节点添加 force:true，Playwright 会绕过可见性检查直接触发点击",
+                    "③ 若不确定该操作是否可选，向用户询问：「这个步骤是必须完成的还是可以跳过？」",
+                    "④ 检查节点执行时机：元素可能在前序操作完成后才变为可见，可在前一节点加 delayMs 等待",
+                ],
+            }
+        elif selector_count is not None and selector_count > 1:
+            selector_diagnostic = {
+                "kind": SELECTOR_MULTI_MATCH_FIRST_NOT_ACTIONABLE,
+                "matched_count": selector_count,
+                "message": (
+                    f"selector 命中了 {selector_count} 个元素，Playwright 尝试第一个但其不可操作。"
+                    "需要缩小 selector 精确度或过滤到真正可交互的元素。"
+                ),
+                "repair_directions": [
+                    "调用 inspect_page(scope_selector=失败节点父容器) 查看 DOM 结构，找到可操作的精确元素",
+                    "若操作可选，设 continueOnError:true",
+                ],
+            }
+        elif element_not_visible:
+            selector_diagnostic = {
+                "kind": SELECTOR_MATCH_HIDDEN_OR_NOT_VISIBLE,
+                "matched_count": None,
+                "message": (
+                    "selector 命中的元素不可见（Playwright 未能从错误信息中解析出匹配数量）。"
+                    "若该操作可选，设 continueOnError:true；否则调用 inspect_page 查看元素状态。"
+                ),
+            }
+        if selector_diagnostic is not None:
+            annotations["selector_diagnostic"] = selector_diagnostic
+
+        url_part = f"，建议 URL：{last_browser_url}" if last_browser_url else ""
+        annotations["inspect_hint"] = (
+            "⚠️ 这是 selector 定位超时。"
+            + (
+                "元素已找到但不可见——不要再改 selector，"
+                "正确方向见 selector_diagnostic.repair_directions。"
+                if (selector_count is not None and selector_count >= 1 and element_not_visible)
+                else
+                f"修复前必须先调用 inspect_page(url='<当前页 URL>'{url_part}) 检查真实 DOM——"
+                "直接猜测修改 selector 后重新运行大概率仍会失败。"
+            )
+            + "截图节点对非视觉模型无效，不要用截图取证。"
+        )
+        if last_browser_url:
+            annotations["last_browser_url"] = last_browser_url
+        return annotations
 
     def _attach_failure_evidence(
         self,
@@ -1771,8 +1859,6 @@ class RpaToolExecutor:
         config_patch: dict[str, Any],
         change_context: ChangeContext | None = None,
     ) -> dict[str, Any]:
-        from app.models.schemas import FlowUpdateRequest
-
         flow = await self._flow_service.get_flow(flow_id)
         if flow is None:
             return {"error": f"流程 {flow_id} 不存在"}

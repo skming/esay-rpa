@@ -23,7 +23,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    # 只在类型检查期引用：ai_guards 运行期保持零 ai_* 依赖，getattr 取字段不需要这个类。
+    from app.services.ai_guard_state import GuardState
 
 # ── 工具分组 ──────────────────────────────────────────────────────────────────
 
@@ -105,7 +109,7 @@ class ToolScope:
         return "全部工具"
 
 
-GuardCheck = Callable[[str, dict[str, Any], dict[str, Any]], "dict[str, Any] | None"]
+GuardCheck = Callable[[str, dict[str, Any], "GuardState"], "dict[str, Any] | None"]
 
 
 @dataclass(frozen=True)
@@ -123,12 +127,12 @@ class Guard:
     contract: str | None = None
     requires_state: tuple[str, ...] = field(default=())
 
-    def applies(self, tool_name: str, state: dict[str, Any]) -> bool:
+    def applies(self, tool_name: str, state: GuardState) -> bool:
         if not self.scope.matches(tool_name):
             return False
-        # 声明了前置 state 键的 guard，键为空时整条跳过——省掉每个 check 开头
-        # 重复一遍 `if not state.get(...)`，也让「这条闸何时生效」能被读出来
-        return all(state.get(key) for key in self.requires_state)
+        # 声明了前置 state 字段的 guard，字段为空时整条跳过——省掉每个 check 开头
+        # 重复一遍 `if not state.<字段>`，也让「这条闸何时生效」能被读出来
+        return all(getattr(state, key) for key in self.requires_state)
 
 
 # ── 通用小工具 ────────────────────────────────────────────────────────────────
@@ -153,7 +157,7 @@ def _blocked(tool_name: str, **payload: Any) -> dict[str, Any]:
 def _check_credential_values_in_flow(
     tool_name: str,
     args: dict[str, Any],
-    state: dict[str, Any],
+    state: GuardState,
 ) -> dict[str, Any] | None:
     del state
     exposed = exposed_credential_values(args.get("input_variables"))
@@ -175,10 +179,10 @@ def _check_credential_values_in_flow(
 def _check_acceptance_contract_change(
     tool_name: str,
     args: dict[str, Any],
-    state: dict[str, Any],
+    state: GuardState,
 ) -> dict[str, Any] | None:
     quote = str(args.get("requirement_change_quote") or "").strip()
-    latest = str(state.get("latest_user_message") or "")
+    latest = str(state.latest_user_message or "")
     if quote and quote in latest:
         return None
     return _blocked(
@@ -194,14 +198,14 @@ def _check_acceptance_contract_change(
 def _check_acceptance_contract_sources(
     tool_name: str,
     args: dict[str, Any],
-    state: dict[str, Any],
+    state: GuardState,
 ) -> dict[str, Any] | None:
     contract = args.get("acceptance_contract")
     if contract is None:
         return None
     requirements = contract.get("requirements") if isinstance(contract, dict) else None
     user_text = " ".join(str(
-        state.get("user_requirement_text") or state.get("latest_user_message") or ""
+        state.user_requirement_text or state.latest_user_message or ""
     ).split())
     violations: list[str] = []
     if not isinstance(requirements, list) or not requirements:
@@ -239,7 +243,7 @@ def _check_acceptance_contract_sources(
 # ── 各条 guard 的判定 ─────────────────────────────────────────────────────────
 
 
-def _check_read_only_mode(tool_name: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
+def _check_read_only_mode(tool_name: str, args: dict[str, Any], state: GuardState) -> dict[str, Any] | None:
     return _blocked(
         tool_name,
         required_action="diagnose_only",
@@ -252,7 +256,7 @@ def _check_read_only_mode(tool_name: str, args: dict[str, Any], state: dict[str,
     )
 
 
-def _check_model_no_vision(tool_name: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
+def _check_model_no_vision(tool_name: str, args: dict[str, Any], state: GuardState) -> dict[str, Any] | None:
     return _blocked(
         tool_name,
         required_tool="inspect_page",
@@ -266,9 +270,9 @@ def _check_model_no_vision(tool_name: str, args: dict[str, Any], state: dict[str
 def _check_static_page_evidence_channel(
     tool_name: str,
     args: dict[str, Any],
-    state: dict[str, Any],
+    state: GuardState,
 ) -> dict[str, Any] | None:
-    if state.get("page_evidence_source") != "scrapling_static":
+    if state.page_evidence_source != "scrapling_static":
         return None
     raw_nodes = [*(args.get("nodes") or []), *(args.get("add_nodes") or [])]
     raw_nodes.extend(
@@ -331,8 +335,8 @@ def _check_static_page_evidence_channel(
     return None
 
 
-def _check_challenge_page_lock(tool_name: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
-    locked = state["challenge_page_lock"]
+def _check_challenge_page_lock(tool_name: str, args: dict[str, Any], state: GuardState) -> dict[str, Any] | None:
+    locked = state.challenge_page_lock or {}
     locked_url = str(locked.get("url") or "")
     # 探测类工具只挡同一个 URL：拦截页是这个站点这一刻的状态，不是模型的能力问题，
     # 换个地址去看仍然是正当动作，一律挡掉等于没收了它唯一还能用的眼睛。
@@ -353,8 +357,8 @@ def _check_challenge_page_lock(tool_name: str, args: dict[str, Any], state: dict
     )
 
 
-def _check_failure_budget_lock(tool_name: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
-    locked = state["failure_budget_lock"]
+def _check_failure_budget_lock(tool_name: str, args: dict[str, Any], state: GuardState) -> dict[str, Any] | None:
+    locked = state.failure_budget_lock
     return _blocked(
         tool_name,
         required_action="diagnose_before_structural_update",
@@ -466,7 +470,7 @@ GUARDS: tuple[Guard, ...] = (
 def apply_pre_tool_guards(
     tool_name: str,
     args: dict[str, Any],
-    state: dict[str, Any],
+    state: GuardState,
 ) -> dict[str, Any] | None:
     """按策略表顺序求值；第一条命中的 guard 即拦截结果，返回 None 表示放行。"""
     for guard in GUARDS:

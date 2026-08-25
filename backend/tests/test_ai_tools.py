@@ -47,13 +47,14 @@ from app.services.ai_tools.script_capabilities import (
     semantic_rewrite_node_types,
 )
 from app.services.ai_tools.normalize import _normalize_generated_edges, _normalize_generated_nodes
+from app.services.ai_guard_state import GuardState
 from app.services.ai_phases import initial_facts
 
 
-def _ready_state(**overrides: Any) -> dict[str, Any]:
+def _ready_state(**overrides: Any) -> GuardState:
     """一个可以直接跑流程的会话：流程已存在、证据到手、诊断干净、用户授权。
 
-    阶段机的事实全部 fail-closed，空 dict 会被判成「流程还不存在」，
+    阶段机的事实全部 fail-closed，空 GuardState 会被判成「流程还不存在」，
     断言到的就不是这次改动而是缺省值。
     """
     state = initial_facts(
@@ -62,7 +63,8 @@ def _ready_state(**overrides: Any) -> dict[str, Any]:
         page_evidence_done=True,
         run_authorized=True,
     )
-    state.update(overrides)
+    for key, value in overrides.items():
+        setattr(state, key, value)
     return state
 
 
@@ -1375,7 +1377,7 @@ def test_repeated_navigation_failures_end_in_asking_the_user_for_the_target_url(
 
     _orchestrator_guard_after_tool("run_flow", failure, state)
     _orchestrator_guard_after_tool("get_run_error", result, state)
-    assert state["navigation_failure_hint"]["node_id"] == "nav_menu"
+    assert state.navigation_failure_hint["node_id"] == "nav_menu"
     assert _orchestrator_guard_before_tool("run_flow", {}, state) is not None  # requires inspect_page first
     _orchestrator_guard_after_tool("inspect_page", {"url": "https://example.com/#/index"}, state)
     assert _orchestrator_guard_before_tool("run_flow", {}, state) is None
@@ -1408,7 +1410,7 @@ def test_runtime_escape_finding_survives_a_clean_static_scan() -> None:
 
     # 状态块这一轮报「静态检查通过」，逃逸项仍然要挡住运行
     clean = FlowState(flow_id="f1", findings=[])
-    state["blocking_diagnostics"] = _blocking_diagnostics(clean, state)
+    state.blocking_diagnostics = _blocking_diagnostics(clean, state)
     blocked = _orchestrator_guard_before_tool("run_flow", {}, state)
     assert blocked is not None
     assert blocked["required_action"] == "fix_blocking_diagnostics_first"
@@ -1419,7 +1421,7 @@ def test_runtime_escape_finding_survives_a_clean_static_scan() -> None:
 
     # 真实的结构性修复才允许解锁
     _orchestrator_guard_after_tool("update_flow", {"status": "updated"}, state)
-    state["blocking_diagnostics"] = _blocking_diagnostics(clean, state)
+    state.blocking_diagnostics = _blocking_diagnostics(clean, state)
     assert _orchestrator_guard_before_tool("run_flow", {}, state) is None
 
 
@@ -1913,7 +1915,7 @@ def test_annotate_login_redirect_ignores_intentional_login_page_inspect() -> Non
 
 def test_login_redirected_inspect_does_not_unlock_selector_circuit_breaker() -> None:
     """落到登录页的检查看到的是登录表单，不构成目标页证据。"""
-    state: dict = {}
+    state = GuardState()
 
     _orchestrator_guard_after_tool(
         "inspect_page",
@@ -1921,7 +1923,7 @@ def test_login_redirected_inspect_does_not_unlock_selector_circuit_breaker() -> 
         state,
     )
 
-    assert not state.get("fresh_page_evidence")
+    assert not state.fresh_page_evidence
 
 
 def test_lint_flags_extract_selector_built_as_a_class_union() -> None:
@@ -2101,7 +2103,7 @@ def test_claiming_the_flow_was_created_without_a_single_write_is_withdrawn():
     这是用户报障的原样——回复自信、画布空的，而假话本身不带任何错误码，
     只有「宣称落盘」对上「一个节点都没有」才判得出来。
     """
-    state: dict = {}
+    state = GuardState()
     correction = _overstated_result_claim(
         "流程已创建（无登录节点，直接抓取表格）。请在「输入变量」面板中查看默认输出路径，并运行流程以确认结果。",
         state,
@@ -2122,14 +2124,14 @@ def test_pasting_a_flow_definition_with_a_revision_is_not_a_write():
     correction = _overstated_result_claim(
         '```json\n{"flow_id":"example-list-to-excel","revision":1,'
         '"acceptance_contract":{"requirements":[]}}\n```',
-        {},
+        GuardState(),
     )
     assert correction is not None
     assert "不是交付物" in correction
 
 
 def test_created_claim_is_allowed_once_the_write_landed():
-    state: dict = {}
+    state = GuardState()
     _orchestrator_guard_after_tool(
         "create_flow", {"status": "created", "flow_id": "f1", "revision": 1}, state
     )
@@ -2142,19 +2144,19 @@ def test_a_follow_up_turn_may_refer_to_last_turns_write():
     current_flow_revision 每次请求从零开始：续跑一轮说「流程已更新」指的是上一轮那次写入，
     只看它就会把一句真话撤回，模型接着自我否认，用户更懵。
     """
-    state: dict = {"flow_has_nodes": True}
+    state = GuardState(flow_has_nodes=True)
     assert _overstated_result_claim("流程已更新，等你确认后再跑一次。", state) is None
 
 
 def test_saying_the_flow_is_not_saved_yet_passes():
     """出路必须真的走得通：据实说没保存、缺什么，不该也被撤回。"""
     assert _overstated_result_claim(
-        "流程尚未保存：我还需要目标列表页的 URL 才能按真实 DOM 建节点，请提供后我再创建。", {}
+        "流程尚未保存：我还需要目标列表页的 URL 才能按真实 DOM 建节点，请提供后我再创建。", GuardState()
     ) is None
 
 
 def test_static_checks_alone_cannot_be_called_acceptance():
-    state: dict = {}
+    state = GuardState()
     correction = _overstated_result_claim("审查结果：验收通过，lint_flow 与 validate_flow 均无问题。", state)
     assert correction is not None
     assert "acceptance_audit.passed=true" in correction
@@ -2164,7 +2166,7 @@ def test_static_checks_alone_cannot_be_called_acceptance():
 
 
 def test_acceptance_claim_is_allowed_after_a_passing_audit():
-    state: dict = {}
+    state = GuardState()
     _orchestrator_guard_after_tool(
         "run_flow", {"status": "success", "acceptance_audit": {"passed": True, "issues": []}}, state
     )
@@ -2172,11 +2174,11 @@ def test_acceptance_claim_is_allowed_after_a_passing_audit():
 
 
 def test_ordinary_completion_wording_is_not_treated_as_an_acceptance_claim():
-    assert _overstated_result_claim("lint_flow：通过，无 error。已修改节点 n14。", {"run_succeeded": True}) is None
+    assert _overstated_result_claim("lint_flow：通过，无 error。已修改节点 n14。", GuardState(run_succeeded=True)) is None
 
 
 def test_fix_claim_needs_a_successful_run_after_the_change():
-    state: dict = {}
+    state = GuardState()
     _orchestrator_guard_after_tool("apply_node_fix", {"status": "applied"}, state)
     correction = _overstated_result_claim("已修复 n14 的拆分逻辑。", state)
     assert correction is not None
@@ -2184,22 +2186,22 @@ def test_fix_claim_needs_a_successful_run_after_the_change():
 
 
 def test_stating_only_what_was_changed_passes_while_unverified():
-    state: dict = {}
+    state = GuardState()
     _orchestrator_guard_after_tool("apply_node_fix", {"status": "applied"}, state)
     assert _overstated_result_claim("已按你的要求把 selector 改成 .stats-card，尚未运行验证。", state) is None
 
 
 def test_editing_the_flow_invalidates_the_earlier_run_and_audit():
-    state: dict = {}
+    state = GuardState()
     _orchestrator_guard_after_tool("run_flow", {"status": "success"}, state)
     _orchestrator_guard_after_tool(
         "run_flow", {"status": "success", "acceptance_audit": {"passed": True, "issues": []}}, state
     )
     assert _overstated_result_claim("验收通过。", state) is None
 
-    state["result_claim_corrected"] = False
+    state.result_claim_corrected = False
     _orchestrator_guard_after_tool("update_flow", {"status": "applied"}, state)
-    assert state["run_succeeded"] is False and state["audit_passed"] is False
+    assert state.run_succeeded is False and state.audit_passed is False
     assert _overstated_result_claim("验收通过。", state) is not None
 
 
@@ -2222,7 +2224,7 @@ def test_requirement_text_never_goes_empty():
 
 
 def test_acceptance_request_without_a_single_run_is_pushed_back():
-    state = {"latest_user_message": "流程审查验收"}
+    state = GuardState(latest_user_message="流程审查验收")
     correction = _unmet_verification_request("静态检查通过；未做运行验证，实际输出未经确认。", state)
     assert correction is not None
     assert "run_flow" in correction
@@ -2231,23 +2233,23 @@ def test_acceptance_request_without_a_single_run_is_pushed_back():
 
 
 def test_no_nudge_once_the_flow_was_actually_run():
-    state: dict = {"latest_user_message": "验收一下"}
+    state = GuardState(latest_user_message="验收一下")
     _orchestrator_guard_after_tool("run_flow", {"status": "timeout"}, state)
     assert _unmet_verification_request("流程已暂停等待您操作。", state) is None
 
 
 def test_review_request_alone_does_not_demand_a_run():
-    state = {"latest_user_message": "帮我审查一下这个流程的结构"}
+    state = GuardState(latest_user_message="帮我审查一下这个流程的结构")
     assert _unmet_verification_request("静态检查通过；未做运行验证。", state) is None
 
 
 def test_user_saying_not_to_run_is_respected():
-    state = {"latest_user_message": "验收一下，但不要运行流程"}
+    state = GuardState(latest_user_message="验收一下，但不要运行流程")
     assert _unmet_verification_request("静态检查通过；未做运行验证。", state) is None
 
 
 def test_a_named_blocker_counts_as_an_answer():
-    state = {"latest_user_message": "验收"}
+    state = GuardState(latest_user_message="验收")
     text = "无法自动验收：流程含 control.human_takeover 节点，无法无人值守跑完，请手动运行一次。"
     assert _unmet_verification_request(text, state) is None
 
@@ -3417,7 +3419,7 @@ def test_one_extract_nodes_own_two_variables_are_not_compared_with_each_other() 
 
 def test_describing_a_cleanup_as_done_needs_run_evidence():
     """清洗类需求的失败是静默的，用户只能从这段回复判断做没做成。"""
-    state: dict = {}
+    state = GuardState()
     _orchestrator_guard_after_tool(
         "update_flow",
         {"status": "applied", "changed_nodes": [
@@ -3440,7 +3442,7 @@ def test_describing_a_cleanup_as_done_needs_run_evidence():
 
 def test_the_same_wording_is_fine_when_no_transform_node_was_touched():
     """只改了 selector 却说「去掉了…」说的是流程不是数据，别把正常表述也撤回。"""
-    state: dict = {}
+    state = GuardState()
     _orchestrator_guard_after_tool(
         "update_flow",
         {"status": "applied", "changed_nodes": [
@@ -3453,7 +3455,7 @@ def test_the_same_wording_is_fine_when_no_transform_node_was_touched():
 
 
 def test_cleanup_wording_is_allowed_once_the_audit_has_passed():
-    state: dict = {}
+    state = GuardState()
     _orchestrator_guard_after_tool(
         "update_flow",
         {"status": "applied", "changed_nodes": [{"id": "n6", "type": "script.python"}]},

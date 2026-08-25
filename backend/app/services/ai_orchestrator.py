@@ -9,11 +9,21 @@ import re
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
-from typing import Any, NamedTuple
+from typing import Any
 
 from app.services import ai_repair_ledger as _repair_ledger
 from app.services import ai_session_checkpoint as _session_checkpoint
 from app.services.ai_config_service import AiConfigService
+from app.services.ai_relay_errors import clean_litellm_error, is_vision_error
+from app.services.ai_guard_state import GuardState
+from app.services.ai_model_caps import _model_caps
+from app.services.ai_context_window import (
+    _compact_tool_messages,
+    _context_char_budget,
+    _elide_repeated_result,
+    _expand_history_tool_calls,
+    _mark_history_cache_anchor,
+)
 from app.services.ai_guards import (
     PARALLEL_SAFE_TOOLS as _PARALLEL_SAFE_TOOLS,
     WRITE_TOOLS,
@@ -23,7 +33,6 @@ from app.services.ai_phases import (
     Phase,
     admitted_tool_names,
     apply_phase_gate,
-    initial_facts,
     note_evidence,
     note_failed_attempt,
     note_guard_block,
@@ -56,163 +65,12 @@ FIRST_TOKEN_TIMEOUT = 60       # 等待首个 chunk 超时（秒）
 STALL_TIMEOUT = 60             # 相邻 chunk 间隔超时（秒）
 
 
-_VISION_ERROR_HINTS = (
-    "does not support image",
-    "not support vision",
-    "vision is not supported",
-    "image input is not supported",
-    "multimodal",
-    "image_url",
-    "images are not",
-    "does not support images",
-    "doesn't support image",
-    "unsupported content type",
-    "Invalid content type",
-    "image content",
-)
-
-_BALANCE_ERROR_HINTS = (
-    "insufficient balance",
-    "insufficient_balance",
-    "insufficient quota",
-    "insufficientquota",
-    "credit balance is too low",
-    "you exceeded your current quota",
-    "exceeded your current quota",
-    "account balance",
-    "billing",
-    "payment required",
-    "402",
-    "余额不足",
-    "账户余额",
-    "balance is insufficient",
-    "no balance",
-    "out of credits",
-    "out of quota",
-    "low balance",
-)
-
-_AUTH_ERROR_HINTS = (
-    "invalid api key",
-    "invalid_api_key",
-    "incorrect api key",
-    "api key is invalid",
-    "api key not found",
-    "unauthorized",
-    "authentication failed",
-    "invalid authentication",
-    "invalid credentials",
-)
-
-
-def _is_vision_error(msg: str) -> bool:
-    lower = msg.lower()
-    return any(hint in lower for hint in _VISION_ERROR_HINTS)
-
-
-def _is_balance_error(msg: str) -> bool:
-    lower = msg.lower()
-    return any(hint in lower for hint in _BALANCE_ERROR_HINTS)
-
-
-# 中转拒绝的是「调用方这个客户端」而不是凭据（agentrouter 回 unauthorized client detected）。
-# 这类文案里带 unauthorized，会被 _AUTH_ERROR_HINTS 的裸子串吃掉，于是同一把好密钥、
-# 连中转确实上架的模型也照样被判成「API Key 无效」。所以要先于鉴权判，并把上游原话留给用户。
-_CLIENT_REJECTED_HINTS = (
-    "unauthorized client",
-    "unauthorized_client",
-    "client not allowed",
-    "forbidden client",
-)
-
-
-def _is_client_rejection(msg: str) -> bool:
-    lower = msg.lower()
-    return any(hint in lower for hint in _CLIENT_REJECTED_HINTS)
-
-
-def _is_auth_error(msg: str) -> bool:
-    # 客户端被拒不算凭据失效：落进鉴权分支会让用户去重填一把本来就好的密钥
-    if _is_client_rejection(msg):
-        return False
-    lower = msg.lower()
-    return any(hint in lower for hint in _AUTH_ERROR_HINTS)
-
-
-_LITELLM_PREFIXES = (
-    "litellm.MidStreamFallbackError: ",
-    "litellm.APIConnectionError: ",
-    "litellm.InternalServerError: ",
-    "litellm.APIError: APIError: ",
-    "litellm.AuthenticationError: ",
-    "litellm.BadRequestError: ",
-    "litellm.RateLimitError: ",
-    "litellm.ServiceUnavailableError: ",
-    "litellm.Timeout: ",
-    "litellm.ContextWindowExceededError: ",
-)
-
-
-def _clean_litellm_error(msg: str) -> str:
-    """剥离 LiteLLM 异常前缀，提取可读错误信息。"""
-    import re
-
-    # 部分服务商把余额错误包装成 AuthenticationError，需在剥离前先按异常类型判断
-    is_balance_by_type = "AuthenticationError" in msg and (
-        "402" in msg or "balance" in msg.lower() or "quota" in msg.lower() or "credit" in msg.lower()
-    )
-
-    changed = True
-    while changed:
-        changed = False
-        for prefix in _LITELLM_PREFIXES:
-            if msg.startswith(prefix):
-                msg = msg[len(prefix):]
-                changed = True
-                break
-
-    original_idx = msg.find(" Original exception:")
-    if original_idx != -1:
-        msg = msg[:original_idx].strip()
-
-    # 多层异常类前缀需循环剥离（如 APIConnectionError: OpenAIException - ...）
-    changed = True
-    while changed:
-        new_msg = re.sub(r'^[A-Za-z]+(?:Exception|Error)\s*[-:]\s*', '', msg)
-        changed = new_msg != msg
-        msg = new_msg
-
-    # 兼容双引号 JSON 和 Python dict repr（单引号）两种错误体格式
-    m = re.search(r'["\']message["\']\s*:\s*["\']([^"\']+)["\']', msg)
-    if m:
-        msg = m.group(1)
-
-    if _is_vision_error(msg):
-        return "当前模型不支持图片输入，请切换到支持视觉的模型（如 Claude、GPT-4、Gemini）后重试。"
-
-    if _is_balance_error(msg) or is_balance_by_type:
-        return "模型账户余额不足，请前往服务商平台充值后重试。"
-
-    if _is_client_rejection(msg):
-        # 上游原话里通常带着申诉入口（支持群/工单地址），换成我们自己的措辞等于把出路删掉
-        return f"中转拒绝了本客户端（不是密钥问题，同一把密钥换模型同样被拒）：{msg[:200]}"
-
-    if _is_auth_error(msg):
-        return "API Key 无效或已过期，请在设置页重新配置正确的 API Key。"
-
-    lower = msg.lower()
-    if "concurrency limit" in lower or "too many requests" in lower or "rate limit" in lower:
-        return "请求并发或频率超限，请稍后重试。"
-
-    return msg[:300] if len(msg) > 300 else msg
-
-
 MAX_TOOL_ROUNDS = 30  # strong 模型的轮次上限；weak/standard 模型用下方 tier 分级覆盖更小的值
 
 # 场景化 guidance，按事件注入，避免每轮携带全量指令
 
 
-def _after_write_directive(result: dict[str, Any], state: dict[str, Any]) -> str:
+def _after_write_directive(result: dict[str, Any], state: GuardState) -> str:
     """写入成功后的下一步，由结果与本轮授权推导，不靠模型记忆一串固定顺序。
 
     这里不再复述静态诊断。写入完成后下一轮的状态块就是按新 revision 重算的，
@@ -228,7 +86,7 @@ def _after_write_directive(result: dict[str, Any], state: dict[str, Any]) -> str
             f"{head}但检测到连通性问题：{result.get('connectivity_warning')}\n"
             "先补连线，再谈运行。"
         )
-    if not state.get("run_authorized"):
+    if not state.run_authorized:
         return (
             f"{head}本轮用户只要求修复、没有要求运行：向用户说明改了什么、为什么，"
             "并问是否要运行验证。不要调用 run_flow。"
@@ -275,6 +133,19 @@ _TERMINAL_TOOL_STATUSES = frozenset({
     "blocked_challenge_page",
     "blocked_browser_profile_busy",
 })
+
+
+def _is_terminal_result(result: dict[str, Any]) -> bool:
+    """本轮到此为止、需要用户参与：编排层判定继续调工具不会推进任务。
+
+    两处 after-tool 通道（引导注入与 state 回写）隔十几行先后跑同一判断，收成一处
+    具名谓词，免得将来往名单里加词时只改一处、两条通道就此分叉。
+    """
+    return (
+        result.get("required_action") in _TERMINAL_GUARD_ACTIONS
+        or result.get("status") in _TERMINAL_TOOL_STATUSES
+    )
+
 
 _GUIDANCE_AFTER_TERMINAL_BLOCK = (
     "本轮到此结束：编排层判定继续调用工具不会推进任务，需要用户参与。\n"
@@ -785,327 +656,6 @@ async def _resolve_relay_model(model: str, base_url: str, api_key: str) -> str:
     return f"openai/{sorted(chat_models, reverse=True)[0]}"
 
 
-# 多轮工具循环里 inspect_page / get_run_output 等结果动辄上万字符，旧结果对后续决策
-# 只剩摘要价值。每轮请求前压缩「除最近 N 条外」的大体积 tool 消息，避免长会话
-# 撑爆上下文窗口或拖慢每轮请求。
-_KEEP_FULL_TOOL_RESULTS = 2          # 最近 N 条 tool 消息保留完整内容
-_TOOL_COMPACT_THRESHOLD = 3_000      # 超过该字符数的旧 tool 消息才压缩
-_COMPACTED_MARK = '"_compacted": true'
-
-_DEFAULT_CONTEXT_WINDOW = 200_000
-_CHARS_PER_TOKEN = 1.5               # 中英混排保守估计：纯 ASCII 约 4，CJK 约 1
-_CONTEXT_USABLE_RATIO = 0.7          # 余量留给本轮输出与静态前缀
-_MAX_CONTEXT_CHARS = 400_000         # 大窗口模型的实用上限：百万窗口塞满纯属烧钱
-
-
-class _ModelCaps(NamedTuple):
-    tier: str
-    context_window: int
-    supports_vision: bool
-    supports_cache_control: bool
-
-
-def _model_caps(model_id: str) -> _ModelCaps:
-    """模型能力差异的唯一查询入口。
-
-    分级、上下文窗口、视觉、提示词缓存原先各扫一遍目录、各写一套兜底，加一个模型
-    要记得改四处；漏掉任一处的表现都是静默降级——图片被丢、缓存不生效、按错误的
-    窗口裁剪历史——而不是报错。
-    """
-    from app.services.ai_config_service import AI_MODEL_CATALOG
-    entry = next((e for e in AI_MODEL_CATALOG if e.get("id") == model_id), None)
-    if entry is None:
-        return _ModelCaps(
-            tier="standard",
-            context_window=_DEFAULT_CONTEXT_WINDOW,
-            # 未知模型（自定义/中转透传）视觉乐观放行，被拒时靠 mid-stream fallback 兜底
-            supports_vision=True,
-            supports_cache_control=model_id.startswith(("claude-", "anthropic/")),
-        )
-    return _ModelCaps(
-        tier=str(entry.get("tier") or "standard"),
-        context_window=int(entry.get("context_window") or 0) or _DEFAULT_CONTEXT_WINDOW,
-        supports_vision=not bool(entry.get("no_vision")),
-        supports_cache_control=entry.get("provider") == "anthropic",
-    )
-
-
-def _context_char_budget(model: str) -> int:
-    """按模型上下文窗口推算字符预算。
-
-    原先对所有模型写死 40 万字符。对 Claude 那种百万窗口是合理上限，但目录里还有
-    131k 窗口的 qwen、200k 的 glm——静态前缀就占掉 6 万字符，
-    40 万的阈值对它们等于毫无保护，超窗只会以 API 报错收场。
-    """
-    derived = _model_caps(model).context_window * _CONTEXT_USABLE_RATIO * _CHARS_PER_TOKEN
-    return int(min(derived, _MAX_CONTEXT_CHARS))
-
-
-def _summarize_tool_json(content: str) -> str:
-    """压缩大体积工具结果 JSON：保留标量，列表/字典折叠为数量。"""
-    try:
-        data = json.loads(content)
-    except (json.JSONDecodeError, TypeError):
-        return content[:800] + f"…（已截断，原始 {len(content)} 字符）"
-    if not isinstance(data, dict):
-        return content[:800] + f"…（已截断，原始 {len(content)} 字符）"
-
-    summary: dict[str, Any] = {"_compacted": True}
-    for key, value in data.items():
-        if isinstance(value, (str, int, float, bool)) or value is None:
-            summary[key] = value if not isinstance(value, str) or len(value) <= 300 else value[:300] + "…"
-        elif isinstance(value, list):
-            summary[key] = f"<list[{len(value)}] 已压缩>"
-        elif isinstance(value, dict):
-            summary[key] = f"<dict[{len(value)}键] 已压缩>"
-    summary["_note"] = "此为历史工具结果摘要；如需完整数据请重新调用该工具。"
-    return json.dumps(summary, ensure_ascii=False)
-
-
-_INTERRUPTED_TOOL_RESULT = '{"status": "interrupted", "note": "该工具调用被用户中止，结果未知"}'
-
-
-def _expand_history_tool_calls(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """把前端历史里的 toolCalls 还原成 assistant.tool_calls + tool 消息对。
-
-    前端只发 role/content 时，纯工具回合会退化成 content 为空的 assistant 消息：
-    模型看不到自己上一轮跑过什么工具，且空 content 消息被部分厂商判为非法输入。
-    还原成原生形态后，历史工具结果也一并落进 _compact_tool_messages 的压缩预算。
-    """
-    expanded: list[dict[str, Any]] = []
-    for msg in messages:
-        if msg.get("role") != "assistant":
-            expanded.append(msg)
-            continue
-
-        content = msg.get("content")
-        raw_calls = msg.get("toolCalls") or msg.get("tool_calls") or []
-        calls: list[dict[str, Any]] = []
-        results: list[dict[str, Any]] = []
-        for idx, call in enumerate(raw_calls):
-            if not isinstance(call, dict) or not call.get("tool"):
-                continue
-            # id 只需在本次请求内唯一；前端的 nanoid 可能因重放历史而重复
-            call_id = f"hist_{len(expanded)}_{idx}"
-            calls.append({
-                "id": call_id,
-                "type": "function",
-                "function": {"name": str(call["tool"]), "arguments": str(call.get("args") or "{}")},
-            })
-            result = call.get("result")
-            results.append({
-                "role": "tool",
-                "tool_call_id": call_id,
-                "name": str(call["tool"]),
-                "content": json.dumps(result, ensure_ascii=False) if result is not None else _INTERRUPTED_TOOL_RESULT,
-            })
-
-        if calls:
-            expanded.append({"role": "assistant", "content": content or None, "tool_calls": calls})
-            expanded.extend(results)
-        elif content:
-            expanded.append({"role": "assistant", "content": content})
-    return expanded
-
-
-_OLD_SCREENSHOT_PLACEHOLDER = "[历史截图已移除以控制上下文，如需查看请重新调用 inspect_screenshot]"
-
-
-_DROPPED_HISTORY_MARK = "[上下文超限，已丢弃最早的"
-
-_KEPT_CONSTRAINT_MARK = "【用户此前提出的硬性要求】"
-
-# 用户的约束通常只说一次，且几乎总在会话最早那几轮——正好是超预算时最先被丢掉的部分。
-# 整轮丢弃后模型会重新按自己的默认做法来，用户只能再说一遍，且往往察觉不到是上下文丢了。
-_CONSTRAINT_MARKERS = (
-    "必须", "一定要", "务必", "不要", "不能", "别再", "禁止", "只能", "只用", "记住",
-    "注意", "始终", "每次", "千万", "不许", "不可以", "改成", "改为", "换成",
-)
-_MAX_KEPT_CONSTRAINTS = 8
-_MAX_CONSTRAINT_CHARS = 120
-_SENTENCE_SPLIT_RE = re.compile(r"[。！\n；;]+")
-
-
-def _extract_user_constraints(text: str) -> list[str]:
-    """从用户原话里摘出带约束语气的句子。
-
-    只取**原句**不做改写：改写过的约束就是模型自己的话，没有任何东西能校验它，
-    而这一层的全部价值恰恰在于它来自用户而非模型。
-    """
-    found: list[str] = []
-    for raw in _SENTENCE_SPLIT_RE.split(text or ""):
-        s = raw.strip()
-        if not s or len(s) > _MAX_CONSTRAINT_CHARS:
-            continue
-        if any(marker in s for marker in _CONSTRAINT_MARKERS):
-            found.append(s)
-    return found
-
-
-def _total_content_chars(messages: list[dict[str, Any]]) -> int:
-    return sum(len(str(m.get("content") or "")) for m in messages)
-
-
-def _drop_oldest_turns(messages: list[dict[str, Any]], protect_prefix: int, budget: int) -> int:
-    """丢弃最老的完整对话轮次，返回丢弃条数。
-
-    压缩是单调的——所有 tool 消息都压过一遍后就再也缩不动了，此时若仍超预算，
-    唯一的出路是整轮丢弃，否则下一轮直接撞模型窗口报错。
-    """
-    prefix_chars = _total_content_chars(messages[:protect_prefix])
-    if prefix_chars > budget:
-        # 丢历史救不了：提示词本身就超预算。给出可行动的诊断，而不是把历史清空了事
-        logger.warning(
-            "静态前缀 %s 字符已超出预算 %s，该模型窗口对当前提示词过小", prefix_chars, budget
-        )
-
-    dropped = 0
-    kept_constraints: list[str] = []
-    while _total_content_chars(messages) > budget:
-        # 只在 user 消息处切：保证不会留下没有 assistant.tool_calls 配对的 tool 消息，
-        # 也保证最后一轮（没有后继 user）永远留着
-        cut = next(
-            (i for i in range(protect_prefix + 1, len(messages)) if messages[i].get("role") == "user"),
-            None,
-        )
-        if cut is None:
-            break
-        # 丢之前先把要求捞出来：这一段里可能有上一次丢弃时留下的摘要，它同样会被删掉
-        for doomed in messages[protect_prefix:cut]:
-            content = str(doomed.get("content") or "")
-            if doomed.get("role") == "user":
-                kept_constraints.extend(_extract_user_constraints(content))
-            elif content.startswith(_KEPT_CONSTRAINT_MARK):
-                kept_constraints.extend(
-                    line.lstrip("- ").strip() for line in content.splitlines()[1:] if line.strip()
-                )
-        del messages[protect_prefix:cut]
-        dropped += cut - protect_prefix
-
-    if kept_constraints:
-        deduped = list(dict.fromkeys(kept_constraints))[-_MAX_KEPT_CONSTRAINTS:]
-        messages.insert(protect_prefix, {
-            "role": "system",
-            "content": (
-                f"{_KEPT_CONSTRAINT_MARK}以下是用户在已丢弃的早期对话里的原话，"
-                "现在依然有效，不要因为看不到上文就退回默认做法：\n"
-                + "\n".join(f"- {c}" for c in deduped)
-            ),
-        })
-
-    if dropped:
-        note = {
-            "role": "system",
-            "content": f"{_DROPPED_HISTORY_MARK} {dropped} 条历史消息；如需早期细节请重新调用对应工具]",
-        }
-        # 同一次会话可能反复触发，替换旧提示而不是层层叠加
-        if protect_prefix < len(messages) and str(
-            messages[protect_prefix].get("content") or ""
-        ).startswith(_DROPPED_HISTORY_MARK):
-            messages[protect_prefix] = note
-        else:
-            messages.insert(protect_prefix, note)
-        logger.warning("上下文超预算 %s 字符，已丢弃最早 %s 条历史消息", budget, dropped)
-    return dropped
-
-
-def _compact_tool_messages(
-    messages: list[dict[str, Any]], budget: int = _DEFAULT_CONTEXT_WINDOW, protect_prefix: int = 0
-) -> None:
-    """原地压缩较旧的超大 tool 消息，最近几条保留完整内容；压不动仍超预算则整轮丢弃。"""
-    tool_indices = [
-        i for i, m in enumerate(messages)
-        if m.get("role") == "tool" and isinstance(m.get("content"), str)
-    ]
-    if tool_indices:
-        total_chars = _total_content_chars(messages)
-        keep_full = 1 if total_chars > budget else _KEEP_FULL_TOOL_RESULTS
-        for i in tool_indices[:-keep_full] if keep_full else tool_indices:
-            content = messages[i]["content"]
-            if len(content) > _TOOL_COMPACT_THRESHOLD and _COMPACTED_MARK not in content:
-                messages[i]["content"] = _summarize_tool_json(content)
-
-    # 截图 vision 消息单张就有几十万字符 base64，且永不因上文压缩而缩小；
-    # 只保留最新一张，更早的替换为文本占位，防止多截图会话上下文只增不减。
-    image_indices = [
-        i for i, m in enumerate(messages)
-        if isinstance(m.get("content"), list)
-        and any(isinstance(p, dict) and p.get("type") == "image_url" for p in m["content"])
-    ]
-    for i in image_indices[:-1]:
-        texts = [
-            str(p.get("text") or "")
-            for p in messages[i]["content"]
-            if isinstance(p, dict) and p.get("type") == "text"
-        ]
-        messages[i]["content"] = ("\n".join(t for t in texts if t) or "") + "\n" + _OLD_SCREENSHOT_PLACEHOLDER
-
-    _drop_oldest_turns(messages, protect_prefix, budget)
-
-
-_ELIDE_MIN_CHARS = 2_000  # 小结果重发比指回去更省，指针本身也要占字符
-
-
-def _elide_repeated_result(
-    tool_name: str, arguments: str, result: Any, seen: dict[tuple[str, str], str]
-) -> str:
-    """同参数同结果的工具调用只送一次全文，之后送一句指回原文的话。
-
-    inspect_page 一次一万七千字符，同一页反复探是常态。这里是「已执行、逐字比对后确认相同」
-    才折叠，不是跳过调用——页面被点击改变过就不会相等，也就不会折叠，不存在读到旧状态的风险。
-    """
-    payload = json.dumps(result, ensure_ascii=False)
-    key = (tool_name, arguments)
-    if seen.get(key) == payload and len(payload) >= _ELIDE_MIN_CHARS:
-        return json.dumps({
-            "_unchanged": True,
-            "message": f"本次 {tool_name} 的返回与上一次同参数调用逐字相同，内容见上文，未重复输出。",
-        }, ensure_ascii=False)
-    seen[key] = payload
-    return payload
-
-
-def _stable_prefix_end(messages: list[dict[str, Any]]) -> int:
-    """返回第一条「后续轮次还可能被改写」的消息下标，其之前的内容逐字不变。
-
-    压缩与截图占位都是一次性的（`_COMPACTED_MARK` / 内容已不是 image_url 就不再改），
-    所以改写前沿只会前进不会回头；前沿之前是可缓存的稳定前缀。
-    """
-    tool_indices = [
-        i for i, m in enumerate(messages)
-        if m.get("role") == "tool" and isinstance(m.get("content"), str)
-    ]
-    end = tool_indices[-_KEEP_FULL_TOOL_RESULTS] if len(tool_indices) > _KEEP_FULL_TOOL_RESULTS else 0
-    image_indices = [
-        i for i, m in enumerate(messages)
-        if isinstance(m.get("content"), list)
-        and any(isinstance(p, dict) and p.get("type") == "image_url" for p in m["content"])
-    ]
-    if image_indices:
-        # 最新一张截图会在下一张到来时被替换成占位符，不能划进稳定区
-        end = min(end, image_indices[-1])
-    return max(end, 0)
-
-
-def _mark_history_cache_anchor(messages: list[dict[str, Any]], model: str, relayed: bool) -> None:
-    """在稳定前缀的末尾打第三个缓存断点，让历史对话也走缓存读。
-
-    system 与 few-shot 的断点只覆盖静态前缀；真正随轮次膨胀的是工具结果，28 轮能到十万字符，
-    没有断点就每轮原价重发。断点必须打在改写前沿之前，否则一次改写让整段缓存作废。
-    锚点打在 tool 消息上：litellm 只对 role=tool 读取消息顶层的 cache_control。
-    """
-    if relayed or not _model_caps(model).supports_cache_control:
-        return
-    # Anthropic 断点上限 4 个，system/few-shot 已占 2 个，旧锚点必须先撤
-    for message in messages:
-        if message.get("role") == "tool":
-            message.pop("cache_control", None)
-    for index in range(_stable_prefix_end(messages) - 1, -1, -1):
-        if messages[index].get("role") == "tool":
-            messages[index]["cache_control"] = {"type": "ephemeral"}
-            return
-
-
 def _split_partial_tag_suffix(text: str, tag: str) -> tuple[str, str]:
     """若 text 以 tag 的真前缀结尾（如 "<thi"——标签被流式 chunk 边界劈开），
     把该前缀扣下留到拼上下一个 chunk 后再判定，返回 (可安全发出的部分, 扣下的部分)。"""
@@ -1535,7 +1085,7 @@ def _detect_turn_intents(
 
 
 def _tool_schemas_for_round(
-    state: dict[str, Any], intents: _TurnIntents
+    state: GuardState, intents: _TurnIntents
 ) -> list[dict[str, Any]]:
     """只暴露当前阶段与当前能力下能推进任务的工具。
 
@@ -1549,7 +1099,7 @@ def _tool_schemas_for_round(
     拦截仍然保留在 `ai_guards`：只读是调用方给的授权边界，不能只靠"没暴露"来守
     （工具名是模型能凭记忆猜出来的，schema 之外的调用也照样会到达执行器）。
     """
-    if state.get("terminal_response_only") or state.get("closing_statement_only"):
+    if state.terminal_response_only or state.closing_statement_only:
         return []
     if intents.create_requested and not intents.create_url:
         return []
@@ -1569,23 +1119,23 @@ def _tool_schemas_for_round(
     ]
 
 
-def _unavailable_tools(state: dict[str, Any]) -> frozenset[str]:
+def _unavailable_tools(state: GuardState) -> frozenset[str]:
     """本轮从头到尾都用不了的工具，与阶段无关。"""
     unavailable: set[str] = set()
-    if state.get("read_only_tools"):
+    if state.read_only_tools:
         unavailable |= WRITE_TOOLS
-    if state.get("model_no_vision"):
+    if state.model_no_vision:
         unavailable.add("inspect_screenshot")
     return frozenset(unavailable)
 
 
-def _system_prompt_for_round(state: dict[str, Any]) -> str:
+def _system_prompt_for_round(state: GuardState) -> str:
     """页面探测完成前只加载探测契约；DOM 到手后再加载完整构建规则。
 
     只对「从零建流程」这条路生效。修复路径上的取证阶段仍需完整规则：模型看完 DOM
     紧接着就要改节点，换成探测契约等于把构建规则从它手上拿走。
     """
-    if resolve_phase(state) is Phase.DISCOVER and not state.get("flow_has_nodes"):
+    if resolve_phase(state) is Phase.DISCOVER and not state.flow_has_nodes:
         return PAGE_DISCOVERY_PROMPT
     return SYSTEM_PROMPT
 
@@ -1605,18 +1155,15 @@ def _terminal_tool_response(tool_name: str, result: Any) -> str | None:
 
 
 def _after_tool_guidance(
-    tool_name: str, result: Any, state: dict[str, Any] | None = None
+    tool_name: str, result: Any, state: GuardState | None = None
 ) -> tuple[str | None, bool]:
     """返回 (要注入的系统引导, 是否跳过本轮剩余的并行调用)。"""
     if not isinstance(result, dict):
         return None, False
-    state = state or {}
+    state = state or GuardState()
     if result.get("required_action") == "ask_user":
         return _GUIDANCE_AFTER_ASK_USER, True
-    if (
-        result.get("required_action") in _TERMINAL_GUARD_ACTIONS
-        or result.get("status") in _TERMINAL_TOOL_STATUSES
-    ):
+    if _is_terminal_result(result):
         # 拦截本身不产出正文。不明确要求收尾，模型常常直接空轮结束，
         # 用户只看到一个空气泡，既不知道被挡住了也不知道该给什么。
         return _GUIDANCE_AFTER_TERMINAL_BLOCK, True
@@ -1748,52 +1295,43 @@ class AiOrchestrator:
             protect_prefix += 1
 
         evidence_state = load_verification_state(flow_id, flow_state.revision, flow_state.definition_digest)
-        guard_state: dict[str, Any] = {
-            "flow_id": flow_id,
+        guard_state = GuardState(
+            flow_id=flow_id,
+            # 验收台账事实：current_flow_revision / run_verified_revision / accepted_revision
             **evidence_state,
-            "repair_sessions": int(ledger.get("sessions") or 0) + 1,
-            "node_field_history": dict(ledger.get("node_field_history") or {}),
-            "node_selector_fix_counts": dict(ledger.get("node_selector_fix_counts") or {}),
-            # 阶段机读的事实（见 ai_phases.initial_facts）。这里给的是「本轮没有特殊意图」
-            # 时的局面：证据不作要求、运行不设限；下面的意图接线才会收紧。
+            repair_sessions=int(ledger.get("sessions") or 0) + 1,
+            node_field_history=dict(ledger.get("node_field_history") or {}),
+            node_selector_fix_counts=dict(ledger.get("node_selector_fix_counts") or {}),
+            # 阶段机读的事实。这里给的是「本轮没有特殊意图」时的局面：证据不作要求、
+            # 运行不设限（run_authorized=True）；下面的意图接线才会逐项收紧。
             # blocking_diagnostics 每轮由状态块的诊断集重算，见主循环。
-            **initial_facts(
-                flow_has_nodes=not flow_state.is_blank,
-                page_evidence_required=None,
-                page_evidence_done=task_state.phase == "page_inspected",
-                run_authorized=True,
-            ),
-            # 静态扫描漏掉、只有运行期才暴露的阻断项（如未定义变量逃逸）。
-            # 状态块重算不出来，所以单独存，由一次成功的结构性修复清除。
-            "runtime_escape_findings": [],
-            "challenge_page_lock": None,
-            "terminal_response_only": False,
-            # 只收工具、正文交给模型自己写（改动已落盘，只剩「要不要运行」这个决定）
-            "closing_statement_only": False,
+            flow_has_nodes=not flow_state.is_blank,
+            page_evidence_done=task_state.phase == "page_inspected",
+            run_authorized=True,
             # 本轮请求已被判定为「建流程 / 修流程 / 要运行」，即职责范围之内。
             # 拿拒答模板收尾会被撤回重写（见 _misapplied_refusal）。
-            "turn_intent_actionable": bool(
+            turn_intent_actionable=bool(
                 intents.repair or intents.create_requested or intents.run_authorized
             ),
-            "page_evidence_source": task_state.last_inspection_source,
-            "read_only_tools": read_only,     # 自愈诊断模式：阻断所有写入类工具
-            "model_no_vision": not _model_caps(model).supports_vision,  # 阻断 inspect_screenshot
+            page_evidence_source=task_state.last_inspection_source,
+            read_only_tools=read_only,     # 自愈诊断模式：阻断所有写入类工具
+            model_no_vision=not _model_caps(model).supports_vision,  # 阻断 inspect_screenshot
             # full_messages 里混着 few-shot 那轮虚构的 user 消息
-            "user_requirement_text": task_state.requirement_text,
-            "latest_user_message": _latest_user_message(messages),
-            "active_task": {
+            user_requirement_text=task_state.requirement_text,
+            latest_user_message=_latest_user_message(messages),
+            active_task={
                 "target_url": task_state.target_url,
                 "phase": task_state.phase,
                 "last_inspection_status": task_state.last_inspection_status,
                 "last_inspection_source": task_state.last_inspection_source,
             },
-        }
+        )
 
         # 上一轮被中断（用户点停止、断流、关窗）时留下的预算与未了结义务。
         # 放在初始化之后覆盖：默认值是"这轮从零开始"，检查点存在才说明不是。
         checkpoint = _session_checkpoint.load(flow_id)
         if checkpoint:
-            guard_state.update(checkpoint)
+            guard_state.apply_checkpoint(checkpoint)
             resume_note = _session_checkpoint.summarize(checkpoint)
             if resume_note:
                 full_messages.insert(protect_prefix, {"role": "system", "content": resume_note})
@@ -1804,29 +1342,29 @@ class AiOrchestrator:
             # 纯变量或拓扑问题去抓一次页面纯属浪费。运行期报出 selector 失败时
             # （get_run_error 的 inspect_hint）会在 _orchestrator_guard_after_tool 里补置位。
             if any(f.get("issue") in _BROWSER_SELECTOR_ISSUES for f in flow_state.findings):
-                guard_state["page_evidence_required"] = {"reason": "repair_touches_page_elements"}
+                guard_state.page_evidence_required = {"reason": "repair_touches_page_elements"}
                 # 修复请求要的是「现在页面长什么样」。历史上探过一次不算——
                 # 上次探测之后流程和站点都可能变了，那份 DOM 支撑不了这次判断。
-                guard_state["page_evidence_done"] = False
+                guard_state.page_evidence_done = False
             # 刻意不进 _PERSISTED_KEYS：只锁本轮。用户下一句往往就是「跑一下看看」，
             # 那时 repair 关键词不再出现，锁自然不会重新挂上。
             # 同一句里已给出运行授权时不挂：否则「修完跑一遍验收」这类既报问题又要结论的
             # 请求会被结构性地判成「不许运行」，模型只能交静态检查，用户拿不到答案。
-            guard_state["run_authorized"] = bool(intents.run_authorized)
+            guard_state.run_authorized = bool(intents.run_authorized)
             full_messages.append({"role": "system", "content": _GUIDANCE_BEFORE_REPAIR})
         if intents.preserve_execution_channel:
-            guard_state["repair_intent"] = "preserve_execution_channel"
-            guard_state["browser_chain_node_ids"] = flow_state.browser_chain_node_ids
+            guard_state.repair_intent = "preserve_execution_channel"
+            guard_state.browser_chain_node_ids = flow_state.browser_chain_node_ids
             full_messages.append({"role": "system", "content": _GUIDANCE_PRESERVE_EXECUTION_CHANNEL})
 
         if intents.create_url:
             # 空白流程已有 flow_id，该走 update_flow 落节点而不是再建一个
             build_tool = "update_flow" if flow_id and not _is_local_draft_flow_id(flow_id) else "create_flow"
-            guard_state["page_evidence_required"] = {
+            guard_state.page_evidence_required = {
                 "url": intents.create_url,
                 "reason": "build_from_page",
             }
-            guard_state["page_evidence_done"] = task_state.phase == "page_inspected"
+            guard_state.page_evidence_done = task_state.phase == "page_inspected"
             full_messages.append({"role": "system", "content": _build_guidance_before_create(build_tool)})
 
         vision_fallback_done = False
@@ -1835,7 +1373,7 @@ class AiOrchestrator:
         meter = _SessionMeter()
         repeated_results: dict[tuple[str, str], str] = {}
         last_verification_status = current_verification_status(guard_state)
-        last_verification_revision = guard_state.get("current_flow_revision")
+        last_verification_revision = guard_state.current_flow_revision
         last_run: dict[str, Any] | None = None
 
         for round_num in range(effective_max_rounds):
@@ -1855,8 +1393,8 @@ class AiOrchestrator:
             sync_state_message(full_messages, render_flow_state(flow_state))
             # 阶段由事实推导，所以事实必须每轮跟着状态块一起重算：用户可能在画布上
             # 直接补了节点，也可能把节点删空。存一份「上轮的阶段」就是第二份真相。
-            guard_state["blocking_diagnostics"] = _blocking_diagnostics(flow_state, guard_state)
-            guard_state["flow_has_nodes"] = not flow_state.is_blank
+            guard_state.blocking_diagnostics = _blocking_diagnostics(flow_state, guard_state)
+            guard_state.flow_has_nodes = not flow_state.is_blank
             _mark_history_cache_anchor(full_messages, model, relayed)
             collected_tool_calls: dict[int, dict[str, str]] = {}
             round_usage: Any = None
@@ -1895,11 +1433,11 @@ class AiOrchestrator:
                 return
             except Exception as exc:
                 # 视觉降级：模型拒绝图片输入时剥离截图块并重试一次。
-                if not vision_fallback_done and _is_vision_error(str(exc)) and _strip_image_messages(full_messages):
+                if not vision_fallback_done and is_vision_error(str(exc)) and _strip_image_messages(full_messages):
                     vision_fallback_done = True
                     yield {"type": "status", "delta": "当前模型不支持图片，已移除截图重试…"}
                     continue
-                yield {"type": "error", "message": _clean_litellm_error(str(exc))}
+                yield {"type": "error", "message": clean_litellm_error(str(exc))}
                 yield {"type": "done"}
                 return
 
@@ -1974,13 +1512,13 @@ class AiOrchestrator:
                 meter.add_round(round_usage, round_elapsed)
                 yield {"type": "usage", "usage": meter.snapshot(effective_max_rounds)}
             except Exception as stream_exc:
-                if not vision_fallback_done and _is_vision_error(str(stream_exc)) and _strip_image_messages(full_messages):
+                if not vision_fallback_done and is_vision_error(str(stream_exc)) and _strip_image_messages(full_messages):
                     # 已 yield 的本轮部分文本无法撤回，重试后可能出现重复段落——
                     # 视觉错误几乎总在首 token 前抛出（请求校验阶段），实际影响可忽略。
                     vision_fallback_done = True
                     yield {"type": "status", "delta": "当前模型不支持图片，已移除截图重试…"}
                     continue
-                yield {"type": "error", "message": _clean_litellm_error(str(stream_exc))}
+                yield {"type": "error", "message": clean_litellm_error(str(stream_exc))}
                 yield {"type": "done"}
                 return
 
@@ -2118,7 +1656,7 @@ class AiOrchestrator:
                 if args is not None:
                     try:
                         # after-guard 需要读取本次调用参数（如 selector 修改目标节点）
-                        guard_state["_last_tool_args"] = args
+                        guard_state._last_tool_args = args
                         guard_result = _orchestrator_guard_before_tool(tool_name, args, guard_state)
                         if guard_result is not None:
                             result = guard_result
@@ -2168,9 +1706,9 @@ class AiOrchestrator:
                     # 下一轮的状态块要讲「最近一次运行怎么样了」，来源就是这里
                     last_run = result
                 if isinstance(result, dict):
-                    event_flow_id = result.get("flow_id") or guard_state.get("flow_id")
+                    event_flow_id = result.get("flow_id") or guard_state.flow_id
                     if isinstance(event_flow_id, str):
-                        guard_state["flow_id"] = event_flow_id
+                        guard_state.flow_id = event_flow_id
                         record_events(event_flow_id, [
                             event for event in (result.get("events") or []) if isinstance(event, dict)
                         ])
@@ -2184,7 +1722,7 @@ class AiOrchestrator:
                 # 工具计数发生后立即推送；若用户此时关闭窗口，落盘的 usage 仍与工具卡片一致。
                 yield {"type": "usage", "usage": meter.snapshot(effective_max_rounds)}
                 verification_status = current_verification_status(guard_state)
-                verification_revision = guard_state.get("current_flow_revision")
+                verification_revision = guard_state.current_flow_revision
                 if (
                     verification_revision is not None
                     and (
@@ -2208,7 +1746,7 @@ class AiOrchestrator:
                     ),
                 })
 
-                if _image_b64 and not guard_state.get("model_no_vision"):
+                if _image_b64 and not guard_state.model_no_vision:
                     _image_label = (
                         f"[{tool_name} 失败现场截图：{result.get('failure_screenshot_note', '')}]"
                         if tool_name == "get_run_error"
@@ -2225,7 +1763,7 @@ class AiOrchestrator:
                 guidance, stop_round = _after_tool_guidance(tool_name, result, guard_state)
                 if guidance:
                     full_messages.append({"role": "system", "content": guidance})
-                if guard_state.get("terminal_response_only"):
+                if guard_state.terminal_response_only:
                     terminal_response = _terminal_tool_response(tool_name, result)
                 if stop_round:
                     _stop_after = _exec_idx
@@ -2375,7 +1913,7 @@ def _fabricated_write_receipt(text: str) -> bool:
     return '"revision"' in text and ('"flow_id"' in text or '"nodes"' in text)
 
 
-def _overstated_result_claim(text: str, state: dict[str, Any]) -> str | None:
+def _overstated_result_claim(text: str, state: GuardState) -> str | None:
     """回复承诺的确定性超出了本会话拿到的证据。
 
     证据分三级，从根本往上：写入有没有落盘（流程是否真的存在），改动后有没有成功运行过
@@ -2383,15 +1921,15 @@ def _overstated_result_claim(text: str, state: dict[str, Any]) -> str | None:
     工具作废——流程一改，之前那次运行和审计针对的就不是这份定义了。每会话只纠正一次，
     否则模型改口后的回复会再次命中同一批词。
     """
-    if state.get("result_claim_corrected"):
+    if state.result_claim_corrected:
         return None
 
     evidence_status = current_verification_status(state)
     audit_verified = evidence_status == "accepted" or (
-        state.get("current_flow_revision") is None and state.get("audit_passed")
+        state.current_flow_revision is None and state.audit_passed
     )
     run_verified = evidence_status in {"run_verified", "accepted"} or (
-        state.get("current_flow_revision") is None and state.get("run_succeeded")
+        state.current_flow_revision is None and state.run_succeeded
     )
 
     # 最根本的一级：写入本身有没有发生。用户看到「流程已创建」却打开一张空画布时，
@@ -2401,14 +1939,14 @@ def _overstated_result_claim(text: str, state: dict[str, Any]) -> str | None:
     # 每次请求从零开始，续跑一轮说「流程已更新」指的是上一轮那次写入，那不是假话。
     # 空画布不同——空流程既没被创建也没被更新过，这句话怎么读都是假的。
     if (
-        not state.get("flow_has_nodes")
-        and state.get("current_flow_revision") is None
+        not state.flow_has_nodes
+        and state.current_flow_revision is None
         and (
             any(phrase in text for phrase in _FLOW_SAVED_CLAIM_PHRASES)
             or _fabricated_write_receipt(text)
         )
     ):
-        state["result_claim_corrected"] = True
+        state.result_claim_corrected = True
         return (
             "你上一条回复已被撤回，用户没有看到，请完整重写整段回复（不要只补一句更正）。\n"
             "撤回原因：你说流程已经创建/保存好了，但没有任何一次写入成功，当前流程里没有一个业务节点——"
@@ -2421,7 +1959,7 @@ def _overstated_result_claim(text: str, state: dict[str, Any]) -> str | None:
         )
 
     if any(phrase in text for phrase in _ACCEPTANCE_CLAIM_PHRASES) and not audit_verified:
-        state["result_claim_corrected"] = True
+        state.result_claim_corrected = True
         return (
             "你上一条回复已被撤回，用户没有看到，请完整重写整段回复（不要只补一句更正）。\n"
             "撤回原因：你下了验收通过的结论，但当前这份流程定义没有一次 acceptance_audit.passed=true 的运行。"
@@ -2433,7 +1971,7 @@ def _overstated_result_claim(text: str, state: dict[str, Any]) -> str | None:
         )
 
     if any(phrase in text for phrase in _VERIFIED_FIX_CLAIM_PHRASES) and not run_verified:
-        state["result_claim_corrected"] = True
+        state.result_claim_corrected = True
         return (
             "你上一条回复已被撤回，用户没有看到，请完整重写整段回复（不要只补一句更正）。\n"
             "撤回原因：你说问题已修复，但本次改动之后没有成功运行过。改动是否真的生效只有运行结果能证明，"
@@ -2447,11 +1985,11 @@ def _overstated_result_claim(text: str, state: dict[str, Any]) -> str | None:
     # 清洗类需求的失败是静默的：脚本跑通、变量非空、产物照落，而一个字符都没删。
     # 用户只能从这段回复判断做没做成，所以在没有产物证据时不许把"打算怎么处理"写成"已经处理了"
     if (
-        state.get("transform_node_touched")
+        state.transform_node_touched
         and not audit_verified
         and any(phrase in text for phrase in _DATA_EFFECT_CLAIM_PHRASES)
     ):
-        state["result_claim_corrected"] = True
+        state.result_claim_corrected = True
         return (
             "你上一条回复已被撤回，用户没有看到，请完整重写整段回复（不要只补一句更正）。\n"
             "撤回原因：你描述了加工节点对数据的实际效果（去除了什么、留下了什么），"
@@ -2481,15 +2019,15 @@ _RUN_BLOCKER_PHRASES = (
 )
 
 
-def _unmet_verification_request(text: str, state: dict[str, Any]) -> str | None:
+def _unmet_verification_request(text: str, state: GuardState) -> str | None:
     """用户要的是验收结论，本轮却一次都没运行。
 
     降级措辞只解决了「别说谎」，没解决「用户什么也没拿到」：静态检查判断不了
     抓取内容对不对，而这正是用户问的。会话内只催一次，避免模型坚持不跑时空转。
     """
-    if state.get("verification_nudged") or state.get("run_attempted"):
+    if state.verification_nudged or state.run_attempted:
         return None
-    request = str(state.get("latest_user_message") or "")
+    request = str(state.latest_user_message or "")
     if not any(phrase in request for phrase in _VERIFICATION_REQUEST_PHRASES):
         return None
     if any(phrase in request for phrase in _NO_RUN_REQUEST_PHRASES):
@@ -2497,7 +2035,7 @@ def _unmet_verification_request(text: str, state: dict[str, Any]) -> str | None:
     if any(phrase in text for phrase in _RUN_BLOCKER_PHRASES):
         return None
 
-    state["verification_nudged"] = True
+    state.verification_nudged = True
     return (
         "你上一条回复已被撤回，用户没有看到，请完整重写整段回复（不要只补一句更正）。\n"
         "撤回原因：用户要的是「这个流程到底能不能用」这个判断，你本轮一次都没有运行流程，"
@@ -2521,17 +2059,17 @@ _SESSION_REQUIREMENT_MAX_CHARS = 2000
 _REFUSAL_TEMPLATE_MARKERS = ("我只能协助处理 RPA 流程", "只能协助处理 RPA 流程的创建")
 
 
-def _misapplied_refusal(text: str, state: dict[str, Any]) -> str | None:
+def _misapplied_refusal(text: str, state: GuardState) -> str | None:
     """用拒答模板回绝了一个已被判定为职责范围内的请求。
 
     只在本轮识别出建流程/修流程/要运行意图时才判——用户真问天气时这句回绝是对的。
     """
-    if state.get("refusal_corrected") or not state.get("turn_intent_actionable"):
+    if state.refusal_corrected or not state.turn_intent_actionable:
         return None
     if not any(marker in text for marker in _REFUSAL_TEMPLATE_MARKERS):
         return None
 
-    state["refusal_corrected"] = True
+    state.refusal_corrected = True
     return (
         "你上一条回复已被撤回，用户没有看到，请完整重写整段回复（不要只补一句更正）。\n"
         "撤回原因：你用「我只能协助处理 RPA 流程…」回绝了这次请求，但编排层已经判定"
@@ -2593,7 +2131,7 @@ def _latest_user_message(messages: list[dict[str, Any]]) -> str:
 
 
 def _blocking_diagnostics(
-    flow_state: FlowState, state: dict[str, Any]
+    flow_state: FlowState, state: GuardState
 ) -> list[dict[str, Any]] | None:
     """本轮还挡着 run_flow 的诊断项。每轮开头重算一次，不累积。
 
@@ -2603,7 +2141,7 @@ def _blocking_diagnostics(
     """
     blocking = [f for f in flow_state.findings if is_blocking_finding(f)]
     blocking += [
-        f for f in (state.get("runtime_escape_findings") or []) if f not in blocking
+        f for f in (state.runtime_escape_findings or []) if f not in blocking
     ]
     return blocking or None
 
@@ -2611,7 +2149,7 @@ def _blocking_diagnostics(
 def _orchestrator_guard_before_tool(
     tool_name: str,
     args: dict[str, Any],
-    state: dict[str, Any],
+    state: GuardState,
 ) -> dict[str, Any] | None:
     """硬性护栏：prompt 规则只是建议，这里强制少数不能靠模型记忆遵守的规则
     （违反会导致昂贵或误导性的运行）。
@@ -2636,7 +2174,7 @@ def _orchestrator_guard_before_tool(
     return apply_phase_gate(tool_name, args, state)
 
 
-def _build_change_context(state: dict[str, Any]) -> _ChangeContext:
+def _build_change_context(state: GuardState) -> _ChangeContext:
     """本轮的写入约束，随每次工具调用传给执行器。
 
     执行器是全进程单例，这些是每轮才知道的东西，不能挂在它身上。
@@ -2644,11 +2182,11 @@ def _build_change_context(state: dict[str, Any]) -> _ChangeContext:
     删改主链路节点属于正常编辑。
     """
     protected: set[str] = set()
-    if state.get("repair_intent") == "preserve_execution_channel":
-        protected = {str(nid) for nid in (state.get("browser_chain_node_ids") or set())}
+    if state.repair_intent == "preserve_execution_channel":
+        protected = {str(nid) for nid in (state.browser_chain_node_ids or set())}
     return _ChangeContext(
         protected_node_ids=frozenset(protected),
-        fresh_page_evidence=bool(state.get("fresh_page_evidence")),
+        fresh_page_evidence=bool(state.fresh_page_evidence),
     )
 
 
@@ -2666,7 +2204,7 @@ def _run_failure_signature(result: dict[str, Any]) -> str:
 
 
 def _count_repair_cycle(
-    state: dict[str, Any],
+    state: GuardState,
     last_error: Any,
     *,
     kind: str,
@@ -2701,21 +2239,21 @@ def _count_repair_cycle(
 # 而不是等到线上某条义务凭空消失——写入侧的缺陷历来都是这样，没有任何症状。
 
 
-def _note_page_evidence(tool_name: str, result: dict[str, Any], state: dict[str, Any]) -> None:
+def _note_page_evidence(tool_name: str, result: dict[str, Any], state: GuardState) -> None:
     """inspect_page / inspect_screenshot 探测成功后的共有记账。"""
     # 取证成功才记指纹：失败的探测没拿到任何东西，重试是正当的。
-    note_evidence(state, tool_name, state.get("_last_tool_args") or {})
+    note_evidence(state, tool_name, state._last_tool_args or {})
     # 新页面证据到手，解锁节点级 selector 熔断。
     # 落到登录页的检查看到的是登录表单，对目标页不构成证据，不能解锁。
     if not result.get("redirected_to_login"):
-        state["fresh_page_evidence"] = True
+        state.fresh_page_evidence = True
 
 
-def _after_inspect_page(result: dict[str, Any], state: dict[str, Any]) -> None:
+def _after_inspect_page(result: dict[str, Any], state: GuardState) -> None:
     if result.get("status") == "blocked_challenge_page":
         # 刻意不进 _PERSISTED_KEYS：这道锁只在本轮有效。用户下一句往往正是
         # 「我过完验证了，再跑一次」，跨轮留着会把唯一的出路也锁死。
-        state["challenge_page_lock"] = {
+        state.challenge_page_lock = {
             "url": result.get("requested_url"),
             "label": result.get("challenge_label"),
         }
@@ -2724,32 +2262,32 @@ def _after_inspect_page(result: dict[str, Any], state: dict[str, Any]) -> None:
     if result.get("error"):
         return
     _note_page_evidence("inspect_page", result, state)
-    state["page_evidence_source"] = result.get("inspection_source") or "browser_dom"
+    state.page_evidence_source = result.get("inspection_source") or "browser_dom"
     # 看过页面就算证据到手，不再区分是否落到了登录页：区分了会造出一个死局——
     # 站点一直重定向到登录页时，模型既写不了流程也走不到收尾，只能耗完轮次。
     # 「登录页不算目标页证据」这条判断由上面的 fresh_page_evidence 承担，它管的是
     # 节点级 selector 熔断，拦错了还有出路。
-    state["page_evidence_done"] = True
+    state.page_evidence_done = True
 
 
-def _after_inspect_screenshot(result: dict[str, Any], state: dict[str, Any]) -> None:
+def _after_inspect_screenshot(result: dict[str, Any], state: GuardState) -> None:
     # 刻意不设 page_evidence_done：DOM 取证义务要的是 selector 能落地的结构，看图看不出来
     if not result.get("error"):
         _note_page_evidence("inspect_screenshot", result, state)
 
 
-def _note_acceptance_audit(audit: dict[str, Any], state: dict[str, Any]) -> None:
+def _note_acceptance_audit(audit: dict[str, Any], state: GuardState) -> None:
     if audit.get("passed"):
-        state["audit_passed"] = True
+        state.audit_passed = True
         # 业务校验通过 = 问题已解决，之前的失败尝试不该再挡住后续正常编辑
-        state["node_selector_fix_counts"] = {}
-        state["node_field_history"] = {}
+        state.node_selector_fix_counts = {}
+        state.node_field_history = {}
         note_verified(state)
-        _repair_ledger.clear(state.get("flow_id"))
+        _repair_ledger.clear(state.flow_id)
         return
     # 质量审计不合格是这类空转循环的主要形态：跑得起来但交付不了，
     # 只盯 run_flow 的失败状态会完全数不到
-    state["audit_findings"] = {
+    state.audit_findings = {
         "issues": audit.get("issues", []),
         "repair_plan": audit.get("repair_plan", []),
     }
@@ -2762,7 +2300,7 @@ def _note_acceptance_audit(audit: dict[str, Any], state: dict[str, Any]) -> None
     )
 
 
-def _note_undefined_variable_escape(result: dict[str, Any], state: dict[str, Any]) -> None:
+def _note_undefined_variable_escape(result: dict[str, Any], state: GuardState) -> None:
     """运行期「变量未定义」说明静态检查漏检。
 
     它不在静态诊断集里（漏网就是它的定义），所以单独记一处：状态块每轮重算，
@@ -2786,10 +2324,10 @@ def _note_undefined_variable_escape(result: dict[str, Any], state: dict[str, Any
         ),
         "escaped_variable": escaped_var,
     }
-    state["runtime_escape_findings"] = (state.get("runtime_escape_findings") or []) + [escape_finding]
+    state.runtime_escape_findings = (state.runtime_escape_findings or []) + [escape_finding]
 
 
-def _after_run_flow(result: dict[str, Any], state: dict[str, Any]) -> None:
+def _after_run_flow(result: dict[str, Any], state: GuardState) -> None:
     status = str(result.get("status") or "")
 
     # acceptance_audit 只在 task.status == "success" 时才挂上（见 executor._run_flow 结尾），
@@ -2801,12 +2339,12 @@ def _after_run_flow(result: dict[str, Any], state: dict[str, Any]) -> None:
     # 超时/暂停也算尝试过：这些是真拦路条件，不该再催模型去跑。
     # 起跑前被拒且模型自己能改的那几条不算——见 _RUN_REFUSED_MODEL_FIXABLE。
     if status not in _RUN_REFUSED_MODEL_FIXABLE:
-        state["run_attempted"] = True
+        state.run_attempted = True
 
     if status == "success":
         # 只记跑通，不清零修复计数：质量审计不合格的运行 status 同样是 success，
         # 在这里清零会让「跑成功 → 审计不过 → 再改」的循环永远攒不满次数
-        state["run_succeeded"] = True
+        state.run_succeeded = True
     elif status not in _RUN_WAITING_STATUSES:
         # 停下来等人不是一次失败的修复：流程没跑完是因为轮到用户了，
         # 记进熔断计数会让「等一次人工接管」白白吃掉三分之一的修复预算
@@ -2823,7 +2361,7 @@ def _after_run_flow(result: dict[str, Any], state: dict[str, Any]) -> None:
         _note_undefined_variable_escape(result, state)
 
     if status == "blocked_by_failure_budget":
-        state["failure_budget_lock"] = {
+        state.failure_budget_lock = {
             "flow_id": result.get("flow_id"),
             "recent_failed_task_ids": result.get("recent_failed_task_ids", []),
             "recent_failed_nodes": result.get("recent_failed_nodes", []),
@@ -2832,10 +2370,10 @@ def _after_run_flow(result: dict[str, Any], state: dict[str, Any]) -> None:
         }
 
 
-def _after_get_run_error(result: dict[str, Any], state: dict[str, Any]) -> None:
+def _after_get_run_error(result: dict[str, Any], state: GuardState) -> None:
     # 带回失败现场截图也算新证据。
     if result.get("failure_screenshot_note"):
-        state["fresh_page_evidence"] = True
+        state.fresh_page_evidence = True
     if not result.get("inspect_hint"):
         return
 
@@ -2846,8 +2384,8 @@ def _after_get_run_error(result: dict[str, Any], state: dict[str, Any]) -> None:
     suggested["wait_selector"] = "table, [role=grid], nav, main"
     # 报出 selector/可见性错误就要求真去看一次 DOM：静态诊断读不到页面，
     # 不看就改等于按上一次的想象再猜一遍。
-    state["page_evidence_required"] = suggested
-    state["page_evidence_done"] = False
+    state.page_evidence_required = suggested
+    state.page_evidence_done = False
 
     failed_node = result.get("failed_node_config") if isinstance(result.get("failed_node_config"), dict) else {}
     failed_node_id = str(result.get("failed_node_id") or failed_node.get("id") or "")
@@ -2883,7 +2421,7 @@ def _after_get_run_error(result: dict[str, Any], state: dict[str, Any]) -> None:
         # 导航类熔断后给的出路（换 browser.open 直达 URL、或向用户要目标 URL）
         # 和别的失败完全不同，不归类就丢了这条出路；再扣一次费则是同一次失败算两遍。
         reclassify_last_attempt(state, kind="navigation")
-        state["navigation_failure_hint"] = {
+        state.navigation_failure_hint = {
             "node_id": failed_node_id,
             "node_type": failed_type,
             "selector_diagnostic": selector_diagnostic,
@@ -2896,11 +2434,11 @@ def _after_get_run_error(result: dict[str, Any], state: dict[str, Any]) -> None:
         }
 
 
-def _after_flow_write(result: dict[str, Any], state: dict[str, Any]) -> None:
+def _after_flow_write(result: dict[str, Any], state: GuardState) -> None:
     """四个写工具共有：作废旧证据 + 按写入后那一版 lint 重算闸门。"""
     # 流程一被改动，之前那次运行和审计就不再针对当前这份定义，证据全部作废。
-    state["run_succeeded"] = False
-    state["audit_passed"] = False
+    state.run_succeeded = False
+    state.audit_passed = False
     # 页面和运行结果都可能因为这次改动而不同，重探同一个目标不再算原地打转
     note_progress(state)
     # 取 changed_nodes 而不是调用参数：update_nodes 的 patch 里没有 type，
@@ -2913,7 +2451,7 @@ def _after_flow_write(result: dict[str, Any], state: dict[str, Any]) -> None:
         isinstance(item, dict) and item.get("type") in TRANSFORM_NODE_TYPES
         for item in (flow_event.get("affected_nodes") or [])
     ):
-        state["transform_node_touched"] = True
+        state.transform_node_touched = True
 
     # 写入返回里的 lint 针对的是写入之后那一版，比状态块（本轮开头那一版）更新，所以据它更新闸门。
     # 不更新的话，「改完接着在同一轮跑」会被上一版的诊断拦住，而拦它的理由已经不存在了——
@@ -2929,12 +2467,12 @@ def _after_flow_write(result: dict[str, Any], state: dict[str, Any]) -> None:
     if post_write is not None:
         # 复用 _blocking_diagnostics：与轮次开头那条路径共用同一份判定，
         # 两边算法一旦分岔，阶段就会随「上次是谁更新的」而变
-        state["blocking_diagnostics"] = _blocking_diagnostics(
+        state.blocking_diagnostics = _blocking_diagnostics(
             FlowState(findings=post_write), state
         )
 
 
-def _after_node_edit(result: dict[str, Any], state: dict[str, Any]) -> None:
+def _after_node_edit(result: dict[str, Any], state: GuardState) -> None:
     """update_flow / apply_node_fix 共有：修复台账 + 解除各类失败标记。
 
     台账记本流程每个受跟踪字段的取值轨迹与 selector 修改次数，跨会话累计。取执行器返回的
@@ -2943,7 +2481,7 @@ def _after_node_edit(result: dict[str, Any], state: dict[str, Any]) -> None:
     去判回摆的：记错一次，之后每一次判定都错。
     """
     changes = [c for c in (result.get("tracked_field_changes") or []) if isinstance(c, dict)]
-    field_history: dict[str, list[str]] = state.setdefault("node_field_history", {})
+    field_history: dict[str, list[str]] = state.node_field_history
     for change in changes:
         trail = field_history.setdefault(f"{change.get('node_id')}.{change.get('field')}", [])
         value = str(change.get("value"))
@@ -2954,60 +2492,60 @@ def _after_node_edit(result: dict[str, Any], state: dict[str, Any]) -> None:
         str(c.get("node_id")) for c in changes if c.get("field") == "selector"
     }
     if selector_nodes:
-        fix_counts = state.setdefault("node_selector_fix_counts", {})
+        fix_counts = state.node_selector_fix_counts
         for node_id in selector_nodes:
             fix_counts[node_id] = fix_counts.get(node_id, 0) + 1
         # 一次页面证据只够支撑一次改动：改完还没重新看过页面，下一次又是盲改
-        state["fresh_page_evidence"] = False
+        state.fresh_page_evidence = False
 
     if changes:
         _repair_ledger.save(
-            state.get("flow_id"),
+            state.flow_id,
             node_field_history=field_history,
-            node_selector_fix_counts=state.get("node_selector_fix_counts") or {},
-            sessions=int(state.get("repair_sessions") or 1),
+            node_selector_fix_counts=state.node_selector_fix_counts or {},
+            sessions=int(state.repair_sessions or 1),
         )
 
     # 只有真实结构修复才能解除各类失败标记，下一次运行会重新审计。
-    state["audit_findings"] = None
-    state["navigation_failure_hint"] = None
-    state["runtime_escape_findings"] = []
+    state.audit_findings = None
+    state.navigation_failure_hint = None
+    state.runtime_escape_findings = []
 
 
-def _after_create_flow(result: dict[str, Any], state: dict[str, Any]) -> None:
+def _after_create_flow(result: dict[str, Any], state: GuardState) -> None:
     if result.get("error"):
         return
     _after_flow_write(result, state)
     # 本轮内就得脱离 BUILD：不然刚建完的流程在同一轮里仍被判成「还不存在」，
     # 模型接下来那次 run_flow 会被自己刚满足的前置门挡掉。
-    state["flow_has_nodes"] = True
+    state.flow_has_nodes = True
 
 
-def _after_update_flow(result: dict[str, Any], state: dict[str, Any]) -> None:
+def _after_update_flow(result: dict[str, Any], state: GuardState) -> None:
     if result.get("error"):
         return
     _after_flow_write(result, state)
     _after_node_edit(result, state)
 
 
-def _after_apply_node_fix(result: dict[str, Any], state: dict[str, Any]) -> None:
+def _after_apply_node_fix(result: dict[str, Any], state: GuardState) -> None:
     if result.get("error"):
         return
     _after_flow_write(result, state)
     _after_node_edit(result, state)
     # 熔断之后唯一还放行的写工具：它成功落盘说明模型确实定位到了单个节点、不是又一次盲改，
     # 所以这把锁只能由它解除。update_flow 不行——整流程重写正是这把锁要拦的东西。
-    state["failure_budget_lock"] = None
+    state.failure_budget_lock = None
 
 
-def _after_set_acceptance_contract(result: dict[str, Any], state: dict[str, Any]) -> None:
+def _after_set_acceptance_contract(result: dict[str, Any], state: GuardState) -> None:
     if result.get("error"):
         return
     _after_flow_write(result, state)
 
 
 # 工具名 → 写入函数。写工具那四项必须与 _FLOW_WRITE_TOOLS 一致（元测试守）。
-_AFTER_TOOL_HANDLERS: dict[str, Callable[[dict[str, Any], dict[str, Any]], None]] = {
+_AFTER_TOOL_HANDLERS: dict[str, Callable[[dict[str, Any], GuardState], None]] = {
     "apply_node_fix": _after_apply_node_fix,
     "create_flow": _after_create_flow,
     "get_run_error": _after_get_run_error,
@@ -3037,7 +2575,7 @@ _AFTER_TOOL_NO_STATE_EFFECT = frozenset({
 })
 
 
-def _orchestrator_guard_after_tool(tool_name: str, result: Any, state: dict[str, Any]) -> None:
+def _orchestrator_guard_after_tool(tool_name: str, result: Any, state: GuardState) -> None:
     """把一次工具返回写进 guard_state。
 
     与工具无关的三件事在前，且顺序敏感；其余全部按工具分派。
@@ -3049,16 +2587,13 @@ def _orchestrator_guard_after_tool(tool_name: str, result: Any, state: dict[str,
     # 模型会接着去翻已经看过的东西。这里只收工具，收尾正文仍由模型自己写——换成
     # terminal_response_only 会走模板回复，把「改了哪个节点的哪个字段」那段顶掉。
     if result.get("required_action") == "ask_user":
-        state["closing_statement_only"] = True
+        state.closing_statement_only = True
     # 被阻断的调用不携带真实工具输出，不应影响 state
     if result.get("status") == "blocked_by_orchestrator_guard":
         return
 
-    if (
-        result.get("required_action") in _TERMINAL_GUARD_ACTIONS
-        or result.get("status") in _TERMINAL_TOOL_STATUSES
-    ):
-        state["terminal_response_only"] = True
+    if _is_terminal_result(result):
+        state.terminal_response_only = True
 
     handler = _AFTER_TOOL_HANDLERS.get(tool_name)
     if handler is not None:

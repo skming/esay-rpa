@@ -313,6 +313,20 @@ def test_tracked_changes_report_what_actually_landed() -> None:
     assert plain.tracked_field_changes == ()
 
 
+def test_clearing_a_field_to_null_is_not_a_tracked_change() -> None:
+    """把 selector 显式写成 null 不是「换一个取值再试」，没有可回摆的对象。
+
+    记成一次改动会往回摆历史里塞进 "None"，并虚耗一格 selector 修复预算——两个下游判据
+    都吃这份 tracked_changes。改到 null 仍是一次真实写入（signature 变了、不算空转），
+    只是不该被这三条判据盯上。
+    """
+    before = _flow([{"id": "n1", "type": "browser.extract", "selector": ".b"}])
+    after = _flow([{"id": "n1", "type": "browser.extract", "selector": None}])
+    report = inspect_change(before, after)
+    assert not report.rejected
+    assert report.tracked_field_changes == ()
+
+
 def test_selector_fix_budget_requires_new_evidence_after_enough_blind_attempts() -> None:
     ledger = {"node_selector_fix_counts": {"n1": NODE_SELECTOR_FIX_BUDGET}}
     before, after = _selector_change(".b", ".brand-new")
