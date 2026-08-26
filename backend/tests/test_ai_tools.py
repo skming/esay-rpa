@@ -48,7 +48,6 @@ from app.services.ai_tools.script_capabilities import (
 )
 from app.services.ai_tools.normalize import _normalize_generated_edges, _normalize_generated_nodes
 from app.services.ai_guard_state import GuardState
-from app.services.ai_phases import initial_facts
 
 
 def _ready_state(**overrides: Any) -> GuardState:
@@ -57,7 +56,7 @@ def _ready_state(**overrides: Any) -> GuardState:
     阶段机的事实全部 fail-closed，空 GuardState 会被判成「流程还不存在」，
     断言到的就不是这次改动而是缺省值。
     """
-    state = initial_facts(
+    state = GuardState(
         flow_has_nodes=True,
         page_evidence_required=None,
         page_evidence_done=True,

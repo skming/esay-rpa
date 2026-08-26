@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from app.services import ai_orchestrator, ai_phases
+from app.services import ai_orchestrator, ai_phases, ai_tool_events
 from app.services import ai_session_checkpoint as checkpoint
 from app.services.ai_guard_state import GuardState
 from app.services.ai_phases import VERIFY_ATTEMPT_BUDGET
@@ -172,12 +172,15 @@ def test_static_diagnostics_are_not_carried_across_sessions() -> None:
 def test_every_guard_state_key_is_explicitly_decided() -> None:
     """写入侧唯一的症状来源。
 
-    编排层往 guard_state 里写 29 个键，「这个键要不要跨轮留下」全靠人记得。
-    忘了存 → 中断续跑丢义务；不该存却存了 → 流程已经修好还挡着人。两种都不报错。
+    编排层、阶段机、工具事件归约三处都会往 guard_state 里写键，「这个键要不要跨轮留下」
+    全靠人记得。忘了存 → 中断续跑丢义务；不该存却存了 → 流程已经修好还挡着人。两种都不报错。
     所以每个被写过的键必须在两张表里表过态，新增一个而没表态就在这里红。
+
+    模块名单也要跟着写入点走：少扫一个模块，那批键就永远不会在这里被要求表态——
+    ai_tool_events 的三个 revision 字段就这么在名单外待过一阵。
     """
     written: set[str] = set()
-    for module in (ai_orchestrator, ai_phases):
+    for module in (ai_orchestrator, ai_phases, ai_tool_events):
         tree = ast.parse(inspect.getsource(module))
         for node in ast.walk(tree):
             targets: list[ast.expr] = []

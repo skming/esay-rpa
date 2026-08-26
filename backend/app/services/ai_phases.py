@@ -164,29 +164,6 @@ PHASE_GUARD_IDS = frozenset({
 })
 
 
-# ── 事实初始化 ────────────────────────────────────────────────────────────────
-
-
-def initial_facts(
-    *,
-    flow_has_nodes: bool,
-    page_evidence_required: dict[str, Any] | None,
-    page_evidence_done: bool,
-    run_authorized: bool,
-) -> GuardState:
-    """阶段机读的那几个事实，其余字段走 GuardState 的默认值（事实未知、不设限）。
-
-    分开一个函数而不是让编排层手写字面量，是为了让「阶段读哪些事实」可枚举——
-    漏掉一个键时阶段会静默地退回 BUILD，而只有 VERIFY 放行 run_flow。
-    """
-    return GuardState(
-        flow_has_nodes=bool(flow_has_nodes),
-        page_evidence_required=page_evidence_required,
-        page_evidence_done=bool(page_evidence_done),
-        run_authorized=bool(run_authorized),
-    )
-
-
 # ── 阶段推导 ──────────────────────────────────────────────────────────────────
 
 
@@ -565,7 +542,6 @@ __all__ = [
     "admitted_tool_names",
     "apply_phase_gate",
     "describe_phases",
-    "initial_facts",
     "new_budget",
     "note_evidence",
     "note_failed_attempt",

@@ -17,7 +17,7 @@ from app.services.ai_flow_state import (
     sync_state_message,
 )
 from app.services.ai_guard_state import GuardState
-from app.services.ai_phases import VERIFY_ATTEMPT_BUDGET, initial_facts
+from app.services.ai_phases import VERIFY_ATTEMPT_BUDGET
 from app.services.ai_model_caps import _model_caps
 from app.services.ai_context_window import (
     _compact_tool_messages,
@@ -65,7 +65,7 @@ def _ready(**overrides: Any) -> GuardState:
     编排层用例要验的是「钩子有没有把事实改对」，起点必须是一个明确的可运行局面，
     否则断言到的是缺省值而不是这次改动。
     """
-    state = initial_facts(
+    state = GuardState(
         flow_has_nodes=True,
         page_evidence_required=None,
         page_evidence_done=True,
@@ -1173,7 +1173,7 @@ def test_compact_tool_messages_strips_all_but_latest_screenshot() -> None:
         {"role": "assistant", "content": "看过了"},
         _image_message("[截图2]"),
     ]
-    _compact_tool_messages(messages)
+    _compact_tool_messages(messages, budget=100_000)
     # 旧截图替换为文本占位（保留原文字说明），最新一张保持 vision 块
     assert isinstance(messages[1]["content"], str)
     assert "[截图1]" in messages[1]["content"]

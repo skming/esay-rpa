@@ -62,9 +62,9 @@ def test_observe_guards_records_guard_id_and_restores_the_original() -> None:
 def test_observe_guards_also_records_phase_refusals() -> None:
     """拦截分两层，只钩住 GUARDS 那层会让阶段类断言永远静默通过——一盏假绿灯。"""
     from app.services import ai_orchestrator
-    from app.services.ai_phases import initial_facts
+    from app.services.ai_guard_state import GuardState
 
-    state = initial_facts(
+    state = GuardState(
         flow_has_nodes=False,
         page_evidence_required=None,
         page_evidence_done=True,
@@ -156,12 +156,13 @@ async def _fixture_phase(
 ) -> tuple[object, list[str | None]]:
     from app.services.ai_flow_state import build_flow_state
     from app.services.ai_orchestrator import _blocking_diagnostics
-    from app.services.ai_phases import initial_facts, resolve_phase
+    from app.services.ai_guard_state import GuardState
+    from app.services.ai_phases import resolve_phase
 
     executor = MockToolExecutor(scenario.tool_overrides)
     executor.calls = [(name, {}) for name in prior_calls]
     flow_state = await build_flow_state(executor, scenario.flow_id)
-    state = initial_facts(
+    state = GuardState(
         flow_has_nodes=not flow_state.is_blank,
         page_evidence_required=None,
         page_evidence_done=True,

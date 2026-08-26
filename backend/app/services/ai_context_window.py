@@ -10,7 +10,7 @@ import logging
 import re
 from typing import Any
 
-from app.services.ai_model_caps import _DEFAULT_CONTEXT_WINDOW, _model_caps
+from app.services.ai_model_caps import _model_caps
 
 logger = logging.getLogger(__name__)
 
@@ -206,7 +206,7 @@ def _drop_oldest_turns(messages: list[dict[str, Any]], protect_prefix: int, budg
 
 
 def _compact_tool_messages(
-    messages: list[dict[str, Any]], budget: int = _DEFAULT_CONTEXT_WINDOW, protect_prefix: int = 0
+    messages: list[dict[str, Any]], budget: int, protect_prefix: int = 0
 ) -> None:
     """原地压缩较旧的超大 tool 消息，最近几条保留完整内容；压不动仍超预算则整轮丢弃。"""
     tool_indices = [
@@ -216,7 +216,7 @@ def _compact_tool_messages(
     if tool_indices:
         total_chars = _total_content_chars(messages)
         keep_full = 1 if total_chars > budget else _KEEP_FULL_TOOL_RESULTS
-        for i in tool_indices[:-keep_full] if keep_full else tool_indices:
+        for i in tool_indices[:-keep_full]:
             content = messages[i]["content"]
             if len(content) > _TOOL_COMPACT_THRESHOLD and _COMPACTED_MARK not in content:
                 messages[i]["content"] = _summarize_tool_json(content)

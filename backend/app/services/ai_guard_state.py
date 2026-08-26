@@ -41,7 +41,8 @@ class GuardState:
     attempt_budget: dict[str, Any] = field(default_factory=new_budget)
     evidence_collected: list[str] = field(default_factory=list)
 
-    # 验收台账事实（load_verification_state）：只在构造时给，之后不改
+    # 验收台账事实：构造时由 load_verification_state 给，本轮内由
+    # reduce_evidence_state 按工具事件推进（写流程作废已验证的 revision）
     current_flow_revision: int | None = None
     run_verified_revision: int | None = None
     accepted_revision: int | None = None

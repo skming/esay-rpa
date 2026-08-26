@@ -22,7 +22,6 @@ from app.services.ai_phases import (
     admitted_tool_names,
     apply_phase_gate,
     describe_phases,
-    initial_facts,
     note_evidence,
     note_failed_attempt,
     note_guard_block,
@@ -42,7 +41,7 @@ _ALL_TOOLS = frozenset({
 
 def _ready(**overrides: Any) -> GuardState:
     """一个可以直接跑流程的会话：流程已存在、证据到手、诊断干净、用户授权。"""
-    state = initial_facts(
+    state = GuardState(
         flow_has_nodes=True,
         page_evidence_required=None,
         page_evidence_done=True,
