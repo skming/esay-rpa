@@ -127,7 +127,7 @@ runtime_services = create_runtime_services(settings=settings, broker=broker)
 task_manager = runtime_services.task_manager
 task_manager.set_notifier(dingtalk_notifier)
 task_manager.set_overlay_analyzer(overlay_analyzer)
-task_manager.set_extension_bridge(extension_bridge_service)
+task_manager.set_extension_bridge(extension_bridge_service, is_extension_enabled=lambda: bool(extension_config_service.load()["enabled"]))
 code_generator = ScraplingCodeGenerator()
 site_analyzer = SiteAnalyzer()
 flow_service = runtime_services.flow_service
@@ -334,7 +334,10 @@ async def delete_flow(flow_id: str) -> dict[str, bool]:
 
 @app.post("/api/tasks", response_model=TaskSnapshot)
 async def create_task(request: RunTaskRequest) -> TaskSnapshot:
-    return await task_manager.start_task(request)
+    try:
+        return await task_manager.start_task(request)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.get("/api/tasks", response_model=list[TaskSnapshot])
@@ -927,7 +930,10 @@ async def close_picker() -> dict:
 async def extension_bridge_status() -> dict:
     connected_since = extension_bridge_service.connected_since
     return {
+        # connected 带 8s 断线宽限，只为 UI 指示灯防抖；canExecute 是不平滑的真实状态。
+        # 运行前置门控必须看后者，否则重连窗口里按钮仍可点，动作直接发到空 socket。
         "connected": extension_bridge_service.is_connected_for_display,
+        "canExecute": extension_bridge_service.is_connected,
         "enabled": extension_config_service.load()["enabled"],
         "connectedSince": datetime.fromtimestamp(connected_since, tz=timezone.utc).isoformat() if connected_since is not None else None,
     }
@@ -949,6 +955,9 @@ async def extension_bridge_execute(payload: dict) -> dict:
     action = payload.get("action")
     if not isinstance(action, dict) or not action.get("type"):
         raise HTTPException(status_code=422, detail="action.type 不能为空")
+    # 这个口子同样操作用户真实登录的浏览器，开关关掉时不能因为"只是手工测试"就放行。
+    if not extension_config_service.load()["enabled"]:
+        raise HTTPException(status_code=409, detail="插件执行器已在设置中关闭")
     try:
         result = await extension_bridge_service.execute(action)
     except ConnectionError as exc:

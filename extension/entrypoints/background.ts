@@ -44,13 +44,12 @@ const NAVIGATION_TIMEOUT_MS = 15000;
 const KEEPALIVE_ALARM_NAME = 'rpa-studio-bridge-keepalive';
 const KEEPALIVE_PERIOD_MINUTES = 1;
 const HEARTBEAT_INTERVAL_MS = 20000;
-const CONNECTION_LEASE_KEY = 'rpa-studio-bridge-connection-lease';
-const CONNECTION_LEASE_TTL_MS = 45000;
-const CONNECTION_LEASE_RECHECK_MS = 5000;
-const CONNECTION_LEASE_SETTLE_MS = 100;
-// 后端拒绝重复连接的 close code：收到即说明本实例租约与后端不一致，须明显放慢重连，避免反复顶替成死循环。
-const DUPLICATE_CONNECTION_CLOSE_CODE = 4409;
-const DUPLICATE_CONNECTION_BACKOFF_MS = 15000;
+// 后端顶替本连接时发的私有 close code：说明另一个浏览器（另一个 profile / 另一台 Chrome）也接上了同一座桥。
+// 必须与普通断线区分开：普通断线该 3s 快速重连，被顶替时快速重连就是互相顶替的死循环，每次顶替都会让
+// 对面正在跑的动作直接失败。故按 15s→60s 递增退避，且只有用户主动打开 popup 才清零。
+const REPLACED_CONNECTION_CLOSE_CODE = 4409;
+const REPLACED_CONNECTION_BACKOFF_MS = 15000;
+const REPLACED_CONNECTION_MAX_BACKOFF_MS = 60000;
 const HANDSHAKE_FAILURE_BACKOFF_MS = 15000;
 // ERR_CONNECTION_REFUSED 由内核直接打进控制台、JS 拦不掉；桌面应用没开时只能靠退避降低刷屏。
 const HANDSHAKE_FAILURE_MAX_BACKOFF_MS = 60000;
@@ -64,13 +63,8 @@ let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let reconnectDelayMs = INITIAL_RECONNECT_DELAY_MS;
 let handshakeFailureDelayMs = HANDSHAKE_FAILURE_BACKOFF_MS;
+let replacedConnectionDelayMs = REPLACED_CONNECTION_BACKOFF_MS;
 let lastForegroundRetryAt = 0;
-const workerInstanceId = crypto.randomUUID();
-
-type ConnectionLease = {
-  ownerId: string;
-  expiresAt: number;
-};
 
 // "当前工作标签页"指针，对应 Playwright 的 context.page：锁定后跟着走，不再重读 OS 焦点，避免切页"串台"。
 let controlledTabId: number | null = null;
@@ -242,7 +236,9 @@ async function closeControlledTab(): Promise<{ ok: boolean; result?: unknown; er
   }
   await browser.tabs.remove(tab.id);
   controlledTabId = null;
-  const remaining = await resolveControlledTab();
+  // 必须 passive：controlledTabId 刚被置 null，不带这个选项就会落到 findActiveTab()，
+  // 把用户当前正在看的标签页收为受控——下一次 browser.open 就直接把它导航走了。
+  const remaining = await resolveControlledTab({ passive: true });
   return { ok: true, result: { url: remaining?.url ?? '' } };
 }
 
@@ -337,56 +333,6 @@ function clearHeartbeat(): void {
   }
 }
 
-async function readConnectionLease(): Promise<ConnectionLease | null> {
-  const stored = await browser.storage.session.get(CONNECTION_LEASE_KEY);
-  const lease = stored[CONNECTION_LEASE_KEY];
-  if (
-    lease !== null &&
-    typeof lease === 'object' &&
-    typeof (lease as ConnectionLease).ownerId === 'string' &&
-    typeof (lease as ConnectionLease).expiresAt === 'number'
-  ) {
-    return lease as ConnectionLease;
-  }
-  return null;
-}
-
-async function acquireConnectionLease(): Promise<boolean> {
-  const now = Date.now();
-  const lease = await readConnectionLease();
-  if (lease !== null && lease.ownerId !== workerInstanceId && lease.expiresAt > now) {
-    return false;
-  }
-  await browser.storage.session.set({
-    [CONNECTION_LEASE_KEY]: {
-      ownerId: workerInstanceId,
-      expiresAt: now + CONNECTION_LEASE_TTL_MS,
-    } satisfies ConnectionLease,
-  });
-  // storage.session 非原子锁：写入后短暂等待再读回，只有仍持有 ownerId 的实例才真正建 WS。
-  await new Promise((resolve) => setTimeout(resolve, CONNECTION_LEASE_SETTLE_MS));
-  const confirmed = await readConnectionLease();
-  return confirmed?.ownerId === workerInstanceId;
-}
-
-async function refreshConnectionLease(): Promise<void> {
-  const lease = await readConnectionLease();
-  if (lease?.ownerId !== workerInstanceId) return;
-  await browser.storage.session.set({
-    [CONNECTION_LEASE_KEY]: {
-      ownerId: workerInstanceId,
-      expiresAt: Date.now() + CONNECTION_LEASE_TTL_MS,
-    } satisfies ConnectionLease,
-  });
-}
-
-async function releaseConnectionLease(): Promise<void> {
-  const lease = await readConnectionLease();
-  if (lease?.ownerId === workerInstanceId) {
-    await browser.storage.session.remove(CONNECTION_LEASE_KEY);
-  }
-}
-
 function startHeartbeat(currentSocket: WebSocket): void {
   clearHeartbeat();
   heartbeatTimer = setInterval(() => {
@@ -396,7 +342,6 @@ function startHeartbeat(currentSocket: WebSocket): void {
     }
     // 后端会忽略无 requestId 的消息；这里只为产生真实 WS 流量，防止 worker 无事件休眠后反复重连。
     currentSocket.send(JSON.stringify({ type: 'keepalive', sentAt: Date.now() }));
-    void refreshConnectionLease();
   }, HEARTBEAT_INTERVAL_MS);
 }
 
@@ -408,7 +353,7 @@ function scheduleReconnect(delayOverrideMs?: number): void {
   }
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
-    void connect();
+    connect();
   }, delayMs);
 }
 
@@ -419,18 +364,18 @@ function retryConnectionNow(): void {
   lastForegroundRetryAt = now;
   reconnectDelayMs = INITIAL_RECONNECT_DELAY_MS;
   handshakeFailureDelayMs = HANDSHAKE_FAILURE_BACKOFF_MS;
-  void connect();
+  // 被顶替的退避只在这里清零：用户打开了 popup，才说明他要的是当前这个浏览器。若改到 open 里清零，
+  // 两个浏览器会稳定地每 15s 互相顶替一次，退避形同没有。
+  replacedConnectionDelayMs = REPLACED_CONNECTION_BACKOFF_MS;
+  connect();
 }
 
-async function connect(): Promise<void> {
+// 必须保持同步：一旦这里出现 await，isSocketActive() 与 socket = nextSocket 之间就有了可中断点，
+// 同一个 worker 的多个入口（装载时的 defineBackground 体 + onInstalled、alarm + onStartup）会各建一条 WS。
+// 多出来的那条被所有 handler 用 socket !== nextSocket 忽略，但后端仍当它活着——反过来顶替掉真正在用的那条。
+function connect(): void {
   if (isSocketActive()) return;
   clearReconnectTimer();
-
-  const hasLease = await acquireConnectionLease();
-  if (!hasLease) {
-    scheduleReconnect(CONNECTION_LEASE_RECHECK_MS);
-    return;
-  }
 
   const nextSocket = new WebSocket(buildBackendWebSocketUrl('/ws/extension/bridge'));
   socket = nextSocket;
@@ -447,18 +392,26 @@ async function connect(): Promise<void> {
 
   nextSocket.addEventListener('message', (event) => {
     if (socket !== nextSocket) return;
-    void handleInstruction(JSON.parse(event.data as string) as BridgeInstruction);
+    let instruction: BridgeInstruction;
+    try {
+      instruction = JSON.parse(event.data as string) as BridgeInstruction;
+    } catch (error) {
+      // 帧解不出来就没有 requestId，回不了错——只能记一条，后端那侧走超时收场
+      console.warn('[rpa-studio-bridge] dropped a malformed instruction frame', error);
+      return;
+    }
+    void handleInstruction(instruction);
   });
 
   nextSocket.addEventListener('close', (event) => {
     if (socket !== nextSocket) return;
     socket = null;
     clearHeartbeat();
-    void releaseConnectionLease();
-    if (event.code === DUPLICATE_CONNECTION_CLOSE_CODE) {
-      // 后端已有别的连接在线（非网络问题、是租约对不上）：明显放慢重试，让持有连接的一方稳定下来。
-      console.log('[rpa-studio-bridge] backend reports another connection already active, backing off');
-      scheduleReconnect(DUPLICATE_CONNECTION_BACKOFF_MS);
+    if (event.code === REPLACED_CONNECTION_CLOSE_CODE) {
+      // 被另一个浏览器顶替（不是网络问题）：递增退避，把两边互相顶替的频率压下来。
+      console.log(`[rpa-studio-bridge] connection replaced by another browser, backing off ${replacedConnectionDelayMs / 1000}s`);
+      scheduleReconnect(replacedConnectionDelayMs);
+      replacedConnectionDelayMs = Math.min(replacedConnectionDelayMs * 2, REPLACED_CONNECTION_MAX_BACKOFF_MS);
       return;
     }
     if (!hasOpened || event.code === 1006) {
@@ -486,33 +439,51 @@ async function handleInstruction(instruction: BridgeInstruction): Promise<void> 
   const { action } = instruction;
   void notifyAutomationActivity();
   let result: { ok: boolean; result?: unknown; error?: string };
-  if (action.type === 'browser.screenshot') {
-    result = await captureActiveTabScreenshot();
-  } else if (action.type === 'automation.group.start') {
-    result = await ensureControlledTabGroup(action.title);
-  } else if (action.type === 'automation.group.end') {
-    result = await markControlledTabGroupDone(action.title);
-  } else if (action.type === 'browser.open') {
-    result = await navigateActiveTab(action);
-  } else if (action.type === 'browser.tab.open') {
-    result = await openNewTab(action);
-  } else if (action.type === 'browser.tab.switch') {
-    result = await switchTab(action);
-  } else if (action.type === 'browser.tab.close') {
-    result = await closeControlledTab();
-  } else if (action.trusted === true && (action.type === 'browser.click' || action.type === 'browser.fill')) {
-    result = await dispatchTrustedInput(action);
-  } else {
-    result = await sendToActiveTab(action);
+  try {
+    if (action.type === 'browser.screenshot') {
+      result = await captureActiveTabScreenshot();
+    } else if (action.type === 'automation.group.start') {
+      result = await ensureControlledTabGroup(action.title);
+    } else if (action.type === 'automation.group.end') {
+      result = await markControlledTabGroupDone(action.title);
+    } else if (action.type === 'browser.open') {
+      result = await navigateActiveTab(action);
+    } else if (action.type === 'browser.tab.open') {
+      result = await openNewTab(action);
+    } else if (action.type === 'browser.tab.switch') {
+      result = await switchTab(action);
+    } else if (action.type === 'browser.tab.close') {
+      result = await closeControlledTab();
+    } else if (action.trusted === true && (action.type === 'browser.click' || action.type === 'browser.fill')) {
+      result = await dispatchTrustedInput(action);
+    } else {
+      result = await sendToActiveTab(action);
+    }
+  } catch (error) {
+    // 上面每个分支里的 tabs.update/create/get/remove、waitForTabLoad 都会 reject：用户中途关掉
+    // 自动化标签页、目标是 chrome:// 这类禁止导航的 URL 都算常态。抛出去只会变成一条被丢弃的
+    // rejection，BridgeResult 永远不发，后端等满 30s 才以「扩展执行动作超时」收场——真因整个丢掉。
+    result = { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
   const response: BridgeResult = { requestId: instruction.requestId, ...result };
-  socket?.send(JSON.stringify(response));
+  if (socket === null || socket.readyState !== WebSocket.OPEN) {
+    // 长动作跑完时连接可能已经换过一轮。这里只能记账：后端的 future 认 requestId，等不到就超时
+    console.warn('[rpa-studio-bridge] socket unavailable, dropping result for', instruction.requestId);
+    return;
+  }
+  socket.send(JSON.stringify(response));
 }
 
+// 纯提示、失败无所谓，但它内部的 tabs.update 会 reject：调用方一律 void，不自己兜住就是未处理的 rejection
 async function notifyAutomationActivity(retries = 1): Promise<void> {
   for (let attempt = 0; attempt <= retries; attempt += 1) {
-    const result = await sendToActiveTab({ type: 'automation.activity' }, { passive: true });
-    if (result.ok) return;
+    try {
+      const result = await sendToActiveTab({ type: 'automation.activity' }, { passive: true });
+      if (result.ok) return;
+    } catch {
+      // 忽略：活跃度提示失败不影响本次动作
+    }
+    if (attempt === retries) return;
     await new Promise((resolve) => setTimeout(resolve, 180));
   }
 }
@@ -552,8 +523,11 @@ async function dispatchTrustedInput(action: BridgeInstruction['action']): Promis
 
       if (action.type === 'browser.fill') {
         if (action.inputValue === undefined) return { ok: false, error: 'browser.fill 需要 inputValue' };
-        await chrome.debugger.sendCommand(debuggee, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', modifiers: 2 /* Ctrl */ });
-        await chrome.debugger.sendCommand(debuggee, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', modifiers: 2 });
+        // 全选走 commands 而不是猜 modifier 位：macOS 上 Ctrl+A 是「移到行首」而非全选，
+        // 光标跳到 0、Backspace 什么也删不掉，insertText 于是插在原值前面而不是替换掉它。
+        // commands 让 Chrome 按自身平台绑定执行编辑命令，两个平台都对。
+        await chrome.debugger.sendCommand(debuggee, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', commands: ['selectAll'] });
+        await chrome.debugger.sendCommand(debuggee, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA' });
         await chrome.debugger.sendCommand(debuggee, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace' });
         await chrome.debugger.sendCommand(debuggee, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace' });
         await chrome.debugger.sendCommand(debuggee, 'Input.insertText', { text: action.inputValue });
@@ -684,17 +658,18 @@ async function resumeHumanTakeover(taskId: string): Promise<void> {
 }
 
 export default defineBackground(() => {
-  void connect();
+  connect();
   void browser.alarms.create(KEEPALIVE_ALARM_NAME, { periodInMinutes: KEEPALIVE_PERIOD_MINUTES });
   browser.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name !== KEEPALIVE_ALARM_NAME) return;
     if (!isSocketActive()) scheduleReconnect();
   });
   // onStartup 主动补连，避免浏览器刚重启、SW 还没被 alarm/事件唤醒那段时间桥接断连；onInstalled 覆盖安装/更新。
+  // 这几个入口在装载时可能同一 tick 内连着触发，靠 connect() 同步判 isSocketActive() 去重。
   browser.runtime.onStartup.addListener(() => {
-    void connect();
+    connect();
   });
   browser.runtime.onInstalled.addListener(() => {
-    void connect();
+    connect();
   });
 });

@@ -25,12 +25,28 @@ function dispatchClick(el: Element): void {
   }
 }
 
+// React 在 input/textarea 实例上重写了 value 的属性描述符，直连赋值会顺带把它的 _valueTracker
+// 一起更新；随后派发的 input 事件里 React 比对「当前值 === tracker 值」判定没有变化，onChange
+// 于是不触发，受控组件的 state 停在旧值——DOM 看着填上了，页面其实没收到，还会在下次渲染被写回。
+// 走原型上的原生 setter 绕开实例描述符，tracker 才会与 DOM 不一致，React 才认这次输入。
+// Vue/Angular 读 event.target.value，两种写法都通；<select> 走 React 的 change 事件通路、
+// 不做值比对，所以 dispatchSelect 不需要这层。
+function setNativeValue(el: HTMLInputElement | HTMLTextAreaElement, text: string): void {
+  const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+  if (setter === undefined) {
+    el.value = text;
+    return;
+  }
+  setter.call(el, text);
+}
+
 function dispatchType(el: Element, text: string): void {
   if (!(el instanceof HTMLInputElement) && !(el instanceof HTMLTextAreaElement)) return;
   const rect = el.getBoundingClientRect();
   moveCursorTo(rect.x + rect.width / 2, rect.y + rect.height / 2);
   el.focus();
-  el.value = text;
+  setNativeValue(el, text);
   el.dispatchEvent(new Event('input', { bubbles: true }));
   el.dispatchEvent(new Event('change', { bubbles: true }));
 }

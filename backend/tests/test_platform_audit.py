@@ -118,6 +118,9 @@ class _TaskManager:
     def is_extension_connected(self) -> bool:
         return False
 
+    def is_extension_enabled(self) -> bool:
+        return True
+
 
 def _executor(task: TaskSnapshot, *, revision: int = 1) -> RpaToolExecutor:
     class _FlowService:

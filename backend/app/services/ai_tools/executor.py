@@ -1126,8 +1126,18 @@ class RpaToolExecutor:
         return changed_nodes, updated_node_snapshots
 
     async def _check_extension_connection(self) -> dict[str, Any]:
+        # "开关没开"和"浏览器没接上"要分开报：混成一句话，模型只会反复喊"请打开扩展"，
+        # 而用户的扩展本来就开着，真正要动的是设置里的开关。
+        enabled = self._task_manager.is_extension_enabled()
         connected = self._task_manager.is_extension_connected()
+        if not enabled:
+            return {
+                "enabled": False,
+                "connected": connected,
+                "message": "插件执行器已在设置中关闭。请提示用户到「设置 · 浏览器插件」里开启，否则无法用 browser_executor='extension' 运行。",
+            }
         return {
+            "enabled": True,
             "connected": connected,
             "message": (
                 "扩展已连接，可以使用 browser_executor='extension' 运行。"
@@ -1282,6 +1292,15 @@ class RpaToolExecutor:
         flow = await self._flow_service.get_flow(flow_id)
         if flow is None:
             return {"error": f"流程 {flow_id} 不存在"}
+
+        if browser_executor == "extension" and not self._task_manager.is_extension_enabled():
+            return {
+                "status": "extension_disabled",
+                "message": (
+                    "已阻止运行：请求使用 browser_executor='extension'，但插件执行器已在设置中关闭。"
+                    "请提示用户到「设置 · 浏览器插件」里开启，不要静默改用 Playwright 执行器。"
+                ),
+            }
 
         if browser_executor == "extension" and not self._task_manager.is_extension_connected():
             return {

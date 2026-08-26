@@ -6,6 +6,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+import pytest
+
 from app.models.schemas import RunTaskRequest, ScrapeResult
 from app.services.artifact_store import LocalArtifactStore
 from app.services.file_action_runner import FileActionRunner
@@ -328,6 +330,9 @@ async def test_task_manager_shows_and_hides_extension_banner_through_human_takeo
     notifier = RecordingOverlayNotifier()
     manager = TaskManager(runner=FakeRunner(), broker=LogBroker(), artifact_store=LocalArtifactStore(artifact_root=tmp_path))
     manager._extension_executor = fake_extension  # type: ignore[assignment]
+    # 绕过 set_extension_bridge 直接注入执行器时必须补上开关闭包：没有闭包按关闭处理（fail-closed），
+    # 否则这条流程会以「插件已在设置中关闭」报错，而不是走到人工接管暂停。
+    manager._is_extension_enabled = lambda: True  # type: ignore[assignment]
     manager.set_notifier(notifier)
 
     snapshot = await manager.start_task(
@@ -618,6 +623,13 @@ async def test_task_manager_runs_task_to_success(tmp_path) -> None:
             flowName="测试流程",
             targetUrl="https://example.com/",
             selector="h1::text",
+            flowDefinition={
+                "nodes": [
+                    {"id": "start", "type": "start"},
+                    {"id": "fetch", "type": "browser.fetch", "targetUrl": "https://example.com/", "selector": "h1::text"},
+                ],
+                "edges": [{"source": "start", "target": "fetch"}],
+            },
         )
     )
 
@@ -769,6 +781,7 @@ async def test_task_manager_routes_fetch_node_to_extension_and_keeps_structured_
     fake_extension = FakeExtensionExecutor({"table.orders": [{"姓名": "张三", "金额": "100"}, {"姓名": "李四", "金额": "200"}]})
     manager = TaskManager(runner=runner, broker=LogBroker(), artifact_store=LocalArtifactStore(artifact_root=tmp_path))
     manager._extension_executor = fake_extension  # type: ignore[assignment]
+    manager._is_extension_enabled = lambda: True  # type: ignore[assignment]
 
     snapshot = await manager.start_task(
         RunTaskRequest(
@@ -805,6 +818,69 @@ async def test_task_manager_routes_fetch_node_to_extension_and_keeps_structured_
     variables = {variable.name: variable.value for variable in current.variables}
     assert variables["orders"] == '[{"姓名": "张三", "金额": "100"}, {"姓名": "李四", "金额": "200"}]'
     assert variables["first_order"] == '{"姓名": "张三", "金额": "100"}'
+
+
+async def test_task_manager_refuses_extension_executor_when_disabled_in_settings(tmp_path) -> None:
+    """设置里关掉插件后，一条活着的 WebSocket 不能再成为操作用户真实登录浏览器的入口。
+
+    这是所有路由到插件执行器的路径（REST / AI 试跑 / 定时任务）共用的唯一闸门。
+    """
+    runner = RecordingRunner()
+    fake_extension = FakeExtensionExecutor({".target::text": ["不该被抓到"]})
+    manager = TaskManager(runner=runner, broker=LogBroker(), artifact_store=LocalArtifactStore(artifact_root=tmp_path))
+    manager._extension_executor = fake_extension  # type: ignore[assignment]
+    manager._is_extension_enabled = lambda: False  # type: ignore[assignment]
+
+    snapshot = await manager.start_task(
+        RunTaskRequest(
+            flowName="插件被关闭",
+            targetUrl="https://example.com/fallback",
+            selector=".fallback::text",
+            browserExecutor="extension",
+            flowDefinition={
+                "nodes": [
+                    {"id": "start", "type": "start"},
+                    {
+                        "id": "fetch",
+                        "title": "采集订单",
+                        "type": "browser.fetch",
+                        "targetUrl": "https://example.com/orders",
+                        "selector": ".target::text",
+                    },
+                ],
+                "edges": [{"source": "start", "target": "fetch"}],
+            },
+        )
+    )
+    current = await wait_for_status(manager, snapshot.task_id, {"error"})
+
+    assert fake_extension.actions == []
+    assert runner.requests == []
+    assert current.error is not None
+    assert "关闭" in current.error
+
+
+async def test_task_manager_rejects_run_request_without_flow_definition(tmp_path) -> None:
+    """TaskManager 只执行流程定义：没有 flowDefinition 的请求当场拒掉，不建任务记录。
+
+    以前这种请求会从遗留顶层字段拼一个临时节点直接跑 Playwright，而且那条路径绕过了执行器选择——
+    选了插件也照样静默换成 Playwright，抓的是没有登录态的页面，交出空数据而不是报错。
+    """
+    runner = RecordingRunner()
+    manager = TaskManager(runner=runner, broker=LogBroker(), artifact_store=LocalArtifactStore(artifact_root=tmp_path))
+
+    with pytest.raises(ValueError, match="flowDefinition"):
+        await manager.start_task(
+            RunTaskRequest(
+                flowName="缺少流程定义",
+                targetUrl="https://example.com/orders",
+                selector=".target::text",
+                browserExecutor="extension",
+            )
+        )
+
+    assert runner.requests == []
+    assert await manager.list_tasks() == []
 
 
 async def test_task_manager_excludes_auxiliary_browser_extract_from_final_result(tmp_path) -> None:
@@ -1977,13 +2053,22 @@ async def test_task_manager_step_over_pauses_again_before_next_node(tmp_path) ->
 
 
 async def test_task_manager_respects_queue_concurrency(tmp_path) -> None:
+    def _single_fetch_definition() -> dict[str, object]:
+        return {
+            "nodes": [
+                {"id": "start", "type": "start"},
+                {"id": "fetch", "type": "browser.fetch", "targetUrl": "https://example.com/", "selector": "h1::text"},
+            ],
+            "edges": [{"source": "start", "target": "fetch"}],
+        }
+
     runner = SlowRunner()
     manager = TaskManager(runner=runner, broker=LogBroker(), artifact_store=LocalArtifactStore(artifact_root=tmp_path), concurrency=1)
     first = await manager.start_task(
-        RunTaskRequest(flowName="任务一", targetUrl="https://example.com/", selector="h1::text")
+        RunTaskRequest(flowName="任务一", targetUrl="https://example.com/", selector="h1::text", flowDefinition=_single_fetch_definition())
     )
     second = await manager.start_task(
-        RunTaskRequest(flowName="任务二", targetUrl="https://example.com/", selector="h1::text")
+        RunTaskRequest(flowName="任务二", targetUrl="https://example.com/", selector="h1::text", flowDefinition=_single_fetch_definition())
     )
 
     for _ in range(20):

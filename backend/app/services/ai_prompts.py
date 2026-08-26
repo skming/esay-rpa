@@ -264,7 +264,7 @@ _SEC['step4_execute'] = """### 第四步：实施与验证
 **⚠️ 执行器选择（浏览器扩展 vs Playwright）**：
 - 用户要求"用 Chrome 扩展""复用真实登录态""不要用 Playwright"等 → 这是 `run_flow` 的 `browser_executor="extension"` **调用参数**，不是流程变量（写进 `variables` 会被 `misplaced_call_parameters` 判错）。
 - 传 `browser_executor="extension"` 前必须先调用 `check_extension_connection`；未连接时**停止并如实告知用户**"扩展未连接，请先打开 Chrome 扩展并确认已登录目标网站"，不要静默改用 Playwright，也不要只在流程里加一个提示性的 `variable.log` 节点替代真实检查。
-- `run_flow` 本身在 `browser_executor="extension"` 且未连接时也会直接拦截并返回 `status=extension_not_connected`；收到这个 status 时同样应停止并提示用户，不得重试或换回 Playwright 掩盖问题。
+- `run_flow` 本身在 `browser_executor="extension"` 且未连接时也会直接拦截并返回 `status=extension_not_connected`；插件在设置里被关闭时返回 `status=extension_disabled`（这时要让用户去「设置 · 浏览器插件」开开关，而不是让他去开浏览器）。收到这两个 status 时同样应停止并提示用户，不得重试或换回 Playwright 掩盖问题。
 
 **⚠️ 定时任务与任务控制**：
 - 用户说"每天X点自动跑""每小时执行一次""定时抓取"等 → 用 `create_schedule`（5 段 Cron：分 时 日 月 周，时区默认 Asia/Shanghai）。创建前先 `list_schedules` 查重，避免同一流程重复建任务。

@@ -152,6 +152,7 @@ class TaskManager:
         self._notifier: object | None = None
         self._overlay_analyzer: object | None = None
         self._extension_executor: ExtensionExecutor | None = None
+        self._is_extension_enabled: Callable[[], bool] | None = None
         self._background_tasks: set[asyncio.Task] = set()
 
     def set_notifier(self, notifier: object) -> None:
@@ -160,16 +161,25 @@ class TaskManager:
     def set_overlay_analyzer(self, analyzer: object) -> None:
         self._overlay_analyzer = analyzer
 
-    def set_extension_bridge(self, bridge: ExtensionBridgeService) -> None:
+    def set_extension_bridge(self, bridge: ExtensionBridgeService, *, is_extension_enabled: Callable[[], bool]) -> None:
+        """is_extension_enabled 是必传关键字参数：留默认值就等于默认放行，那样设置里关掉插件后，
+        一条活着的 WebSocket 仍然能操作用户真实登录的浏览器。每次调用而不是缓存布尔值——开关可以在运行中被改。"""
         self._extension_executor = ExtensionExecutor(bridge=bridge)
+        self._is_extension_enabled = is_extension_enabled
+
+    def is_extension_enabled(self) -> bool:
+        return self._is_extension_enabled is not None and self._is_extension_enabled()
 
     def is_extension_connected(self) -> bool:
         return self._extension_executor is not None and self._extension_executor.is_connected
 
     def _resolve_browser_executor(self, record: TaskRecord) -> BrowserExecutor:
+        # 所有路由到插件执行器的路径（REST、AI 试跑、定时任务）都汇到这里，开关判定只放这一处。
         if record.request.browser_executor == "extension":
             if self._extension_executor is None:
                 raise ConnectionError("插件执行器未启用：后端未注册 ExtensionBridgeService")
+            if not self.is_extension_enabled():
+                raise ConnectionError("插件执行器已在设置中关闭：请先在「设置 · 浏览器插件」里开启后再运行")
             return self._extension_executor
         return self._browser_action_runner
 
@@ -201,6 +211,12 @@ class TaskManager:
         await self._queue.stop()
 
     async def start_task(self, request: RunTaskRequest) -> TaskSnapshot:
+        # TaskManager 只执行流程定义。flow_definition 在 schema 上仍是可选的，因为同一个
+        # RunTaskRequest 也被当作定时任务的存量载荷持久化——那种载荷只带 flow_id，定义在触发时
+        # 由 FlowRunner 现取，改成必填会让磁盘上已有的调度全部反序列化失败。所以门控放在执行
+        # 入口：拿不到定义就直接拒，不建任务记录。
+        if request.flow_definition is None:
+            raise ValueError("缺少 flowDefinition：运行请求必须带流程定义，或改用 POST /api/flows/{flowId}/run 按已保存流程运行")
         executable_nodes = self._resolve_executable_nodes(request)
         task_id = f"t_{uuid4()}"
         now = datetime.now(UTC)
@@ -371,12 +387,12 @@ class TaskManager:
         try:
             total_steps = max(len(record.executable_nodes), 1) + 2
             await self._update_snapshot(record, status="running", progress=RuntimeProgress(current_step=1, total_steps=total_steps, percent=10, elapsed_ms=0))
-            # flow_definition 存在时 target_url 是遗留字段的无关默认值，不作为启动详情展示
-            startup_detail = None if record.request.flow_definition is not None else str(record.request.target_url)
-            await self._append_log(record, "info", f"任务启动 · {record.request.flow_name}", startup_detail, node_id="start")
+            # detail 传 None：target_url 是遗留顶层字段，只作为各节点请求的兜底默认值，
+            # 不代表这次运行真正访问的地址，展示出来会误导。
+            await self._append_log(record, "info", f"任务启动 · {record.request.flow_name}", None, node_id="start")
             await self._append_log(record, "info", _build_run_config_message(record.request), None, node_id=record.request.start_node_id or "start")
 
-            result = await self._run_fetch_nodes(record, started)
+            result = await self._run_flow_definition(record, started)
 
             elapsed_ms = max(int((datetime.now(UTC) - started).total_seconds() * 1000), 0)
             artifact = await self._artifact_store.save_json(
@@ -479,62 +495,6 @@ class TaskManager:
         await self._task_store.append_log(entry)
         await self._broker.publish(entry)
 
-    async def _run_fetch_nodes(self, record: TaskRecord, started: datetime) -> ScrapeResult:
-        if record.request.flow_definition is not None:
-            return await self._run_flow_definition(record, started)
-
-        if not record.executable_nodes:
-            # 旧版单节点抓取请求（没有 flow_definition 也没有可执行节点列表）：
-            # 从遗留的顶层字段（target_url/selector 等）拼出一个临时节点直接跑一次
-            record.active_node_id = record.request.start_node_id or "n1"
-            request = FlowDefinitionSelector.build_request_for_fetch_node(
-                record.request,
-                _resolve_node_variables(_build_request_node(record.request), record.variables),
-            )
-            return await self._runner.run(
-                record.snapshot.task_id,
-                request,
-                lambda level, message, detail=None: self._append_log(record, level, message, detail, node_id=record.active_node_id or "n1"),
-            )
-
-        results: list[ScrapeResult] = []
-        total_steps = len(record.executable_nodes) + 2
-        for index, node in enumerate(record.executable_nodes, start=1):
-            if record.canceled:
-                raise asyncio.CancelledError
-
-            node_id = _read_node_id(node, fallback=f"n{index}")
-            record.active_node_id = node_id
-            node_title = _read_node_title(node, fallback=f"采集步骤 {index}")
-            await self._update_snapshot(
-                record,
-                progress=RuntimeProgress(
-                    current_step=index + 1,
-                    total_steps=total_steps,
-                    percent=min(95, max(10, int(((index + 1) / total_steps) * 100))),
-                    elapsed_ms=max(int((datetime.now(UTC) - started).total_seconds() * 1000), 0),
-                ),
-            )
-            if _is_variable_node(node):
-                await self._pause_for_debug_if_needed(record, node_id=node_id, node_title=node_title)
-                await self._run_variable_action_node(record, node, node_id=node_id, node_title=node_title)
-                continue
-
-            await self._pause_for_debug_if_needed(record, node_id=node_id, node_title=node_title)
-            step_request = FlowDefinitionSelector.build_request_for_fetch_node(record.request, _resolve_node_variables(node, record.variables))
-            await self._append_log(record, "running", f"执行节点 · {node_title}", step_request.selector, node_id=node_id)
-            result = await self._run_fetch_node(record, step_request, node=node, node_id=node_id, node_title=node_title)
-            if result is not None:
-                results.append(result)
-                saved_names = apply_fetch_result_variables(node, result, record.variables)
-                if saved_names:
-                    await self._append_log(record, "success", f"输出变量已更新 · {', '.join(saved_names)}", None, node_id=node_id)
-                    await self._update_snapshot(record, variables=record.variables.snapshots())
-
-        if not results:
-            raise RuntimeError("所有 browser.fetch 节点执行失败")
-        return _merge_scrape_results(results)
-
     async def _run_flow_definition(self, record: TaskRecord, started: datetime) -> ScrapeResult:
         definition = record.request.flow_definition
         if definition is None:
@@ -562,7 +522,13 @@ class TaskManager:
                     await self._execute_flow_node(record, state, node, outgoing_edges=[], should_follow_edges=False)
         finally:
             await _export_browser_cookies(state.browser_context)
-            await self._resolve_browser_executor(record).close_context(state.browser_context)
+            try:
+                await self._resolve_browser_executor(record).close_context(state.browser_context)
+            except Exception as exc:
+                # finally 里抛出的异常会顶掉 try 里真正的失败原因。运行途中在设置里关掉插件开关
+                # 就会走到这里：真正的节点报错会被改写成"插件已关闭"，用户照着去开开关也修不好。
+                # 清理失败要留痕（上下文可能泄漏），但不能替换根因，也不能跳过下面的产物清理。
+                await self._append_log(record, "warn", "浏览器上下文清理失败", str(exc), node_id=record.active_node_id or "end")
             self._prune_run_outputs(record)
 
         if state.results:
@@ -2161,20 +2127,6 @@ def _read_data_detail(node: dict[str, object]) -> str | None:
 def _safe_artifact_name(value: str) -> str:
     normalized = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip()).strip("-")
     return normalized or "screenshot"
-
-
-def _build_request_node(request: RunTaskRequest) -> dict[str, object]:
-    return {
-        "type": "browser.fetch",
-        "targetUrl": str(request.target_url),
-        "selector": request.selector,
-        "fetcher": request.fetcher,
-        "extractMode": request.extract_mode,
-        "attribute": request.attribute,
-        "adaptive": request.adaptive,
-        "autoSave": request.auto_save,
-        "timeoutMs": request.timeout_ms,
-    }
 
 
 _RUN_SCOPE_LABELS = {

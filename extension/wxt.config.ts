@@ -10,7 +10,7 @@ export default defineConfig({
   manifest: {
     name: 'Easy RPA',
     description: '自动化浏览器插件',
-    permissions: ['activeTab', 'scripting', 'debugger', 'alarms', 'storage', 'tabs', 'tabGroups'],
+    permissions: ['activeTab', 'scripting', 'debugger', 'alarms', 'tabs', 'tabGroups'],
     host_permissions: ['<all_urls>'],
   },
 });

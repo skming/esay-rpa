@@ -449,6 +449,21 @@ def test_task_log_websocket_replays_existing_logs() -> None:
                 "targetUrl": "https://quotes.toscrape.com/",
                 "selector": ".quote .text::text",
                 "timeoutMs": 1000,
+                "flowDefinition": {
+                    "nodes": [
+                        {"id": "start", "type": "start"},
+                        {
+                            "id": "fetch",
+                            "type": "browser.fetch",
+                            "targetUrl": "https://quotes.toscrape.com/",
+                            "selector": ".quote .text::text",
+                            "fetcher": "static",
+                            "extractMode": "text",
+                            "timeoutMs": 1000,
+                        },
+                    ],
+                    "edges": [{"source": "start", "target": "fetch"}],
+                },
             },
         )
         assert task_response.status_code == 200
@@ -660,3 +675,32 @@ async def test_relay_failure_body_reaches_the_user_whole(monkeypatch) -> None:
         assert sent["json"]["model"] == "gpt-5.6-sol"
     finally:
         orch._relay_models_cache.clear()
+
+
+async def test_extension_status_reports_canexecute_separately_from_display_connected() -> None:
+    """connected 带 8s 断线宽限、用于指示灯防抖；canExecute 不平滑——运行前置门控必须看后者，
+    否则重连窗口里运行按钮仍可点，动作直接发到空 socket。"""
+    import app.main as main_module
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        response = await client.get("/api/extension/status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body.keys()) >= {"connected", "canExecute", "enabled", "connectedSince"}
+    assert body["canExecute"] is main_module.extension_bridge_service.is_connected
+    assert body["canExecute"] is False, "测试进程里没有真实插件连接"
+
+
+async def test_extension_execute_hook_refuses_when_disabled_in_settings(monkeypatch) -> None:
+    """手工测试口子同样操作用户真实登录的浏览器，开关关掉时不能因为"只是测试"就放行。"""
+    import app.main as main_module
+
+    monkeypatch.setattr(main_module.extension_config_service, "load", lambda: {"enabled": False})
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        response = await client.post(
+            "/api/extension/execute", json={"action": {"type": "browser.click", "selector": "#x"}}
+        )
+
+    assert response.status_code == 409
+    assert "关闭" in response.json()["detail"]

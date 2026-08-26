@@ -36,6 +36,21 @@ def build_task_request() -> RunTaskRequest:
         targetUrl="https://quotes.toscrape.com/",
         selector=".quote .text::text",
         timeoutMs=1000,
+        # 调度载荷要么绑定 flow_id（触发时由 FlowRunner 现取流程定义、覆盖这里的 flowDefinition），
+        # 要么自带定义。TaskManager 不再从遗留顶层字段拼临时节点执行。
+        flowDefinition={
+            "nodes": [
+                {"id": "start", "type": "start"},
+                {
+                    "id": "fetch",
+                    "type": "browser.fetch",
+                    "targetUrl": "https://quotes.toscrape.com/",
+                    "selector": ".quote .text::text",
+                    "timeoutMs": 1000,
+                },
+            ],
+            "edges": [{"source": "start", "target": "fetch"}],
+        },
     )
 
 

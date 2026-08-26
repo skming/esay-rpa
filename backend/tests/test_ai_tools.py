@@ -486,11 +486,12 @@ class FakeFlowService:
 
 
 class FakeTaskManager:
-    def __init__(self, *, with_failing_tasks: bool = True, extension_connected: bool = False) -> None:
+    def __init__(self, *, with_failing_tasks: bool = True, extension_connected: bool = False, extension_enabled: bool = True) -> None:
         now = datetime.now(UTC)
         self.started = False
         self.started_request = None
         self.extension_connected = extension_connected
+        self.extension_enabled = extension_enabled
         self.tasks = (
             [
                 TaskSnapshot(
@@ -551,6 +552,9 @@ class FakeTaskManager:
     def is_extension_connected(self) -> bool:
         return self.extension_connected
 
+    def is_extension_enabled(self) -> bool:
+        return self.extension_enabled
+
 
 async def test_run_flow_blocks_after_repeated_similar_failures() -> None:
     task_manager = FakeTaskManager()
@@ -590,6 +594,28 @@ async def test_run_flow_blocks_when_extension_requested_but_not_connected() -> N
 
     assert result["status"] == "extension_not_connected"
     assert task_manager.started is False
+
+
+async def test_run_flow_blocks_when_extension_disabled_in_settings() -> None:
+    """开关关掉时不能只报"未连接"：那会让模型一路催用户去开浏览器，而用户浏览器早就开着了。"""
+    task_manager = FakeTaskManager(with_failing_tasks=False, extension_connected=True, extension_enabled=False)
+    executor = RpaToolExecutor(flow_service=FakeFlowService(), task_manager=task_manager)  # type: ignore[arg-type]
+
+    result = await executor._run_flow("flow-1", browser_executor="extension")
+
+    assert result["status"] == "extension_disabled"
+    assert "设置" in result["message"]
+    assert task_manager.started is False
+
+
+async def test_check_extension_connection_reports_disabled_switch() -> None:
+    task_manager = FakeTaskManager(extension_connected=True, extension_enabled=False)
+    executor = RpaToolExecutor(flow_service=FakeFlowService(), task_manager=task_manager)  # type: ignore[arg-type]
+
+    result = await executor._check_extension_connection()
+
+    assert result["enabled"] is False
+    assert "设置" in result["message"]
 
 
 class _SimpleFlowService:

@@ -1836,6 +1836,7 @@ _RUN_NOT_STARTED_STATUSES = frozenset({
     "blocked_by_failure_budget",
     "blocked_browser_profile_busy",
     "extension_not_connected",
+    "extension_disabled",
     "empty_credential_variables",
     "missing_run_variables",
     "misplaced_call_parameters",

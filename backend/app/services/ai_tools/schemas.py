@@ -222,7 +222,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "passed=true 才算交付达标，passed=false 按 repair_plan 修流程后重跑；"
                 "error 后诊断；paused_for_human / waiting_for_user_input"
                 "表示原任务仍在等待用户，禁止重新运行；timeout 可查询状态。extension 未连接时"
-                "返回 extension_not_connected，不会回退到 Playwright。"
+                "返回 extension_not_connected，被设置关闭时返回 extension_disabled，两者都不会回退到 Playwright。"
             ),
             "parameters": {
                 "type": "object",
@@ -251,9 +251,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "check_extension_connection",
             "description": (
-                "查询 Chrome 扩展桥接的实时连接状态。在用户要求使用扩展执行器"
-                "（browser_executor='extension'）运行流程前必须先调用一次；"
-                "未连接时应停止并提示用户先打开扩展、确保有已登录的标签页，而不是直接尝试运行。"
+                "查询 Chrome 扩展桥接的实时状态，返回 enabled（设置里的开关）与 connected（是否有浏览器接上）。"
+                "在用户要求使用扩展执行器（browser_executor='extension'）运行流程前必须先调用一次；"
+                "enabled=false 时提示用户去「设置 · 浏览器插件」开启，connected=false 时提示用户打开 Chrome 扩展、"
+                "确保有已登录的标签页——两种情形都应停止，而不是直接尝试运行。"
             ),
             "parameters": {"type": "object", "properties": {}},
         },

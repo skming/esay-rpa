@@ -19,6 +19,7 @@ class FakeWebSocket:
     def __init__(self) -> None:
         self.sent: list[dict] = []
         self.closed = False
+        self.close_code: int | None = None
         self._incoming: asyncio.Queue = asyncio.Queue()
 
     async def accept(self) -> None:
@@ -26,6 +27,8 @@ class FakeWebSocket:
 
     async def close(self, code: int = 1000, reason: str = "") -> None:
         self.closed = True
+        if self.close_code is None:
+            self.close_code = code
 
     async def receive_json(self) -> dict:
         item = await self._incoming.get()
@@ -161,6 +164,9 @@ async def test_second_connection_replaces_first_and_fails_old_pending() -> None:
 
     assert service.is_connected
     await wait_until(lambda: first.closed)
+    # 4409 是被顶替方唯一能区分"另一个浏览器抢走了桥"和"网络断了"的信号；掉回默认 1000
+    # 就会被当成普通断线 3s 快速重连，两个浏览器互相顶替，谁的运行都跑不完。
+    assert first.close_code == 4409
     with pytest.raises(ConnectionError, match="顶替"):
         await pending_execute
 
@@ -234,3 +240,55 @@ async def test_audit_log_never_contains_input_value_or_extracted_text() -> None:
     assert record["selector"] == "#password"
     assert "s3cr3t-password" not in json.dumps(record)
     assert "招商银行" not in json.dumps(record)
+
+
+async def test_audit_record_written_when_connection_is_replaced_mid_action() -> None:
+    """动作已经发进用户真实浏览器、回执还没回来就被顶替：这条也必须留痕。
+
+    审计日志的用途是事后追查"到底对这个浏览器做过什么"，异常路径恰恰是最需要它的地方。
+    """
+    service = ExtensionBridgeService()
+    first = FakeWebSocket()
+    first_task = asyncio.create_task(service.handle_connection(first))
+    await asyncio.sleep(0)
+
+    pending_execute = asyncio.create_task(service.execute({"type": "browser.click", "selector": "#pay"}, timeout=2.0))
+    while not first.sent:
+        await asyncio.sleep(0)
+
+    second = FakeWebSocket()
+    second_task = asyncio.create_task(service.handle_connection(second))
+    await asyncio.sleep(0)
+    with pytest.raises(ConnectionError):
+        await pending_execute
+
+    first.disconnect()
+    await first_task
+    second.disconnect()
+    await second_task
+
+    audit_path = storage.resolve_logs_dir() / "extension_bridge_audit.jsonl"
+    record = json.loads(audit_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert set(record.keys()) == {"requestId", "timestamp", "actionType", "selector", "ok", "error", "durationMs"}
+    assert record["actionType"] == "browser.click"
+    assert record["selector"] == "#pay"
+    assert record["ok"] is False
+    assert "顶替" in record["error"]
+
+
+async def test_audit_record_written_on_timeout() -> None:
+    service = ExtensionBridgeService()
+    ws = FakeWebSocket()
+    connection_task = asyncio.create_task(service.handle_connection(ws))
+    await asyncio.sleep(0)
+
+    with pytest.raises(TimeoutError):
+        await service.execute({"type": "browser.click", "selector": "#never"}, timeout=0.01)
+
+    ws.disconnect()
+    await connection_task
+
+    audit_path = storage.resolve_logs_dir() / "extension_bridge_audit.jsonl"
+    record = json.loads(audit_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert record["ok"] is False
+    assert record["error"] == "timeout"

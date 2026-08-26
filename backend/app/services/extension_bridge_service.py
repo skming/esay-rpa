@@ -1,7 +1,8 @@
 """桥接浏览器扩展（见 /extension）：扩展的 background service worker 与本服务保持一条持久 WebSocket，
 按 requestId 做请求/响应配对（同一时刻只有一个扩展实例连接）。
-这是 Playwright 驱动的 BrowserActionRunner 之外的可选执行器，只能在用户真实 Chrome 窗口打开时工作，
-不支持无人值守/定时执行；调用方需先检查 `is_connected` 再路由节点到此执行器。
+这是 Playwright 驱动的 BrowserActionRunner 之外的可选执行器，只能在用户真实 Chrome 窗口打开时工作。
+定时任务可以指定它（create_schedule 会带无人值守告警），但触发时没有已连接浏览器就整次失败、绝不回退
+Playwright；调用方需先检查 `is_connected` 再路由节点到此执行器。
 """
 from __future__ import annotations
 
@@ -28,6 +29,13 @@ _RECEIVE_TIMEOUT_SECONDS = 45.0
 # 新连接到达时立即顶替旧连接（而非等待判活窗口）：曾用"30s 无心跳判僵尸"方案，
 # 但插件重连远快于该窗口，导致真实重连被反复拒绝、动作发往死 socket 干等超时。
 # 单例桥接前提是同一时刻只有一个真实浏览器，新连接几乎总是同一插件重连而非竞争方。
+#
+# 被顶替方必须能把"我被顶替了"和"网络断了"分开：普通断线该快速重连（3s 起），被顶替说明
+# 另一个浏览器在争抢同一座桥，快速重连就是互相顶替的死循环——每次顶替都会 fail 掉对面
+# 正在跑的动作。用私有 close code 通知它按 15s→60s 退避（见插件 REPLACED_CONNECTION_CLOSE_CODE）。
+# 上限：这只能把争抢频率压到 60s 一次，不会收敛出稳定归属方。真要支持多浏览器同时在线，
+# 得由后端在顶替前主动 ping 现任、按存活情况仲裁，而不是让先到者无条件赢。
+_REPLACED_CONNECTION_CLOSE_CODE = 4409
 
 # 插件操作的是用户真实登录态浏览器，单独留痕供事后安全审查；只记录类型/选择器/耗时/成败，
 # 不记录 inputValue 或页面文本（可能含密码、验证码等敏感数据）。
@@ -111,12 +119,12 @@ class ExtensionBridgeService:
         self._last_seen_at = None
         self._fail_all_pending("扩展连接已被新连接顶替")
         if old_socket is not None:
-            asyncio.ensure_future(self._close_quietly(old_socket))
+            asyncio.ensure_future(self._close_quietly(old_socket, code=_REPLACED_CONNECTION_CLOSE_CODE))
 
     @staticmethod
-    async def _close_quietly(websocket: WebSocket) -> None:
+    async def _close_quietly(websocket: WebSocket, *, code: int = 1000) -> None:
         try:
-            await websocket.close()
+            await websocket.close(code=code)
         except Exception:
             pass
 
@@ -151,21 +159,30 @@ class ExtensionBridgeService:
             await self._socket.send_json({"requestId": request_id, "action": action})
             response = await asyncio.wait_for(future, timeout=timeout)
         except TimeoutError:
-            self._pending.pop(request_id, None)
-            _write_audit_record({**audit_base, "ok": False, "error": "timeout", "durationMs": int((time.monotonic() - started_at) * 1000)})
+            self._audit_action(audit_base, started_at, error="timeout")
             raise TimeoutError(f"扩展执行动作超时（{timeout}s）: {action.get('type')}") from None
+        except (Exception, asyncio.CancelledError) as exc:
+            # 连接被顶替/断开（ConnectionError）、send 失败、运行被中止都走这里。动作可能已经送到
+            # 用户真实登录的浏览器并执行完，只是回执送不回来——这份日志的用途正是事后追查"到底
+            # 对这个浏览器做过什么"，异常路径不留痕等于在最需要它的地方留白。
+            self._audit_action(audit_base, started_at, error=str(exc) or exc.__class__.__name__)
+            raise
         finally:
             self._pending.pop(request_id, None)
 
         ok = bool(response.get("ok", False))
-        _write_audit_record(
-            {
-                **audit_base,
-                "ok": ok,
-                "error": None if ok else (response.get("error") or "扩展执行动作失败"),
-                "durationMs": int((time.monotonic() - started_at) * 1000),
-            }
-        )
+        self._audit_action(audit_base, started_at, error=None if ok else (response.get("error") or "扩展执行动作失败"))
         if not ok:
             raise RuntimeError(response.get("error") or "扩展执行动作失败")
         return response.get("result", {})
+
+    @staticmethod
+    def _audit_action(audit_base: dict[str, Any], started_at: float, *, error: str | None) -> None:
+        _write_audit_record(
+            {
+                **audit_base,
+                "ok": error is None,
+                "error": error,
+                "durationMs": int((time.monotonic() - started_at) * 1000),
+            }
+        )
