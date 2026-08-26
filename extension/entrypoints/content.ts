@@ -93,7 +93,8 @@ function dispatchKey(el: Element, key: string): void {
     moveCursorTo(rect.x + rect.width / 2, rect.y + rect.height / 2);
   }
   const parts = key.split('+');
-  const mainKey = parts[parts.length - 1];
+  // split 至少返回一个元素，末段就是主键；`?? key` 只为让类型收窄，不是真存在的兜底分支
+  const mainKey = parts[parts.length - 1] ?? key;
   const modifiers = new Set(parts.slice(0, -1).map((part) => part.toLowerCase()));
   const code = legacyKeyCode(mainKey);
   const eventInit: KeyboardEventInit & { keyCode?: number; charCode?: number } = {

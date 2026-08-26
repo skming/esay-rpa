@@ -88,8 +88,8 @@ function findCloseAffordance(maskRect: DOMRect): HTMLElement | null {
 /** 返回是否尝试过关闭动作（不保证真的关掉了，调用方无需依赖返回值改变行为） */
 export function dismissBlockingOverlays(): boolean {
   const masks = collectOverlayCandidates().filter((el) => !attemptedOverlays.has(el));
-  if (masks.length === 0) return false;
   const mask = masks[masks.length - 1];
+  if (mask === undefined) return false;
   attemptedOverlays.add(mask);
 
   const closeButton = findCloseAffordance(mask.getBoundingClientRect());

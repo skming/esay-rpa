@@ -186,17 +186,18 @@ function siblingsAfter(el: Element): Element[] {
 // `A:has-text("xxx") B` 的 Playwright 语义是"先按文本筛出祖先 A、再在其内找后代 B"，
 // 故逐段推进匹配，而非剥离 :has-text 拼成一条扁平 CSS 统一过滤。
 function querySelectorAllInRoot(root: Document | ShadowRoot, selector: string): Element[] {
-  const segments = buildSelectorSegments(selector);
-  if (segments.length === 0) return [];
+  // 解构出首段再判 undefined，而不是判 segments.length：后面整段逻辑都建立在"第一段必然存在"
+  // 之上，把这个前提写成一次判空，比每处下标访问各自断言一遍更难写错。
+  const [firstSegment, ...restSegments] = buildSelectorSegments(selector);
+  if (firstSegment === undefined) return [];
 
   try {
-    let candidates: Element[] = Array.from(root.querySelectorAll(segments[0].css)).filter((el) =>
-      matchesSegmentFilter(el, segments[0])
+    let candidates: Element[] = Array.from(root.querySelectorAll(firstSegment.css)).filter((el) =>
+      matchesSegmentFilter(el, firstSegment)
     );
-    if (segments[0].innermost) candidates = filterInnermost(candidates);
+    if (firstSegment.innermost) candidates = filterInnermost(candidates);
 
-    for (let i = 1; i < segments.length; i += 1) {
-      const segment = segments[i];
+    for (const segment of restSegments) {
       const seen = new Set<Element>();
       const next: Element[] = [];
       for (const candidate of candidates) {
