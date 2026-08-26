@@ -32,4 +32,12 @@ export default tseslint.config(
       '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],
     },
   },
+  {
+    // shadcn 组件按上游原样保留（upstream 的 button.tsx 自己就是 `export { Button, buttonVariants }`），
+    // 拆文件消警告等于每次同步上游都要重新拆一遍。只影响开发期热更新粒度，不影响产物。
+    files: ['src/components/ui/**/*.{ts,tsx}'],
+    rules: {
+      'react-refresh/only-export-components': 'off',
+    },
+  },
 );

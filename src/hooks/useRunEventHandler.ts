@@ -199,6 +199,7 @@ export function useRunEventHandler({
       }
     },
     [
+      activeFlowNameRef,
       activeRunIdRef,
       callBridge,
       lastRunIdRef,

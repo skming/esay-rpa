@@ -33,7 +33,9 @@ export function VariableNameField({
 }): ReactElement {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
-  const rows = variables ?? [];
+  // 走 useMemo 而不是裸 `variables ?? []`：variables 缺省时每次渲染都是新数组，
+  // 下面两个 useMemo 的依赖恒变，等于没缓存。
+  const rows = useMemo(() => variables ?? [], [variables]);
   const existingNames = useMemo(() => rows.map((row) => row.name), [rows]);
   const normalizedQuery = query.trim().toLowerCase();
   const validation = useMemo(() => validateVariableNameInput(value, { existingNames, mode }), [existingNames, mode, value]);

@@ -434,8 +434,7 @@ export function useElectronBridge({
       windowId,
       debugControl,
       dismissToast,
-      pushToast,
-      resetRunView
+      pushToast
     ]
   );
 }

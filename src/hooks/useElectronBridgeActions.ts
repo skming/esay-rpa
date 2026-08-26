@@ -913,6 +913,7 @@ export function useElectronBridgeActions({
     [
       activeRunId,
       activeRunFlowId,
+      activeFlowNameRef,
       callBridge,
       clearLastRunOverrides,
       currentFlow,
@@ -933,8 +934,10 @@ export function useElectronBridgeActions({
       setActiveRunFlowId,
       setArtifactContent,
       setArtifacts,
+      setCanvasFitVersion,
       setGeneratedScript,
       setLogs,
+      setPickerActive,
       setQueueStats,
       setRuntimeStatus,
       setRuns,

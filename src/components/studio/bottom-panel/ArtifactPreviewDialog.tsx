@@ -4,7 +4,7 @@ import 'react-json-view-lite/dist/index.css';
 import './json-view-theme.css';
 import { rpaJsonViewStyles } from './jsonViewStyles';
 import type { ReactElement, ReactNode } from 'react';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
@@ -178,7 +178,7 @@ export function ArtifactPreviewContent({ content, loading }: { content: Artifact
         </div>
       ) : ooxmlExt ? (
         // key 让换文档时预览器整体重挂载，页码/状态随之复位，无需在 effect 里手工重置
-        <OoxmlPreview content={content.content} ext={ooxmlExt} filename={filename} key={artifactId} />
+        <OoxmlPreview content={content.content} ext={ooxmlExt} key={artifactId} />
       ) : isMarkdown ? (
         <MarkdownPreview source={decodeMarkdownSource(raw)} />
       ) : parsedJson !== null ? (
@@ -203,7 +203,7 @@ type PagedViewer = {
   pageCount: number;
 };
 
-function OoxmlPreview({ content, ext, filename }: { content: string; ext: string; filename: string }): ReactElement {
+function OoxmlPreview({ content, ext }: { content: string; ext: string }): ReactElement {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const viewerRef = useRef<PagedViewer | null>(null);
@@ -214,8 +214,6 @@ function OoxmlPreview({ content, ext, filename }: { content: string; ext: string
 
   const isXlsx = ext === '.xlsx' || ext === '.xlsm' || ext === '.xls';
   const isDocx = ext === '.docx' || ext === '.doc';
-
-  const getBuffer = useCallback((): ArrayBuffer => base64ToArrayBuffer(content), [content]);
 
   useEffect(() => {
     let cancelled = false;
@@ -230,7 +228,7 @@ function OoxmlPreview({ content, ext, filename }: { content: string; ext: string
 
     const init = async (): Promise<void> => {
       try {
-        const buffer = getBuffer();
+        const buffer = base64ToArrayBuffer(content);
         console.debug('[OoxmlPreview] buffer size', buffer.byteLength, 'ext', ext);
 
         if (isXlsx) {
@@ -289,7 +287,7 @@ function OoxmlPreview({ content, ext, filename }: { content: string; ext: string
       viewerRef.current?.destroy();
       viewerRef.current = null;
     };
-  }, [content, filename]);
+  }, [content, ext, isDocx, isXlsx]);
 
   if (status === 'error') {
     return (

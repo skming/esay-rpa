@@ -38,7 +38,11 @@ export function PropertyPanel({
   const [draft, setDraft] = useState<RpaNodeConfigDraft>(() =>
     createNodeConfigDraft(selectedNode?.data ?? { description: '', kind: 'browser', status: 'pending', title: '' })
   );
-  const savedDraft = useMemo(() => (selectedNode === undefined ? null : createNodeConfigDraft(selectedNode.data)), [selectedNode?.data]);
+  // 依赖挂 data/id 而不是整个 selectedNode：只挪动节点位置时 xyflow 会换掉节点对象但 data 不变，
+  // 挂整个对象等于每次拖动都重建草稿、把面板里没保存的编辑冲掉。
+  const selectedNodeData = selectedNode?.data;
+  const selectedNodeId = selectedNode?.id;
+  const savedDraft = useMemo(() => (selectedNodeData === undefined ? null : createNodeConfigDraft(selectedNodeData)), [selectedNodeData]);
   const dirty = savedDraft !== null && JSON.stringify(draft) !== JSON.stringify(savedDraft);
   const [copied, setCopied] = useState(false);
   const setPendingDraft = usePropertyPanelStore((state) => state.setPendingDraft);
@@ -46,12 +50,12 @@ export function PropertyPanel({
   // 运行走的是画布节点，面板里没保存的草稿它看不见——把草稿交给 store，运行前替运行方落盘。
   // 只有 dirty 时发布：否则每次选中节点都写一次 store，运行方要多判一次「和已存的一样吗」。
   useEffect(() => {
-    if (selectedNode === undefined || !dirty) {
+    if (selectedNodeId === undefined || !dirty) {
       setPendingDraft(null);
       return;
     }
-    setPendingDraft({ nodeId: selectedNode.id, draft });
-  }, [dirty, draft, selectedNode?.id, setPendingDraft]);
+    setPendingDraft({ nodeId: selectedNodeId, draft });
+  }, [dirty, draft, selectedNodeId, setPendingDraft]);
 
   useEffect(() => () => setPendingDraft(null), [setPendingDraft]);
 

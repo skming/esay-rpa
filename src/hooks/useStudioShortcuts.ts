@@ -124,5 +124,5 @@ export function useStudioShortcuts({
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onContextAction, onDeleteEdge, onRedo, onSave, onSelectNode, onToggleAiPanel, onUndo, selectedEdgeId, selectedNodeId]);
+  }, [onContextAction, onDeleteEdge, onFocusProperties, onRedo, onSave, onSelectNode, onToggleAiPanel, onUndo, selectedEdgeId, selectedNodeId]);
 }

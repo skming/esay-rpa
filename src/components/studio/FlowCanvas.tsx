@@ -25,7 +25,7 @@ import { useCanvasShortcuts } from '../../hooks/useCanvasShortcuts';
 import type { CanvasToolMode, ContextMenuAction, ContextMenuState, NodeRuntimeState, RpaNodeData, RuntimeProgress, RuntimeVariable } from '../../types/rpa';
 import { CanvasToolbar } from './canvas-toolbar/CanvasToolbar';
 import { ContextMenu } from './ContextMenu';
-import { nodeTypes } from './FlowNodes';
+import { nodeTypes } from './flowNodeTypes';
 
 export function FlowCanvas({
   bottomPanelOpen,
