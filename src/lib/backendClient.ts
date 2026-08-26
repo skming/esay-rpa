@@ -52,7 +52,10 @@ type RequestOptions = {
 };
 
 export type ExtensionStatus = {
+  /** 带 8s 断线宽限的展示状态，只用于指示灯防抖；不要用它决定能不能运行。 */
   connected: boolean;
+  /** 不平滑的真实状态，运行前置门控看这个。 */
+  canExecute: boolean;
   enabled: boolean;
   connectedSince: string | null;
 };

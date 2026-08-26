@@ -1,14 +1,7 @@
 import { useEffect, useRef } from 'react';
 
+import { hasOpenOverlay, isEditableTarget, isInteractiveTarget } from '../lib/keyboardTargets';
 import type { CanvasToolMode } from '../types/rpa';
-
-function isEditableTarget(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) {
-    return false;
-  }
-  const tagName = target.tagName.toLowerCase();
-  return tagName === 'input' || tagName === 'textarea' || tagName === 'select' || target.isContentEditable;
-}
 
 function isSpaceKey(event: KeyboardEvent): boolean {
   return event.code === 'Space' || event.key === ' ' || event.key === 'Spacebar';
@@ -48,11 +41,21 @@ export function useCanvasShortcuts({
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent): void => {
-      if (isEditableTarget(event.target)) {
+      // 组字期间的 Space 是候选翻页，不是临时平移
+      if (event.isComposing || isEditableTarget(event.target)) {
+        return;
+      }
+
+      // 浮层开着时画布被挡住：切工具模式、开关网格都看不到，按键该留给浮层
+      if (hasOpenOverlay()) {
         return;
       }
 
       if (isSpaceKey(event)) {
+        // 焦点在按钮上时 Space 属于「激活这个控件」，抢下来会让工具栏整排按钮按不动
+        if (isInteractiveTarget(event.target)) {
+          return;
+        }
         event.preventDefault();
         if (event.repeat || temporaryPanOriginRef.current !== null) {
           return;

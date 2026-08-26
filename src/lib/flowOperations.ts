@@ -138,6 +138,45 @@ export function deleteNodeAndReconnect(nodes: Node<RpaNodeData>[], edges: Edge[]
   return [...retainedEdges, createFlowEdge(incomingEdge.source, outgoingEdge.target, typeof incomingEdge.label === 'string' ? incomingEdge.label : undefined)];
 }
 
+export type DeleteImpact = {
+  /** 前驱能接到后继：false 表示这一段删完就断开，没有任何连线补上 */
+  reconnects: boolean;
+  /** 除被重连的那一条入边/出边之外，会被直接丢弃且不重连的连线数 */
+  droppedEdgeCount: number;
+  /** 上述连线另一端的节点标题，用来让用户看清丢的是哪几条分支 */
+  droppedNeighborTitles: string[];
+};
+
+/** 预告 deleteNodeAndReconnect 会顺带丢掉哪些连线，供删除确认框如实告知。 */
+export function summarizeDeleteImpact(nodes: Node<RpaNodeData>[], edges: Edge[], nodeId: string): DeleteImpact {
+  const intact: DeleteImpact = { reconnects: true, droppedEdgeCount: 0, droppedNeighborTitles: [] };
+  if (nodeId === 'start' || nodeId === 'end' || !nodes.some((node) => node.id === nodeId)) {
+    return intact;
+  }
+
+  // 必须与 deleteNodeAndReconnect 取同一条边——它用 find 拿数组里最早的入边/出边。
+  // 这里换成别的挑法（例如按 label 选主干）就会报出与实际删法不符的影响面，
+  // 比「不提示」更糟：用户照着提示以为保住的那条分支，才是真被删掉的那条。
+  const incoming = edges.filter((edge) => edge.target === nodeId);
+  const outgoing = edges.filter((edge) => edge.source === nodeId);
+  const reconnects = incoming.length > 0 && outgoing.length > 0 && incoming[0].source !== outgoing[0].target;
+
+  const droppedIn = reconnects ? incoming.slice(1) : incoming;
+  const droppedOut = reconnects ? outgoing.slice(1) : outgoing;
+  const titleById = new Map(nodes.map((node) => [node.id, node.data.title]));
+  const titles = [
+    ...droppedIn.map((edge) => titleById.get(edge.source)),
+    ...droppedOut.map((edge) => titleById.get(edge.target)),
+  ].filter((title): title is string => title !== undefined && title.length > 0);
+
+  return {
+    reconnects,
+    droppedEdgeCount: droppedIn.length + droppedOut.length,
+    // 标题去重只为可读，条数由 droppedEdgeCount 单独给：两个节点同名时不能靠标题数量算连线
+    droppedNeighborTitles: [...new Set(titles)],
+  };
+}
+
 // getDefaultDescription/getDefaultAction 按 label 文案匹配组件面板项，新增或改名组件时需同步这两处，否则拖入的节点会缺省为通用占位配置。
 function getDefaultDescription(payload: ComponentDragPayload): string {
   if (payload.nodeType === 'browser') return payload.label === '打开网页' ? 'https://example.com/' : 'CSS 选择器 · 等待 30s';

@@ -15,6 +15,7 @@ import {
   createFlowNode,
   deleteNodeAndReconnect,
   insertNodeAfter,
+  summarizeDeleteImpact,
   type ComponentDragPayload,
 } from '../lib/flowOperations';
 import { usePropertyPanelStore } from '../stores/usePropertyPanelStore';
@@ -176,9 +177,13 @@ export function useFlowCanvas() {
       if (nodeId === 'start' || nodeId === 'end') return;
       const target = flowNodes.find((node) => node.id === nodeId);
       if (target === undefined) return;
-      setDeleteTarget({ id: target.id, title: target.data.title });
+      setDeleteTarget({
+        id: target.id,
+        title: target.data.title,
+        impact: summarizeDeleteImpact(flowNodes, flowEdges, nodeId),
+      });
     },
-    [flowNodes]
+    [flowEdges, flowNodes]
   );
 
   const confirmDeleteNode = useCallback((): void => {

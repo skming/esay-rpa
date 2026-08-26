@@ -9,7 +9,6 @@ import { useAiPanelState } from './hooks/useAiPanelState';
 import { useElectronBridge } from './hooks/useElectronBridge';
 import { useFlowCanvas } from './hooks/useFlowCanvas';
 import { useFlowDraftAutosave } from './hooks/useFlowDraftAutosave';
-import { useStudioShortcuts } from './hooks/useStudioShortcuts';
 import { insertNodeAfter, insertNodeBefore, type ComponentDragPayload } from './lib/flowOperations';
 import { useBottomPanelStore } from './stores/useBottomPanelStore';
 import { useFlowVariableStore } from './stores/useFlowVariableStore';
@@ -117,19 +116,6 @@ export default function App(): ReactElement {
     },
     [canvas, electron]
   );
-
-  useStudioShortcuts({
-    onContextAction: handleContextAction,
-    onDeleteEdge: canvas.deleteEdge,
-    onFocusProperties: () => canvas.focusNode(canvas.selectedNodeId),
-    onSave: () => void electron.saveFlow(),
-    onRedo: canvas.redoAction,
-    onSelectNode: canvas.setSelectedNodeId,
-    onToggleAiPanel: () => ai.setAiPanelOpen(!ai.aiPanelOpen),
-    onUndo: canvas.undoAction,
-    selectedEdgeId: canvas.selectedEdgeId,
-    selectedNodeId: canvas.selectedNodeId,
-  });
 
   return (
     <TooltipProvider delayDuration={400}>

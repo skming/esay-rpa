@@ -241,9 +241,9 @@ function FlowCanvasInner({
     let runningSteps = 0;
     let totalSteps = 0;
     for (const node of visibleNodes) {
-      if (node.data.status === 'running') runningSteps += 1;
       if (node.id === 'start' || node.id === 'end') continue;
       totalSteps += 1;
+      if (node.data.status === 'running') runningSteps += 1;
       if (node.data.status === 'done') doneSteps += 1;
     }
     return { doneSteps, runningSteps, totalSteps };
@@ -462,7 +462,7 @@ function FlowCanvasInner({
       x: rect.width / 2 - centerX * current.zoom,
       y: rect.height / 2 - centerY * current.zoom
     });
-  }, [flowNodes, focusNodeRequest]);
+  }, [flowNodes, focusNodeRequest, getViewport, setViewport]);
 
   return (
     <main className="flex min-w-0 flex-1 flex-col bg-canvas">

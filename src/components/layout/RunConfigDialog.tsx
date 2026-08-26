@@ -31,13 +31,15 @@ type RunConfigDraft = {
 const EXTENSION_STATUS_POLL_MS = 3000; // 弹框打开期间轮询，让用户手动开启插件后无需重开弹框即可看到状态更新
 
 type ExtensionAvailability = {
-  connected: boolean;
+  canExecute: boolean;
   enabled: boolean;
 };
 
-/** 弹框打开时轮询插件桥接状态，供下方开关在插件未连接时提前警示 */
+/** 弹框打开时轮询插件桥接状态，供下方开关在插件未连接时提前警示。
+ *  这里取 canExecute（真实连接）而不是 connected（带 8s 宽限的展示态）：这个弹框是"要不要现在跑"
+ *  的决策点，宽限期里显示"已连接"却把动作发到空 socket，比指示灯抖一下糟得多。 */
 function useExtensionAvailability(open: boolean): ExtensionAvailability {
-  const [availability, setAvailability] = useState<ExtensionAvailability>({ connected: false, enabled: true });
+  const [availability, setAvailability] = useState<ExtensionAvailability>({ canExecute: false, enabled: true });
 
   useEffect(() => {
     if (!open) {
@@ -48,11 +50,11 @@ function useExtensionAvailability(open: boolean): ExtensionAvailability {
       try {
         const data = await backend.getExtensionStatus();
         if (!cancelled) {
-          setAvailability({ connected: data.connected === true, enabled: data.enabled !== false });
+          setAvailability({ canExecute: data.canExecute === true, enabled: data.enabled !== false });
         }
       } catch {
         if (!cancelled) {
-          setAvailability({ connected: false, enabled: true });
+          setAvailability({ canExecute: false, enabled: true });
         }
       }
     };
@@ -115,7 +117,7 @@ export function RunConfigDialog({
     }
   }
   const extensionAvailability = useExtensionAvailability(open);
-  const extensionConnected = extensionAvailability.connected;
+  const extensionCanExecute = extensionAvailability.canExecute;
   const extensionEnabled = extensionAvailability.enabled;
   const selectedScopeNeedsNode = draft.scope !== 'full';
   const selectedNodeRunnable = selectedNodeId !== 'start' && selectedNodeId !== 'end';
@@ -311,17 +313,17 @@ export function RunConfigDialog({
               <span
                 className={cn(
                   'inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium',
-                  !extensionEnabled ? 'bg-slate-200 text-slate-700' : extensionConnected ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-200 text-slate-700'
+                  !extensionEnabled ? 'bg-slate-200 text-slate-700' : extensionCanExecute ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-200 text-slate-700'
                 )}
               >
-                <span className={cn('h-1.5 w-1.5 rounded-full', extensionEnabled && extensionConnected ? 'bg-emerald-500' : 'bg-slate-400')} />
-                {!extensionEnabled ? '已在设置中关闭' : extensionConnected ? '已连接' : '未连接'}
+                <span className={cn('h-1.5 w-1.5 rounded-full', extensionEnabled && extensionCanExecute ? 'bg-emerald-500' : 'bg-slate-400')} />
+                {!extensionEnabled ? '已在设置中关闭' : extensionCanExecute ? '已连接' : '未连接'}
               </span>
             </span>
             <Switch
               aria-label="使用浏览器插件执行"
               checked={extensionEnabled && draft.browserExecutor === 'extension'}
-              disabled={!extensionEnabled || !extensionConnected}
+              disabled={!extensionEnabled || !extensionCanExecute}
               onCheckedChange={(checked) => {
                 const next = checked ? 'extension' : 'playwright';
                 updateDraft('browserExecutor', next);
@@ -337,7 +339,7 @@ export function RunConfigDialog({
           {onSetDefaultBrowserExecutor !== undefined && (
             <p className="-mt-2 text-[10px] text-slate-500">已作为该流程的默认执行方式保存，定时任务可单独覆盖。</p>
           )}
-          {!extensionConnected && (
+          {!extensionCanExecute && (
             <p className="-mt-2 text-[11px] text-slate-500">
               {extensionEnabled ? '插件未连接？' : '插件已在设置中关闭。'}
               <button

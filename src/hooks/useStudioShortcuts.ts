@@ -1,14 +1,7 @@
 import { useEffect } from 'react';
 
+import { hasOpenOverlay, isEditableTarget, isInteractiveTarget } from '../lib/keyboardTargets';
 import type { ContextMenuAction } from '../types/rpa';
-
-function isEditableTarget(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) {
-    return false;
-  }
-  const tagName = target.tagName.toLowerCase();
-  return tagName === 'input' || tagName === 'textarea' || tagName === 'select' || target.isContentEditable;
-}
 
 export function useStudioShortcuts({
   onContextAction,
@@ -35,12 +28,30 @@ export function useStudioShortcuts({
 }): void {
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent): void => {
+      // 输入法组字期间的 keydown 属于候选框：Enter 是选词、Escape 是取消候选。
+      // 中文用户每敲一个词都会经过这里，抢下来等于选不了词、也退不出候选。
+      if (event.isComposing) {
+        return;
+      }
+
+      // 有对话框/菜单开着就整体让路，交给它自己的键盘处理
+      if (hasOpenOverlay()) {
+        return;
+      }
+
+      const editable = isEditableTarget(event.target);
+
       if (event.key === 'Escape') {
-        event.preventDefault();
+        // 不 preventDefault：Escape 是浏览器和上层组件的退出键（退出全屏、关掉原生下拉），
+        // 这里只是顺手用它退出焦点，没有理由把这些一并掐掉
         if (event.target instanceof HTMLElement) {
           event.target.blur();
         }
-        onSelectNode('start');
+        // 只在焦点不在输入框时重置选中：正在属性面板改字段时按 Escape（多半是关掉某个候选层），
+        // 若顺手把选中跳回 start，整个属性面板会换成 start 节点，用户没写完的编辑失去落点
+        if (!editable) {
+          onSelectNode('start');
+        }
         return;
       }
 
@@ -51,7 +62,7 @@ export function useStudioShortcuts({
         return;
       }
 
-      if (isEditableTarget(event.target)) {
+      if (editable) {
         return;
       }
 
@@ -59,6 +70,10 @@ export function useStudioShortcuts({
       const modifier = event.metaKey || event.ctrlKey;
 
       if (event.key === 'Enter' && !modifier) {
+        // 焦点在按钮/链接上时 Enter 属于「激活这个控件」，不能抢
+        if (isInteractiveTarget(event.target)) {
+          return;
+        }
         event.preventDefault();
         onFocusProperties?.();
         return;
