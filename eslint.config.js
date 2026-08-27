@@ -2,15 +2,15 @@ import js from '@eslint/js';
 import globals from 'globals';
 import reactHooks from 'eslint-plugin-react-hooks';
 import reactRefresh from 'eslint-plugin-react-refresh';
-import tseslint from 'typescript-eslint';
+import { config as defineConfig, configs as tsConfigs } from 'typescript-eslint';
 
-export default tseslint.config(
+export default defineConfig(
   {
     ignores: ['dist', 'dist-electron', 'release', 'backend', 'extension', 'coverage', '*.cjs'],
   },
   {
     files: ['**/*.{ts,tsx}'],
-    extends: [js.configs.recommended, ...tseslint.configs.recommended],
+    extends: [js.configs.recommended, ...tsConfigs.recommended],
     languageOptions: {
       ecmaVersion: 2022,
       globals: { ...globals.browser, ...globals.node },
@@ -22,19 +22,14 @@ export default tseslint.config(
     rules: {
       ...reactHooks.configs.recommended.rules,
       'react-refresh/only-export-components': ['warn', { allowConstantExport: true }],
-      // 全仓已改为渲染期按前值调整 state / 派生 state / key 重置，不再有 effect 内同步 setState。
-      // 剩余 3 处 disable 均已就地注明是 await 之后的 setState（规则不区分 await 边界）
       'react-hooks/set-state-in-effect': 'error',
-      // 组件必须来自常量表或静态引用，不能由函数返回——那样 React 无法确认组件身份稳定
       'react-hooks/static-components': 'error',
-      // 项目已开 tsconfig strict 且全仓零 any，保持该基线
       '@typescript-eslint/no-explicit-any': 'error',
       '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],
     },
   },
   {
-    // shadcn 组件按上游原样保留（upstream 的 button.tsx 自己就是 `export { Button, buttonVariants }`），
-    // 拆文件消警告等于每次同步上游都要重新拆一遍。只影响开发期热更新粒度，不影响产物。
+    // disable the react-refresh rule for the UI components.
     files: ['src/components/ui/**/*.{ts,tsx}'],
     rules: {
       'react-refresh/only-export-components': 'off',
