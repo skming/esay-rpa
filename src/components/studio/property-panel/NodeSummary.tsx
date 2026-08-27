@@ -17,7 +17,6 @@ const ACTION_TYPE_LABELS: Record<string, string> = {
   'browser.tab.open': '打开标签页',
   'browser.tab.close': '关闭标签页',
   'browser.extract': '获取文本',
-  'browser.scrape': '提取数据',
   'browser.select': '下拉选择',
   'browser.check': '复选框',
   'browser.drag': '拖拽操作',

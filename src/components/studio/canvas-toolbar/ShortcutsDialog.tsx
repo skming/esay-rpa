@@ -30,7 +30,7 @@ const SHORTCUT_GROUPS: Array<{ items: Array<{ keys: string[]; label: string }>; 
     items: [
       { keys: ['Enter'], label: '编辑选中节点' },
       { keys: [CMD, 'D'], label: '复制选中节点' },
-      { keys: ['B'], label: '切换断点' },
+      { keys: [CMD, 'B'], label: '切换断点' },
       { keys: ['Delete'], label: '删除选中节点 / 连线' },
       { keys: [CMD, 'Z'], label: '撤销（含节点拖动）' },
       { keys: [CMD, '⇧', 'Z'], label: '重做' },

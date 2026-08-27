@@ -104,7 +104,7 @@ export function useStudioShortcuts({
         return;
       }
 
-      if (key === 'b') {
+      if (modifier && key === 'b') {
         event.preventDefault();
         onContextAction('breakpoint', selectedNodeId);
         return;

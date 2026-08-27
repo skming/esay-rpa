@@ -408,9 +408,9 @@ The sticky header bar anchors every workspace page. It signals desktop-app chrom
 
 ### Inputs / Fields
 
-- **Style:** `rounded-md` (6px), `border border-slate-200`, `bg-white`, 12px text, `height: 32px`
+- **Style:** `rounded-md` (6px), `border border-slate-200`, `bg-white`, 11px text, `height: 32px`
 - **Focus:** `focus-visible:border-accent-line focus-visible:ring-2 focus-visible:ring-accent-soft`（注意是三个独立类，连写成 `border-accent-linefocus:ring-2` 会让 Tailwind 整条失效且不报错）
-- **Error:** `border-red-400`, `ring-red-200`
+- **Error:** driven by `aria-invalid` on the field itself — `border-red-200`, `bg-red-50`, `text-red-700`, focus `border-red-300` / `ring-red-100`. The attribute and the color come from one switch, so a red field always announces as invalid; callers set `aria-invalid` and nothing else. A field that is merely *unusual* rather than invalid (a shadowed variable name) is amber and carries no `aria-invalid`.
 - **Disabled:** `opacity-50 cursor-not-allowed bg-slate-50`
 
 ### Navigation (NavRail)

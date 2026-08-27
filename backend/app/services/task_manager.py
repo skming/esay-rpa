@@ -1924,7 +1924,7 @@ def _is_collectable_result_node(node: dict[str, object]) -> bool:
     """
     if node.get("includeInResult") is False:
         return False
-    return node.get("type") in {"browser.extract", "ui.extract", "browser.scrape", "browser.fetch"}
+    return node.get("type") in {"browser.extract", "ui.extract", "browser.fetch"}
 
 
 def _read_node_id(node: dict[str, object], *, fallback: str) -> str:

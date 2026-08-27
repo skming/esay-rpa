@@ -63,7 +63,6 @@ export function VariableNameField({
           aria-invalid={validation.issue === 'invalid'}
           className={cn(
             'pr-8 font-mono text-[11px]',
-            validation.issue === 'invalid' && 'border-red-200 bg-red-50 text-red-700 focus:border-red-300 focus:ring-red-100',
             validation.issue !== 'invalid' && validation.issue !== null && 'border-amber-200 bg-amber-50 text-amber-800 focus:border-amber-300 focus:ring-amber-100'
           )}
           onChange={(event: ChangeEvent<HTMLInputElement>) => onChange(event.target.value)}
