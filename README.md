@@ -91,6 +91,7 @@ lsof -ti :8765 | xargs kill
 - `ai/`：AI 配置和对话记录。
 - `runtime/browser/`：浏览器 Profile 与 Cookie。
 - `workspace/runs/`：流程运行产物。
+- `cache/`：内联脚本落盘等可重建的中间文件，删掉不丢数据。
 - `logs/`：后端日志。
 
 ## 项目文档

@@ -2,12 +2,15 @@
 name: Easy RPA
 description: Desktop automation platform for developers — precise, capable, built to disappear into the workflow.
 colors:
-  indigo: "#6366f1"
-  indigo-strong: "#2563eb"
-  indigo-press: "#1d4ed8"
-  indigo-soft: "rgba(99,102,241,0.10)"
-  indigo-line: "rgba(99,102,241,0.38)"
+  accent: "#6366f1"
+  accent-strong: "#2563eb"
+  accent-press: "#1d4ed8"
+  accent-bright: "#818cf8"
+  accent-soft: "rgba(99,102,241,0.10)"
+  accent-wash: "rgba(99,102,241,0.05)"
+  accent-line: "rgba(99,102,241,0.38)"
   brand-gradient: "linear-gradient(90deg, #6366f1, #2563eb)"
+  brand-subtle: "#eef2ff"
   paper: "#f8fafc"
   paper-sunk: "#f1f5f9"
   ink: "#0f172a"
@@ -20,36 +23,45 @@ colors:
   surface: "#ffffff"
   live: "#3b82f6"
   live-soft: "rgba(59,130,246,0.12)"
-  semantic-running-border: "#93c5fd"
-  semantic-running-surface: "#eff6ff"
-  semantic-success-border: "#bbf7d0"
-  semantic-success-surface: "#f0fdf4"
-  semantic-warning-border: "#fde68a"
-  semantic-warning-surface: "#fffbeb"
-  semantic-error-border: "#fecaca"
-  semantic-error-surface: "#fff1f2"
+  live-line: "rgba(59,130,246,0.45)"
+  semantic-running-border: "oklch(88.2% 0.059 254.128)"
+  semantic-running-surface: "oklch(97% 0.014 254.604)"
+  semantic-success-border: "oklch(90.5% 0.093 164.15)"
+  semantic-success-surface: "oklch(97.9% 0.021 166.113)"
+  semantic-warning-border: "oklch(92.4% 0.12 95.746)"
+  semantic-warning-surface: "oklch(98.7% 0.022 95.277)"
+  semantic-error-border: "oklch(88.5% 0.062 18.334)"
+  semantic-error-surface: "oklch(97.1% 0.013 17.38)"
   node-browser: "#2563eb"
+  node-browser-bg: "#eff6ff"
   node-browser-pill: "#dbeafe"
   node-browser-text: "#1d4ed8"
   node-excel: "#16a34a"
+  node-excel-bg: "#f0fdf4"
   node-excel-pill: "#dcfce7"
   node-excel-text: "#15803d"
   node-ui: "#7c3aed"
+  node-ui-bg: "#faf5ff"
   node-ui-pill: "#ede9fe"
   node-ui-text: "#6d28d9"
   node-file: "#ea580c"
+  node-file-bg: "#fff7ed"
   node-file-pill: "#ffedd5"
   node-file-text: "#c2410c"
   node-data: "#0891b2"
+  node-data-bg: "#ecfeff"
   node-data-pill: "#cffafe"
   node-data-text: "#0e7490"
   node-script: "#475569"
+  node-script-bg: "#f8fafc"
   node-script-pill: "#f1f5f9"
   node-script-text: "#1e293b"
   node-control: "#dc2626"
+  node-control-bg: "#fff1f2"
   node-control-pill: "#ffe4e6"
   node-control-text: "#b91c1c"
   node-variable: "#4f46e5"
+  node-variable-bg: "#eef2ff"
   node-variable-pill: "#e0e7ff"
   node-variable-text: "#4338ca"
   node-browser-border: "#dbeafe"
@@ -70,6 +82,28 @@ colors:
   json-index: "oklch(0.72 0.05 264)"
   json-dim: "oklch(0.50 0.02 264)"
   json-accent: "oklch(0.62 0.10 264)"
+shadows:
+  xs: "0 1px 2px rgba(15,23,42,0.05)"
+  sm: "0 1px 3px rgba(15,23,42,0.06), 0 1px 2px rgba(15,23,42,0.04)"
+  card: "0 1px 3px rgba(15,23,42,0.06), 0 1px 2px rgba(15,23,42,0.04)"
+  node: "0 1px 3px rgba(15,23,42,0.06), 0 1px 2px rgba(15,23,42,0.04)"
+  md: "0 4px 6px rgba(15,23,42,0.07), 0 2px 4px rgba(15,23,42,0.05)"
+  lg: "0 10px 15px rgba(15,23,42,0.08), 0 4px 6px rgba(15,23,42,0.04)"
+  panel: "0 10px 30px rgba(15,23,42,0.12), 0 4px 10px rgba(15,23,42,0.06)"
+  glass: "0 8px 32px rgba(15,23,42,0.06), inset 0 1px 0 rgba(255,255,255,0.85)"
+  running: "0 2px 16px rgba(59,130,246,0.22)"
+  node-selected: "0 0 0 3px rgba(99,102,241,0.22), 0 4px 20px rgba(15,23,42,0.12)"
+zIndex:
+  sticky: 10
+  raised: 20
+  dropdown: 50
+  drawer-backdrop: 80
+  drawer: 81
+  modal-backdrop: 90
+  modal: 91
+  select: 110
+  toast: 120
+  banner: 200
 typography:
   display:
     fontFamily: "Inter Variable, PingFang SC, system-ui, sans-serif"
@@ -159,8 +193,8 @@ components:
     height: "28px"
   button-secondary:
     backgroundColor: "{colors.surface}"
-    textColor: "{colors.indigo-strong}"
-    borderColor: "{colors.indigo-line}"
+    textColor: "{colors.accent-strong}"
+    borderColor: "{colors.accent-line}"
     rounded: "{rounded.md}"
     height: "28px"
   button-outline:
@@ -174,16 +208,16 @@ components:
     backgroundColor: "{colors.surface}"
     borderColor: "{colors.rule}"
     rounded: "{rounded.lg}"
-    shadow: "0 1px 3px rgba(15,23,42,0.06), 0 1px 2px rgba(15,23,42,0.04)"
+    shadow: "{shadows.xs}"
     padding: "20px"
   flow-node:
     backgroundColor: "{colors.surface}"
     rounded: "{rounded.xl}"
-    shadow: "0 1px 3px rgba(15,23,42,0.06), 0 1px 2px rgba(15,23,42,0.04)"
+    shadow: "{shadows.sm}"
     width: "240px"
   nav-item-active:
-    backgroundColor: "{colors.indigo-soft}"
-    textColor: "{colors.indigo-strong}"
+    backgroundColor: "{colors.accent-soft}"
+    textColor: "{colors.accent-strong}"
     rounded: "{rounded.sm}"
     height: "36px"
   nav-item-default:
@@ -301,7 +335,7 @@ Canvas edges: selected uses the brand indigo `#6366f1`; a loop edge uses dashed 
 
 **The Mono-Is-Data Rule.** If the value is a number, timestamp, version string, step count, or technical identifier — it uses JetBrains Mono with `tabular-nums`. No exceptions.
 
-**The Uppercase Label Rule.** Section panel headers use: `font-mono text-[9.5px] uppercase tracking-[0.1em] text-slate-400`. Not `font-semibold text-[12px] text-slate-600`. The bold-prominent style is a web-app pattern. The small-mono-uppercase style is a precision tool pattern.
+**The Uppercase Label Rule.** Section panel headers in the Studio property panel use: `font-mono text-[9.5px] uppercase tracking-widest text-slate-500`. Not `font-semibold text-[12px] text-slate-600`, and not `text-slate-400` — that tone is icon-only. The bold-prominent style is a web-app pattern. The small-mono-uppercase style is a precision tool pattern.
 
 ---
 
@@ -309,23 +343,29 @@ Canvas edges: selected uses the brand indigo `#6366f1`; a loop edge uses dashed 
 
 Easy RPA uses **soft, layered shadows + a 1px hairline border** for elevation. Cards, panels, and flow nodes get real, gentle depth (the RPA register, not the austere terminal). Depth is conveyed through:
 
-1. **Soft shadow**: `--shadow-sm` (`0 1px 3px / 0 1px 2px` slate) at rest on cards/nodes; `--shadow-md` on hover.
+1. **Soft shadow**: `--shadow-sm` at rest on flow nodes, escalating to `--shadow-md` on hover; content panels stay flat at `--shadow-xs`.
 2. **Background luminance step**: Canvas (`#f8fafc`) → Surface (`#ffffff`).
 3. **1px hairline border**: `border-rule` on content panels and nodes.
 4. **Light NavRail**: white with a hairline right edge — chrome is all-light.
 
 ### Shadow Vocabulary
 
-- **Overlay shadow** (`0 8px 32px rgba(15,23,42,0.10), 0 2px 8px rgba(15,23,42,0.06)`): Dialogs, popovers, dropdown menus.
-- **Node canvas shadow** (`0 2px 8px rgba(15,23,42,0.07), 0 1px 3px rgba(15,23,42,0.05)`): React Flow nodes.
-- **Node selected ring** (`--shadow-node-selected`: `0 0 0 3px rgba(99,102,241,0.22), 0 4px 20px rgba(15,23,42,0.12)`): brand-indigo selection ring on the flow canvas.
-- **Running glow** (`running-glow` class): Animated indigo gradient border applied to StatusTile and running nodes. The signature live-execution signal.
+Values are normative in the frontmatter `shadows:` block and defined once in `src/styles.css` `@theme`. Name the token here, never restate the value.
+
+- **`--shadow-xs`**: `Panel` / `StatBand` on operational surfaces. This is the ceiling off-canvas.
+- **`--shadow-sm`** = **`--shadow-card`** = **`--shadow-node`**: same value under three role names. Flow nodes at rest.
+- **`--shadow-md`**: hover escalation, flow nodes only.
+- **`--shadow-lg`** / **`--shadow-panel`**: overlays — dialogs, popovers, dropdown menus, the floating AI panel.
+- **`--shadow-glass`**: the inset top highlight is what separates a glass surface from a plain overlay; the outer blur alone is not the effect.
+- **`--shadow-running`**: live-blue ambient glow, running nodes only.
+- **`--shadow-node-selected`**: brand-indigo selection ring. Defined but currently unused — `RpaStepNode` inline-styles the ring from the node kind's own accent (`FlowNodes.tsx`), so the ring never reads as a second, conflicting color next to the kind color.
+- **Running glow** (`running-glow` class): animated indigo→blue gradient border (`#6366f1 → #3b82f6 → #2563eb`) on running flow nodes, paired with `--shadow-running`. The signature live-execution signal, and the only place it is applied.
 
 ### Named Rules
 
-**The Soft-Shadow Rule.** Content panels, cards, and flow nodes carry `--shadow-sm` at rest and escalate to `--shadow-md` on hover, paired with a `border-rule` hairline. Ambient *glow* (large colored blur) is still reserved for the running state only.
+**The Soft-Shadow Rule.** Flow nodes carry `--shadow-sm` at rest and escalate to `--shadow-md` on hover. Content panels and cards do not escalate — `--shadow-xs` plus a `border-rule` hairline is the whole elevation story off-canvas. Ambient *glow* (large colored blur) is reserved for the running state only.
 
-**The No-Hover-Lift Rule.** Cards and nodes do not animate on hover with `translate-y`. Hover = shadow escalation + border darkening only. Hover-lift is a marketing-page pattern; desktop tool panels stay put.
+**The No-Hover-Lift Rule.** Cards and nodes do not animate on hover with `translate-y`. Hover = shadow escalation + border darkening on canvas nodes, background shift only on cards. Hover-lift is a marketing-page pattern; desktop tool panels stay put.
 
 ---
 
@@ -360,11 +400,11 @@ The sticky header bar anchors every workspace page. It signals desktop-app chrom
 
 - **Corner Style:** `rounded-xl` (12px)
 - **Background:** Surface white (`#ffffff`)
-- **Shadow:** `shadow-[0_1px_4px_rgba(15,23,42,0.06)]` on stat tiles only; none on other content panels
+- **Shadow:** none on `ui/card.tsx`; the operational `SURFACE` primitives carry `shadow-xs`. Never deeper off-canvas.
 - **Border:** `border border-slate-200/70` at rest
 - **Internal Padding:** `p-5` (20px)
 - **Hover:** `hover:bg-slate-50/60` — no translate, no shadow escalation
-- **Semantic variants:** StatusTile shifts background + border + gains `running-glow` when executing.
+- **Semantic variants:** none. Runtime state is reported by `StateTag` and `Figure tone="live"` inside the `StatBand`, not by recoloring a card.
 
 ### Inputs / Fields
 
@@ -385,18 +425,20 @@ The sticky header bar anchors every workspace page. It signals desktop-app chrom
 
 ### Section Labels (PanelSection)
 
-- Always: `font-mono text-[9.5px] uppercase tracking-[0.1em] text-slate-500`
+Scoped to the Studio property panel — this is the one surface that still carries the mono-uppercase label voice. Operational pages label with Inter 11px instead (see `Figure` / `Panel` below).
+
+- Always: `font-mono text-[9.5px] uppercase tracking-widest text-slate-500`
 - Always preceded by a small icon: Lucide, 14px, `strokeWidth={1.5}`, `text-slate-400`（图标是装饰性重复，可用更浅的一档）
 - Never: bold, `text-slate-600`, larger than 11px, sentence case
 - `text-slate-400`（2.56:1）不可用于任何承载文字的元素——它只够画图标
 
 ### Operational surface primitives (`workspace/surfaces.tsx`)
 
-One small set of primitives carries every non-canvas page (Dashboard, Task Center, Scheduler, Statistics, Permissions). There is deliberately **no hero-metric tile** — a desktop tool reports state in a status strip, not a KPI grid.
+One small set of primitives carries every non-canvas page (Dashboard, Task Center, Scheduler, Statistics, Permissions). All of them share one class constant — `SURFACE` (`rounded-xl border border-rule bg-surface shadow-xs`); operational elevation changes there, not per component. There is deliberately **no hero-metric tile** — a desktop tool reports state in a status strip, not a KPI grid.
 
-- **`StatBand`:** one slim row (`min-h-11`), hairline-divided, `rounded-lg border border-rule bg-surface shadow-xs`. Wraps `Figure` children.
+- **`StatBand`:** one slim row (`min-h-11`), hairline-divided. Wraps `Figure` children.
 - **`Figure`:** 11px label + 15px `.figure` value (Inter Bold, `tabular-nums`, `tracking -0.02em`) + optional 10px mono note. `tone="live"` colors a non-zero value with the live blue.
-- **`Panel`:** white card, `rounded-lg border border-rule shadow-xs`, icon + section label header. Never nested inside another Panel.
+- **`Panel`:** white card, icon + section label header. Never nested inside another Panel.
 - **`KeyRow`:** label / value pair on one hairline-separated row. `mono` prop switches the value to JetBrains Mono.
 - **`StateTag`:** semantic dot + label. Color is **always** paired with the text label (colorblind-safe). States: `live` (breathing dot) / `success` / `warning` / `error` / `idle`.
 - **`SurfaceEmpty`:** centered 11px `text-ink-3` empty state.
@@ -408,7 +450,7 @@ The canvas is the product's hero surface; node state must read at a glance from 
 - **Status bar:** a full-width `h-[3px]` bar pinned to the node's top edge, color = state. Running uses `bg-running-strip animate-shimmer` (flowing live blue); done emerald, error red, pending/skipped slate. This is the across-the-room signal.
 - **Status pill:** an explicit `icon + 中文标签` pill on the right of the node body (`运行中 / 完成 / 失败 / 待运行 / 跳过`), tinted to the state with a `ring-1` outline. Color is always paired with icon + label (colorblind-safe).
 - **Running emphasis:** the running node additionally gets the `running-glow` animated border + `shadow-running`; the edge into a running node gets `edge-running` (a flowing dashed Indigo stroke). Live execution should be the most alive thing on screen.
-- **Selected:** `shadow-(--shadow-node-selected)` (Indigo focus ring), never a color change that competes with status.
+- **Selected:** a 3px ring + soft drop shadow, inline-styled from the node kind's own accent — the ring reinforces which kind you picked instead of introducing a second color. Never a fill change that competes with status.
 
 ---
 
@@ -418,10 +460,10 @@ The canvas is the product's hero surface; node state must read at a glance from 
 
 - **Do** use `border border-slate-200/70` for inline content panel boundaries. The border is the elevation signal; ambient shadow is not.
 - **Do** use JetBrains Mono + `tabular-nums` for every number that can change dynamically.
-- **Do** use `font-mono text-[9.5px] uppercase tracking-[0.1em] text-slate-500` for section panel labels. Every time.
-- **Do** apply `running-glow` to the StatusTile and animated nodes when `runtimeStatus === 'running'`. The animated border IS the live signal.
-- **Do** shift the StatusTile's background AND border when runtimeStatus changes. Text-color change alone is insufficient.
-- **Do** keep the brand indigo (`#6366f1`) rare: primary buttons, active nav items, selection only. Running state uses the live blue (`#3b82f6`), never the brand.
+- **Do** use `font-mono text-[9.5px] uppercase tracking-widest text-slate-500` for `PanelSection` labels in the Studio property panel. Every time — and only there.
+- **Do** apply `running-glow` to a flow node when its status is `running`. The animated border IS the live signal.
+- **Do** report runtime state off-canvas through `StateTag` (dot + label) and `Figure tone="live"`. Recoloring a whole card is not the pattern here — the status strip is.
+- **Do** keep the brand indigo (`#6366f1`) rare: primary buttons, active nav items, focus rings. Running state uses the live blue (`#3b82f6`), never the brand; canvas selection uses the selected node's own kind accent.
 - **Do** give every semantic state a non-color differentiator — icon and label alongside color.
 - **Do** use `rounded-xl` (12px) for content panels and `rounded-lg` (8px) for controls.
 - **Do** use `hover:bg-slate-50/60` on cards. A barely perceptible background shift is the hover signal.

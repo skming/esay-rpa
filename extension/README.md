@@ -40,7 +40,7 @@ curl http://127.0.0.1:8765/api/extension/status
 - 标签页：`browser.tab.open`、`browser.tab.switch`、`browser.tab.close`
 - 截图：`browser.screenshot`
 - 可视化：目标元素高亮、人工接管 Banner
-- 可信输入：`trustedInput: true` 时通过 Chrome Debugger/CDP 执行点击或输入
+- 可信输入：动作带 `trusted: true` 时通过 Chrome Debugger/CDP 执行点击或输入
 
 ## 手工测试
 

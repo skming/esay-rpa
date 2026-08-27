@@ -37,7 +37,7 @@ The interface communicates that the system is doing complex things reliably. It 
 
 4. **Restrained identity.** The brand runs Indigo `#6366f1` → Blue `#2563eb` (gradient for primary actions; Blue-600 for active states, links, and AA text). A distinct live blue `#3b82f6` marks running state so it never collides with the brand. Color appears in purposeful, semantic positions — active states, brand marks, run indicators — never as decoration. Signal through placement, not saturation.
 
-5. **Density calibrated to expertise.** Target users are developers. Dense-but-legible beats spacious-but-shallow. Inter labels for section headers, tabular numerals for statistics, 12px body in dense list rows. (The earlier mono-uppercase "ledger" label voice has been retired — it read as editorial, not tool.) Every pixel freed from decoration goes to information.
+5. **Density calibrated to expertise.** Target users are developers. Dense-but-legible beats spacious-but-shallow. Inter labels for section headers, tabular numerals for statistics, 12px body in dense list rows. (The mono-uppercase "ledger" label voice is retired from the operational surfaces, where it read as editorial rather than tool; it survives only on the Studio property panel's `PanelSection`, where a 9.5px mono label has to hold its own against dense technical config.) Every pixel freed from decoration goes to information.
 
 ## Accessibility & Inclusion
 
