@@ -30,8 +30,7 @@ export function ConfigTab({
   const actionType = node.data.action?.type ?? DEFAULT_ACTION_TYPE_BY_KIND[node.data.kind];
   const isNoExec = actionType === 'control.noop' || actionType === 'control.break';
 
-  // 拾取结果回填草稿要读到最新 draft，但不能因 draft 变化重跑：否则用户手改过的 selector
-  // 会被上一次的拾取结果盖回去。useEffectEvent 就是这个语义——闭包读最新值，自身不进依赖。
+  // 不能因 draft 变化重跑：用户手改过的 selector 会被上一次的拾取结果盖回去
   const applyPickerResult = useEffectEvent((result: PickerResult): void => {
     onDraftChange({
       ...draft,

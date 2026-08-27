@@ -37,8 +37,7 @@ export function VariablePickerField({
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
 
-  // 走 useMemo 而不是裸 `variables ?? []`：variables 缺省时每次渲染都是新数组，
-  // 下面 groupedRows 的依赖恒变，等于没缓存。
+  // variables 缺省时裸 `?? []` 每次渲染都是新数组，下面 groupedRows 的依赖恒变，等于没缓存
   const rows = useMemo(() => variables ?? [], [variables]);
   const normalizedQuery = query.trim().toLowerCase();
 

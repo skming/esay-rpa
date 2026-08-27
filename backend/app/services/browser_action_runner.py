@@ -1163,8 +1163,7 @@ async def _heal_selector(page: object, node: FlowNode, variables: RuntimeVariabl
     return None
 
 
-# Schema 驱动抓取（outputSchema）
-# 节点声明期望的输出字段，运行时把提取行对齐成 schema 契约：
+# 节点用 outputSchema 声明期望的输出字段，运行时把提取行对齐成 schema 契约：
 #   dict 行（table 模式）：表头 精确 → 别名 → 包含 匹配后改名为 schema 字段；
 #   list 行（无表头表格）：按列序命名；纯文本行：单字段包装。
 # 必需字段全部/部分未命中直接报错并列出实际可用列，驱动 AI 修复映射而不是

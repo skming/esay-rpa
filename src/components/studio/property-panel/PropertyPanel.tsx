@@ -38,8 +38,7 @@ export function PropertyPanel({
   const [draft, setDraft] = useState<RpaNodeConfigDraft>(() =>
     createNodeConfigDraft(selectedNode?.data ?? { description: '', kind: 'browser', status: 'pending', title: '' })
   );
-  // 依赖挂 data/id 而不是整个 selectedNode：只挪动节点位置时 xyflow 会换掉节点对象但 data 不变，
-  // 挂整个对象等于每次拖动都重建草稿、把面板里没保存的编辑冲掉。
+  // 只挪动位置时 xyflow 会换掉节点对象但 data 不变，依赖挂整个 selectedNode 等于每次拖动都重建草稿、冲掉未保存的编辑
   const selectedNodeData = selectedNode?.data;
   const selectedNodeId = selectedNode?.id;
   const savedDraft = useMemo(() => (selectedNodeData === undefined ? null : createNodeConfigDraft(selectedNodeData)), [selectedNodeData]);

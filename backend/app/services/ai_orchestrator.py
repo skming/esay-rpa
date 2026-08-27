@@ -275,9 +275,6 @@ _BROWSER_SELECTOR_ISSUES = frozenset({
 })
 
 
-# strong: 顶级模型，完整 prompt + 30 轮
-# standard: 主流模型，完整 prompt + 20 轮
-# weak: 小/快模型，精简 prompt + 12 轮
 # Tier 由 config/model_catalog.json 的 tier 字段定义；未在 catalog 中的模型默认 standard。
 _WEAK_TOOL_ROUNDS = 12
 _STANDARD_TOOL_ROUNDS = 20
