@@ -108,6 +108,32 @@ async def run_benchmark(args: argparse.Namespace) -> AntiBotSummary:
     )
 
 
+def fetch_definition(target: AntiBotTarget) -> dict[str, Any]:
+    """TaskManager 只执行 flowDefinition，顶层扁平字段仅被携带，不参与抓取。
+    所以 fetcher/extractMode/attribute 必须写进节点：漏一个就落回
+    build_request_for_fetch_node 的默认值（fetcher=static），评测出的成功率
+    不属于这个 target 声明的抓取方式，而这条偏差在结果里看不出来。"""
+    return {
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {
+                "id": "fetch",
+                "type": "browser.fetch",
+                "targetUrl": target.target_url,
+                "selector": target.selector,
+                "fetcher": target.fetcher,
+                "extractMode": target.extract_mode,
+                "attribute": target.attribute,
+                "adaptive": True,
+                "autoSave": False,
+                "timeoutMs": target.timeout_ms,
+                "outputVariable": "rows",
+            },
+        ],
+        "edges": [{"source": "start", "target": "fetch"}],
+    }
+
+
 async def run_target(*, client: AsyncClient, target: AntiBotTarget, attempt: int) -> AntiBotRecord:
     started_at = datetime.now(UTC)
     started = time.perf_counter()
@@ -129,6 +155,7 @@ async def run_target(*, client: AsyncClient, target: AntiBotTarget, attempt: int
                 "timeoutMs": target.timeout_ms,
                 "adaptive": True,
                 "autoSave": False,
+                "flowDefinition": fetch_definition(target),
             },
         )
         response.raise_for_status()

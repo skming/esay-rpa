@@ -117,6 +117,41 @@ async def run_load_test(args: argparse.Namespace) -> LoadTestSummary:
         main_module.scheduler_service = original_scheduler_service
 
 
+TARGET_URL = "https://books.toscrape.com/"
+SELECTOR = ".product_pod h3 a::text"
+TASK_TIMEOUT_MS = 30000
+
+
+def task_payload(flow_name: str) -> dict[str, Any]:
+    """SyntheticRunner 只 sleep，不会真去取页面，但 TaskManager.start_task 拿不到 flowDefinition 就直接拒。
+    直接入队会退 422；走调度触发时该异常被 run_due_schedules 当作「失效调度」吞掉，只推进 next_run_at，
+    tick 永远返回空列表、cron 采样为 0——两条路径都必须交一份结构完整的定义。"""
+    return {
+        "flowName": flow_name,
+        "targetUrl": TARGET_URL,
+        "selector": SELECTOR,
+        "fetcher": "static",
+        "extractMode": "text",
+        "timeoutMs": TASK_TIMEOUT_MS,
+        "flowDefinition": {
+            "nodes": [
+                {"id": "start", "type": "start"},
+                {
+                    "id": "fetch",
+                    "type": "browser.fetch",
+                    "targetUrl": TARGET_URL,
+                    "selector": SELECTOR,
+                    "fetcher": "static",
+                    "extractMode": "text",
+                    "outputVariable": "rows",
+                    "timeoutMs": TASK_TIMEOUT_MS,
+                },
+            ],
+            "edges": [{"source": "start", "target": "fetch"}],
+        },
+    }
+
+
 async def create_tasks(*, client: AsyncClient, args: argparse.Namespace) -> tuple[list[str], list[float], int]:
     semaphore = asyncio.Semaphore(args.create_concurrency)
     latencies: list[float] = []
@@ -125,14 +160,7 @@ async def create_tasks(*, client: AsyncClient, args: argparse.Namespace) -> tupl
 
     async def create_one(index: int) -> None:
         nonlocal failed_count
-        payload = {
-            "flowName": f"压测流程-{index}",
-            "targetUrl": "https://books.toscrape.com/",
-            "selector": ".product_pod h3 a::text",
-            "fetcher": "static",
-            "extractMode": "text",
-            "timeoutMs": 30000,
-        }
+        payload = task_payload(f"压测流程-{index}")
         async with semaphore:
             started = time.perf_counter()
             response = await client.post("/api/tasks", json=payload)
@@ -181,12 +209,7 @@ async def measure_cron_error(*, client: AsyncClient, samples: int, tick_interval
             "cronExpression": "* * * * * *",
             "timezone": "UTC",
             "enabled": True,
-            "task": {
-                "flowName": "Cron 误差压测",
-                "targetUrl": "https://books.toscrape.com/",
-                "selector": ".product_pod h3 a::text",
-                "timeoutMs": 30000,
-            },
+            "task": task_payload("Cron 误差压测"),
         },
     )
     response.raise_for_status()

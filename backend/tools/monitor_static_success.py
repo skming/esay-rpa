@@ -87,6 +87,29 @@ async def run_monitor(args: argparse.Namespace) -> MonitorSummary:
     )
 
 
+def fetch_definition(args: argparse.Namespace) -> dict[str, Any]:
+    """TaskManager 只执行 flowDefinition，顶层扁平字段仅被携带，不参与抓取。
+    extractMode/attribute 必须写进节点，否则落回 build_request_for_fetch_node 的
+    默认 text 模式，监控到的成功率不是 --extract-mode 指定的那种取值方式。"""
+    return {
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {
+                "id": "fetch",
+                "type": "browser.fetch",
+                "targetUrl": args.target_url,
+                "selector": args.selector,
+                "fetcher": "static",
+                "extractMode": args.extract_mode,
+                "attribute": args.attribute,
+                "timeoutMs": args.task_timeout_ms,
+                "outputVariable": "rows",
+            },
+        ],
+        "edges": [{"source": "start", "target": "fetch"}],
+    }
+
+
 async def run_cycle(*, client: AsyncClient, args: argparse.Namespace) -> MonitorRecord:
     started_at = datetime.now(UTC)
     started = time.perf_counter()
@@ -106,6 +129,7 @@ async def run_cycle(*, client: AsyncClient, args: argparse.Namespace) -> Monitor
                 "extractMode": args.extract_mode,
                 "attribute": args.attribute,
                 "timeoutMs": args.task_timeout_ms,
+                "flowDefinition": fetch_definition(args),
             },
         )
         create_response.raise_for_status()
