@@ -38,13 +38,22 @@ const NODE_STATUS: Record<NodeStatus, {
   },
 };
 
-function NodeStatusPill({ status }: { status: NodeStatus }): ReactElement | null {
-  if (status === 'pending') return null;
+function NodeStatusPill({ status }: { status: NodeStatus }): ReactElement {
   const s = NODE_STATUS[status];
   const Icon = s.icon;
   return (
-    <span className={cn('inline-flex shrink-0 items-center justify-center rounded-full p-1.5', s.pill)} title={s.label}>
-      <Icon className={cn('h-3.5 w-3.5', s.spin === true && 'animate-spin')} strokeWidth={2} />
+    <span
+      aria-atomic="true"
+      aria-label={`节点状态：${s.label}`}
+      className={cn(
+        'inline-flex shrink-0 items-center justify-center gap-1 rounded-full px-2 py-1 text-[10px] font-medium leading-none',
+        s.pill,
+      )}
+      role="status"
+      title={s.label}
+    >
+      <Icon className={cn('h-3 w-3', s.spin === true && 'animate-spin')} strokeWidth={2} />
+      <span>{s.label}</span>
     </span>
   );
 }
@@ -72,6 +81,8 @@ export function RpaStepNode({ data, selected }: NodeProps<Node<RpaNodeData>>): R
           boxShadow: `0 0 0 3px ${style.accent}38, 0 4px 20px rgba(15,23,42,0.12)`,
         } : undefined}
       >
+        <div aria-hidden="true" className={cn('h-1 w-full', NODE_STATUS[data.status].bar)} />
+
         {data.breakpoint && (
           <span
             className="absolute left-2.5 top-2.5 z-(--z-sticky) grid h-2.5 w-2.5 place-items-center rounded-full bg-red-500 ring-2 ring-white"
@@ -89,6 +100,7 @@ export function RpaStepNode({ data, selected }: NodeProps<Node<RpaNodeData>>): R
                 ? 'border-amber-200 bg-amber-50 text-amber-700'
                 : 'border-slate-200 bg-slate-50 text-slate-500',
             )}
+            aria-label={data.validationSeverity === 'error' ? `${data.validationCount} 个运行错误` : `${data.validationCount} 个运行提醒`}
             title={data.validationSeverity === 'error' ? '当前节点存在运行错误' : '当前节点存在运行提醒'}
           >
             {data.validationCount}
@@ -187,6 +199,7 @@ function NodeAction({
         'flex h-7 w-7 items-center justify-center rounded-lg transition-all duration-150 active:scale-90',
         className,
       )}
+      aria-label={label}
       onClick={handleClick}
       title={label}
       type="button"

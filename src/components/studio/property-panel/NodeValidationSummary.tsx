@@ -49,6 +49,8 @@ export function NodeValidationSummary({
   }));
 
   const summaryIssues = dedupeIssues([...structureIssues, ...outputIssues]);
+  const visibleSummaryIssues = summaryIssues.slice(0, 4);
+  const remainingSummaryIssues = summaryIssues.slice(4);
   const hasMissing = missingVarNames.length > 0;
   const errorCount = summaryIssues.filter((i) => i.severity === 'error').length + (hasMissing ? missingVarNames.length : 0);
   const warnCount = summaryIssues.filter((i) => i.severity === 'warn').length;
@@ -113,19 +115,34 @@ export function NodeValidationSummary({
             {warnCount > 0 && <Badge variant="default">{warnCount} 个提醒</Badge>}
           </div>
           <div className="mt-2 space-y-1.5">
-            {summaryIssues.slice(0, 4).map((issue) => (
-              <div
-                className="rounded-md border border-black/5 bg-white/70 px-2 py-1.5 text-[10px] leading-4"
-                key={`${issue.nodeId}-${issue.severity}-${issue.message}`}
-              >
-                {issue.message}
-              </div>
-            ))}
+            {visibleSummaryIssues.map((issue) => <ValidationIssueRow issue={issue} key={issueKey(issue)} />)}
+            {remainingSummaryIssues.length > 0 && (
+              <details className="group">
+                <summary className="cursor-pointer rounded-md border border-black/5 bg-white/70 px-2 py-1.5 text-[10px] font-medium transition hover:bg-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40">
+                  还有 {remainingSummaryIssues.length} 项，展开查看
+                </summary>
+                <div className="mt-1.5 space-y-1.5">
+                  {remainingSummaryIssues.map((issue) => <ValidationIssueRow issue={issue} key={issueKey(issue)} />)}
+                </div>
+              </details>
+            )}
           </div>
         </div>
       )}
     </div>
   );
+}
+
+function ValidationIssueRow({ issue }: { issue: RunValidationIssue }): ReactElement {
+  return (
+    <div className="rounded-md border border-black/5 bg-white/70 px-2 py-1.5 text-[10px] leading-4">
+      {issue.message}
+    </div>
+  );
+}
+
+function issueKey(issue: RunValidationIssue): string {
+  return `${issue.nodeId}-${issue.severity}-${issue.message}`;
 }
 
 function dedupeIssues(issues: RunValidationIssue[]): RunValidationIssue[] {

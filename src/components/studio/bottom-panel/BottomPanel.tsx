@@ -124,6 +124,8 @@ export function BottomPanel({
             const count = levelCounts[level];
             return (
               <button
+                aria-label={hidden ? `显示${LOG_LEVEL_LABELS[level]}日志` : `隐藏${LOG_LEVEL_LABELS[level]}日志`}
+                aria-pressed={!hidden}
                 className={cn(
                   'flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] transition-all hover:bg-slate-100',
                   hidden ? 'text-slate-500' : tone.text
@@ -131,6 +133,7 @@ export function BottomPanel({
                 key={level}
                 onClick={() => toggleLogLevel(level)}
                 title={hidden ? `显示${LOG_LEVEL_LABELS[level]}` : `隐藏${LOG_LEVEL_LABELS[level]}`}
+                type="button"
               >
                 <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', hidden ? 'bg-slate-300' : tone.dot)} />
                 {LOG_LEVEL_LABELS[level]}

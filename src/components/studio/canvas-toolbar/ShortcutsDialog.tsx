@@ -35,6 +35,7 @@ const SHORTCUT_GROUPS: Array<{ items: Array<{ keys: string[]; label: string }>; 
       { keys: [CMD, 'Z'], label: '撤销（含节点拖动）' },
       { keys: [CMD, '⇧', 'Z'], label: '重做' },
       { keys: [CMD, 'S'], label: '保存流程' },
+      { keys: [CMD, 'J'], label: '打开/关闭 AI 助手' },
       { keys: ['Esc'], label: '取消选择 / 退出输入框' }
     ]
   }
