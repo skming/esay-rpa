@@ -1,6 +1,8 @@
+import { Search, X } from 'lucide-react';
 import type { ReactElement, ReactNode } from 'react';
 
 import { cn } from '../../lib/utils';
+import { Input } from '../ui/input';
 
 export type StatusTone = 'live' | 'success' | 'warning' | 'error' | 'idle';
 
@@ -150,6 +152,43 @@ export function Fact({
       >
         {value}
       </div>
+    </div>
+  );
+}
+
+/** 刻意不覆写 Input 自带的 focus-visible 焦点环：各页各写一套 focus: 会让鼠标点击也描边，且焦点色互不相同。 */
+export function SearchField({
+  label, onChange, placeholder, value, className,
+}: {
+  label: string;
+  onChange: (value: string) => void;
+  placeholder: string;
+  value: string;
+  className?: string;
+}): ReactElement {
+  return (
+    <div className={cn('relative min-w-0 max-w-sm flex-1', className)}>
+      <Search
+        className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-ink-4"
+        strokeWidth={1.5}
+      />
+      <Input
+        aria-label={label}
+        className="h-9 rounded-md border-rule-2 bg-surface pl-9 pr-8 text-[12px] text-ink-2 placeholder:text-ink-3"
+        onChange={(event) => onChange(event.target.value)}
+        placeholder={placeholder}
+        value={value}
+      />
+      {value !== '' && (
+        <button
+          aria-label="清除搜索"
+          className="absolute right-2.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-ink-4 transition-colors hover:bg-paper-sunk hover:text-ink-2"
+          onClick={() => onChange('')}
+          type="button"
+        >
+          <X className="h-3.5 w-3.5" strokeWidth={1.5} />
+        </button>
+      )}
     </div>
   );
 }

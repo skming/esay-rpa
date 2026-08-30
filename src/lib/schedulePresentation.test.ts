@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { ScheduleSnapshot } from '../types/electron';
-import { buildCronExpression, countEnabledSchedules, describeCronExpression, filterSchedules, formatScheduleDateTime, parseCronFields, previewNextCronRuns } from './schedulePresentation';
+import { buildCronExpression, countEnabledSchedules, describeCronExpression, describeNextRun, filterSchedules, formatScheduleDateTime, parseCronFields, previewNextCronRuns, selectUpcomingSchedules } from './schedulePresentation';
 
 function buildSchedule(overrides: Partial<ScheduleSnapshot> = {}): ScheduleSnapshot {
   return {
@@ -58,5 +58,26 @@ describe('schedulePresentation', () => {
     });
     expect(buildCronExpression({ dayOfMonth: '*', dayOfWeek: '1-5', hour: '9', minute: '30', month: '*' })).toBe('30 9 * * 1-5');
     expect(previewNextCronRuns('0 9 * * *', new Date('2026-06-10T08:58:00+08:00'), 2)).toHaveLength(2);
+  });
+
+  it('按下次触发时刻升序取启用调度，忽略停用与未计算的调度', () => {
+    const schedules = [
+      buildSchedule({ name: '午间', nextRunAt: '2026-06-10T12:00:00.000Z', scheduleId: 'schedule-1' }),
+      buildSchedule({ name: '停用', nextRunAt: '2026-06-10T07:00:00.000Z', scheduleId: 'schedule-2', status: 'disabled' }),
+      buildSchedule({ name: '清晨', nextRunAt: '2026-06-10T08:00:00.000Z', scheduleId: 'schedule-3' }),
+      buildSchedule({ name: '未计算', nextRunAt: null, scheduleId: 'schedule-4' })
+    ];
+
+    expect(selectUpcomingSchedules(schedules).map((schedule) => schedule.name)).toEqual(['清晨', '午间']);
+    expect(selectUpcomingSchedules(schedules, 1).map((schedule) => schedule.name)).toEqual(['清晨']);
+    expect(selectUpcomingSchedules([])).toEqual([]);
+  });
+
+  it('下次运行文案区分停用、待算与排期已被清空', () => {
+    expect(describeNextRun(buildSchedule({ nextRunAt: '2026-06-10T12:00:00.000Z' }))).toBe(formatScheduleDateTime('2026-06-10T12:00:00.000Z'));
+    expect(describeNextRun(buildSchedule({ nextRunAt: null, status: 'disabled' }))).toBe('已停用');
+    expect(describeNextRun(buildSchedule({ lastError: '上次触发失败', nextRunAt: null, status: 'disabled' }))).toBe('已停用');
+    expect(describeNextRun(buildSchedule({ nextRunAt: null }))).toBe('等待计算');
+    expect(describeNextRun(buildSchedule({ lastError: '无效 Cron 表达式: 99 99 * * *', nextRunAt: null }))).toBe('已停止排期');
   });
 });

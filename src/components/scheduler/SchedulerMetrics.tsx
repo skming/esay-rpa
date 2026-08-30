@@ -1,14 +1,12 @@
 import type { ReactElement } from 'react';
 
-import { countEnabledSchedules, formatScheduleDateTime } from '../../lib/schedulePresentation';
+import { countEnabledSchedules, formatScheduleDateTime, selectUpcomingSchedules } from '../../lib/schedulePresentation';
 import type { ScheduleSnapshot } from '../../types/electron';
 import { Figure, StatBand } from '../workspace/surfaces';
 
 export function SchedulerMetrics({ schedules }: { schedules: ScheduleSnapshot[] }): ReactElement {
   const enabledCount = countEnabledSchedules(schedules);
-  const latestNextRun = schedules
-    .filter((s) => s.nextRunAt !== null && s.nextRunAt !== undefined)
-    .sort((a, b) => new Date(a.nextRunAt ?? '').getTime() - new Date(b.nextRunAt ?? '').getTime())[0];
+  const nextSchedule = selectUpcomingSchedules(schedules, 1)[0];
 
   return (
     <StatBand>
@@ -16,9 +14,9 @@ export function SchedulerMetrics({ schedules }: { schedules: ScheduleSnapshot[] 
       <Figure label="启用任务" value={enabledCount} note="自动" tone={enabledCount > 0 ? 'live' : 'ink'} />
       <Figure label="停用任务" value={schedules.length - enabledCount} note="暂停" />
       <Figure
-        label="最近触发"
-        value={latestNextRun === undefined ? '未计算' : formatScheduleDateTime(latestNextRun.nextRunAt)}
-        note="下次"
+        label="下次触发"
+        value={nextSchedule === undefined ? '无启用调度' : formatScheduleDateTime(nextSchedule.nextRunAt)}
+        note={nextSchedule?.name}
       />
     </StatBand>
   );

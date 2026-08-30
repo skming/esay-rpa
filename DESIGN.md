@@ -442,6 +442,7 @@ One small set of primitives carries every non-canvas page (Dashboard, Task Cente
 - **`KeyRow`:** label / value pair on one hairline-separated row. `mono` prop switches the value to JetBrains Mono.
 - **`StateTag`:** semantic dot + label. Color is **always** paired with the text label (colorblind-safe). States: `live` (breathing dot) / `success` / `warning` / `error` / `idle`.
 - **`SurfaceEmpty`:** centered 11px `text-ink-3` empty state.
+- **`SearchField`:** the list-filter input (leading search glyph, trailing clear button, `aria-label` required). It keeps `Input`'s own `focus-visible` accent ring — pages must not restyle the focus state per toolbar.
 
 ### Flow Node Status (Canvas — Signature)
 

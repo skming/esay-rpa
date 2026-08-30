@@ -96,6 +96,24 @@ export function countEnabledSchedules(schedules: ScheduleSnapshot[]): number {
   return schedules.filter((schedule) => schedule.status === 'enabled').length;
 }
 
+export function selectUpcomingSchedules(schedules: ScheduleSnapshot[], limit?: number): ScheduleSnapshot[] {
+  const upcoming = schedules
+    .filter((schedule) => schedule.status === 'enabled' && typeof schedule.nextRunAt === 'string' && schedule.nextRunAt.trim() !== '')
+    .sort((left, right) => new Date(left.nextRunAt ?? '').getTime() - new Date(right.nextRunAt ?? '').getTime());
+  return limit === undefined ? upcoming : upcoming.slice(0, limit);
+}
+
+export function describeNextRun(schedule: ScheduleSnapshot): string {
+  if (typeof schedule.nextRunAt === 'string' && schedule.nextRunAt.trim() !== '') {
+    return formatScheduleDateTime(schedule.nextRunAt);
+  }
+  // 停用与"排期被系统清掉"都表现为 nextRunAt 为空，混成一句会把用户自己按的暂停说成故障。
+  if (schedule.status !== 'enabled') {
+    return '已停用';
+  }
+  return schedule.lastError === null || schedule.lastError === undefined || schedule.lastError === '' ? '等待计算' : '已停止排期';
+}
+
 function isNumeric(value: string): boolean {
   return /^\d+$/.test(value);
 }

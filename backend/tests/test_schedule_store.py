@@ -39,12 +39,13 @@ async def test_sqlalchemy_schedule_store_persists_crud(tmp_path) -> None:
     assert [item.schedule_id for item in listed] == ["schedule-1"]
     assert listed[0].task.flow_name == "持久化测试流程"
 
-    updated = listed[0].model_copy(update={"next_run_at": datetime.now(UTC) - timedelta(seconds=1), "last_task_id": "task-1"})
+    updated = listed[0].model_copy(update={"next_run_at": datetime.now(UTC) - timedelta(seconds=1), "last_task_id": "task-1", "last_error": "调度绑定的流程不存在"})
     await store.save(updated)
 
     due = await store.due(datetime.now(UTC))
     assert [item.schedule_id for item in due] == ["schedule-1"]
     assert due[0].last_task_id == "task-1"
+    assert due[0].last_error == "调度绑定的流程不存在"
 
     deleted = await store.delete("schedule-1")
     assert deleted is True

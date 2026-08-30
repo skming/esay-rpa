@@ -1,9 +1,9 @@
-import { Clock3, MoreHorizontal, Pencil, PauseCircle, PlayCircle, Trash2, Zap } from 'lucide-react';
+import { AlertTriangle, Clock3, MoreHorizontal, Pencil, PauseCircle, PlayCircle, Trash2, Zap } from 'lucide-react';
 import type { ReactElement } from 'react';
 import { useState } from 'react';
 
 import type { ElectronBridgeState } from '../../hooks/useElectronBridge';
-import { describeCronExpression, formatScheduleDateTime } from '../../lib/schedulePresentation';
+import { describeCronExpression, describeNextRun, formatScheduleDateTime } from '../../lib/schedulePresentation';
 import type { ScheduleSnapshot } from '../../types/electron';
 import { cn } from '../../lib/utils';
 import { Fact, StateTag, SURFACE } from '../workspace/surfaces';
@@ -24,6 +24,7 @@ export function ScheduleTaskCard({
 }): ReactElement {
   const enabled = schedule.status === 'enabled';
   const [editOpen, setEditOpen] = useState(false);
+  const lastError = schedule.lastError ?? '';
 
   return (
     <article className={cn(SURFACE, 'transition-colors duration-150 hover:border-rule-2')}>
@@ -87,6 +88,13 @@ export function ScheduleTaskCard({
         </div>
       </div>
 
+      {lastError !== '' && (
+        <div className="flex items-start gap-2 border-t border-red-200 bg-red-50 px-5 py-3 text-[11.5px] text-red-700">
+          <AlertTriangle className="mt-px h-3.5 w-3.5 shrink-0" strokeWidth={1.5} />
+          <span className="min-w-0 break-words">上次触发失败：{lastError}</span>
+        </div>
+      )}
+
       <div className="grid grid-cols-2 gap-x-6 gap-y-4 border-t border-rule px-5 py-4 sm:grid-cols-4">
         <Fact label="绑定流程" value={schedule.task.flowName} />
         <Fact label="时区" value={schedule.timezone} />
@@ -100,9 +108,7 @@ export function ScheduleTaskCard({
         <Fact
           label="下次运行"
           mono={schedule.nextRunAt !== null && schedule.nextRunAt !== undefined}
-          value={schedule.nextRunAt === null || schedule.nextRunAt === undefined
-            ? '等待计算'
-            : formatScheduleDateTime(schedule.nextRunAt)}
+          value={describeNextRun(schedule)}
         />
       </div>
 

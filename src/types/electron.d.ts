@@ -411,6 +411,7 @@ export type ScheduleSnapshot = {
   lastRunAt?: string | null;
   nextRunAt?: string | null;
   lastTaskId?: string | null;
+  lastError?: string | null;
 };
 
 export type ScheduleTriggerResult = {

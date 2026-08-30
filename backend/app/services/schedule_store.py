@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 
-from sqlalchemy import Boolean, DateTime, String, delete, select
+from sqlalchemy import Boolean, DateTime, String, Text, delete, select
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -95,6 +95,7 @@ class ScheduleRow(Base):
     last_run_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     next_run_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     last_task_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
 
@@ -156,6 +157,7 @@ class SqlAlchemyScheduleStore:
         row.last_run_at = schedule.last_run_at
         row.next_run_at = schedule.next_run_at
         row.last_task_id = schedule.last_task_id
+        row.last_error = schedule.last_error
         row.created_at = schedule.created_at
         row.updated_at = schedule.updated_at
 
@@ -173,6 +175,7 @@ class SqlAlchemyScheduleStore:
             last_run_at=row.last_run_at,
             next_run_at=row.next_run_at,
             last_task_id=row.last_task_id,
+            last_error=row.last_error,
         )
 
 

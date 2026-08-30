@@ -649,6 +649,7 @@ class ScheduleSnapshot(ApiModel):
     last_run_at: datetime | None = None
     next_run_at: datetime | None = None
     last_task_id: str | None = None
+    last_error: str | None = None
 
 
 def _is_safe_variable_name(value: str) -> bool:
