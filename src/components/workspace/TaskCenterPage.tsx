@@ -151,7 +151,7 @@ export function TaskCenterPage({
       title="任务管理"
     >
       <StatBand>
-        <Figure first label="全部流程" value={items.length} note="已配置" />
+        <Figure first label="活动流程" value={items.length} note="已配置" />
         <Figure label="已调度" value={items.filter((i) => i.nextRunAt !== null).length} note="自动触发" />
         <Figure
           label="运行中"
@@ -175,7 +175,7 @@ export function TaskCenterPage({
         viewMode={viewMode}
       />
 
-      <div className="min-w-0 flex-1 space-y-4">
+      <div className="min-w-0">
         {showArchived ? (
           <ArchivedList
             flows={filteredArchivedFlows}

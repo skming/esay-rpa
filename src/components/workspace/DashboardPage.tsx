@@ -1,22 +1,20 @@
-import { CircleDashed, Play } from 'lucide-react';
+import { CalendarClock } from 'lucide-react';
 import type { ReactElement } from 'react';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 import type { ElectronBridgeState } from '../../hooks/useElectronBridge';
+import { formatScheduleDateTime, selectUpcomingSchedules } from '../../lib/schedulePresentation';
 import type { TaskSnapshot } from '../../types/electron';
 import { RefreshButton } from '../ui/refresh-button';
-import { Figure, KeyRow, Panel, StatBand, StateTag } from './surfaces';
+import { Figure, KeyRow, Panel, StatBand, StateTag, SurfaceEmpty } from './surfaces';
 import type { StatusTone } from './surfaces';
 import { RunDetailDialog } from './RunDetailDialog';
 import { RunHistoryList } from './RunHistoryList';
 import { WorkspaceShell } from './WorkspaceShell';
 
-export function DashboardPage({
-  electron,
-}: {
-  electron: ElectronBridgeState;
-  onOpenTaskCenter: () => void;
-}): ReactElement {
+const UPCOMING_LIMIT = 5;
+
+export function DashboardPage({ electron }: { electron: ElectronBridgeState }): ReactElement {
   const loadedRef = useRef(false);
   const [detailRun, setDetailRun] = useState<TaskSnapshot | null>(null);
 
@@ -35,6 +33,11 @@ export function DashboardPage({
   const queuedCount = electron.queueStats?.queuedCount ?? 0;
   const concurrency = electron.queueStats?.concurrency ?? 1;
 
+  const upcoming = useMemo(
+    () => selectUpcomingSchedules(electron.schedules, UPCOMING_LIMIT),
+    [electron.schedules],
+  );
+
   const status = STATUS[electron.runtimeStatus];
 
   return (
@@ -44,6 +47,7 @@ export function DashboardPage({
           variant="ghost"
           onClick={async () => {
             await electron.loadQueueStats();
+            await electron.loadSchedules();
             await electron.loadRuns({ limit: 20 });
           }}
         />
@@ -66,7 +70,7 @@ export function DashboardPage({
         <Figure
           label="运行中"
           value={activeCount}
-          note={queuedCount > 0 ? `排队 ${queuedCount}` : '空闲'}
+          note={queuedCount > 0 ? `排队 ${queuedCount} · 上限 ${concurrency}` : `上限 ${concurrency}`}
           tone={activeCount > 0 ? 'live' : 'ink'}
         />
         <Figure
@@ -79,21 +83,28 @@ export function DashboardPage({
         />
       </StatBand>
 
-      {/* items-start：两个面板行数不同，拉伸会留死白 */}
-      <div className="grid items-start gap-5 lg:grid-cols-2">
-        <Panel label="执行摘要" icon={<CircleDashed className="h-3.5 w-3.5" strokeWidth={1.5} />}>
-          <KeyRow label="当前步骤" value={`${electron.progress.currentStep} / ${electron.progress.totalSteps}`} />
-          <KeyRow label="累计耗时" value={fmtElapsed(electron.progress.elapsedMs)} mono />
-          <KeyRow label="运行产物" value={`${electron.artifacts.length} 个`} />
-          <KeyRow label="变量快照" value={`${electron.variables.length} 个`} last />
-        </Panel>
-
-        <Panel label="任务队列" icon={<Play className="h-3.5 w-3.5" strokeWidth={1.5} />}>
-          <KeyRow label="并发上限" value={<>{concurrency}<span className="ml-1 font-sans text-[11px] font-normal text-ink-3">并行</span></>} mono />
-          <KeyRow label="运行中" value={<span className={activeCount > 0 ? 'text-live' : undefined}>{activeCount}</span>} mono />
-          <KeyRow label="排队中" value={<span className={queuedCount > 0 ? 'text-amber-700' : undefined}>{queuedCount}</span>} mono last />
-        </Panel>
-      </div>
+      <Panel
+        bodyClassName={upcoming.length === 0 ? 'p-0' : undefined}
+        icon={<CalendarClock className="h-3.5 w-3.5" strokeWidth={1.5} />}
+        label="即将触发"
+      >
+        {upcoming.length === 0 ? (
+          <SurfaceEmpty
+            title="没有待触发的调度"
+            hint="在调度中心新建 Cron 触发器后，最近的几次触发会出现在这里。"
+          />
+        ) : (
+          upcoming.map((schedule, index) => (
+            <KeyRow
+              key={schedule.scheduleId}
+              label={schedule.name}
+              last={index === upcoming.length - 1}
+              mono
+              value={formatScheduleDateTime(schedule.nextRunAt)}
+            />
+          ))
+        )}
+      </Panel>
 
       <RunHistoryList
         onInspectRun={(run) => {
@@ -126,8 +137,3 @@ const STATUS: Record<
   stopped: { text: '已停止', tag: '手动停止', state: 'warning' },
   paused_for_human: { text: '等待接管', tag: '人工接管', state: 'warning' },
 };
-
-function fmtElapsed(ms: number): string {
-  const s = Math.max(0, Math.floor(ms / 1000));
-  return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
-}

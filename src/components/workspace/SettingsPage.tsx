@@ -16,6 +16,7 @@ import { NotificationConfigPanel } from './settings/NotificationConfigPanel';
 import { SettingsSideTabs } from './settings/SettingsSideTabs';
 import { SystemInfoPanel } from './settings/SystemInfoPanel';
 import type { SettingsSection } from './settings/types';
+import { settingsPanelId, settingsTabId } from './settings/types';
 
 export function SettingsPage({ electron }: { electron: ElectronBridgeState }): ReactElement {
   const location = useLocation();
@@ -46,10 +47,16 @@ export function SettingsPage({ electron }: { electron: ElectronBridgeState }): R
   };
 
   return (
-    <WorkspaceShell description="系统信息 · AI 模型 · 通知渠道 · 浏览器扩展" fill title="设置">
+    <WorkspaceShell description="本机配置与运行环境" fill title="设置">
       <section className={cn('grid min-h-0 flex-1 overflow-hidden lg:grid-cols-[200px_minmax(0,1fr)]', SURFACE)}>
         <SettingsSideTabs active={activeSection} onChange={setActiveSection} />
-        <div className="no-scrollbar min-h-0 min-w-0 overflow-auto border-t border-rule lg:border-l lg:border-t-0" role="tabpanel">
+        <div
+          aria-labelledby={settingsTabId(activeSection)}
+          className="no-scrollbar min-h-0 min-w-0 overflow-auto border-t border-rule lg:border-l lg:border-t-0"
+          id={settingsPanelId(activeSection)}
+          role="tabpanel"
+          tabIndex={-1}
+        >
           {activeSection === 'system' && (
             <SystemInfoPanel clearing={clearing} electron={electron} onClear={clearData} />
           )}

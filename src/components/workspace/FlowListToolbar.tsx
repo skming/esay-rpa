@@ -1,10 +1,10 @@
-import { Grid2X2, List, Search } from 'lucide-react';
+import { Grid2X2, List } from 'lucide-react';
 import type { ReactElement } from 'react';
 
 import type { FlowListViewMode } from '../../stores/useWorkspaceStore';
 import { cn } from '../../lib/utils';
 import { IconButton } from '../ui/button';
-import { Input } from '../ui/input';
+import { SearchField } from './surfaces';
 
 // 只管筛选与视图，新建/导入/刷新在页头 actions
 export function FlowListToolbar({
@@ -45,18 +45,12 @@ export function FlowListToolbar({
         </SegmentButton>
       </div>
 
-      <div className="relative min-w-0 max-w-sm flex-1">
-        <Search
-          className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-ink-4"
-          strokeWidth={1.5}
-        />
-        <Input
-          className="h-9 rounded-md border-rule-2 bg-surface pl-9 text-[12px] text-ink-2 placeholder:text-ink-3 focus:border-accent focus:ring-2 focus:ring-accent-soft"
-          onChange={(event) => onQueryChange(event.target.value)}
-          placeholder={showArchived ? '搜索归档流程' : '搜索流程、版本或目录'}
-          value={query}
-        />
-      </div>
+      <SearchField
+        label="搜索流程"
+        onChange={onQueryChange}
+        placeholder={showArchived ? '搜索归档流程' : '搜索流程、版本或目录'}
+        value={query}
+      />
 
       {!showArchived && (
         <div className="flex shrink-0 items-center gap-0.5 rounded-md border border-rule-2 bg-paper-sunk p-0.5">

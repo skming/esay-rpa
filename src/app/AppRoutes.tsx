@@ -16,10 +16,7 @@ export function AppRoutes(context: AppRuntimeContext): ReactElement {
 
   return (
     <Routes>
-      <Route
-        element={<DashboardPage electron={context.electron} onOpenTaskCenter={() => navigate(ROUTE_PATHS.tasks)} />}
-        path={ROUTE_PATHS.dashboard}
-      />
+      <Route element={<DashboardPage electron={context.electron} />} path={ROUTE_PATHS.dashboard} />
       <Route element={<StudioRoute {...context} />} path={ROUTE_PATHS.studio} />
       <Route element={<TaskCenterPage electron={context.electron} onOpenStudio={() => navigate(ROUTE_PATHS.studio)} />} path={ROUTE_PATHS.tasks} />
       <Route element={<SchedulerPage electron={context.electron} />} path={ROUTE_PATHS.scheduler} />
