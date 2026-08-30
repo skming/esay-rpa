@@ -94,6 +94,35 @@ def test_corrupt_checkpoint_is_ignored_not_raised(tmp_path: Path) -> None:
     assert checkpoint.load("f1") == {}
 
 
+def test_valid_json_with_invalid_timestamp_is_ignored_not_raised(tmp_path: Path) -> None:
+    """JSON 能解析不等于元数据可用；坏时间戳不能把整轮请求带崩。"""
+    d = tmp_path / "checkpoints"
+    d.mkdir(parents=True)
+    (d / "flow_f1.json").write_text(json.dumps({
+        "state": {"attempt_budget": _budget(2)},
+        "updated_at": "不是时间戳",
+    }), encoding="utf-8")
+
+    assert checkpoint.load("f1") == {}
+
+
+def test_invalid_persisted_state_shape_is_ignored_before_apply(tmp_path: Path) -> None:
+    """已知字段类型损坏时整份检查点作废，不能把字符串回灌成 attempt_budget。"""
+    d = tmp_path / "checkpoints"
+    d.mkdir(parents=True)
+    (d / "flow_f1.json").write_text(json.dumps({
+        "state": {"attempt_budget": "three"},
+        "updated_at": time.time(),
+    }), encoding="utf-8")
+
+    loaded = checkpoint.load("f1")
+    state = GuardState()
+    state.apply_checkpoint({"attempt_budget": "three"})
+
+    assert loaded == {}
+    assert state.attempt_budget == _budget(0)
+
+
 def test_missing_flow_id_is_a_no_op() -> None:
     """临时流程没有 id，落盘会互相串台。"""
     checkpoint.save(None, GuardState(attempt_budget=_budget(5)), rounds=1)
@@ -245,6 +274,45 @@ async def test_interrupted_session_keeps_what_the_tools_already_cost(
     await stream.aclose()
 
     assert checkpoint.load("f-int").get("page_evidence_required"), "中断丢掉义务后，下轮会直接重跑而不是先看 DOM"
+
+
+async def test_created_flow_moves_interrupted_checkpoint_off_the_local_draft(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """create_flow 返回真实 ID 后，前端会立刻切换；检查点也必须跟着切换。"""
+    import litellm
+
+    from app.services.ai_orchestrator import AiOrchestrator
+
+    from test_ai_orchestrator import _chunk, _FakeExecutor, _FakeStream, _tool_call_chunk
+
+    monkeypatch.setattr(checkpoint, "resolve_ai_dir", lambda: tmp_path)
+    checkpoint.save("local-draft", GuardState(attempt_budget=_budget(1)), rounds=1)
+
+    async def fake_acompletion(**kwargs: Any) -> Any:
+        return _FakeStream([
+            _chunk(tool_calls=[_tool_call_chunk(
+                0,
+                call_id="create-1",
+                name="create_flow",
+                arguments='{"name":"新流程","nodes":[],"edges":[]}',
+            )], finish="tool_calls"),
+        ])
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+
+    stream = AiOrchestrator(tool_executor=_FakeExecutor()).stream(  # type: ignore[arg-type]
+        messages=[{"role": "user", "content": "继续创建流程"}],
+        model="test-model",
+        flow_id="local-draft",
+    )
+    async for event in stream:
+        if event["type"] == "tool_result":
+            break
+    await stream.aclose()
+
+    assert checkpoint.load("flow-1").get("attempt_budget", {}).get("spent") == 1
+    assert checkpoint.load("local-draft") == {}
 
 
 async def test_orchestrator_resumes_then_clears_on_completion(

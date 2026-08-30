@@ -13,11 +13,13 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from app.core.storage import resolve_ai_dir
+from app.services.ai_guard_state import is_valid_checkpoint_value
 from app.services.ai_phases import VERIFY_ATTEMPT_BUDGET
 
 if TYPE_CHECKING:
@@ -96,12 +98,20 @@ def load(flow_id: str | None) -> dict[str, Any]:
         return {}
     if not isinstance(data, dict):
         return {}
-    if time.time() - float(data.get("updated_at") or 0) > _STALE_SECONDS:
+    try:
+        updated_at = float(data.get("updated_at"))
+    except (TypeError, ValueError):
+        return {}
+    age = time.time() - updated_at
+    if not math.isfinite(updated_at) or age < 0 or age > _STALE_SECONDS:
         return {}
     state = data.get("state")
     if not isinstance(state, dict):
         return {}
-    return {k: v for k, v in state.items() if k in _PERSISTED_KEYS}
+    persisted = {k: v for k, v in state.items() if k in _PERSISTED_KEYS}
+    if any(not is_valid_checkpoint_value(key, value) for key, value in persisted.items()):
+        return {}
+    return persisted
 
 
 def save(flow_id: str | None, state: GuardState, *, rounds: int) -> None:

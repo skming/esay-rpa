@@ -1702,9 +1702,11 @@ class AiOrchestrator:
                 if tool_name in _RUN_STATE_TOOLS and _tool_call_succeeded(result):
                     # 下一轮的状态块要讲「最近一次运行怎么样了」，来源就是这里
                     last_run = result
+                previous_flow_id = flow_id
                 if isinstance(result, dict):
                     event_flow_id = result.get("flow_id") or guard_state.flow_id
                     if isinstance(event_flow_id, str):
+                        flow_id = event_flow_id
                         guard_state.flow_id = event_flow_id
                         record_events(event_flow_id, [
                             event for event in (result.get("events") or []) if isinstance(event, dict)
@@ -1714,6 +1716,8 @@ class AiOrchestrator:
                     meter.blocked_calls += 1
                 _orchestrator_guard_after_tool(tool_name, result, guard_state)
                 _session_checkpoint.save(flow_id, guard_state, rounds=meter.rounds)
+                if previous_flow_id != flow_id:
+                    _session_checkpoint.clear(previous_flow_id)
 
                 yield {"type": "tool_result", "tool": tool_name, "result": result, "call_id": tc["call_id"]}
                 # 工具计数发生后立即推送；若用户此时关闭窗口，落盘的 usage 仍与工具卡片一致。
@@ -2247,6 +2251,13 @@ def _note_page_evidence(tool_name: str, result: dict[str, Any], state: GuardStat
         state.fresh_page_evidence = True
 
 
+def _note_read_evidence(tool_name: str, result: dict[str, Any], state: GuardState) -> None:
+    """只在读取成功时记指纹；任务本身的 error 状态仍是一份有效运行证据。"""
+    if result.get("error") or result.get("status") in {"blocked_by_orchestrator_guard", "skipped"}:
+        return
+    note_evidence(state, tool_name, state._last_tool_args or {})
+
+
 def _after_inspect_page(result: dict[str, Any], state: GuardState) -> None:
     if result.get("status") == "blocked_challenge_page":
         # 刻意不进 _PERSISTED_KEYS：这道锁只在本轮有效。用户下一句往往正是
@@ -2369,6 +2380,7 @@ def _after_run_flow(result: dict[str, Any], state: GuardState) -> None:
 
 
 def _after_get_run_error(result: dict[str, Any], state: GuardState) -> None:
+    _note_read_evidence("get_run_error", result, state)
     # 带回失败现场截图也算新证据。
     if result.get("failure_screenshot_note"):
         state.fresh_page_evidence = True
@@ -2430,6 +2442,14 @@ def _after_get_run_error(result: dict[str, Any], state: GuardState) -> None:
                 "若未知目标 URL，先 inspect_page 当前应用可见导航/按钮结构，再只修复该单个导航节点。"
             ),
         }
+
+
+def _after_get_run_logs(result: dict[str, Any], state: GuardState) -> None:
+    _note_read_evidence("get_run_logs", result, state)
+
+
+def _after_get_run_output(result: dict[str, Any], state: GuardState) -> None:
+    _note_read_evidence("get_run_output", result, state)
 
 
 def _after_flow_write(result: dict[str, Any], state: GuardState) -> None:
@@ -2547,6 +2567,8 @@ _AFTER_TOOL_HANDLERS: dict[str, Callable[[dict[str, Any], GuardState], None]] = 
     "apply_node_fix": _after_apply_node_fix,
     "create_flow": _after_create_flow,
     "get_run_error": _after_get_run_error,
+    "get_run_logs": _after_get_run_logs,
+    "get_run_output": _after_get_run_output,
     "inspect_page": _after_inspect_page,
     "inspect_screenshot": _after_inspect_screenshot,
     "run_flow": _after_run_flow,
@@ -2557,14 +2579,9 @@ _AFTER_TOOL_HANDLERS: dict[str, Callable[[dict[str, Any], GuardState], None]] = 
 # 返回不改变任何事实的工具。要显式列出来，理由跟 GUARDS / _PER_ROUND_KEYS 一样：
 # 新增工具时必须表态，漏一个不会报错，只会让它的返回静默不进 state。
 #
-# get_run_logs / get_run_output 在此列是个既有的不对称：它们同属 EVIDENCE_TOOLS，却从来
-# 没记过取证指纹，于是「重复取同一份日志」这条判据对它们不生效。本次不改动，写在这里
-# 是为了让它是一个明确的决定，而不是一处谁都没注意到的遗漏。
 _AFTER_TOOL_NO_STATE_EFFECT = frozenset({
     "check_extension_connection",
     "create_schedule",
-    "get_run_logs",
-    "get_run_output",
     "list_node_types",
     "list_schedules",
     "publish_flow",

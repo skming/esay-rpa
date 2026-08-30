@@ -9,6 +9,8 @@ from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from app.services.ai_flow_state import (
     FlowState,
     build_flow_state,
@@ -506,6 +508,36 @@ def test_every_schema_tool_decides_whether_it_writes_facts() -> None:
     assert not overlap, f"两张表重叠：{sorted(overlap)}"
     # 写工具必须四个都有处理函数：漏掉一个，那次写入之后旧的运行结果仍被当成有效证据
     assert not set(_FLOW_WRITE_TOOLS) - set(_AFTER_TOOL_HANDLERS)
+
+
+@pytest.mark.parametrize("tool_name,result", [
+    ("get_run_logs", {"task_id": "t1", "count": 1, "logs": [{"message": "done"}]}),
+    ("get_run_output", {"task_id": "t1", "status": "success", "variables": {"rows": 3}}),
+    ("get_run_error", {"task_id": "t1", "status": "error", "run_error": "boom"}),
+])
+def test_successful_read_evidence_is_not_fetched_twice(
+    tool_name: str, result: dict[str, Any]
+) -> None:
+    """日志、输出和失败现场已经进上下文后，同参复取只会制造无效工具轮。"""
+    state = _ready()
+    args = {"task_id": "t1"}
+    state._last_tool_args = args
+
+    _orchestrator_guard_after_tool(tool_name, result, state)
+
+    blocked = _orchestrator_guard_before_tool(tool_name, args, state)
+    assert blocked and blocked["guard_id"] == "evidence_already_collected"
+
+
+def test_failed_read_does_not_consume_the_evidence_fingerprint() -> None:
+    """没读到证据时允许修正参数后重试；失败结果不能冒充已经取证。"""
+    state = _ready()
+    args = {"task_id": "missing"}
+    state._last_tool_args = args
+
+    _orchestrator_guard_after_tool("get_run_output", {"error": "任务不存在"}, state)
+
+    assert _orchestrator_guard_before_tool("get_run_output", args, state) is None
 
 
 def test_the_two_lock_statuses_come_from_exactly_one_tool_each() -> None:
@@ -1345,8 +1377,12 @@ async def test_parallel_tool_calls_after_create_flow_get_placeholder_responses(m
         messages=[{"role": "user", "content": "帮我建一个流程"}], model="test-model",
     )]
 
-    # list_node_types 没有真正执行（create_flow 后 break）……
-    assert [c[0] for c in executor.calls] == ["create_flow"]
+    # list_node_types 没有真正执行（create_flow 后 break）；第 2 轮可以用新 ID 做内部状态刷新。
+    executed_names = [call[0] for call in executor.calls]
+    assert executed_names[0] == "create_flow"
+    assert executed_names.count("create_flow") == 1
+    assert "list_node_types" not in executed_names
+    assert ("get_flow", {"flow_id": "flow-1"}) in executor.calls
     # ……但拿到了 skipped 占位结果事件
     skipped = [e for e in events if e["type"] == "tool_result" and e["tool"] == "list_node_types"]
     assert len(skipped) == 1 and skipped[0]["result"]["status"] == "skipped"

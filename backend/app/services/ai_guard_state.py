@@ -22,6 +22,43 @@ def new_budget() -> dict[str, Any]:
     return {"spent": 0, "signatures": {}, "attempts": []}
 
 
+def is_valid_checkpoint_value(key: str, value: Any) -> bool:
+    """检查点字段的 JSON 形状校验；坏值宁可丢弃，也不能污染本轮状态。"""
+    if key == "attempt_budget":
+        if not isinstance(value, dict):
+            return False
+        spent = value.get("spent", 0)
+        signatures = value.get("signatures", {})
+        attempts = value.get("attempts", [])
+        return (
+            isinstance(spent, int)
+            and not isinstance(spent, bool)
+            and spent >= 0
+            and isinstance(signatures, dict)
+            and all(
+                isinstance(signature, str)
+                and isinstance(count, int)
+                and not isinstance(count, bool)
+                and count >= 0
+                for signature, count in signatures.items()
+            )
+            and isinstance(attempts, list)
+            and all(isinstance(attempt, dict) for attempt in attempts)
+        )
+    if key in {
+        "failure_budget_lock",
+        "audit_findings",
+        "navigation_failure_hint",
+        "page_evidence_required",
+    }:
+        return isinstance(value, dict)
+    if key == "runtime_escape_findings":
+        return isinstance(value, list) and all(isinstance(item, dict) for item in value)
+    if key == "page_evidence_source":
+        return isinstance(value, str)
+    return False
+
+
 @dataclass(slots=True)
 class GuardState:
     """一次 stream() 里贯穿始终的会话状态。字段按生命周期分组，全部带默认值：
@@ -88,12 +125,13 @@ class GuardState:
     _last_tool_args: dict[str, Any] | None = None
 
     def apply_checkpoint(self, checkpoint: dict[str, Any]) -> None:
-        """把中断续跑的检查点（已按 _PERSISTED_KEYS 过滤过的 dict）写回本状态。
+        """把中断续跑的检查点（已过滤且校验过的 dict）写回本状态。
 
         只认当前声明过的字段：老检查点里被删掉的键、或更新版本还不认识的键，
-        直接丢弃而不抛错——检查点是省钱的优化，不该因版本漂移把整轮请求带崩。
+        以及类型已经损坏的值，直接丢弃而不抛错——检查点是省钱的优化，
+        不该因版本漂移或半写文件把整轮请求带崩。
         """
         known = {f.name for f in fields(self)}
         for key, value in checkpoint.items():
-            if key in known:
+            if key in known and is_valid_checkpoint_value(key, value):
                 setattr(self, key, value)
