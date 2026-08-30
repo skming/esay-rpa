@@ -1,47 +1,67 @@
 # Product
 
-## Register
+<!-- impeccable:product-schema 1 -->
 
-product
+## Platform
+
+web
 
 ## Users
 
-Developers and technical users who build and manage web automation pipelines. They are comfortable with flow logic, variables, selectors, and scripting. They are task-focused and efficiency-oriented — they evaluate tools by how little the UI gets in the way of the work. They run this on macOS or Windows alongside code editors and terminal windows.
+Developers and technical users who build and manage web automation pipelines. They are comfortable with flow logic, variables, selectors, and scripting. They are task-focused and efficiency-oriented, and they evaluate tools by how little the UI gets in the way of the work. They use Easy RPA on macOS or Windows alongside code editors and terminal windows.
 
 ## Product Purpose
 
-Easy RPA is a desktop Electron application for creating, running, and monitoring web automation flows. Users build visual node-based pipelines that automate browser interactions (clicking, filling forms, extracting data, navigating pages). The Studio canvas is the core work surface. Dashboard, Scheduler, Task Center, and Settings are operational surfaces for managing running and scheduled automations.
+Easy RPA is a local-first Electron desktop application for creating, running, and monitoring web automation flows. Users build visual node-based pipelines that automate browser interactions such as navigation, clicking, form filling, and data extraction. Studio is the core work surface; Dashboard, Scheduler, Task Center, and Settings support the operation of running and scheduled automations.
 
-Success looks like: a developer can open a flow, run it, diagnose a failure, and fix it in under a minute. The UI never becomes the bottleneck.
+Success means a developer can open a flow, run it, diagnose a failure, and fix it in under a minute. The interface must not become the bottleneck.
 
-## Brand Personality
+## Positioning
 
-Precise · Professional · Capable
+Easy RPA is a local-first visual RPA tool for technical users. Its product mechanism combines two explicit browser execution channels: Playwright with a managed persistent profile for unattended automation, and a Chrome Extension that reuses the user's signed-in browser for SSO, real-session access, and human collaboration. AI assistance is constrained by structured tools, validation, and acceptance evidence rather than treated as an unconstrained chat layer.
 
-The interface communicates that the system is doing complex things reliably. It earns trust through exactness — correct spacing, legible hierarchy, restrained use of color — not through friendliness or approachability. Think Figma's property panel, Raycast's command palette, VS Code's sidebar: serious tools that disappear into the workflow.
+## Operating Context
 
-## Anti-references
+- Users design, test, run, and diagnose flows in Studio, then schedule and monitor operational runs through the supporting panels.
+- Core project data, schedules, execution state, cache, and logs are stored locally under `~/.easy-rpa/` by default.
+- Playwright is the default channel for repeatable unattended runs. The Chrome Extension channel is used when an existing signed-in Chrome session or human participation is required and is not the recommended unattended channel.
+- The application runs as a web interface inside Electron/Chromium on macOS and Windows. Target websites and configured AI providers may still require network access.
 
-- **UiPath / Power Automate** — generic enterprise blue, icon-overloaded, dated Windows-Forms-era layout. Heavy chrome that feels like overhead, not a tool.
-- **Zapier / Make** — SaaS-pastel, friendly bubble UI, approachable-consumer aesthetic. Too soft for a developer tool.
-- **Generic AI dashboards** — purple/indigo gradients, floating glass cards, ambient shadows on everything, "metric number hero" tiles. Looks designed, not functional.
-- **Notion / ClickUp** — document-first, heavy text hierarchy, sidebar that competes with the content. This is a flow editor, not a workspace OS.
+## Capabilities and Constraints
 
-## Design Principles
+- Visual node-based flows cover browser interaction, extraction, data transformation, files and Excel, scheduling, task monitoring, and AI-assisted workflow authoring.
+- Automation scope is the web browser. Native desktop GUI automation is not supported.
+- CAPTCHA bypass is not a product capability. Workflows that encounter a CAPTCHA require a legitimate human or site-supported path.
+- Iframes and open shadow roots are supported automation contexts; closed shadow roots are outside the current technical boundary.
+- Complex site-specific widgets such as arbitrary date ranges, multi-selects, and cascaded selectors are not assumed to have universal handling.
+- The embedded Python execution environment uses a limited dependency allowlist rather than arbitrary third-party package installation.
 
-1. **Precision over decoration.** Every visual element must earn its place. No ambient shadows for aesthetics, no inflated corner radii for approachability. The interface is calibrated, not adorned. When in doubt, remove rather than add.
+## Brand Commitments
 
-2. **State-first surfaces.** The interface reflects live system state (running, error, queue depth, step count) through color, form, and layout — not just text labels. A tile that changes background when a flow is running is more useful than one that only changes a word.
+- Product name: Easy RPA.
+- Personality: precise, professional, and capable.
+- Earn trust through exact behavior, clear system state, and reliable diagnostics rather than decorative friendliness.
+- Maintain the character of a serious developer tool; avoid dated enterprise-suite chrome, soft consumer-SaaS conventions, and generic AI-product tropes.
+- Make only claims supported by the product or evidence on hand. Never invent customer proof, performance results, pricing, licensing, or deployment claims.
 
-3. **Native desktop language.** Design decisions belong in the same visual register as Figma's property panel, Linear, and VS Code. A calm light NavRail, tight spacing, 1px hairline borders, soft single-layer shadows, and Inter labels with JetBrains Mono reserved for technical data (selectors, versions, IDs). Not a web app wrapped in Electron.
+## Evidence on Hand
 
-4. **Restrained identity.** The brand runs Indigo `#6366f1` → Blue `#2563eb` (gradient for primary actions; Blue-600 for active states, links, and AA text). A distinct live blue `#3b82f6` marks running state so it never collides with the brand. Color appears in purposeful, semantic positions — active states, brand marks, run indicators — never as decoration. Signal through placement, not saturation.
+- `README.md` and `OVERVIEW.md` document the product scope, architecture, workflows, execution channels, and known boundaries.
+- The repository implementation provides demonstrable product behavior across Studio, Dashboard, Scheduler, Task Center, and Settings.
+- Existing identity and interface assets include `DESIGN.md`, `src/assets/app-icon.png`, and the application icon set under `buildResources/`.
+- No public customer testimonials, case studies, press coverage, or quantified outcome data are currently available. Future work must not imply or fabricate them.
 
-5. **Density calibrated to expertise.** Target users are developers. Dense-but-legible beats spacious-but-shallow. Inter labels for section headers, tabular numerals for statistics, 12px body in dense list rows. (The mono-uppercase "ledger" label voice is retired from the operational surfaces, where it read as editorial rather than tool; it survives only on the Studio property panel's `PanelSection`, where a 9.5px mono label has to hold its own against dense technical config.) Every pixel freed from decoration goes to information.
+## Product Principles
+
+1. **Keep the tool out of the way.** Favor efficient, expert workflows and information density that serves the task.
+2. **Expose state and evidence.** Running, queued, failed, and completed work must be understandable and diagnosable without guesswork.
+3. **Preserve local control.** Keep project data and execution observable and locally owned, and state clearly when a workflow crosses that boundary.
+4. **Match the execution channel to the job.** Distinguish unattended automation from signed-in or human-assisted browser work instead of hiding their tradeoffs.
+5. **Constrain automation and AI with verifiable outcomes.** Structured tools, validation, and acceptance evidence take precedence over confident but unsupported output.
 
 ## Accessibility & Inclusion
 
-- Target: WCAG 2.1 AA minimum. AAA for body text contrast where achievable.
-- Platform: Electron / Chromium on macOS and Windows. Full keyboard navigation expected by developer users.
-- Reduced motion: respect `prefers-reduced-motion` for any transitions added.
-- Color blind safe: semantic states (running/error/warning/success) must always have a non-color differentiator (icon or label) in addition to color.
+- Target WCAG 2.1 AA at minimum, with AAA body-text contrast where achievable.
+- Support full keyboard navigation expected by developer users on macOS and Windows.
+- Respect `prefers-reduced-motion` for transitions and animations.
+- Give every semantic state, including running, error, warning, and success, a non-color differentiator such as an icon or label.
