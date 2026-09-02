@@ -48,6 +48,7 @@ import {
   writeLiveServerInfo,
 } from './lib/impeccable-paths.mjs';
 import { countByPage as countPendingByPage } from './live/manual-edits-buffer.mjs';
+import { collectProjectDetectorIgnores } from './live/project-ignores.mjs';
 import {
   createManualApplyController,
   summarizeManualApplyFailures,
@@ -754,9 +755,20 @@ function createRequestHandler({ detectScript, liveScriptParts }) {
         commandPrefix: IMPECCABLE_COMMAND_PREFIX,
         appRoot: process.cwd(),
         parts,
+        // Read per request rather than cached, so editing the config and
+        // reloading the tab is enough to pick up a new waiver. Config comes
+        // from every root the session spans (appRoot, contextRoot, repoRoot):
+        // in a monorepo the hook and the CLI key it at the repo root, which
+        // is not the appRoot this process chdir'd onto.
+        projectIgnores: collectProjectDetectorIgnores({
+          appRoot: process.cwd(),
+          contextRoot: LIVE_ROOTS?.contextRoot,
+          repoRoot: LIVE_ROOTS?.repoRoot,
+          scriptsDir: __dirname,
+        }),
       });
       res.writeHead(200, {
-        'Content-Type': 'application/javascript',
+        'Content-Type': 'application/javascript; charset=utf-8',
         'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
         'Pragma': 'no-cache',
       });
@@ -765,7 +777,7 @@ function createRequestHandler({ detectScript, liveScriptParts }) {
     }
     if (p === '/detect.js' || p === '/') {
       if (!detectScript) { res.writeHead(404); res.end('Not available'); return; }
-      res.writeHead(200, { 'Content-Type': 'application/javascript' });
+      res.writeHead(200, { 'Content-Type': 'application/javascript; charset=utf-8' });
       res.end(detectScript);
       return;
     }
