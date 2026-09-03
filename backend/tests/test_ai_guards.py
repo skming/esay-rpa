@@ -15,12 +15,24 @@ from typing import Any
 
 from app.services.ai_guard_state import GuardState
 from app.services.ai_guards import (
+    FLOW_WRITE_TOOLS,
     GUARDS,
+    PARALLEL_SAFE_TOOLS,
+    WRITE_TOOLS,
     apply_pre_tool_guards,
     call_fingerprint,
     describe_guards,
     guard_contract_lines,
 )
+from app.services.ai_tools.schemas import TOOL_SCHEMAS
+
+
+# 无副作用、只回答「现在是什么样」的工具。生产代码不需要这个集合——它只是下面那条
+# 元测试的对照面，所以按 tests/test_ai_prompts.py 的 PLATFORM_ONLY_TOOLS 的先例留在测试里。
+_READ_ONLY_TOOLS = frozenset({
+    "check_extension_connection", "get_run_error", "get_run_logs", "get_run_output",
+    "inspect_page", "inspect_screenshot", "list_node_types", "list_schedules",
+})
 
 
 def _blocked_by(tool: str, args: dict[str, Any], state: GuardState) -> dict[str, Any]:
@@ -38,6 +50,35 @@ def test_read_only_mode_blocks_every_write_but_no_diagnosis() -> None:
     # 诊断手段一个都不能收——只读模式的产物就是一份根因分析
     for tool in ("get_run_error", "inspect_page", "get_run_logs", "get_run_output"):
         assert apply_pre_tool_guards(tool, {}, state) is None
+
+
+def test_schedule_needs_the_user_to_have_asked_for_a_schedule() -> None:
+    """定时任务是本层能造成的最大既成事实，判据是用户提没提过周期。
+
+    enabled 默认 true，建完就按 cron 无人值守地拉起浏览器操作真实站点，而这个工具
+    既不过阶段机也没有别的授权检查。三个方向都得钉住：没提过要拦、提过要放行、
+    停用永远不拦（否则模型建错了也撤不回来）。
+    """
+    blocked = _blocked_by("create_schedule", {
+        "flow_id": "f1", "cron_expression": "0 9 * * *",
+    }, GuardState(user_requirement_text="帮我抓取商品列表导出成 Excel"))
+    assert blocked["guard_id"] == "schedule_requires_user_request"
+    assert blocked["required_action"] == "ask_user"
+    # 启用同样是新增无人值守执行，不能只挡创建
+    assert _blocked_by("toggle_schedule", {"schedule_id": "s1", "enabled": True}, GuardState(
+        user_requirement_text="把导出文件名加上日期",
+    ))["guard_id"] == "schedule_requires_user_request"
+
+    # 用户提过就放行；判据取整段需求原文，「继续」这类指令句不会把它冲掉
+    for text in ("每天9点自动跑一次", "加个定时任务", "工作日早上跑", "cron 设成每小时"):
+        assert apply_pre_tool_guards("create_schedule", {
+            "flow_id": "f1", "cron_expression": "0 9 * * *",
+        }, GuardState(user_requirement_text=text, latest_user_message="继续")) is None, text
+
+    # 停用是撤销，任何时候都要放过
+    assert apply_pre_tool_guards("toggle_schedule", {
+        "schedule_id": "s1", "enabled": False,
+    }, GuardState(user_requirement_text="关掉它")) is None
 
 
 def test_screenshot_is_blocked_only_for_models_without_vision() -> None:
@@ -111,6 +152,32 @@ def test_static_page_evidence_enforces_static_fetcher() -> None:
     }, state) is None
     assert apply_pre_tool_guards("create_flow", {
         "nodes": [{"id": "fetch", "type": "browser.fetch"}],
+    }, state) is None
+
+
+def test_static_page_evidence_gate_covers_apply_node_fix() -> None:
+    """三个落节点的工具都要挡住。
+
+    只挡 create_flow/update_flow 的话，模型改调 apply_node_fix 就能用 config_patch
+    把 fetcher 换成 dynamic 或把节点 type 换成浏览器交互——证据通道等于执行通道这条
+    判据就只在两个工具上成立，而绕开它不需要任何新信息。
+    """
+    state = GuardState(page_evidence_source="scrapling_static")
+    blocked = _blocked_by("apply_node_fix", {
+        "flow_id": "f1", "node_id": "fetch", "config_patch": {"fetcher": "dynamic"},
+    }, state)
+    assert blocked["guard_id"] == "static_page_evidence_requires_fetch_flow"
+    assert blocked["required_action"] == "set_fetcher_to_static"
+    assert blocked["found_fetcher"] == "dynamic"
+
+    blocked = _blocked_by("apply_node_fix", {
+        "flow_id": "f1", "node_id": "n1", "config_patch": {"type": "browser.click"},
+    }, state)
+    assert blocked["unsupported_node_types"] == ["browser.click"]
+
+    # 普通配置字段照旧放行，否则静态证据下连补 selector 都做不了
+    assert apply_pre_tool_guards("apply_node_fix", {
+        "flow_id": "f1", "node_id": "fetch", "config_patch": {"selector": "tbody tr"},
     }, state) is None
 
 
@@ -256,6 +323,25 @@ def test_guard_ids_are_unique_and_ordered_by_precedence() -> None:
     # 契约行是注入 system prompt 的，缺了 summary/contract 的条目会变成空 bullet
     assert all(line.strip() != "-" for line in guard_contract_lines())
     assert all(guard.summary for guard in GUARDS)
+
+
+def test_every_tool_is_classified_as_writing_or_read_only() -> None:
+    """新增工具必须先表态有没有副作用，否则它一出生就在所有闸门之外。
+
+    WRITE_TOOLS 是三处扣除的共同底本：只读模式的禁令、schema 层的能力扣除、
+    以及「哪些调用会改变世界」这个判断本身。漏登记不会有任何报错——工具照样能调，
+    只是自愈诊断的只读模式对它不生效，等于无人值守时它可以随便改流程、拉起运行。
+    反过来，PARALLEL_SAFE_TOOLS 里混进一个有副作用的工具，编排层会并发起跑它。
+    """
+    schema_names = {str(item["function"]["name"]) for item in TOOL_SCHEMAS}
+    assert WRITE_TOOLS & _READ_ONLY_TOOLS == frozenset(), "同一个工具不能既写又只读"
+    unclassified = schema_names - WRITE_TOOLS - _READ_ONLY_TOOLS
+    assert not unclassified, f"以下工具未表态有无副作用：{sorted(unclassified)}"
+    stale = (WRITE_TOOLS | _READ_ONLY_TOOLS) - schema_names
+    assert not stale, f"以下工具已不在 TOOL_SCHEMAS，名单过期：{sorted(stale)}"
+
+    assert FLOW_WRITE_TOOLS <= WRITE_TOOLS
+    assert PARALLEL_SAFE_TOOLS <= _READ_ONLY_TOOLS
 
 
 def test_every_guard_has_a_test_in_this_file() -> None:

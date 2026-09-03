@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -51,6 +52,18 @@ PARALLEL_SAFE_TOOLS = frozenset({
 
 _CREDENTIAL_NAME_TOKENS = (
     "password", "passwd", "pwd", "token", "secret", "api_key", "apikey", "credential",
+)
+
+# 用户提过定时/周期，才算要过定时任务。判据放在本模块而不是编排层：ai_guards 运行期
+# 保持零 ai_* 依赖，而这条判据只有这一个执行点。
+#
+# 判宽的代价不对称：多收一个词，流程就可能在用户不知情的时候每天自己跑起来去操作站点；
+# 漏判只是多一轮问答（cron 时间和时区本来也得问）。所以这里只收「明说了周期」的措辞，
+# 不收「自动」——「自动填表」「自动导出」说的是流程本身干什么，不是要定时触发。
+_SCHEDULE_AUTHORIZATION_RE = re.compile(
+    r"(定时|定期|周期性|每天|每日|每周|每月|每小时|每隔|每晚|每早|工作日|"
+    r"自动跑|自动运行|自动执行|排程|schedule|cron)",
+    re.IGNORECASE,
 )
 
 
@@ -256,6 +269,38 @@ def _check_read_only_mode(tool_name: str, args: dict[str, Any], state: GuardStat
     )
 
 
+def _check_schedule_authorization(
+    tool_name: str,
+    args: dict[str, Any],
+    state: GuardState,
+) -> dict[str, Any] | None:
+    """用户没要求定时，就不许把流程挂上定时器。
+
+    create_schedule 的 enabled 默认 true，落地即开始按 cron 无人值守地拉起浏览器操作
+    真实站点——这是本层能造成的最大既成事实，而它原来一道门都不过：阶段机刻意不管
+    这个工具（PHASE_GATED_TOOLS 不含它），执行器只查暂停节点和缺省变量，都不问「谁让你建的」。
+
+    判据取整段会话的需求原文而不是最新那一句：定时通常在第一句提出（「每天9点跑一次」），
+    随后几轮是「继续」「修一下」，只看最新消息会把用户真提过的定时需求判成没提过。
+
+    停用不拦：那是撤销无人值守执行。用「关掉它」这种不含周期词的话让模型去停一个
+    刚建错的定时任务，是这道闸唯一必须放过的方向。
+    """
+    if tool_name == "toggle_schedule" and not args.get("enabled"):
+        return None
+    text = " ".join(str(state.user_requirement_text or state.latest_user_message or "").split())
+    if _SCHEDULE_AUTHORIZATION_RE.search(text):
+        return None
+    return _blocked(
+        tool_name,
+        required_action="ask_user",
+        message=(
+            "用户没有要求定时运行，不能自行创建或启用定时任务。"
+            "流程交回用户手动运行；确实需要定时就先问清周期、具体时间和时区，由用户确认后再建。"
+        ),
+    )
+
+
 def _check_model_no_vision(tool_name: str, args: dict[str, Any], state: GuardState) -> dict[str, Any] | None:
     return _blocked(
         tool_name,
@@ -280,6 +325,9 @@ def _check_static_page_evidence_channel(
         for item in args.get("update_nodes") or []
         if isinstance(item, dict) and isinstance(item.get("patch"), dict)
     )
+    # apply_node_fix 的 config_patch 是同一件事「一份 patch 打在某个节点上」，只是参数名不同。
+    # 漏掉它，模型换个工具就能把 fetcher 改成 dynamic，这条通道判据形同虚设。
+    raw_nodes.append(args.get("config_patch"))
     nodes = [item for item in raw_nodes if isinstance(item, dict)]
     node_types = {str(item.get("type") or "") for item in nodes}
     unsupported = sorted(
@@ -420,6 +468,16 @@ GUARDS: tuple[Guard, ...] = (
         # 所以没有 contract：写进提示词会让模型以为审查请求下工具会被拦，从而不敢动手。
     ),
     Guard(
+        id="schedule_requires_user_request",
+        summary="用户没要求定时，不得创建或启用定时任务",
+        scope=ToolScope(include=frozenset({"create_schedule", "toggle_schedule"})),
+        check=_check_schedule_authorization,
+        contract=(
+            "定时任务只能在用户明确要求周期运行（「定时」「每天」「每隔…」等）时创建或启用；"
+            "用户没提就把流程交回他手动运行，不要顺手挂定时器。"
+        ),
+    ),
+    Guard(
         id="model_no_vision",
         summary="模型不支持图片输入时禁用 inspect_screenshot",
         scope=ToolScope(include=frozenset({"inspect_screenshot"})),
@@ -429,7 +487,7 @@ GUARDS: tuple[Guard, ...] = (
     Guard(
         id="static_page_evidence_requires_fetch_flow",
         summary="静态页面证据只能用于创建 browser.fetch 流程",
-        scope=ToolScope(include=frozenset({"create_flow", "update_flow"})),
+        scope=ToolScope(include=frozenset({"create_flow", "update_flow", "apply_node_fix"})),
         requires_state=("page_evidence_source",),
         check=_check_static_page_evidence_channel,
         contract=(

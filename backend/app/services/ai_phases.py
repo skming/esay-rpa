@@ -97,7 +97,8 @@ _PHASE_CONTRACTS: tuple[tuple[Phase, str], ...] = (
     ),
     (
         Phase.VERIFY,
-        "用户只说「修一下 / 报错了」时，改完交回用户，不要顺手 run_flow；要不要重跑由用户决定。",
+        "用户没有明确要求运行（「修一下」「报错了」「加个字段」都算）时，改完交回用户，"
+        "不要顺手 run_flow；要不要跑由用户决定。",
     ),
 )
 
@@ -247,11 +248,7 @@ def _check_repeated_evidence(
     比旧的「连续 3 次」严格更准：三次探测三个不同 URL 不再被误挡，
     重复探测同一个 URL 在第 2 次就拦下而不是第 4 次。
     """
-    if tool_name not in EVIDENCE_TOOLS:
-        return None
-    seen = state.evidence_collected or []
-    fingerprint = call_fingerprint(tool_name, args)
-    if fingerprint not in seen:
+    if not evidence_already_collected(tool_name, args, state):
         return None
     return _blocked(
         tool_name,
@@ -265,6 +262,21 @@ def _check_repeated_evidence(
             "确实需要新证据时，换目标（另一个 URL / 另一个 task_id）或先落一次改动。"
         ),
     )
+
+
+def evidence_already_collected(
+    tool_name: str,
+    args: dict[str, Any],
+    state: GuardState,
+) -> bool:
+    """这次取证是不是本轮已经取过的同一次。纯查询：不记账、不改状态。
+
+    单独拿出来是给编排层的并发预取用：预取抢在串行门之前执行，必须先问同一个问题，
+    而门本身会记账（拦截计数、预算），问第二遍就等于重复计价。
+    """
+    if tool_name not in EVIDENCE_TOOLS:
+        return False
+    return call_fingerprint(tool_name, args) in (state.evidence_collected or [])
 
 
 def _refuse_for_phase(
@@ -364,7 +376,7 @@ def _refuse_unauthorized_run(
     state: GuardState,
     phase: Phase,
 ) -> dict[str, Any]:
-    """用户只要求修复时，改完不许顺手把流程跑起来。
+    """本轮没拿到运行授权时，改完不许顺手把流程跑起来。
 
     拦错了，用户补一句「跑一下」；放行错了，就是在用户没点运行的情况下拉起浏览器
     去操作真实站点。所以宁可偏向拦。
@@ -379,7 +391,7 @@ def _refuse_unauthorized_run(
         phase,
         required_action="ask_user" if landed else "explain_and_wait",
         message=(
-            "用户这一轮要的是修复，没有要求运行。改完把结论交回用户，"
+            "用户这一轮只要求改动，没有要求运行。改完把结论交回用户，"
             "由用户决定要不要重跑——run_flow 会拉起真实浏览器去操作站点。"
         ),
     )

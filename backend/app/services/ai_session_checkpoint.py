@@ -74,6 +74,13 @@ _PER_ROUND_KEYS = frozenset({
     "current_flow_revision", "run_verified_revision", "accepted_revision",
     # 不是事实：flow_id 是检查点文件名本身，_last_tool_args 只在一次调用内传参
     "flow_id", "_last_tool_args",
+    # 本轮请求本身：下一轮换了一句话，这些就全过期了
+    "latest_user_message", "user_requirement_text", "turn_intent_actionable", "active_task",
+    # 调用方与模型这一轮的授权/能力，由 stream() 的入参决定，不是会话事实：
+    # 存下来会让下一轮沿用上一轮的调用方授权（自愈诊断的只读模式尤其不能漏出去）
+    "read_only_tools", "model_no_vision",
+    # 另有归属：修复台账（ai_repair_ledger）按 flow 落盘，每轮开场重读
+    "repair_sessions",
 })
 
 # 中断后隔了很久再回来，页面和流程多半都变了，旧预算不该再挡人。

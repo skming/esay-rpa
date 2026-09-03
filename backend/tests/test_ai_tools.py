@@ -1516,6 +1516,31 @@ async def test_update_flow_does_not_overwrite_an_already_meaningful_name() -> No
     assert flow_service.flow.name == "抖店登录流程"
 
 
+async def test_apply_node_fix_refuses_structural_fields() -> None:
+    """id/type 不在这个工具的权限内。
+
+    放开它，apply_node_fix 就成了「不过结构校验的 update_flow」：换 type 会让
+    连线指向一个不存在的能力，改 id 直接把节点从 edges 上摘掉，而这条路上
+    _validate_update_structure、start/end 保护、孤儿检查一条都不执行。
+    """
+    executor = RpaToolExecutor(  # type: ignore[arg-type]
+        flow_service=FakeRenamableFlowService(initial_name="新建 RPA 流程"),
+        task_manager=FakeTaskManager(),
+    )
+
+    for patch, expected in (
+        ({"type": "browser.click"}, ["type"]),
+        ({"id": "other"}, ["id"]),
+        ({"id": "other", "type": "browser.click", "selector": "td"}, ["id", "type"]),
+    ):
+        result = await executor.execute("apply_node_fix", {
+            "flow_id": "flow-rename-1", "node_id": "start", "config_patch": patch,
+        })
+        assert result["status"] == "blocked_structural_patch"
+        assert result["rejected_fields"] == expected
+        assert result["error"]
+
+
 # ─── Schedule & task-control tools ─────────────────────────────────────────────
 
 def _make_flow_snapshot(
@@ -2246,6 +2271,29 @@ def test_requirement_text_drops_bare_commands_and_repeats():
 def test_requirement_text_never_goes_empty():
     # 空需求会让 requirement_text 接管失效，模型又能自己填需求
     assert _session_requirement_text([{"role": "user", "content": "流程审查验收"}]) == "流程审查验收"
+
+
+def test_requirement_text_keeps_the_latest_correction_when_over_budget():
+    """超额时从中间丢，两端都要在。
+
+    最新那句是 acceptance_contract sourceQuote 的唯一来源，从尾部截掉它，
+    模型改验收契约时引什么都对不上，只能换措辞反复撞同一条护栏；
+    首条是主条款的出处，同样不能丢。
+    """
+    messages = [{"role": "user", "content": "抓取工作台核心业务指标并导出 Excel"}]
+    messages += [
+        {"role": "user", "content": f"把第 {i} 列改成千分位并保留两位小数" * 8}
+        for i in range(30)
+    ]
+    messages.append({"role": "user", "content": "只要状态为已通过的行"})
+
+    text = _session_requirement_text(messages)
+
+    assert len(text) <= 2000
+    assert "抓取工作台核心业务指标并导出 Excel" in text
+    assert "只要状态为已通过的行" in text
+    assert "把第 29 列" in text
+    assert "把第 0 列" not in text
 
 
 def test_acceptance_request_without_a_single_run_is_pushed_back():

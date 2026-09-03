@@ -378,7 +378,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "直接修改单个节点的配置字段（selector、outputVariable、path 等），立即写入，无需用户确认。\n"
                 "⚠️ 写入后不会出现任何确认按钮——修复完成后直接告知用户结果，不要让用户'点击应用变更'。\n"
                 "适用场景：修复单个节点的字段错误（如补全 path、修正 selector）。\n"
-                "多节点结构性变更（增删节点、调整连线）请改用 update_flow。"
+                "结构性变更请改用 update_flow：增删节点、调整连线，以及换节点 type——"
+                "config_patch 里出现 id/type 会被直接拒绝。"
             ),
             "parameters": {
                 "type": "object",
@@ -387,7 +388,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "node_id": {"type": "string"},
                     "config_patch": {
                         "type": "object",
-                        "description": "需要更新的配置字段键值对",
+                        "description": "需要更新的配置字段键值对；不接受 id/type",
                     },
                 },
                 "required": ["flow_id", "node_id", "config_patch"],

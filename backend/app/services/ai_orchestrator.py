@@ -28,11 +28,13 @@ from app.services.ai_guards import (
     PARALLEL_SAFE_TOOLS as _PARALLEL_SAFE_TOOLS,
     WRITE_TOOLS,
     apply_pre_tool_guards,
+    call_fingerprint,
 )
 from app.services.ai_phases import (
     Phase,
     admitted_tool_names,
     apply_phase_gate,
+    evidence_already_collected,
     note_evidence,
     note_failed_attempt,
     note_guard_block,
@@ -88,7 +90,7 @@ def _after_write_directive(result: dict[str, Any], state: GuardState) -> str:
         )
     if not state.run_authorized:
         return (
-            f"{head}本轮用户只要求修复、没有要求运行：向用户说明改了什么、为什么，"
+            f"{head}本轮用户只要求改动、没有要求运行：向用户说明改了什么、为什么，"
             "并问是否要运行验证。不要调用 run_flow。"
         )
     return (
@@ -905,7 +907,7 @@ class _TurnIntents:
     create_requested: bool = False
     # 非 None 即检测到创建意图，值为需求里的首个 URL
     create_url: str | None = None
-    # 用户这一句里已经授权运行（验收/跑一下/核对…）
+    # 本轮已授权运行：用户点明了要跑（验收/跑一下/核对…），或这轮就是从零建流程
     run_authorized: bool = False
 
 
@@ -1058,10 +1060,8 @@ def _detect_turn_intents(
         intents.repair = True
     # 用户明确说了要跑/要验收就是授权，即使同一句里还带着修复词。
     # 显式的「不要运行」优先级最高：它是撤回授权，不是没给授权。
-    intents.run_authorized = bool(
-        _RUN_AUTHORIZATION_RE.search(user_text)
-        and not any(phrase in user_text for phrase in _NO_RUN_REQUEST_PHRASES)
-    )
+    run_refused = any(phrase in user_text for phrase in _NO_RUN_REQUEST_PHRASES)
+    intents.run_authorized = bool(_RUN_AUTHORIZATION_RE.search(user_text)) and not run_refused
     # 结构性 guard，故意不靠关键字门控：用户描述问题的措辞（"抓不全"/"内容少了一半"等）
     # 是关键字列表永远无法穷举的集合。
     if flow_id and flow_state.has_browser_chain and not _is_explicit_channel_switch_request(user_text_lower):
@@ -1078,6 +1078,12 @@ def _detect_turn_intents(
             intents.create_url = urls[0]
         elif intents.create_requested and resolved.target_url and not _NEW_TASK_RE.search(user_text):
             intents.create_url = resolved.target_url
+    # 从零建流程本身就是运行授权。用户要的是一条能用的流程，而「能不能用」这个判断只随
+    # run_flow 的 acceptance_audit 回来；建完不跑就收尾，等于把验证甩回给用户自己试，
+    # 而 BUILD→VERIFY 这条主线（含验收契约与预算熔断）在第一轮永远走不到。
+    # 已经在改的流程不算：那时用户要的是这次改动，跑不跑由他说。
+    if intents.create_requested and not run_refused:
+        intents.run_authorized = True
     return intents
 
 
@@ -1299,12 +1305,15 @@ class AiOrchestrator:
             repair_sessions=int(ledger.get("sessions") or 0) + 1,
             node_field_history=dict(ledger.get("node_field_history") or {}),
             node_selector_fix_counts=dict(ledger.get("node_selector_fix_counts") or {}),
-            # 阶段机读的事实。这里给的是「本轮没有特殊意图」时的局面：证据不作要求、
-            # 运行不设限（run_authorized=True）；下面的意图接线才会逐项收紧。
+            # 阶段机读的事实。默认局面是「证据不作要求」；下面的意图接线才会逐项收紧。
             # blocking_diagnostics 每轮由状态块的诊断集重算，见主循环。
             flow_has_nodes=not flow_state.is_blank,
             page_evidence_done=task_state.phase == "page_inspected",
-            run_authorized=True,
+            # 运行授权只由本轮用户这句话给（见 _detect_turn_intents），不能默认放开：
+            # run_flow 会拉起真实浏览器去操作站点，而检查点刻意不存这个字段
+            # （ai_session_checkpoint._PERSISTED_KEYS），默认给 True 就等于把那道防线绕开——
+            # 断流恢复后的第一轮又是「未经授权也能跑」。
+            run_authorized=bool(intents.run_authorized),
             # 本轮请求已被判定为「建流程 / 修流程 / 要运行」，即职责范围之内。
             # 拿拒答模板收尾会被撤回重写（见 _misapplied_refusal）。
             turn_intent_actionable=bool(
@@ -1343,11 +1352,6 @@ class AiOrchestrator:
                 # 修复请求要的是「现在页面长什么样」。历史上探过一次不算——
                 # 上次探测之后流程和站点都可能变了，那份 DOM 支撑不了这次判断。
                 guard_state.page_evidence_done = False
-            # 刻意不进 _PERSISTED_KEYS：只锁本轮。用户下一句往往就是「跑一下看看」，
-            # 那时 repair 关键词不再出现，锁自然不会重新挂上。
-            # 同一句里已给出运行授权时不挂：否则「修完跑一遍验收」这类既报问题又要结论的
-            # 请求会被结构性地判成「不许运行」，模型只能交静态检查，用户拿不到答案。
-            guard_state.run_authorized = bool(intents.run_authorized)
             full_messages.append({"role": "system", "content": _GUIDANCE_BEFORE_REPAIR})
         if intents.preserve_execution_channel:
             guard_state.repair_intent = "preserve_execution_channel"
@@ -1598,8 +1602,17 @@ class AiOrchestrator:
 
             # 只读工具先并发起跑，串行循环走到它时直接取结果，省掉逐个 await 的串行往返。
             # 少于两个不预取：单个并发没收益，只多一层任务管理。
+            #
+            # 预取跑在串行门之前，所以「这次调用会不会被拒」必须在这里先问一遍：判漏了
+            # 就是真的多读了一次，事后再取消任务也追不回来（结果还会被丢掉，只留下一条
+            # 「已阻断」给用户看）。这四个工具唯一会撞上的门是重复取证——判据是指纹，
+            # 用 ai_phases 的纯查询版问，不能调门本身：门会记账，问第二遍就重复计价。
             prefetched: dict[int, asyncio.Task[Any]] = {}
             if sum(1 for _, _tc in tool_items if _tc["name"] in _PARALLEL_SAFE_TOOLS) > 1:
+                # 同一批里参数完全相同的第二次读取不抢跑：取证类的会被串行门以
+                # evidence_already_collected 拒掉（门判的是第一次记账之后的状态），
+                # 其余两个读到的也只会是同一份。跳过不改变结果——真到它那一格时串行分支照旧执行。
+                _pf_batch_prints: set[str] = set()
                 for _pf_idx, _pf_tc in tool_items:
                     if _pf_tc["name"] not in _PARALLEL_SAFE_TOOLS:
                         continue
@@ -1611,6 +1624,12 @@ class AiOrchestrator:
                         continue  # 参数非法交给下面的串行分支报错，这里不抢着执行
                     if _pf_dups:
                         continue
+                    if evidence_already_collected(_pf_tc["name"], _pf_args, guard_state):
+                        continue
+                    _pf_print = call_fingerprint(_pf_tc["name"], _pf_args)
+                    if _pf_print in _pf_batch_prints:
+                        continue
+                    _pf_batch_prints.add(_pf_print)
                     prefetched[_pf_idx] = asyncio.create_task(
                         self._executor.execute(_pf_tc["name"], _pf_args, {})
                     )
@@ -2097,6 +2116,12 @@ def _session_requirement_text(messages: list[dict[str, Any]]) -> str:
 
     首条消息通常是需求，后续是纠正，两者都可能含约束，所以不只取一条；
     但纯指令句要剔除、重复句要去重，否则「流程审查验收」发六遍就成了六个需求关键词。
+
+    刻意跨整段会话，不按任务周期切。`_NEW_TASK_RE` 里的「另一个 / 换一个」会命中
+    「把这一列换成另一个字段」这类普通纠正，切错就把原始需求从这里抹掉，
+    反过来让 acceptance_contract_sources_must_match_user 连环拦截主条款的引用。
+    换任务的边界交给前端「清空对话」——它 backendDelete 整份历史，下一次请求带的
+    就只有新消息，比任何措辞判据都准。
     """
     parts: list[str] = []
     seen: set[str] = set()
@@ -2115,7 +2140,31 @@ def _session_requirement_text(messages: list[dict[str, Any]]) -> str:
         seen.add(text)
         parts.append(text)
     # 全被判成指令时不能返回空——空会让 requirement_text 接管失效，模型又能自己填需求了
-    return ("\n".join(parts) or first_user_text)[:_SESSION_REQUIREMENT_MAX_CHARS]
+    return _fit_requirement_parts(parts or [first_user_text])
+
+
+def _fit_requirement_parts(parts: list[str]) -> str:
+    """把需求片段压进额度：保住首条和最新一条，先丢中间。
+
+    截断方向不是风格问题。requirement_text 是 acceptance_contract_sources_must_match_user
+    判 sourceQuote 的底本，从尾部截掉等于让用户最新那句纠正不存在——模型改验收契约时
+    引什么都对不上，只能换个措辞再撞一次，而重复撞同一条护栏是最贵的一种空转。
+    首条也不能丢：验收契约的主条款引的就是原始需求那句。
+    """
+    budget = _SESSION_REQUIREMENT_MAX_CHARS
+    if len(parts) == 1:
+        return parts[0][:budget]
+    # 最新那条先占位（最多半额），首条拿剩下的：一条超长消息不能把另一端整条挤掉。
+    latest = parts[-1][:budget // 2]
+    head = parts[0][:budget - len(latest) - 1]
+    kept = [head, latest]
+    remaining = budget - len(head) - len(latest) - 1
+    for text in reversed(parts[1:-1]):
+        if len(text) + 1 > remaining:
+            break
+        kept.insert(1, text)
+        remaining -= len(text) + 1
+    return "\n".join(kept)
 
 
 def _latest_user_message(messages: list[dict[str, Any]]) -> str:

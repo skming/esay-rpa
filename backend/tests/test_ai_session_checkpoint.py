@@ -207,11 +207,24 @@ def test_every_guard_state_key_is_explicitly_decided() -> None:
 
     模块名单也要跟着写入点走：少扫一个模块，那批键就永远不会在这里被要求表态——
     ai_tool_events 的三个 revision 字段就这么在名单外待过一阵。
+
+    构造时传的键同样算写入。只扫 `state.x = ...` 会漏掉一整类：编排层大部分事实是
+    GuardState(...) 一次给全的，`run_authorized` 从「事后收紧」改成「构造时按意图给」
+    之后，这条元测试就再也要求不到它表态了。
     """
     written: set[str] = set()
     for module in (ai_orchestrator, ai_phases, ai_tool_events):
         tree = ast.parse(inspect.getsource(module))
         for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "GuardState"
+            ):
+                written |= {
+                    kw.arg for kw in node.keywords
+                    if kw.arg is not None and kw.arg in _GUARD_STATE_FIELDS
+                }
             targets: list[ast.expr] = []
             if isinstance(node, ast.Assign):
                 targets = list(node.targets)

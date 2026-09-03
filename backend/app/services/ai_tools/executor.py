@@ -67,6 +67,11 @@ _PLACEHOLDER_FLOW_NAMES = frozenset({"新建 RPA 流程", "未命名流程"})
 # run_flow 的调用参数名。塞进 variables 既不报错也不生效，是最难自查的一类静默失效
 _RUN_CALL_PARAM_NAMES = frozenset({"browser_executor", "flow_id", "task_id"})
 
+# apply_node_fix 只改单节点的配置字段。id/type 决定这个节点是什么、连线还指不指向它，
+# 一旦可改，这个工具就是「不过结构校验的 update_flow」：_validate_update_structure、
+# start/end 保护、newly_orphaned 阻断、connectivity_warning 在这条路上一条都不执行。
+_STRUCTURAL_NODE_KEYS = frozenset({"id", "type"})
+
 # category/sensitive 没标全时的兜底：凭据字段的命名相当稳定
 _CREDENTIAL_NAME_TOKENS = (
     "password", "passwd", "pwd", "username", "user_name", "account",
@@ -1878,6 +1883,18 @@ class RpaToolExecutor:
         config_patch: dict[str, Any],
         change_context: ChangeContext | None = None,
     ) -> dict[str, Any]:
+        rejected_fields = sorted(_STRUCTURAL_NODE_KEYS & set(config_patch or {}))
+        if rejected_fields:
+            return {
+                "status": "blocked_structural_patch",
+                "error": (
+                    f"apply_node_fix 不能改 {'/'.join(rejected_fields)}："
+                    "这两个字段决定节点是什么、连线还指不指向它。"
+                    "换节点类型或调整连线请用 update_flow——那条路上有结构校验和孤儿检查。"
+                ),
+                "rejected_fields": rejected_fields,
+            }
+
         flow = await self._flow_service.get_flow(flow_id)
         if flow is None:
             return {"error": f"流程 {flow_id} 不存在"}

@@ -664,6 +664,21 @@ def test_run_authorization_is_detected_only_from_an_explicit_ask() -> None:
             [{"role": "user", "content": text}], "flow-1", blank
         ).run_authorized is False, text
 
+    # 从零建流程算授权：用户要的是一条能用的流程，而「能不能用」只随 run_flow 的
+    # acceptance_audit 回来，建完不跑等于把验证甩给用户自己试。
+    assert _detect_turn_intents(
+        [{"role": "user", "content": "帮我做一个抓 https://a.test 商品列表的流程"}], None, blank
+    ).run_authorized is True
+    # 「不要运行」是撤回，建流程这一支也压不过它
+    assert _detect_turn_intents(
+        [{"role": "user", "content": "帮我做一个抓 https://a.test 的流程，先不要运行"}], None, blank
+    ).run_authorized is False
+    # 改存量流程不沾这条：那时用户要的是这次改动，跑不跑由他说
+    assert _detect_turn_intents(
+        [{"role": "user", "content": "给导出文件名加上日期"}], "flow-1",
+        FlowState(is_blank=False, nodes=[{"id": "start", "type": "start"}]),
+    ).run_authorized is False
+
 
 def test_misapplied_refusal_is_rewritten_only_when_the_turn_was_actionable() -> None:
     """拒答模板本身要留着（真无关话题还得用），错的是把它用在职责范围内的请求上。"""
@@ -1252,6 +1267,47 @@ class _FakeExecutor:
         return {"status": "ok"}
 
 
+_VERIFIABLE_DEFINITION = {
+    "nodes": [
+        {"id": "start", "type": "start", "title": "开始"},
+        {"id": "fetch", "type": "browser.fetch", "url": "https://a.test", "fetcher": "static"},
+        {"id": "ext", "type": "browser.extract", "selector": "table", "mode": "table",
+         "outputVariable": "rows"},
+        {"id": "w", "type": "file.write", "path": "out.json", "source": "rows"},
+        {"id": "end", "type": "end", "title": "结束"},
+    ],
+    "edges": [
+        {"id": "e1", "source": "start", "target": "fetch"},
+        {"id": "e2", "source": "fetch", "target": "ext"},
+        {"id": "e3", "source": "ext", "target": "w"},
+        {"id": "e4", "source": "w", "target": "end"},
+    ],
+}
+_VERIFIABLE_CONTRACT = {
+    "requirements": [{"id": "r1", "description": "导出表格数据", "sourceQuote": "把表格导出成文件"}],
+    "deliverables": [{"id": "d1", "variable": "rows", "kind": "table", "required": True,
+                      "requirementIds": ["r1"]}],
+}
+
+
+class _RunnableFlowExecutor(_FakeExecutor):
+    """一个诊断干净、验收契约齐备的流程：阶段机会判成 VERIFY，run_flow 只剩授权这道门。"""
+
+    async def execute(
+        self, tool_name: str, args: dict[str, Any],
+        progress_sink: dict[str, Any] | None = None,
+        change_context: Any = None,
+    ) -> dict[str, Any]:
+        self.calls.append((tool_name, args))
+        if tool_name == "get_flow":
+            return {
+                "flow_id": "flow-run", "revision": 3,
+                "definition": _VERIFIABLE_DEFINITION,
+                "acceptance_contract": _VERIFIABLE_CONTRACT,
+            }
+        return {"status": "ok"}
+
+
 class _RevisionFlowExecutor(_FakeExecutor):
     async def execute(
         self, tool_name: str, args: dict[str, Any],
@@ -1272,6 +1328,51 @@ class _RevisionFlowExecutor(_FakeExecutor):
                 },
             }
         return {"status": "ok"}
+
+
+async def _run_flow_attempt(monkeypatch, user_text: str, flow_id: str | None = "flow-run"):
+    """让模型在一轮里直奔 run_flow，返回（执行器实际收到的调用, 被拦结果）。"""
+    import litellm
+
+    rounds = iter([
+        _FakeStream([_chunk(tool_calls=[_tool_call_chunk(
+            0, call_id="r1", name="run_flow", arguments='{"flow_id": "flow-run"}',
+        )], finish="tool_calls")]),
+        _FakeStream([_chunk(content="好的。", finish="stop")]),
+    ])
+
+    async def fake_acompletion(**kwargs: Any) -> Any:
+        return next(rounds)
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    executor = _RunnableFlowExecutor()
+    events = [e async for e in AiOrchestrator(tool_executor=executor).stream(  # type: ignore[arg-type]
+        messages=[{"role": "user", "content": user_text}], model="test-model", flow_id=flow_id,
+    )]
+    blocked = [
+        e["result"] for e in events
+        if e["type"] == "tool_result" and e["result"].get("guard_id") == "run_not_authorized"
+    ]
+    return executor.calls, blocked
+
+
+async def test_running_needs_this_turn_authorization_not_a_default(monkeypatch) -> None:
+    """默认不许跑。
+
+    run_authorized 以前在构造 GuardState 时写死 True，只有 repair 意图那一支会收紧：
+    于是「加个字段」这类改动请求、以及断流恢复后的第一轮（检查点刻意不存这个字段，
+    正是为了不把上一句的授权当这一句的），模型都能直接拉起真实浏览器去操作站点。
+    这条测试钉的是构造时的接线，不是 _detect_turn_intents 的判据——判据判对了但没接上，
+    行为和没改一样。
+    """
+    calls, blocked = await _run_flow_attempt(monkeypatch, "把导出文件名改成带日期的")
+    assert [c for c in calls if c[0] == "run_flow"] == []
+    assert blocked and blocked[0]["required_action"] == "ask_user"
+
+    # 用户点名要跑就放行——收紧不能把「跑一下验收」这类请求也一起挡掉
+    calls, blocked = await _run_flow_attempt(monkeypatch, "跑一下验收，看导出的表对不对")
+    assert [c for c in calls if c[0] == "run_flow"], "明确要求运行时不能再挡"
+    assert not blocked
 
 
 async def test_every_round_carries_exactly_one_fresh_state_block(monkeypatch) -> None:
@@ -1432,6 +1533,41 @@ async def test_parallel_calls_of_same_tool_get_distinct_call_ids(monkeypatch) ->
     assert set(args_by_id) == {e["call_id"] for e in starts}
     assert sorted(args_by_id.values()) == ['{"url": "https://a.test"}', '{"url": "https://b.test"}']
     assert {e["call_id"] for e in events if e["type"] == "tool_result"} == set(args_by_id)
+
+
+async def test_duplicate_read_in_one_round_reaches_the_executor_once(monkeypatch) -> None:
+    """并发预取不能抢在重复取证判据之前把同一次读取跑两遍。
+
+    预取是在串行门之前起跑的，判漏了就是真的多读了一次——事后取消任务追不回来，
+    结果还会被丢掉，用户只看到第二张卡片写着「已阻断」。所以判据必须在建任务之前问一遍。
+    """
+    import litellm
+
+    rounds = iter([
+        _FakeStream([
+            _chunk(tool_calls=[_tool_call_chunk(0, name="get_run_output", arguments='{"task_id": "t1"}')]),
+            _chunk(tool_calls=[_tool_call_chunk(1, name="get_run_output", arguments='{"task_id": "t1"}')],
+                   finish="tool_calls"),
+        ]),
+        _FakeStream([_chunk(content="结果只有一份。", finish="stop")]),
+    ])
+
+    async def fake_acompletion(**kwargs: Any) -> Any:
+        return next(rounds)
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+
+    executor = _FakeExecutor()
+    events = [e async for e in AiOrchestrator(tool_executor=executor).stream(  # type: ignore[arg-type]
+        messages=[{"role": "user", "content": "把这次运行的结果给我看看"}], model="test-model",
+    )]
+
+    assert [c for c in executor.calls if c[0] == "get_run_output"] == [("get_run_output", {"task_id": "t1"})]
+    blocked = [
+        e for e in events
+        if e["type"] == "tool_result" and e["result"].get("guard_id") == "evidence_already_collected"
+    ]
+    assert len(blocked) == 1, "第二次仍要如实告诉模型证据已经在上下文里"
 
 
 async def test_empty_response_mid_session_retries_once(monkeypatch) -> None:
