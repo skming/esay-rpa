@@ -70,10 +70,10 @@ export function FlowDiffPreview({
 
   return (
     <div className="my-2 rounded-md border border-accent-line bg-accent-soft text-[11px]">
-      <div className="flex items-center gap-1.5 border-b border-accent-linepx-2.5 py-1.5">
+      <div className="flex items-center gap-1.5 border-b border-accent-line px-2.5 py-1.5">
         <GitBranch className="h-3 w-3 text-accent" />
         <span className="font-semibold text-accent-strong">流程变更预览</span>
-        <span className="ml-auto text-accent">
+        <span className="ml-auto text-accent-strong">
           {addCount > 0 && `+${addCount} `}
           {modCount > 0 && `~${modCount} `}
           {delCount > 0 && `-${delCount}`}
@@ -99,7 +99,7 @@ export function FlowDiffPreview({
               <span className="min-w-0 truncate">修改节点：{formatNodeLabel(nodeLookup?.[patch.id], patch.id)}</span>
               <LocateButton nodeId={patch.id} onFocusNode={onFocusNode} />
             </div>
-            <pre className="ml-5 font-mono text-[10px] text-amber-600 leading-relaxed">
+            <pre className="ml-5 font-mono text-[10px] text-amber-800 leading-relaxed">
               {JSON.stringify(patch.patch, null, 2)}
             </pre>
           </div>
@@ -114,13 +114,13 @@ export function FlowDiffPreview({
       </div>
 
       {result === 'ok' ? (
-        <div className="border-t border-accent-linepx-2.5 py-1.5 text-emerald-600">✓ 变更已应用</div>
+        <div className="border-t border-accent-line px-2.5 py-1.5 text-emerald-700">✓ 变更已应用</div>
       ) : result === 'error' ? (
-        <div className="border-t border-accent-linepx-2.5 py-1.5 text-red-600">
+        <div className="border-t border-accent-line px-2.5 py-1.5 text-red-600">
           ⚠ 应用失败{errorMsg ? `：${errorMsg}` : '，请重试'}
         </div>
       ) : (
-        <div className="flex gap-2 border-t border-accent-linepx-2.5 py-1.5">
+        <div className="flex gap-2 border-t border-accent-line px-2.5 py-1.5">
           <Button disabled={applying} onClick={() => void handleApply()} size="sm" variant="primary">
             {applying ? '应用中…' : '应用变更'}
           </Button>

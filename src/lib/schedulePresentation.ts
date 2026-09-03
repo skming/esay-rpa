@@ -1,6 +1,6 @@
 import type { ScheduleSnapshot } from '../types/electron';
 
-export type ScheduleFilter = 'all' | 'enabled' | 'disabled';
+export type ScheduleFilter = 'all' | 'attention' | 'enabled' | 'disabled';
 export type CronFields = {
   minute: string;
   hour: string;
@@ -12,14 +12,22 @@ export type CronFields = {
 export function filterSchedules(schedules: ScheduleSnapshot[], filter: ScheduleFilter, query: string): ScheduleSnapshot[] {
   const normalizedQuery = query.trim().toLowerCase();
   return [...schedules]
-    .filter((schedule) => filter === 'all' || schedule.status === filter)
+    .filter((schedule) => {
+      if (filter === 'all') return true;
+      if (filter === 'attention') return hasScheduleError(schedule);
+      return schedule.status === filter;
+    })
     .filter((schedule) => {
       if (normalizedQuery.length === 0) {
         return true;
       }
       return `${schedule.name} ${schedule.cronExpression} ${schedule.timezone} ${schedule.task.flowName}`.toLowerCase().includes(normalizedQuery);
     })
-    .sort((left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime());
+    .sort(compareSchedulesForOperations);
+}
+
+export function hasScheduleError(schedule: ScheduleSnapshot): boolean {
+  return schedule.status === 'enabled' && typeof schedule.lastError === 'string' && schedule.lastError.trim() !== '';
 }
 
 export function describeCronExpression(expression: string): string {
@@ -125,6 +133,30 @@ function padTime(value: string): string {
 function normalizeCronParts(expression: string): string[] {
   const parts = expression.trim().replace(/\s+/g, ' ').split(' ').filter(Boolean);
   return parts.length === 6 ? parts.slice(1) : parts;
+}
+
+function compareSchedulesForOperations(left: ScheduleSnapshot, right: ScheduleSnapshot): number {
+  const attentionOrder = Number(hasScheduleError(right)) - Number(hasScheduleError(left));
+  if (attentionOrder !== 0) return attentionOrder;
+
+  const enabledOrder = Number(right.status === 'enabled') - Number(left.status === 'enabled');
+  if (enabledOrder !== 0) return enabledOrder;
+
+  const leftNextRun = dateOrInfinity(left.nextRunAt);
+  const rightNextRun = dateOrInfinity(right.nextRunAt);
+  if (leftNextRun !== rightNextRun) return leftNextRun - rightNextRun;
+  return dateOrZero(right.updatedAt) - dateOrZero(left.updatedAt);
+}
+
+function dateOrInfinity(value: string | null | undefined): number {
+  if (value === null || value === undefined || value.trim() === '') return Number.POSITIVE_INFINITY;
+  const time = new Date(value).getTime();
+  return Number.isNaN(time) ? Number.POSITIVE_INFINITY : time;
+}
+
+function dateOrZero(value: string): number {
+  const time = new Date(value).getTime();
+  return Number.isNaN(time) ? 0 : time;
 }
 
 function matchesCron(date: Date, fields: string[]): boolean {

@@ -80,7 +80,7 @@ export function ComponentLibrary({
         <div className="px-2.5 pt-2.5 pb-1.5">
           <Label
             className={cn(
-              'flex h-7 items-center gap-2 rounded-lg border px-2.5 text-slate-500 transition-all duration-150',
+              'flex h-7 items-center gap-2 rounded-lg border px-2.5 text-slate-500 transition-[border-color,background-color,box-shadow] duration-150',
               'border-slate-200 bg-slate-50/60',
               'focus-within:border-accent-line focus-within:bg-white focus-within:ring-3 focus-within:ring-accent-soft',
             )}
@@ -165,7 +165,7 @@ function ComponentLibraryItem({
     <button
       className={cn(
         'group flex h-8 w-full cursor-grab items-center justify-start gap-2 rounded-lg px-2 text-left text-[11px] text-slate-600',
-        'transition-all duration-150 hover:bg-accent-soft hover:text-accent-strong',
+        'transition-[background-color,color,transform] duration-150 hover:bg-accent-soft hover:text-accent-strong',
         'active:cursor-grabbing active:scale-[0.98]',
       )}
       draggable
@@ -184,7 +184,7 @@ function ComponentLibraryItem({
       <span className="h-1.5 w-1.5 shrink-0 rounded-full opacity-70" style={{ background: style.accent }} />
       <span className="min-w-0 flex-1 truncate">{item.label}</span>
       {item.popular && (
-        <Badge className="rounded-md px-1 text-[9px] border-amber-100 bg-amber-50 text-amber-600" variant="amber">
+        <Badge className="rounded-md px-1 text-[9px]" variant="amber">
           常用
         </Badge>
       )}

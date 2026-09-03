@@ -5,11 +5,11 @@ import appIcon from '../../assets/app-icon.png';
 import { cn } from '../../lib/utils';
 import { useWorkspaceStore } from '../../stores/useWorkspaceStore';
 
-export type AppPage = 'dashboard' | 'permissions' | 'scheduler' | 'settings' | 'statistics' | 'studio' | 'tasks';
+export type AppPage = 'dashboard' | 'permissions' | 'scheduler' | 'settings' | 'studio' | 'tasks';
 
 const NAV_ITEMS = [
   { label: '概览', icon: BarChart2, page: 'dashboard' as AppPage },
-  { label: '任务管理', icon: ListTodo, page: 'tasks' as AppPage },
+  { label: '任务中心', icon: ListTodo, page: 'tasks' as AppPage },
   { label: '调度中心', icon: Calendar, page: 'scheduler' as AppPage },
 ];
 
@@ -59,7 +59,7 @@ export function NavRail({
             <button
               aria-current={active ? 'page' : undefined}
               className={cn(
-                'relative flex h-9 w-full items-center rounded-md text-[12px] font-medium transition-all duration-150',
+                'relative flex h-9 w-full items-center rounded-md text-[12px] font-medium transition-colors duration-150',
                 collapsed ? 'justify-center' : 'gap-2.5 px-2.5',
                 active
                   ? 'bg-accent-soft text-accent-strong'
@@ -89,7 +89,7 @@ export function NavRail({
       <div className={cn('shrink-0 py-2', collapsed ? 'px-1.5' : 'px-2')}>
         <button
           className={cn(
-            'relative flex h-9 w-full items-center rounded-md text-[12px] font-medium transition-all duration-150',
+            'relative flex h-9 w-full items-center rounded-md text-[12px] font-medium transition-colors duration-150',
             collapsed ? 'justify-center' : 'gap-2.5 px-2.5',
             activePage === 'settings'
               ? 'bg-accent-soft text-accent-strong'
@@ -115,7 +115,7 @@ export function NavRail({
 
       {collapsed && (
         <button
-          className="absolute right-0 top-12 z-(--z-raised) flex h-5 w-5 -translate-y-1/2 translate-x-1/2 items-center justify-center rounded-full border border-rule bg-white text-slate-500 shadow-sm transition-all duration-150 hover:border-slate-300 hover:bg-slate-50 hover:text-accent-strong"
+          className="absolute right-0 top-12 z-(--z-raised) flex h-6 w-6 -translate-y-1/2 translate-x-1/2 items-center justify-center rounded-full border border-rule bg-white text-slate-500 shadow-sm transition-colors duration-150 hover:border-slate-300 hover:bg-slate-50 hover:text-accent-strong"
           onClick={() => setCollapsed(false)}
           title="展开侧边栏"
           type="button"

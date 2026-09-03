@@ -75,17 +75,17 @@ function UsageFooter({ usage }: { usage: AiUsage }): ReactElement {
     : 0;
   const nearLimit = usage.rounds >= usage.max_rounds - 3;
   return (
-    <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-slate-100 px-1 pt-1.5 font-mono text-[10px] tabular-nums text-slate-400">
-      <span className={cn(nearLimit && 'text-amber-600')}>
+    <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-slate-100 px-1 pt-1.5 font-mono text-[10px] tabular-nums text-slate-500">
+      <span className={cn(nearLimit && 'text-amber-800')}>
         {usage.rounds}/{usage.max_rounds} 轮
       </span>
       <span>
         {formatTokens(usage.total_tokens)} tokens
-        {usage.cached_tokens > 0 && <span className="text-slate-300"> · 缓存 {cacheRate}%</span>}
+        {usage.cached_tokens > 0 && <span> · 缓存 {cacheRate}%</span>}
       </span>
       <span>模型耗时 {usage.llm_seconds}s</span>
       {usage.blocked_calls > 0 && (
-        <span className="text-amber-600">{usage.blocked_calls} 次被护栏拦下</span>
+        <span className="text-amber-800">{usage.blocked_calls} 次被护栏拦下</span>
       )}
     </div>
   );
@@ -143,9 +143,9 @@ export function ProcessingTimeline({
           className={cn(
             'font-mono text-[10px] tabular-nums',
             summary.tone === 'error'
-              ? 'text-red-500'
+              ? 'text-red-600'
               : summary.tone === 'blocked'
-                ? 'text-amber-600'
+                ? 'text-amber-800'
                 : 'text-slate-500'
           )}
         >

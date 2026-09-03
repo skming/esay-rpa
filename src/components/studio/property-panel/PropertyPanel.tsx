@@ -166,7 +166,7 @@ export function PropertyPanel({
             )}
           </div>
         </Tabs>
-        <div className="flex h-11 shrink-0 items-center gap-1.5 border-t border-slate-200/60 bg-white/95 px-2.5 py-2 backdrop-blur-sm">
+        <div className="flex h-11 shrink-0 items-center gap-1.5 border-t border-slate-200/60 bg-white/95 px-2.5 py-2">
           <Button className="h-7 flex-1 gap-1.5" disabled={selectedNode === undefined || !dirty || saveState === 'saving'} onClick={handleSave} variant="primary">
             {getSaveButtonIcon(saveState)}
             {getSaveButtonText(dirty, saveState)}
@@ -176,7 +176,7 @@ export function PropertyPanel({
               <RotateCcw className="h-3.5 w-3.5" strokeWidth={1.5} />
             </Button>
           )}
-          <Button aria-label="复制配置 JSON" className="h-7 w-7 shrink-0 px-0 text-slate-400 hover:text-slate-600" disabled={selectedNode === undefined} onClick={handleCopy} title="复制配置 JSON" variant="ghost">
+          <Button aria-label="复制配置 JSON" className="h-7 w-7 shrink-0 px-0 text-slate-500 hover:text-slate-700" disabled={selectedNode === undefined} onClick={handleCopy} title="复制配置 JSON" variant="ghost">
             {copied ? <Check className="h-3.5 w-3.5" strokeWidth={2} /> : <Copy className="h-3.5 w-3.5" strokeWidth={1.5} />}
           </Button>
         </div>

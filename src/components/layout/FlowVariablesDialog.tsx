@@ -304,7 +304,7 @@ function VariableValuePreview({ variable }: { variable: RuntimeVariable }): Reac
       <div className="flex items-center gap-1.5">
         {ok ? <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" strokeWidth={1.5} /> : <CircleAlert className="h-3.5 w-3.5 text-red-500" strokeWidth={1.5} />}
         <span className="font-medium">{ok ? '解析成功' : '解析失败'}</span>
-        <span className="font-mono text-slate-500">{variable.type}</span>
+        <span className="font-mono">{variable.type}</span>
       </div>
       <div className="mt-1 min-w-0 break-words font-mono text-[10px]">
         {variable.sensitive === true && ok ? '敏感变量已隐藏解析值' : parsed.message}

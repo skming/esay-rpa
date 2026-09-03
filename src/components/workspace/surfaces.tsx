@@ -7,9 +7,9 @@ import { Input } from '../ui/input';
 export type StatusTone = 'live' | 'success' | 'warning' | 'error' | 'idle';
 
 const STATE: Record<StatusTone, { dot: string; text: string; live?: boolean }> = {
-  live: { dot: 'bg-live', text: 'text-live', live: true },
-  success: { dot: 'bg-emerald-500', text: 'text-emerald-600' },
-  warning: { dot: 'bg-amber-500', text: 'text-amber-600' },
+  live: { dot: 'bg-live', text: 'text-accent-strong', live: true },
+  success: { dot: 'bg-emerald-500', text: 'text-emerald-700' },
+  warning: { dot: 'bg-amber-500', text: 'text-amber-700' },
   error: { dot: 'bg-red-500', text: 'text-red-600' },
   idle: { dot: 'bg-slate-300', text: 'text-slate-500' },
 };
@@ -31,6 +31,45 @@ export function StateTag({
 
 /** 页面级容器的统一外观，调用方不要各写各的半径与投影。 */
 export const SURFACE = 'rounded-xl border border-rule bg-surface shadow-xs';
+
+export function HealthRail({ children }: { children: ReactNode }): ReactElement {
+  return (
+    <section className={cn('grid overflow-hidden divide-x divide-rule', SURFACE)} style={{ gridTemplateColumns: `repeat(${Array.isArray(children) ? children.length : 1}, minmax(0, 1fr))` }}>
+      {children}
+    </section>
+  );
+}
+
+export function HealthSignal({
+  detail,
+  icon,
+  label,
+  state,
+  value,
+}: {
+  detail: ReactNode;
+  icon: ReactElement;
+  label: string;
+  state?: StatusTone;
+  value: ReactNode;
+}): ReactElement {
+  const cfg = state === undefined ? null : STATE[state];
+  return (
+    <div className="min-w-0 px-4 py-3.5">
+      <div className="flex items-center gap-2 text-[11px] font-medium text-ink-3">
+        <span className={cn('text-ink-4', cfg?.text)}>{icon}</span>
+        <span className="truncate">{label}</span>
+        {cfg !== null && (
+          <span className={cn('ml-auto h-1.5 w-1.5 shrink-0 rounded-full', cfg.dot, cfg.live && 'live-dot')} />
+        )}
+      </div>
+      <div className={cn('mt-2 truncate text-[16px] font-semibold leading-none tracking-[-0.02em] text-ink', cfg?.text)}>
+        {value}
+      </div>
+      <div className="mt-1.5 truncate text-[10.5px] text-ink-3">{detail}</div>
+    </div>
+  );
+}
 
 // 单行状态条而非 KPI 卡片网格：桌面工具的指标是随时瞥一眼的参考值，不该占据首屏主视觉
 export function StatBand({ children }: { children: ReactNode }): ReactElement {

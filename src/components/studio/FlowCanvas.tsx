@@ -27,6 +27,17 @@ import { CanvasToolbar } from './canvas-toolbar/CanvasToolbar';
 import { ContextMenu } from './ContextMenu';
 import { nodeTypes } from './flowNodeTypes';
 
+/** 小地图的节点填色，镜像 --color-live / emerald / red 三档运行状态。
+ *  MiniMap 把返回值写到 rect 的 fill 属性上，属性值不是 CSS 声明、var() 不解析，
+ *  所以这里只能给字面量——改 token 时这张表要一起改。 */
+const MINIMAP_NODE_COLOR: Record<string, string> = {
+  done: '#10b981',
+  error: '#ef4444',
+  running: '#3b82f6',
+  skipped: '#cbd5e1',
+};
+const MINIMAP_NODE_COLOR_IDLE = '#dde1ea';
+
 export function FlowCanvas({
   bottomPanelOpen,
   canvasFitVersion,
@@ -541,11 +552,7 @@ function FlowCanvasInner({
                 nodeBorderRadius={5}
                 nodeColor={(node) => {
                   const status = (node.data as RpaNodeData | undefined)?.status;
-                  if (status === 'done') return '#10b981';
-                  if (status === 'running') return '#3b82f6';
-                  if (status === 'error') return '#ef4444';
-                  if (status === 'skipped') return '#cbd5e1';
-                  return '#dde1ea';
+                  return (status !== undefined ? MINIMAP_NODE_COLOR[status] : undefined) ?? MINIMAP_NODE_COLOR_IDLE;
                 }}
                 nodeStrokeWidth={0}
                 pannable

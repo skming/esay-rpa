@@ -1,23 +1,25 @@
-import { CalendarClock, ListFilter, Plus } from 'lucide-react';
+import { CalendarClock, Plus } from 'lucide-react';
 import { EmptyPanel, SearchField } from '../workspace/surfaces';
 import { WorkspaceShell } from '../workspace/WorkspaceShell';
 import type { ReactElement } from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 
 import type { ElectronBridgeState } from '../../hooks/useElectronBridge';
-import { filterSchedules, type ScheduleFilter } from '../../lib/schedulePresentation';
+import { filterSchedules, hasScheduleError, type ScheduleFilter } from '../../lib/schedulePresentation';
+import { cn } from '../../lib/utils';
 import { Button } from '../ui/button';
 import { RefreshButton } from '../ui/refresh-button';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../ui/select';
 import { ScheduleCreateDialog } from '../studio/property-panel/ScheduleCreateDialog';
 import { SchedulerMetrics } from './SchedulerMetrics';
-import { ScheduleTaskCard } from './ScheduleTaskCard';
+import { ScheduleListTable } from './ScheduleListTable';
 
 export function SchedulerPage({ electron }: { electron: ElectronBridgeState }): ReactElement {
   const [createOpen, setCreateOpen] = useState(false);
-  const [filter, setFilter] = useState<ScheduleFilter>('all');
-  const [query, setQuery] = useState('');
   const loadedRef = useRef(false);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const filter = normalizeScheduleFilter(searchParams.get('view'));
+  const query = searchParams.get('q') ?? '';
 
   const schedules = useMemo(
     () => filterSchedules(electron.schedules, filter, query),
@@ -27,8 +29,29 @@ export function SchedulerPage({ electron }: { electron: ElectronBridgeState }): 
   useEffect(() => {
     if (loadedRef.current) return;
     loadedRef.current = true;
+    void electron.loadFlows({ silent: true });
     void electron.loadSchedules({ silent: true });
   }, [electron]);
+
+  const updateSearch = (next: { filter?: ScheduleFilter; query?: string }): void => {
+    const params = new URLSearchParams(searchParams);
+    if (next.filter !== undefined) {
+      if (next.filter === 'all') params.delete('view');
+      else params.set('view', next.filter);
+    }
+    if (next.query !== undefined) {
+      if (next.query.trim() === '') params.delete('q');
+      else params.set('q', next.query);
+    }
+    setSearchParams(params, { replace: true });
+  };
+
+  const counts: Record<ScheduleFilter, number> = {
+    all: electron.schedules.length,
+    attention: electron.schedules.filter(hasScheduleError).length,
+    disabled: electron.schedules.filter((schedule) => schedule.status === 'disabled').length,
+    enabled: electron.schedules.filter((schedule) => schedule.status === 'enabled').length,
+  };
 
   return (
     <WorkspaceShell
@@ -46,27 +69,38 @@ export function SchedulerPage({ electron }: { electron: ElectronBridgeState }): 
     >
       <SchedulerMetrics schedules={electron.schedules} />
 
-      <div className="flex items-center gap-3">
+      <div className="flex flex-wrap items-center gap-2 rounded-xl border border-rule bg-surface p-2 shadow-xs">
+        <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
+          {SCHEDULE_FILTERS.map((item) => (
+            <button
+              aria-pressed={filter === item.value}
+              className={cn(
+                'flex h-8 shrink-0 items-center gap-1.5 rounded-md px-2.5 text-[11px] font-medium transition-colors',
+                filter === item.value
+                  ? 'bg-accent-soft text-accent-strong'
+                  : 'text-ink-3 hover:bg-paper-sunk hover:text-ink-2',
+              )}
+              key={item.value}
+              onClick={() => updateSearch({ filter: item.value })}
+              type="button"
+            >
+              {item.label}
+              <span className={cn(
+                'font-mono text-[10px] tabular-nums',
+                filter === item.value ? 'text-accent-strong' : 'text-ink-4',
+              )}>
+                {counts[item.value]}
+              </span>
+            </button>
+          ))}
+        </div>
         <SearchField
+          className="w-64 flex-none"
           label="搜索调度"
-          onChange={setQuery}
+          onChange={(nextQuery) => updateSearch({ query: nextQuery })}
           placeholder="搜索调度名称或流程…"
           value={query}
         />
-
-        <div className="flex w-24 items-center gap-2">
-          <Select onValueChange={(v) => setFilter(v as ScheduleFilter)} value={filter}>
-            <SelectTrigger className="h-9 rounded-md border-rule-2 text-[12px]">
-              <ListFilter className="size-3 text-ink-4" strokeWidth={2} />
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">全部</SelectItem>
-              <SelectItem value="enabled">启用</SelectItem>
-              <SelectItem value="disabled">停用</SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
       </div>
 
       {schedules.length === 0 ? (
@@ -76,15 +110,7 @@ export function SchedulerPage({ electron }: { electron: ElectronBridgeState }): 
           hint="新建调度后可在这里启停、手动触发与删除。"
         />
       ) : (
-        <div className="grid gap-3">
-          {schedules.map((schedule) => (
-            <ScheduleTaskCard
-              electron={electron}
-              key={schedule.scheduleId}
-              schedule={schedule}
-            />
-          ))}
-        </div>
+        <ScheduleListTable electron={electron} schedules={schedules} />
       )}
 
       <ScheduleCreateDialog
@@ -95,4 +121,16 @@ export function SchedulerPage({ electron }: { electron: ElectronBridgeState }): 
       />
     </WorkspaceShell>
   );
+}
+
+const SCHEDULE_FILTERS: Array<{ label: string; value: ScheduleFilter }> = [
+  { label: '全部', value: 'all' },
+  { label: '启用', value: 'enabled' },
+  { label: '需处理', value: 'attention' },
+  { label: '停用', value: 'disabled' },
+];
+
+function normalizeScheduleFilter(value: string | null): ScheduleFilter {
+  const filters: ScheduleFilter[] = ['all', 'enabled', 'attention', 'disabled'];
+  return filters.includes(value as ScheduleFilter) ? value as ScheduleFilter : 'all';
 }

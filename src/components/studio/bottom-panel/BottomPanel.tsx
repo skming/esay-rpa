@@ -127,7 +127,7 @@ export function BottomPanel({
                 aria-label={hidden ? `显示${LOG_LEVEL_LABELS[level]}日志` : `隐藏${LOG_LEVEL_LABELS[level]}日志`}
                 aria-pressed={!hidden}
                 className={cn(
-                  'flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] transition-all hover:bg-slate-100',
+                  'flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] transition-colors hover:bg-slate-100',
                   hidden ? 'text-slate-500' : tone.text
                 )}
                 key={level}

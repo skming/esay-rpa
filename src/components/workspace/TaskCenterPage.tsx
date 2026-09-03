@@ -1,17 +1,16 @@
-import { Archive, FolderOpen, ListTodo, Loader2, Plus, RotateCcw, Trash2 } from 'lucide-react';
+import { Activity, AlertTriangle, Archive, CalendarCheck2, FolderOpen, ListTodo, Loader2, MoreHorizontal, Plus, RotateCcw, Trash2 } from 'lucide-react';
 import { RunDetailDialog } from './RunDetailDialog';
 import type { ReactElement } from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 
-import { FlowCard } from './FlowCard';
 import { FlowCreateDialog } from './FlowCreateDialog';
 import { FlowListTable } from './FlowListTable';
-import { FlowListToolbar } from './FlowListToolbar';
+import { FlowListToolbar, type TaskCenterView } from './FlowListToolbar';
 import { RunHistoryDrawer } from './RunHistoryDrawer';
 import type { ElectronBridgeState } from '../../hooks/useElectronBridge';
 import { buildFlowListItems, filterFlowItems, formatRelativeTime } from '../../lib/taskCenter';
 import { cn } from '../../lib/utils';
-import { useWorkspaceStore } from '../../stores/useWorkspaceStore';
 import type { FlowSnapshot } from '../../types/electron';
 import { Button } from '../ui/button';
 import { RefreshButton } from '../ui/refresh-button';
@@ -27,10 +26,9 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '../ui/alert-dialog';
-import { EmptyPanel, Figure, StatBand, SURFACE } from './surfaces';
+import { EmptyPanel, HealthRail, HealthSignal, SURFACE } from './surfaces';
 import { WorkspaceShell } from './WorkspaceShell';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '../ui/dropdown-menu';
-import { MoreHorizontal } from 'lucide-react';
 
 export function TaskCenterPage({
   electron,
@@ -41,18 +39,15 @@ export function TaskCenterPage({
 }): ReactElement {
   const [createOpen, setCreateOpen] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
-  const [showArchived, setShowArchived] = useState(false);
   const [deleteFlowId, setDeleteFlowId] = useState<string | null>(null);
   const [historyFlowId, setHistoryFlowId] = useState<string | null>(null);
   const [scheduleFlowId, setScheduleFlowId] = useState<string | null>(null);
   const [detailRun, setDetailRun] = useState<import('../../types/electron').TaskSnapshot | null>(null);
   const loadedRef = useRef(false);
+  const [searchParams, setSearchParams] = useSearchParams();
 
-  const flowQuery = useWorkspaceStore((s) => s.flowQuery);
-  const setFlowQuery = useWorkspaceStore((s) => s.setFlowQuery);
-  const selectedFolder = useWorkspaceStore((s) => s.selectedFolder);
-  const viewMode = useWorkspaceStore((s) => s.viewMode);
-  const setViewMode = useWorkspaceStore((s) => s.setViewMode);
+  const view = normalizeTaskCenterView(searchParams.get('view'));
+  const flowQuery = searchParams.get('q') ?? '';
 
   useEffect(() => {
     if (loadedRef.current) return;
@@ -77,8 +72,8 @@ export function TaskCenterPage({
   );
 
   const visibleItems = useMemo(
-    () => filterFlowItems(items, flowQuery, selectedFolder),
-    [flowQuery, items, selectedFolder],
+    () => filterFlowItems(items, flowQuery, view === 'archived' ? 'all' : view),
+    [flowQuery, items, view],
   );
 
   const filteredArchivedFlows = useMemo(() => {
@@ -88,6 +83,29 @@ export function TaskCenterPage({
       `${f.name} ${f.version}`.toLowerCase().includes(q),
     );
   }, [archivedFlows, flowQuery]);
+
+  const viewCounts = useMemo<Record<TaskCenterView, number>>(() => ({
+    all: items.length,
+    archived: archivedFlows.length,
+    disabled: items.filter((item) => item.state === 'disabled').length,
+    failed: items.filter((item) => item.state === 'failed').length,
+    paused: items.filter((item) => item.state === 'paused').length,
+    running: items.filter((item) => item.state === 'running').length,
+    scheduled: items.filter((item) => item.state === 'scheduled').length,
+  }), [archivedFlows.length, items]);
+
+  const updateSearch = (next: { query?: string; view?: TaskCenterView }): void => {
+    const params = new URLSearchParams(searchParams);
+    if (next.view !== undefined) {
+      if (next.view === 'all') params.delete('view');
+      else params.set('view', next.view);
+    }
+    if (next.query !== undefined) {
+      if (next.query.trim() === '') params.delete('q');
+      else params.set('q', next.query);
+    }
+    setSearchParams(params, { replace: true });
+  };
 
   const historyTarget = historyFlowId === null
     ? null
@@ -148,35 +166,48 @@ export function TaskCenterPage({
         </>
       }
       description="流程的运行、调度与历史"
-      title="任务管理"
+      title="任务中心"
     >
-      <StatBand>
-        <Figure first label="活动流程" value={items.length} note="已配置" />
-        <Figure label="已调度" value={items.filter((i) => i.nextRunAt !== null).length} note="自动触发" />
-        <Figure
+      <HealthRail>
+        <HealthSignal
+          detail="可运行与草稿流程"
+          icon={<ListTodo className="h-3.5 w-3.5" strokeWidth={1.5} />}
+          label="流程总数"
+          value={items.length}
+        />
+        <HealthSignal
+          detail={`队列 ${electron.queueStats?.queuedCount ?? 0} · 上限 ${electron.queueStats?.concurrency ?? 1}`}
+          icon={<Activity className="h-3.5 w-3.5" strokeWidth={1.5} />}
           label="运行中"
-          value={electron.queueStats?.activeCount ?? 0}
-          note="活跃"
-          tone={(electron.queueStats?.activeCount ?? 0) > 0 ? 'live' : 'ink'}
+          state={(electron.queueStats?.activeCount ?? viewCounts.running) > 0 ? 'live' : 'idle'}
+          value={electron.queueStats?.activeCount ?? viewCounts.running}
         />
-        <Figure
-          label="最近更新"
-          value={items[0] === undefined ? '--' : formatRelativeTime(items[0].flow.updatedAt)}
+        <HealthSignal
+          detail={viewCounts.failed > 0 ? '需要查看运行证据' : '没有失败流程'}
+          icon={<AlertTriangle className="h-3.5 w-3.5" strokeWidth={1.5} />}
+          label="失败待处理"
+          state={viewCounts.failed > 0 ? 'error' : 'success'}
+          value={viewCounts.failed}
         />
-      </StatBand>
+        <HealthSignal
+          detail={viewCounts.scheduled > 0 ? `${viewCounts.scheduled} 个流程存在启用调度` : '没有启用调度'}
+          icon={<CalendarCheck2 className="h-3.5 w-3.5" strokeWidth={1.5} />}
+          label="已调度"
+          state={viewCounts.scheduled > 0 ? 'success' : 'idle'}
+          value={viewCounts.scheduled}
+        />
+      </HealthRail>
 
       <FlowListToolbar
-        archiveCount={archivedFlows.length}
-        showArchived={showArchived}
-        onQueryChange={setFlowQuery}
-        onToggleArchived={() => { setShowArchived((v) => !v); setFlowQuery(''); }}
-        onViewModeChange={setViewMode}
+        counts={viewCounts}
+        onQueryChange={(query) => updateSearch({ query })}
+        onViewChange={(nextView) => updateSearch({ view: nextView })}
         query={flowQuery}
-        viewMode={viewMode}
+        view={view}
       />
 
       <div className="min-w-0">
-        {showArchived ? (
+        {view === 'archived' ? (
           <ArchivedList
             flows={filteredArchivedFlows}
             onDelete={setDeleteFlowId}
@@ -184,24 +215,6 @@ export function TaskCenterPage({
           />
         ) : visibleItems.length === 0 ? (
           <EmptyActiveState />
-        ) : viewMode === 'card' ? (
-          <div className="grid gap-4 md:grid-cols-3 xl:grid-cols-4">
-            {visibleItems.map((item) => (
-              <FlowCard
-                item={item}
-                key={item.flow.flowId}
-                onArchive={archiveFlow}
-                onDelete={setDeleteFlowId}
-                onEdit={openFlow}
-                onExport={exportFlow}
-                onHistory={openHistory}
-                onRun={runFlow}
-                onSchedule={setScheduleFlowId}
-                onSetStatus={setStatus}
-                onStop={stopFlow}
-              />
-            ))}
-          </div>
         ) : (
           <FlowListTable
             items={visibleItems}
@@ -276,6 +289,11 @@ export function TaskCenterPage({
   );
 }
 
+function normalizeTaskCenterView(value: string | null): TaskCenterView {
+  const views: TaskCenterView[] = ['all', 'running', 'failed', 'scheduled', 'paused', 'disabled', 'archived'];
+  return views.includes(value as TaskCenterView) ? value as TaskCenterView : 'all';
+}
+
 function EmptyActiveState(): ReactElement {
   return (
     <EmptyPanel
@@ -319,7 +337,7 @@ function ArchivedList({
               <TableCell className="pr-5 flex justify-end">
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
-                    <Button className="h-7 rounded-md px-2.5 text-[11px]" variant="ghost">
+                    <Button aria-label="更多操作" className="h-7 rounded-md px-2.5 text-[11px]" variant="ghost">
                       <MoreHorizontal className="h-3 w-3" strokeWidth={1.5} />
                     </Button>
                   </DropdownMenuTrigger>

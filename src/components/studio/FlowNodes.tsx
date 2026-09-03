@@ -14,7 +14,7 @@ const NODE_STATUS: Record<NodeStatus, {
   running: {
     label: '运行中', icon: Loader2, spin: true,
     bar: 'bg-running-strip animate-shimmer',
-    pill: 'bg-live-soft text-[#1d4ed8] ring-1 ring-[var(--color-live-line)]'
+    pill: 'bg-live-soft text-live-ink ring-1 ring-[var(--color-live-line)]'
   },
   done: {
     label: '完成', icon: CheckCircle2,
@@ -165,7 +165,7 @@ export function StartEndNode({ data, selected }: NodeProps<Node<RpaNodeData>>): 
   return (
     <div
       className={cn(
-        'relative grid h-8 w-28 place-items-center rounded-full border text-[11px] font-semibold shadow-sm transition-all duration-200',
+        'relative grid h-8 w-28 place-items-center rounded-full border text-[11px] font-semibold shadow-sm transition-[border-color,background-color,color,box-shadow,filter,transform] duration-200',
         isStart
           ? 'border-emerald-500/30 bg-linear-to-b from-emerald-500 to-green-600 text-white shadow-[0_4px_14px_rgba(16,185,129,0.22)] hover:brightness-105'
           : 'border-slate-200/80 bg-slate-50 text-slate-500 hover:bg-slate-100 hover:text-slate-700',
@@ -196,7 +196,7 @@ function NodeAction({
   return (
     <button
       className={cn(
-        'flex h-7 w-7 items-center justify-center rounded-lg transition-all duration-150 active:scale-90',
+        'flex h-7 w-7 items-center justify-center rounded-lg transition-[background-color,color,transform] duration-150 active:scale-90',
         className,
       )}
       aria-label={label}

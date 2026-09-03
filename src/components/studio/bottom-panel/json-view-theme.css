@@ -6,7 +6,7 @@
    only paint color + the console surface — keyed to the Electric Indigo accent. */
 
 .rpa-json-view {
-  background: oklch(0.175 0.018 264);            /* inky indigo console field */
+  background: var(--color-console);              /* inky indigo console field */
   color: oklch(0.74 0.035 264);
 }
 

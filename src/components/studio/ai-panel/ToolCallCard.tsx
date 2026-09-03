@@ -155,7 +155,7 @@ export function ToolCallCard({
         ) : status === 'blocked' ? (
           <ShieldAlert className="h-3.5 w-3.5 shrink-0 text-amber-500" strokeWidth={2} />
         ) : status === 'stopped' ? (
-          <CircleSlash className="h-3.5 w-3.5 shrink-0 text-slate-400" strokeWidth={2} />
+          <CircleSlash className="h-3.5 w-3.5 shrink-0 text-slate-500" strokeWidth={2} />
         ) : (
           <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-500" strokeWidth={2} />
         )}
@@ -200,7 +200,7 @@ export function ToolCallCard({
           )}
           {/* 展开体高到读完就看不见标题行了，底部再给一个收起入口，省掉反向滚动去找折叠箭头 */}
           <button
-            className="flex w-full items-center justify-center gap-1 border-t border-slate-100 py-1.5 text-[10px] font-medium text-slate-400 transition-colors hover:bg-slate-50 hover:text-slate-600"
+            className="flex w-full items-center justify-center gap-1 border-t border-slate-100 py-1.5 text-[10px] font-medium text-slate-500 transition-colors hover:bg-slate-50 hover:text-slate-600"
             onClick={toggle}
             type="button"
           >

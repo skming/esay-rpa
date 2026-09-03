@@ -38,6 +38,7 @@ function NotificationContent(): ReactElement {
             <Tooltip>
               <TooltipTrigger asChild>
                 <button
+                  aria-label="全部标为已读"
                   className="grid h-6 w-6 place-items-center rounded-md text-ink-4 transition-colors hover:bg-paper-sunk hover:text-ink-2 disabled:pointer-events-none disabled:opacity-40"
                   disabled={unreadCount === 0}
                   onClick={markAllRead}
@@ -51,6 +52,7 @@ function NotificationContent(): ReactElement {
             <Tooltip>
               <TooltipTrigger asChild>
                 <button
+                  aria-label="清空全部通知"
                   className="grid h-6 w-6 place-items-center rounded-md text-ink-4 transition-colors hover:bg-red-50 hover:text-red-500"
                   onClick={clear}
                   type="button"
@@ -106,7 +108,7 @@ export function NotificationPanel({ collapsed }: { collapsed: boolean }): ReactE
   const btn = (
     <button
       className={cn(
-        'relative flex h-9 w-full items-center rounded-md text-[12px] font-medium transition-all duration-150',
+        'relative flex h-9 w-full items-center rounded-md text-[12px] font-medium transition-colors duration-150',
         collapsed ? 'justify-center' : 'gap-2.5 px-2.5',
         'text-slate-500 hover:bg-slate-100 hover:text-slate-800',
       )}
@@ -117,7 +119,7 @@ export function NotificationPanel({ collapsed }: { collapsed: boolean }): ReactE
       {!collapsed && <span className="flex-1 truncate text-left">通知</span>}
       {unreadCount > 0 && (
         <span className={cn(
-          'flex items-center justify-center rounded-full bg-red-500 font-sans text-[9px] font-semibold leading-none text-white',
+          'flex items-center justify-center rounded-full bg-red-600 font-sans text-[9px] font-semibold leading-none text-white',
           collapsed ? 'absolute right-1.5 top-1.5 h-3.5 min-w-3.5 px-0.5' : 'h-4 min-w-4 px-1',
         )}>
           {unreadCount > 99 ? '99+' : unreadCount}

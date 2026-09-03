@@ -12,7 +12,7 @@ export function CanvasStats({ stats }: { stats: CanvasToolbarStats }): ReactElem
       {stats.doneSteps > 0 && (
         <>
           <span className="text-slate-300">·</span>
-          <strong className="whitespace-nowrap text-emerald-600">{stats.doneSteps} 完成</strong>
+          <strong className="whitespace-nowrap text-emerald-700">{stats.doneSteps} 完成</strong>
         </>
       )}
       {stats.runningSteps > 0 && (

@@ -78,24 +78,33 @@ export function HumanTakeoverBanner({ message, url, onOpenPage, onResume, onStop
 
   return (
     <div className="animate-in fade-in-0 slide-in-from-top-3 fixed left-1/2 top-4 z-(--z-banner) w-130 -translate-x-1/2 overflow-hidden rounded-xl bg-white shadow-[0_12px_40px_rgba(15,23,42,0.14),0_2px_8px_rgba(15,23,42,0.06)] duration-200">
-      {/* 进度条在 timeoutMs 内线性归零 */}
+      {/* 播报用的镜像节点。role="alert" 隐含 aria-atomic="true"，直接套在可见文案外层会让
+          读屏每秒重播整条横幅——倒计时就在同一棵子树里。这里只承载静态文案，插入时播报一次。
+          流程停下来等人是全应用最需要被听见的状态，没有它读屏用户只会等到超时。 */}
+      <span className="sr-only" role="alert">
+        {body.length > 0 ? `需要人工接管：${title}。${body}` : `需要人工接管：${title}`}
+      </span>
+
+      {/* 进度条在 timeoutMs 内线性归零。走 scaleX 而不是 width：倒计时每秒改一次，
+          动 width 就是每秒一轮 layout + paint，而这条横幅整个超时窗口都挂在最顶层
+          (--z-banner)，重排代价压在正在等人处理的那一刻。scaleX 只走合成器。 */}
       <div className="h-0.75 w-full bg-amber-100">
         <div
           className={cn(
-            'h-full motion-safe:transition-[width] motion-safe:duration-1000 motion-safe:ease-linear',
-            timedOut ? 'bg-red-400' : urgent ? 'bg-orange-400' : 'bg-amber-400'
+            'h-full w-full origin-left motion-safe:transition-transform motion-safe:duration-1000 motion-safe:ease-linear',
+            timedOut ? 'bg-red-500' : urgent ? 'bg-red-400' : 'bg-amber-400'
           )}
-          style={{ width: `${progressPct}%` }}
+          style={{ transform: `scaleX(${progressPct / 100})` }}
         />
       </div>
 
       <div className="flex items-start gap-3 px-5 pb-3 pt-4">
         <div className={cn(
           'flex h-8 w-8 shrink-0 items-center justify-center rounded-lg',
-          timedOut ? 'bg-red-50' : urgent ? 'bg-orange-50' : 'bg-amber-50'
+          timedOut || urgent ? 'bg-red-50' : 'bg-amber-50'
         )}>
           <UserCheck
-            className={timedOut ? 'text-red-400' : urgent ? 'text-orange-500' : 'text-amber-500'}
+            className={timedOut || urgent ? 'text-red-600' : 'text-amber-600'}
             size={16}
             strokeWidth={2}
           />
@@ -106,7 +115,7 @@ export function HumanTakeoverBanner({ message, url, onOpenPage, onResume, onStop
             <span
               className={cn(
                 'shrink-0 font-mono text-[11px] tabular-nums',
-                timedOut ? 'text-red-500' : urgent ? 'text-orange-500' : 'text-slate-500'
+                timedOut ? 'text-red-700' : urgent ? 'text-red-600' : 'text-slate-500'
               )}
             >
               {timedOut ? '已超时' : formatTime(remaining)}
@@ -125,7 +134,8 @@ export function HumanTakeoverBanner({ message, url, onOpenPage, onResume, onStop
             {onOpenPage && (
               <button
                 type="button"
-                className="ml-1 shrink-0 rounded-md p-1 text-slate-500 transition-colors hover:bg-slate-200 hover:text-slate-600"
+                aria-label="在浏览器中打开"
+                className="ml-1 flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-slate-500 transition-colors hover:bg-slate-200 hover:text-slate-600"
                 onClick={() => { onOpenPage(displayUrl); }}
                 title="在浏览器中打开"
               >
@@ -139,27 +149,27 @@ export function HumanTakeoverBanner({ message, url, onOpenPage, onResume, onStop
       <div className="mx-5 border-t border-slate-100" />
 
       <div className="flex items-center gap-2 px-5 py-3.5">
+        {/* 取 accent-strong 而非跟随横幅的 amber/orange：白字压 amber-500 只有 2.15:1、
+            压 orange-500 只有 2.89:1，而这是流程暂停后唯一的恢复入口。紧急程度由倒计时、
+            图标与进度条承载，不必也不能靠这颗按钮的底色表达。 */}
         <button
           type="button"
           disabled={timedOut}
-          className={cn(
-            'h-8 flex-1 rounded-lg text-[12.5px] font-medium text-white shadow-sm transition-colors active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50',
-            urgent ? 'bg-orange-500 hover:bg-orange-600' : 'bg-amber-500 hover:bg-amber-600'
-          )}
+          className="h-8 flex-1 rounded-lg bg-accent-strong text-[12.5px] font-medium text-white shadow-sm transition-colors hover:bg-accent-press active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50"
           onClick={() => { onResume('next_node'); }}
         >
           已完成，继续
         </button>
         <button
           type="button"
-          className="h-8 rounded-lg border border-slate-200 bg-white px-4 text-[12px] font-medium text-slate-700 transition-all hover:bg-slate-50 active:scale-[0.98]"
+          className="h-8 rounded-lg border border-slate-200 bg-white px-4 text-[12px] font-medium text-slate-700 transition-[background-color,transform] hover:bg-slate-50 active:scale-[0.98]"
           onClick={() => { onResume('current_node'); }}
         >
           重试
         </button>
         <button
           type="button"
-          className="h-8 rounded-lg px-4 text-[12px] font-medium text-slate-500 transition-all hover:bg-slate-100 hover:text-slate-600 active:scale-[0.98]"
+          className="h-8 rounded-lg px-4 text-[12px] font-medium text-slate-500 transition-[background-color,color,transform] hover:bg-slate-100 hover:text-slate-600 active:scale-[0.98]"
           onClick={onStop}
         >
           停止

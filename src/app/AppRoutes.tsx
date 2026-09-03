@@ -5,7 +5,6 @@ import { SchedulerPage } from '../components/scheduler/SchedulerPage';
 import { DashboardPage } from '../components/workspace/DashboardPage';
 import { PermissionsPage } from '../components/workspace/PermissionsPage';
 import { SettingsPage } from '../components/workspace/SettingsPage';
-import { StatisticsPage } from '../components/workspace/StatisticsPage';
 import { TaskCenterPage } from '../components/workspace/TaskCenterPage';
 import type { AppRuntimeContext } from './appContext';
 import { ROUTE_PATHS } from './routeConfig';
@@ -22,7 +21,6 @@ export function AppRoutes(context: AppRuntimeContext): ReactElement {
       <Route element={<SchedulerPage electron={context.electron} />} path={ROUTE_PATHS.scheduler} />
       <Route element={<SettingsPage electron={context.electron} />} path={ROUTE_PATHS.settings} />
       <Route element={<PermissionsPage electron={context.electron} />} path={ROUTE_PATHS.permissions} />
-      <Route element={<StatisticsPage electron={context.electron} />} path={ROUTE_PATHS.statistics} />
       <Route element={<Navigate replace to={ROUTE_PATHS.dashboard} />} path="*" />
     </Routes>
   );

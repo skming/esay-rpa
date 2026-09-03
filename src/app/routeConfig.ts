@@ -7,7 +7,6 @@ export const ROUTE_PATHS = {
   permissions: '/permissions',
   scheduler: '/scheduler',
   settings: '/settings',
-  statistics: '/statistics',
   studio: '/studio',
   tasks: '/tasks',
 } satisfies Record<AppPage, string>;

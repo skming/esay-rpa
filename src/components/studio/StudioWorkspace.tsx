@@ -79,6 +79,10 @@ export function StudioWorkspace({
 
   return (
     <div className="flex min-h-0 flex-1 overflow-hidden">
+      {/* Studio 整条路由此前没有 h1，属性面板的分节标题直接从 h3 起跳：读屏用标题列表
+          导航时会看到一串无主的三级标题。可见的流程名在 TopBar（跨路由共用的外壳，
+          工作区路由自己已有 h1），所以这里只补一个不占位的路由级标题。 */}
+      <h1 className="sr-only">流程编辑器</h1>
       <ComponentLibrary onQuickAdd={canvas.addNodeAfterSelection} />
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <FlowCanvas

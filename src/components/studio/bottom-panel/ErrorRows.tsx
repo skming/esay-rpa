@@ -37,20 +37,21 @@ function ErrorRow({ onJumpToNode, row }: { onJumpToNode: (nodeId: string) => voi
   return (
     <div className="flex gap-2 rounded-lg border border-red-100 bg-red-50 px-2 py-2 text-[11px]">
       <div className="min-w-0 flex-1 space-y-0.5">
-        <div className="flex items-center gap-2 text-[10px] text-red-400">
+        <div className="flex items-center gap-2 text-[10px] text-red-700">
           <span className="font-mono tabular-nums">{row.time}</span>
           {row.nodeId !== undefined && <span className="font-mono">节点 {row.nodeId}</span>}
         </div>
-        <div className="select-text wrap-break-word font-semibold text-red-700">{row.message}</div>
+        <div className="select-text wrap-break-word font-semibold text-red-800">{row.message}</div>
         {row.detail !== undefined
-          ? <pre className="select-text whitespace-pre-wrap break-all font-mono text-[10px] text-red-500">{row.detail}</pre>
-          : <div className="font-mono text-[10px] text-red-300">无更多错误上下文</div>
+          ? <pre className="select-text whitespace-pre-wrap break-all font-mono text-[10px] text-red-700">{row.detail}</pre>
+          : <div className="font-mono text-[10px] text-red-700">无更多错误上下文</div>
         }
       </div>
       <div className="flex shrink-0 flex-col gap-1">
         <Tooltip>
           <TooltipTrigger asChild>
             <Button
+              aria-label="复制错误"
               className="h-7 w-7 border-red-200 bg-white px-0 text-red-500 hover:bg-red-100"
               onClick={handleCopy}
               variant="outline"
@@ -63,6 +64,7 @@ function ErrorRow({ onJumpToNode, row }: { onJumpToNode: (nodeId: string) => voi
         <Tooltip>
           <TooltipTrigger asChild>
             <Button
+              aria-label="定位到节点"
               className="h-7 w-7 border-red-200 bg-white px-0 text-red-500 hover:bg-red-100"
               disabled={row.nodeId === undefined}
               onClick={() => { if (row.nodeId !== undefined) onJumpToNode(row.nodeId); }}

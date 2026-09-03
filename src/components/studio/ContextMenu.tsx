@@ -23,8 +23,8 @@ export function ContextMenu({
 }): ReactElement {
   const actions = [
     { action: 'edit', label: '编辑步骤', color: 'text-accent-strong', icon: Pencil },
-    { action: 'run-from-here', label: '从此处运行', color: 'text-emerald-600', icon: Play },
-    { action: 'breakpoint', label: hasBreakpoint ? '移除断点' : '添加断点', color: 'text-amber-600', icon: Bug },
+    { action: 'run-from-here', label: '从此处运行', color: 'text-emerald-700', icon: Play },
+    { action: 'breakpoint', label: hasBreakpoint ? '移除断点' : '添加断点', color: 'text-amber-800', icon: Bug },
     { action: 'duplicate', label: '复制步骤', color: 'text-slate-600', icon: Copy },
     { action: 'insert-before', label: '前插步骤', color: 'text-slate-600', icon: Plus },
     { action: 'insert-after', label: '后插步骤', color: 'text-slate-600', icon: Plus },

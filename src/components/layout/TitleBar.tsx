@@ -33,7 +33,7 @@ export function TitleBar({ electron }: { electron: ElectronBridgeState }): React
         )}
         <NotificationBell />
         {electron.available && electron.windowId !== null && (
-          <span className="font-mono text-[9px] text-slate-300">
+          <span className="font-mono text-[9px] text-slate-500">
             W{electron.windowId}
           </span>
         )}
@@ -76,7 +76,7 @@ function NotificationBell(): ReactElement {
           <Bell className="h-3.5 w-3.5" strokeWidth={1.5} />
         </IconButton>
         {unreadCount > 0 && (
-          <span className="pointer-events-none absolute -right-0.5 -top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-red-500 px-0.5 font-sans text-[8px] font-semibold leading-none text-white">
+          <span className="pointer-events-none absolute -right-0.5 -top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-red-600 px-0.5 font-sans text-[8px] font-semibold leading-none text-white">
             {unreadCount > 99 ? '99+' : unreadCount}
           </span>
         )}

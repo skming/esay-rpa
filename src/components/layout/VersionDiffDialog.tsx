@@ -137,7 +137,7 @@ function VersionDiffMetrics({ diff, filter, onFilterChange }: { diff: FlowDiffSu
 
 function DiffCount({ type, value }: { type: FlowDiffType; value: number }): ReactElement {
   return (
-    <span className={cn('font-mono', value > 0 ? DIFF_TEXT_CLASS[type] : 'text-slate-400')}>
+    <span className={cn('font-mono', value > 0 ? DIFF_TEXT_CLASS[type] : 'text-slate-500')}>
       {DIFF_SIGN[type]}
       {value}
     </span>
@@ -172,7 +172,7 @@ function VersionDiffRow({ item }: { item: FlowDiffItem }): ReactElement {
             {DIFF_TYPE_LABEL[item.type]}
           </Badge>
           <span className="min-w-0 break-all text-[12px] font-semibold text-slate-700">{item.title}</span>
-          <span className="font-mono text-[10px] text-slate-400">{item.entityId}</span>
+          <span className="font-mono text-[10px] text-slate-500">{item.entityId}</span>
         </div>
         {item.subtitle !== undefined && <div className="mt-0.5 font-mono text-[10px] text-slate-500">{item.subtitle}</div>}
         {item.fields.length > 0 && (
@@ -195,10 +195,10 @@ function DiffFieldRow({ field }: { field: FlowDiffField }): ReactElement {
       <div className="text-[10px] font-semibold text-slate-500">{field.label}</div>
       <div className={cn('mt-1 gap-1.5', stacked ? 'grid' : 'flex flex-wrap items-center')}>
         {field.before !== undefined && <DiffValue stacked={stacked} text={field.before} tone="before" />}
-        {field.before !== undefined && field.after !== undefined && !stacked && <ArrowRight className="h-3 w-3 shrink-0 text-slate-400" strokeWidth={1.5} />}
+        {field.before !== undefined && field.after !== undefined && !stacked && <ArrowRight className="h-3 w-3 shrink-0 text-slate-500" strokeWidth={1.5} />}
         {field.after !== undefined && <DiffValue stacked={stacked} text={field.after} tone="after" />}
-        {field.before === undefined && field.after !== undefined && stacked === false && <span className="text-[10px] text-slate-400">（新增字段）</span>}
-        {field.after === undefined && field.before !== undefined && stacked === false && <span className="text-[10px] text-slate-400">（该字段已删除）</span>}
+        {field.before === undefined && field.after !== undefined && stacked === false && <span className="text-[10px] text-slate-600">（新增字段）</span>}
+        {field.after === undefined && field.before !== undefined && stacked === false && <span className="text-[10px] text-slate-600">（该字段已删除）</span>}
       </div>
     </div>
   );
@@ -213,6 +213,11 @@ function DiffValue({ stacked, text, tone }: { stacked: boolean; text: string; to
         stacked && 'max-h-32 overflow-auto whitespace-pre-wrap'
       )}
     >
+      {/* 改前/改后此前只靠红绿两种底色区分，色觉障碍下这条 diff 读不出方向；
+          堆叠模式连中间那支箭头都没有，只剩上下顺序。−/+ 是 diff 的通用记号，
+          读屏播报的是后面那条中文——符号在语音里念出来分不清是运算还是标记。 */}
+      <span aria-hidden="true" className="mr-1 font-semibold">{tone === 'before' ? '−' : '+'}</span>
+      <span className="sr-only">{tone === 'before' ? '改前 ' : '改后 '}</span>
       {text}
     </span>
   );
@@ -226,9 +231,9 @@ const DIFF_ICON: Record<FlowDiffType, LucideIcon> = {
 };
 
 const DIFF_TEXT_CLASS: Record<FlowDiffType, string> = {
-  added: 'text-emerald-600',
+  added: 'text-emerald-700',
   changed: 'text-blue-600',
-  removed: 'text-red-500'
+  removed: 'text-red-600'
 };
 
 const DIFF_BADGE_VARIANT: Record<FlowDiffType, 'blue' | 'emerald' | 'red'> = {

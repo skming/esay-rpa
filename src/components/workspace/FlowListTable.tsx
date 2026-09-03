@@ -38,17 +38,16 @@ export function FlowListTable({
 }): ReactElement {
   return (
     <div className={cn('overflow-hidden', SURFACE)}>
-      <Table className="table-fixed">
+      <Table className="w-full min-w-0 table-fixed">
         <TableHeader className="bg-paper-sunk">
           <TableRow className="border-rule-2 hover:bg-transparent">
-            <TableHead className="w-84 pl-5 text-[11px] font-medium text-ink-2">任务名称</TableHead>
-            <TableHead className="text-[11px] font-medium text-ink-2">流程 ID</TableHead>
-            <TableHead className="text-[11px] font-medium text-ink-2">状态</TableHead>
-            <TableHead className="text-[11px] font-medium text-ink-2">调度</TableHead>
-            <TableHead className="text-[11px] font-medium text-ink-2">最近修改</TableHead>
-            <TableHead className="text-[11px] font-medium text-ink-2">最近运行</TableHead>
-            <TableHead className="text-[11px] font-medium text-ink-2">30天成功率</TableHead>
-            <TableHead className="w-34 pr-5 text-right text-[11px] font-medium text-ink-2">操作</TableHead>
+            <TableHead className="w-[30%] pl-5 text-[11px] font-medium text-ink-2 xl:w-[25%]">流程</TableHead>
+            <TableHead className="w-[12%] text-[11px] font-medium text-ink-2 xl:w-[10%]">状态</TableHead>
+            <TableHead className="w-[11%] text-[11px] font-medium text-ink-2 xl:w-[10%]">最近结果</TableHead>
+            <TableHead className="w-[12%] text-[11px] font-medium text-ink-2 xl:w-[11%]">30天成功率</TableHead>
+            <TableHead className="w-[14%] text-[11px] font-medium text-ink-2">下次触发</TableHead>
+            <TableHead className="hidden text-[11px] font-medium text-ink-2 xl:table-cell xl:w-[12%]">最近修改</TableHead>
+            <TableHead className="w-[21%] pr-5 text-right text-[11px] font-medium text-ink-2 xl:w-[18%]">操作</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -58,6 +57,7 @@ export function FlowListTable({
                 'border-rule hover:bg-paper',
                 item.state === 'disabled' && 'opacity-50',
                 item.state === 'paused' && 'opacity-65',
+                item.state === 'failed' && 'bg-red-50/40 hover:bg-red-50/60',
               )}
               key={item.flow.flowId}
             >
@@ -71,14 +71,10 @@ export function FlowListTable({
                     <span>·</span>
                     <span className="truncate font-sans">{item.folderPath}</span>
                   </div>
+                  <FlowIdChip className="mt-1 max-w-48" flowId={item.flow.flowId} />
                 </div>
               </TableCell>
-              <TableCell>
-                <FlowIdChip flowId={item.flow.flowId} />
-              </TableCell>
               <TableCell><FlowStatusBadge state={item.state} /></TableCell>
-              <TableCell className="truncate text-[11px] text-ink-3">{formatScheduleHint(item.nextRunAt)}</TableCell>
-              <TableCell className="truncate text-[11px] text-ink-3">{formatRelativeTime(item.flow.updatedAt)}</TableCell>
               <TableCell className="truncate text-[11px] text-ink-3">{formatLastRun(item.lastRunStatus)}</TableCell>
               <TableCell className={cn(
                 'font-mono text-[11px] font-semibold tabular-nums',
@@ -87,12 +83,14 @@ export function FlowListTable({
               )}>
                 {item.successRate === null ? '--' : `${item.successRate}%`}
               </TableCell>
+              <TableCell className="truncate font-mono text-[10px] text-ink-3">{formatScheduleHint(item.nextRunAt)}</TableCell>
+              <TableCell className="hidden truncate text-[11px] text-ink-3 xl:table-cell">{formatRelativeTime(item.flow.updatedAt)}</TableCell>
               <TableCell className="pr-5">
                 <div className="flex justify-end gap-1">
                   {item.state === 'running' ? (
                     <Tooltip>
                       <TooltipTrigger asChild>
-                        <Button className="h-7 w-7 rounded-md px-0 text-red-600 hover:text-red-700" onClick={onStop} variant="subtle">
+                        <Button aria-label={`停止 ${item.flow.name}`} className="h-7 w-7 rounded-md px-0 text-red-600 hover:text-red-700" onClick={onStop} variant="subtle">
                           <Square className="h-3 w-3" fill="currentColor" strokeWidth={1.5} />
                         </Button>
                       </TooltipTrigger>
@@ -101,7 +99,13 @@ export function FlowListTable({
                   ) : (
                     <Tooltip>
                       <TooltipTrigger asChild>
-                        <Button className="h-7 w-7 rounded-md px-0" onClick={() => onRun(item.flow.flowId)} variant="subtle">
+                        <Button
+                          aria-label={`运行 ${item.flow.name}`}
+                          className="h-7 w-7 rounded-md px-0"
+                          disabled={item.state === 'disabled' || item.state === 'paused'}
+                          onClick={() => onRun(item.flow.flowId)}
+                          variant="subtle"
+                        >
                           <Play className="h-3.5 w-3.5" strokeWidth={1.5} />
                         </Button>
                       </TooltipTrigger>
@@ -110,7 +114,7 @@ export function FlowListTable({
                   )}
                   <Tooltip>
                     <TooltipTrigger asChild>
-                      <Button className="h-7 w-7 rounded-md px-0" onClick={() => onSchedule(item.flow.flowId)} variant="subtle">
+                      <Button aria-label={`设置 ${item.flow.name} 的调度`} className="h-7 w-7 rounded-md px-0" onClick={() => onSchedule(item.flow.flowId)} variant="subtle">
                         <TimerReset className="h-3.5 w-3.5" strokeWidth={1.5} />
                       </Button>
                     </TooltipTrigger>
@@ -118,7 +122,7 @@ export function FlowListTable({
                   </Tooltip>
                   <Tooltip>
                     <TooltipTrigger asChild>
-                      <Button className="h-7 w-7 rounded-md px-0" onClick={() => onEdit(item.flow.flowId)} variant="primary">
+                      <Button aria-label={`编辑 ${item.flow.name}`} className="h-7 w-7 rounded-md px-0" onClick={() => onEdit(item.flow.flowId)} variant="primary">
                         <SquarePen className="h-3.5 w-3.5" strokeWidth={1.5} />
                       </Button>
                     </TooltipTrigger>
@@ -128,7 +132,7 @@ export function FlowListTable({
                     <Tooltip>
                       <TooltipTrigger asChild>
                         <DropdownMenuTrigger asChild>
-                          <Button className="h-7 w-7 rounded-md px-0" variant="subtle">
+                          <Button aria-label={`${item.flow.name} 的更多操作`} className="h-7 w-7 rounded-md px-0" variant="subtle">
                             <MoreHorizontal className="h-3.5 w-3.5" strokeWidth={1.5} />
                           </Button>
                         </DropdownMenuTrigger>
@@ -189,6 +193,7 @@ export function FlowIdChip({ flowId, className }: { flowId: string; className?: 
       <Tooltip>
         <TooltipTrigger asChild>
           <button
+            aria-label={copied ? '已复制流程 ID' : '复制流程 ID'}
             className={cn(
               'shrink-0 rounded p-0.5 transition-colors',
               copied ? 'text-emerald-600' : 'text-ink-4 opacity-0 group-hover:opacity-100 hover:text-ink-2',
@@ -251,6 +256,7 @@ function formatLastRun(status: string | null): string {
     running: '运行中',
     stopped: '已停止',
     queued: '排队中',
+    paused_for_human: '等待操作',
   };
   return status !== null ? (map[status] ?? '--') : '--';
 }

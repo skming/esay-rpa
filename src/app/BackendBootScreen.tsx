@@ -40,7 +40,7 @@ export function BackendBootScreen({
               role="progressbar"
             >
               <div
-                className="h-full rounded-full bg-indigo-500 transition-all duration-300"
+                className="h-full rounded-full bg-indigo-500 transition-[width] duration-300"
                 style={{ width: `${installProgress}%` }}
               />
             </div>

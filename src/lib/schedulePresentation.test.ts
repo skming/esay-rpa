@@ -43,6 +43,17 @@ describe('schedulePresentation', () => {
     expect(countEnabledSchedules(schedules)).toBe(2);
   });
 
+  it('把仍启用且带错误的调度归入需处理，并在全部列表中优先展示', () => {
+    const schedules = [
+      buildSchedule({ name: '正常任务', nextRunAt: '2026-09-02T09:00:00.000Z', scheduleId: 'schedule-ok' }),
+      buildSchedule({ lastError: 'Cron 无效', name: '异常任务', nextRunAt: null, scheduleId: 'schedule-error' }),
+      buildSchedule({ lastError: '历史错误', name: '停用任务', scheduleId: 'schedule-disabled', status: 'disabled' }),
+    ];
+
+    expect(filterSchedules(schedules, 'attention', '').map((schedule) => schedule.scheduleId)).toEqual(['schedule-error']);
+    expect(filterSchedules(schedules, 'all', '').map((schedule) => schedule.scheduleId)[0]).toBe('schedule-error');
+  });
+
   it('格式化调度时间空值和 ISO 时间', () => {
     expect(formatScheduleDateTime(null)).toBe('未计算');
     expect(formatScheduleDateTime('2026-06-10T01:02:03.000Z')).toMatch(/2026-06-10/);

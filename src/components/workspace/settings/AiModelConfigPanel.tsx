@@ -402,8 +402,9 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
                         密钥配置
                       </div>
 
-                      <div className="min-w-0">
+                      <div className="relative min-w-0">
                         <input
+                          aria-label={`${g.label} API Key`}
                           className={cn(aiMonoFieldClass, 'pr-8')}
                           placeholder={storedValue && draftValue === undefined ? `已配置 ${storedValue}` : g.placeholder}
                           type={isVisible ? 'text' : 'password'}
@@ -411,7 +412,7 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
                           onChange={e => setDraftKeys(prev => ({ ...prev, [g.env_key]: e.target.value }))}
                         />
                         <button
-                          className="absolute right-1.5 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded text-ink-4 transition-colors hover:bg-paper-sunk hover:text-ink"
+                          className="absolute right-1.5 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-ink-4 transition-colors hover:bg-paper-sunk hover:text-ink"
                           onClick={() => setShowKeys(prev => ({ ...prev, [g.env_key]: !prev[g.env_key] }))}
                           title={isVisible ? '隐藏密钥' : '显示密钥'}
                           type="button"
@@ -421,6 +422,7 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
                       </div>
 
                       <input
+                        aria-label={`${g.label} Base URL`}
                         className={aiMonoFieldClass}
                         placeholder="Base URL"
                         type="text"
@@ -475,7 +477,7 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
                             if (mt.status !== 'fail' || !mt.error) return null;
                             return (
                               <p
-                                className="mt-1.5 wrap-break-word rounded-md bg-red-50/70 px-2.5 py-1.5 font-mono text-[11px] leading-snug text-red-600"
+                                className="mt-1.5 wrap-break-word rounded-md bg-red-50/70 px-2.5 py-1.5 font-mono text-[11px] leading-snug text-red-700"
                                 key={model.id}
                               >
                                 <span className="font-semibold">{model.id}</span>：{mt.error}
@@ -599,7 +601,7 @@ function ManagedModelTag({
         <span className="border-l border-rule px-1.5 text-[10px] text-accent-strong">推荐</span>
       )}
       {ts === 'ok' && testResult.servedBy && (
-        <span className="border-l border-rule px-1.5 font-mono text-[10px] text-amber-600">
+        <span className="border-l border-rule px-1.5 font-mono text-[10px] text-amber-800">
           ↦{testResult.servedBy}
         </span>
       )}

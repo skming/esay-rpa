@@ -178,7 +178,7 @@ export const MessageBubble = memo(function MessageBubble({
             <MarkerContent className="text-[11px] text-slate-500">
               {message.statusText}
               {message.statusDetail !== undefined && (
-                <span className="ml-1 font-mono text-[10px] tabular-nums text-slate-400">· {message.statusDetail}</span>
+                <span className="ml-1 font-mono text-[10px] tabular-nums text-slate-500">· {message.statusDetail}</span>
               )}
             </MarkerContent>
           </Marker>
@@ -231,10 +231,10 @@ export const MessageBubble = memo(function MessageBubble({
         {!isUser && message.error && (
           <div className="mt-1.5 flex w-full items-start gap-2 rounded-xl border border-red-100 bg-red-50 px-3 py-2">
             <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-400" strokeWidth={1.8} />
-            <p className="min-w-0 flex-1 text-[11.5px] leading-relaxed text-red-600">{message.error}</p>
+            <p className="min-w-0 flex-1 text-[11.5px] leading-relaxed text-red-700">{message.error}</p>
             {onRetry && (
               <button
-                className="shrink-0 flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-medium text-red-500 transition-colors hover:bg-red-100 hover:text-red-600"
+                className="shrink-0 flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-medium text-red-700 transition-colors hover:bg-red-100 hover:text-red-800"
                 onClick={onRetry}
                 type="button"
               >

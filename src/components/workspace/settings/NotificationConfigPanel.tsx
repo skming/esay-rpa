@@ -91,6 +91,7 @@ export function NotificationConfigPanel({ electron }: { electron: ElectronBridge
             <div className="grid gap-1.5">
               <span className="text-[11px] text-ink-3">Webhook URL</span>
               <input
+                aria-label="Webhook URL"
                 className={monoFieldClass}
                 onChange={e => setWebhookUrl(e.target.value)}
                 placeholder="https://oapi.dingtalk.com/robot/send?access_token=…"
@@ -103,6 +104,7 @@ export function NotificationConfigPanel({ electron }: { electron: ElectronBridge
               <span className="text-[11px] text-ink-3">加签密钥（可选）</span>
               <div className="relative min-w-0">
                 <input
+                  aria-label="加签密钥"
                   className={cn(monoFieldClass, 'pr-8')}
                   onChange={e => setSecretDraft(e.target.value)}
                   onFocus={() => {
@@ -114,7 +116,7 @@ export function NotificationConfigPanel({ electron }: { electron: ElectronBridge
                   value={secretValue}
                 />
                 <button
-                  className="absolute right-1.5 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded text-ink-4 transition-colors hover:bg-paper-sunk hover:text-ink"
+                  className="absolute right-1.5 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-ink-4 transition-colors hover:bg-paper-sunk hover:text-ink"
                   onClick={() => setSecretVisible(v => !v)}
                   title={secretVisible ? '隐藏密钥' : '显示密钥'}
                   type="button"

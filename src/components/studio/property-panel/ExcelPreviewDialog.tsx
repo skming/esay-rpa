@@ -57,7 +57,7 @@ export function ExcelPreviewDialog({
               <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-500" strokeWidth={1.5} />
               <div>
                 <p className="text-[12px] font-medium text-red-700">无法预览文件</p>
-                <p className="mt-0.5 text-[11px] text-red-600">{error}</p>
+                <p className="mt-0.5 text-[11px] text-red-700">{error}</p>
               </div>
             </div>
           )}

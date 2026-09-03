@@ -55,7 +55,7 @@ export function TopBar({
   if (!visible) return <></>;
 
   return (
-    <header className="flex h-12 shrink-0 items-center overflow-hidden border-b border-slate-200/60 bg-white/97 px-4 backdrop-blur-sm shadow-[0_1px_3px_rgba(15,23,42,0.04)]">
+    <header className="flex h-12 shrink-0 items-center overflow-hidden border-b border-slate-200/60 bg-white/97 px-4 shadow-[0_1px_3px_rgba(15,23,42,0.04)]">
 
       <div className="flex min-w-0 shrink-0 items-center gap-1.5 text-[11px] text-slate-500">
         <FolderTree className="h-3.5 w-3.5 shrink-0" strokeWidth={1.5} />
@@ -241,11 +241,12 @@ function FlowIdCopy({ flowId }: { flowId: string }): ReactElement {
 
   return (
     <button
+      aria-label={`复制流程 ID ${flowId}`}
       className={cn(
-        'flex h-5 items-center gap-1 rounded px-1.5 font-mono text-[9.5px] transition-colors',
+        'flex h-6 items-center gap-1 rounded px-1.5 font-mono text-[9.5px] transition-colors',
         copied
-          ? 'bg-emerald-50 text-emerald-600'
-          : 'bg-slate-100 text-slate-500 hover:bg-slate-200 hover:text-slate-600',
+          ? 'bg-emerald-50 text-emerald-700'
+          : 'bg-slate-100 text-slate-600 hover:bg-slate-200 hover:text-slate-700',
       )}
       onClick={copy}
       type="button"
@@ -264,7 +265,7 @@ function StatusPill({ electron }: { electron: ElectronBridgeState }): ReactEleme
 
   const cfg: Record<typeof runtimeStatus, { icon: ReactElement; label: string; cls: string }> = {
     ready: { icon: <CheckCircle2 className="h-3 w-3" strokeWidth={1.5} />, label: '待运行', cls: 'border-slate-200 bg-slate-50 text-slate-500' },
-    running: { icon: <Loader2 className="h-3 w-3 animate-spin" strokeWidth={1.5} />, label: '运行中', cls: 'border-live-line bg-live-soft text-[#1d4ed8]' },
+    running: { icon: <Loader2 className="h-3 w-3 animate-spin" strokeWidth={1.5} />, label: '运行中', cls: 'border-live-line bg-live-soft text-live-ink' },
     success: { icon: <CheckCircle2 className="h-3 w-3" strokeWidth={1.5} />, label: '已完成', cls: 'border-emerald-200 bg-emerald-50 text-emerald-700' },
     error: { icon: <XCircle className="h-3 w-3" strokeWidth={1.5} />, label: '运行失败', cls: 'border-red-200 bg-red-50 text-red-700' },
     stopped: { icon: <CirclePause className="h-3 w-3" strokeWidth={1.5} />, label: '已停止', cls: 'border-amber-200 bg-amber-50 text-amber-700' },
@@ -322,7 +323,7 @@ function FlowVersionMenu({
         {/* 只承载版本与保存状态：流程名已在左侧面包屑里，重复一遍还得截断 */}
         <Button
           aria-label={`${label} · 版本与流程操作`}
-          className="flex h-7 shrink-0 items-center gap-2 rounded-lg border border-slate-200 bg-slate-50/60 px-2.5 text-[11px] text-slate-700 transition-all duration-150 hover:bg-white hover:border-slate-300 hover:shadow-xs"
+          className="flex h-7 shrink-0 items-center gap-2 rounded-lg border border-slate-200 bg-slate-50/60 px-2.5 text-[11px] text-slate-700 transition-[background-color,border-color,box-shadow] duration-150 hover:bg-white hover:border-slate-300 hover:shadow-xs"
           title={`${label} · 版本与流程操作`}
           variant="ghost"
         >

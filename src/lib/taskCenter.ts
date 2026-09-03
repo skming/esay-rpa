@@ -1,6 +1,7 @@
 import type { FlowSnapshot, ScheduleSnapshot } from '../types/electron';
 
 export type FlowCardState = 'disabled' | 'draft' | 'failed' | 'paused' | 'published' | 'running' | 'scheduled';
+export type FlowFilter = 'all' | 'disabled' | 'failed' | 'paused' | 'running' | 'scheduled';
 
 export type FlowListItem = {
   flow: FlowSnapshot;
@@ -54,11 +55,10 @@ export function buildFlowListItems(flows: FlowSnapshot[], schedules: ScheduleSna
     .sort((left, right) => compareDate(right.flow.updatedAt, left.flow.updatedAt));
 }
 
-export function filterFlowItems(items: FlowListItem[], query: string, folder: string): FlowListItem[] {
+export function filterFlowItems(items: FlowListItem[], query: string, filter: FlowFilter): FlowListItem[] {
   const normalizedQuery = query.trim().toLowerCase();
   return items.filter((item) => {
-    const folderMatched = folder === '全部流程' || item.folderPath === folder;
-    if (!folderMatched) {
+    if (filter !== 'all' && item.state !== filter) {
       return false;
     }
     if (normalizedQuery === '') {

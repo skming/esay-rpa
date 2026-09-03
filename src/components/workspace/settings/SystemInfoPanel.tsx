@@ -47,11 +47,11 @@ export function SystemInfoPanel({
   const statusLabel = (() => {
     switch (status.status) {
       case 'idle': return null;
-      case 'checking': return <span className="text-amber-600">检查中…</span>;
+      case 'checking': return <span className="text-amber-800">检查中…</span>;
       case 'available': return <span className="text-indigo-600">发现新版本 v{status.version}</span>;
-      case 'not-available': return <span className="text-emerald-600">已是最新版本</span>;
+      case 'not-available': return <span className="text-emerald-700">已是最新版本</span>;
       case 'downloading': return <span className="text-indigo-600">下载中 {status.percent ?? 0}%</span>;
-      case 'ready': return <span className="text-emerald-600">v{status.version} 已就绪，重启后安装</span>;
+      case 'ready': return <span className="text-emerald-700">v{status.version} 已就绪，重启后安装</span>;
       case 'error': return (
         <span className="text-red-600">
           {UPDATE_ERROR_LABELS[status.error ?? ''] ?? status.error ?? '未知错误'}
@@ -131,7 +131,7 @@ export function SystemInfoPanel({
           {isDownloading && (
             <div className="h-1 w-full overflow-hidden rounded-full bg-rule">
               <div
-                className="h-full rounded-full bg-accent transition-all duration-300"
+                className="h-full rounded-full bg-accent transition-[width] duration-300"
                 style={{ width: `${status.percent ?? 0}%` }}
               />
             </div>
@@ -176,9 +176,9 @@ export function SystemInfoPanel({
 }
 
 function backendStatusAccent(status: string | null): string | undefined {
-  if (status === 'ready') return 'text-emerald-600';
+  if (status === 'ready') return 'text-emerald-700';
   if (status === 'error') return 'text-red-600';
-  if (status === 'starting' || status === 'checking' || status === 'installing-browser') return 'text-amber-600';
+  if (status === 'starting' || status === 'checking' || status === 'installing-browser') return 'text-amber-800';
   return undefined;
 }
 

@@ -112,22 +112,44 @@ export function Segmented<T extends string>({
   options: { label: string; value: T }[];
   value: T;
 }): ReactElement {
+  const activeIndex = options.findIndex((option) => option.value === value);
+  // radiogroup 的键盘约定：整组只占一个 tab 停靠点，方向键在选项间移动并即时改值。
+  // 焦点必须手动跟着走——值一变，原来那颗按钮的 tabIndex 就成了 -1，焦点留在上面就再也移不动。
+  const move = (group: HTMLDivElement, delta: number): void => {
+    const next = (activeIndex + delta + options.length) % options.length;
+    const option = options[next];
+    if (option === undefined) return;
+    onChange?.(option.value);
+    (group.children[next] as HTMLElement | undefined)?.focus();
+  };
   return (
     <div>
       {label !== undefined && <Label className="mb-1 block">{label}</Label>}
-      <div className="inline-flex w-full rounded-md bg-slate-100 p-0.5" role="tablist">
-        {options.map((option) => {
+      <div
+        aria-label={label}
+        className="inline-flex w-full rounded-md bg-slate-100 p-0.5"
+        onKeyDown={(event) => {
+          const delta = event.key === 'ArrowRight' || event.key === 'ArrowDown' ? 1
+            : event.key === 'ArrowLeft' || event.key === 'ArrowUp' ? -1 : 0;
+          if (delta === 0) return;
+          event.preventDefault();
+          move(event.currentTarget, delta);
+        }}
+        role="radiogroup"
+      >
+        {options.map((option, index) => {
           const active = option.value === value;
           return (
             <button
-              aria-selected={active}
+              aria-checked={active}
               className={cn(
-                'flex-1 rounded-md px-3 py-1 text-[11px] font-medium transition-all duration-150',
-                active ? 'bg-white text-slate-700 shadow-xs' : 'text-slate-500 hover:text-slate-700'
+                'flex-1 rounded-md px-3 py-1 text-[11px] font-medium transition-[background-color,color,box-shadow] duration-150',
+                active ? 'bg-white text-slate-700 shadow-xs' : 'text-slate-600 hover:text-slate-700'
               )}
               key={option.value}
               onClick={() => onChange?.(option.value)}
-              role="tab"
+              role="radio"
+              tabIndex={active || (activeIndex === -1 && index === 0) ? 0 : -1}
               type="button"
             >
               {option.label}

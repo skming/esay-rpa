@@ -144,7 +144,7 @@ export function ArtifactPreviewContent({ content, loading }: { content: Artifact
       : contentType;
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col bg-[oklch(0.175_0.018_264)]">
+    <div className="flex min-h-0 flex-1 flex-col bg-console">
       <div className="flex h-8 shrink-0 items-center gap-2 border-b border-white/10 px-3">
         <Badge className="border-slate-700 bg-slate-900 text-slate-300">
           {badgeLabel}
@@ -157,6 +157,7 @@ export function ArtifactPreviewContent({ content, loading }: { content: Artifact
             <Tooltip>
               <TooltipTrigger asChild>
                 <button
+                  aria-label="复制内容"
                   className="flex h-6 w-6 items-center justify-center rounded transition-colors hover:bg-white/10"
                   onClick={handleCopy}
                   type="button"

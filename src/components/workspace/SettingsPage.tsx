@@ -36,7 +36,7 @@ export function SettingsPage({ electron }: { electron: ElectronBridgeState }): R
         // 重置仅保存在本机的界面状态，后端持久化流程数据不在这里处理。
         useFlowDraftStore.getState().clearDraft();
         useBottomPanelStore.setState({ activeTab: 'logs', height: 188, open: true });
-        useWorkspaceStore.setState({ flowQuery: '', navCollapsed: false, selectedFolder: '全部流程', viewMode: 'card' });
+        useWorkspaceStore.setState({ navCollapsed: false });
         useRunConfigStore.getState().clearLastRunOverrides();
       }
 
