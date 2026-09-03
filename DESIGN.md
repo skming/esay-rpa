@@ -21,9 +21,11 @@ colors:
   rule-2: "rgba(15,23,42,0.14)"
   canvas: "#f8fafc"
   surface: "#ffffff"
+  console: "oklch(0.175 0.018 264)"
   live: "#3b82f6"
   live-soft: "rgba(59,130,246,0.12)"
   live-line: "rgba(59,130,246,0.45)"
+  live-ink: "#1d4ed8"
   semantic-running-border: "oklch(88.2% 0.059 254.128)"
   semantic-running-surface: "oklch(97% 0.014 254.604)"
   semantic-success-border: "oklch(90.5% 0.093 164.15)"
@@ -393,7 +395,8 @@ The sticky header bar anchors every workspace page. It signals desktop-app chrom
 - **Ink:** solid ink fill, paper text. Rare — high-emphasis neutral confirmation.
 - **Danger:** Red background, white text. Stop and delete only.
 - **Ghost:** No border, no background. Ink Muted text. Toolbar icon-buttons, inline row actions.
-- **Focus ring:** `outline: 2px solid var(--color-accent-line)`, `outline-offset: 2px`.
+- **Focus ring:** `outline: 2px solid var(--color-accent)`, `outline-offset: 2px` — one global unlayered rule in `styles.css` owns it for `button / input / textarea / select / a / summary`. It is deliberately solid `accent` (4.47:1), not `accent-line` (1.65:1, invisible), and it deliberately overrides a component's own `focus-visible:outline-none`. Components must not restyle the focus state; canvas nodes and edges are the one exception and are handled in the React Flow section.
+- **Full-bleed field inside a card:** a field with no inset of its own (`ChatInput`'s textarea, `CodeEditor`'s textarea) gets `.focus-by-container` — an unlayered `outline: none` in `styles.css`, the only thing that beats the unlayered global rule — because the outline would land inside the card's own rounded border and read as framing the wrong element. The card then owns the focus state and must itself reach ≥3:1: solid `focus-within:border-accent` (4.47:1 on white, 4.08:1 against `paper-sunk` / `ink`), with a soft `accent-soft` ring or shadow allowed on top as decoration only.
 - **`:active`:** `scale(0.98)` — physical press simulation.
 
 ### Cards / Content Panels
@@ -409,7 +412,7 @@ The sticky header bar anchors every workspace page. It signals desktop-app chrom
 ### Inputs / Fields
 
 - **Style:** `rounded-md` (6px), `border border-slate-200`, `bg-white`, 11px text, `height: 32px`
-- **Focus:** `focus-visible:border-accent-line focus-visible:ring-2 focus-visible:ring-accent-soft`（注意是三个独立类，连写成 `border-accent-linefocus:ring-2` 会让 Tailwind 整条失效且不报错）
+- **Focus:** the visible indicator is the global focus ring above (2px solid `accent`). `focus-visible:border-accent-line focus-visible:ring-2 focus-visible:ring-accent-soft` rides on top as a tint only — at 1.65:1 and 1.07:1 neither can carry the indicator, so a field must never rely on them alone（注意是三个独立类，连写成 `border-accent-linefocus:ring-2` 会让 Tailwind 整条失效且不报错）
 - **Error:** driven by `aria-invalid` on the field itself — `border-red-200`, `bg-red-50`, `text-red-700`, focus `border-red-300` / `ring-red-100`. The attribute and the color come from one switch, so a red field always announces as invalid; callers set `aria-invalid` and nothing else. A field that is merely *unusual* rather than invalid (a shadowed variable name) is amber and carries no `aria-invalid`.
 - **Disabled:** `opacity-50 cursor-not-allowed bg-slate-50`
 
@@ -452,6 +455,7 @@ The canvas is the product's hero surface; node state must read at a glance from 
 - **Status pill:** an explicit `icon + 中文标签` pill on the right of the node body (`运行中 / 完成 / 失败 / 待运行 / 跳过`), tinted to the state with a `ring-1` outline. Color is always paired with icon + label (colorblind-safe).
 - **Running emphasis:** the running node additionally gets the `running-glow` animated border + `shadow-running`; the edge into a running node gets `edge-running` (a flowing dashed Indigo stroke). Live execution should be the most alive thing on screen.
 - **Selected:** a 3px ring + soft drop shadow, inline-styled from the node kind's own accent — the ring reinforces which kind you picked instead of introducing a second color. Never a fill change that competes with status.
+- **Keyboard focus:** React Flow makes both nodes and edges focusable (`tabIndex=0`), so both need an indicator, and they cannot share one — a box around a diagonal edge outlines its bounding box, not the edge. A focused **node** gets `outline: 2px solid var(--color-accent)` at `outline-offset: 3px`, which lands outside the 3px selection ring so focus and selection stay legible together; a focused **edge** gets no box at all and instead thickens to a 2.5px accent stroke. Both live in `styles.css`'s React Flow block, and the global focus rule deliberately excludes `[tabindex]` so it never reaches the canvas.
 
 ---
 
@@ -485,3 +489,4 @@ The canvas is the product's hero surface; node state must read at a glance from 
 - **Don't** look like **Notion or ClickUp** — document-first heavy sidebar. This is a flow editor.
 - **Don't** use warm neutrals (cream, sand, parchment, bone) anywhere in the neutral surface stack.
 - **Don't** use `divide-slate-50` for row dividers. Use `divide-[rgba(15,23,42,0.06)]`.
+- **Don't** write `focus-visible:outline-none` plus a `ring-accent-soft` / `ring-accent-line` / `ring-rule` / `ring-accent/40` replacement. The unlayered global rule wins, so the `outline-none` never lands — and those four ring tokens measure 1.07–1.68:1, so the "replacement" draws nothing. The focus indicator is global and singular; `focusIndicator.test.ts` holds the short list of places allowed to say otherwise.

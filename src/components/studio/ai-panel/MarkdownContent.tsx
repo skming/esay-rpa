@@ -27,7 +27,7 @@ export function MarkdownContent({ text, onFocusNode }: { text: string; onFocusNo
                 <button
                   className={cn(
                     'group/node-id inline-flex items-center gap-0.5 rounded bg-slate-100 px-1 py-0.5 align-baseline font-mono text-[0.92em] font-medium text-slate-800 transition-colors',
-                    onFocusNode && 'cursor-pointer hover:bg-accent-soft hover:text-accent-strong focus:outline-none focus:ring-2 focus:ring-accent-line'
+                    onFocusNode && 'cursor-pointer hover:bg-accent-soft hover:text-accent-strong'
                   )}
                   disabled={!onFocusNode}
                   onClick={() => onFocusNode?.(text)}

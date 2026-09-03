@@ -25,8 +25,8 @@ export function AiAssistantFab({
             // fixed 而非 absolute：位置只认窗口右下角，不受画布/属性面板的收合与滚动影响
             'fixed bottom-5 right-5 z-(--z-dropdown) flex h-11 w-11 items-center justify-center rounded-full',
             'bg-brand-gradient text-(--color-accent-fg) shadow-[0_8px_32px_rgba(15,23,42,0.10),0_2px_8px_rgba(15,23,42,0.06)]',
-            'transition-all duration-200 hover:opacity-90 active:scale-[0.97]',
-            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-soft focus-visible:ring-offset-2',
+            'transition-[opacity,transform] duration-200 hover:opacity-90 active:scale-[0.97]',
+            // 焦点态不在这里写：styles.css 的无 layer 全局规则给出唯一的 2px accent 轮廓
             // 运行信号统一用 live 蓝：静态描边保证降级可读（含 prefers-reduced-motion），呼吸环负责"活着"
             busy && 'fab-live-ring ring-2 ring-live ring-offset-2 ring-offset-slate-50',
             // 面板打开时用 pointer-events-none 而非卸载，让淡出动画能跑完
@@ -41,7 +41,7 @@ export function AiAssistantFab({
       </TooltipTrigger>
       <TooltipContent side="left">
         {label}
-        <span className="ml-1.5 text-slate-400">⌘J</span>
+        <span className="ml-1.5 text-slate-500">⌘J</span>
       </TooltipContent>
     </Tooltip>
   );

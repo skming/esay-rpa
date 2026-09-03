@@ -59,6 +59,10 @@
   /* blue-500 */
   --color-live-soft: rgba(59, 130, 246, 0.12);
   --color-live-line: rgba(59, 130, 246, 0.45);
+  /* Text on live-soft: --color-live is only 3.2:1 there, blue-700 is 5.66:1.
+     Same value as --color-accent-press, kept as a separate name so the live ramp
+     can move without dragging the brand's pressed state along with it. */
+  --color-live-ink: #1d4ed8;
 
   /* Legacy brand-* utilities resolve to the indigo→blue brand (single source). */
   --color-brand-primary: #6366f1;
@@ -70,6 +74,8 @@
   --color-canvas: #f8fafc;
   /* app shell + flow canvas field */
   --color-surface: #ffffff;
+  /* The inky console field — artifact preview and the JSON viewer share it. */
+  --color-console: oklch(0.175 0.018 264);
 
   /* Shadows — soft, layered elevation (the RPA register restores card depth) */
   --shadow-xs: 0 1px 2px rgba(15, 23, 42, 0.05);
@@ -128,10 +134,62 @@ button {
   -webkit-tap-highlight-color: transparent;
 }
 
+/* 全局唯一的焦点指示器，实心 accent 4.47:1（accent-line 只有 1.65:1，画得出来看不见）。
+   刻意不进 @layer：组件自己那圈 ring 是 accent-soft(1.07)/rule(1.13)/accent-40(1.68)，
+   进了 layer 就压不过它们的 focus-visible:outline-none，那些控件会重新失去焦点态。
+   不加 [tabindex] 分支——React Flow 的节点/连线和 Radix 的 TabsContent 都挂 tabIndex=0，
+   会圈到画布和整个面板；画布的焦点态在下面单独给。 */
 button:focus-visible,
-select:focus-visible {
-  outline: 2px solid var(--color-accent-line);
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+a:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--color-accent);
   outline-offset: 2px;
+}
+
+/* 全出血字段：方框会落在圆角卡片内侧，看着像框错了东西，焦点交给外层 focus-within。
+   要压上面那条无 layer 规则，只能同样无 layer。用它的卡片必须给出 ≥3:1 的焦点态。 */
+.focus-by-container:focus-visible {
+  outline: none;
+}
+
+/* ── Vendored shadcn primitives: contrast fixes without forking ──────────────
+   button.tsx / badge.tsx 是 vendored 源码，不改。Tailwind v4 把工具类全放进
+   @layer，本文件这些无 layer 规则因此稳定压过它们。挂的是「失败的那组配色签名」，
+   写出同一组合的元素都会一并修好。十六进制取自 Tailwind v4 的 oklch 调色板。 */
+
+/* danger 变体：白字压 red-500 是 3.82，抬到 red-600（4.76）。hover/active 必须一起抬，
+   否则它们的工具类落在 layer 里、被这条规则吃掉，按钮就没有按下反馈了。
+   不带 button. 前缀：<Button asChild> 渲染 Radix Slot，标签会变成 <a> 之类而静默失配。 */
+.bg-red-500.text-white {
+  background-color: #e7000b;
+  /* red-600 */
+}
+
+.bg-red-500.text-white:hover {
+  background-color: #c10007;
+  /* red-700 */
+}
+
+.bg-red-500.text-white:active {
+  background-color: #9f0712;
+  /* red-800 */
+}
+
+/* Badge 的 default 与 red 变体：调用点不传颜色，只能从这里修。
+   slate-500 压 slate-100 是 4.35、red-600 压 red-50 是 4.36，各差一档。
+   只挂配色签名，不挂 span/rounded-full：cn 是 twMerge，调用点传 rounded-md 就会把圆角类
+   merge 掉（ComponentLibrary.tsx:187 已经在这么传），而圆角不是对比度失败的成因。 */
+.bg-slate-100.text-slate-500 {
+  color: #45556c;
+  /* slate-600 → 6.90 */
+}
+
+.bg-red-50.text-red-600 {
+  color: #c10007;
+  /* red-700 → 5.88 */
 }
 
 /* ── Brand button ────────────────────────────────────────── */
@@ -207,6 +265,22 @@ select {
 .react-flow__edge.selected .react-flow__edge-path,
 .react-flow__edge:hover .react-flow__edge-path {
   stroke: var(--color-accent);
+}
+
+/* React Flow 给节点 div 和连线 <g> 都挂 tabIndex=0，两者都要焦点态但不能共用方框：
+   连线是斜的，方框圈的是包围盒，跟线本体对不上；连线改用加粗描边表示。 */
+.react-flow__node:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 3px;
+}
+
+.react-flow__edge:focus-visible {
+  outline: none;
+}
+
+.react-flow__edge:focus-visible .react-flow__edge-path {
+  stroke: var(--color-accent);
+  stroke-width: 2.5;
 }
 
 .react-flow__edge-textbg {
@@ -521,4 +595,17 @@ select {
   .live-dot::after {
     display: none;
   }
+
+  /* The .edge-running rule above is !important (it has to beat React Flow's own
+     stroke), and its specificity outranks the blanket `*` reset here — so the
+     marching dashes keep looping unless they are stopped at equal specificity. */
+  .edge-running .react-flow__edge-path {
+    animation: none !important;
+  }
+
+  /* 同一个坑：.rpa-handle 的 transition 带 !important，(0,1,0) 压过上面那条 `*`。 */
+  .rpa-handle {
+    transition-duration: 0.001ms !important;
+  }
 }
+

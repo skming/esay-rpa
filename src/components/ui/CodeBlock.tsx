@@ -73,7 +73,6 @@ function CopyButton({ value, variant }: { value: string; variant: CodeBlockVaria
       aria-label={copied ? '已复制' : '复制代码'}
       className={cn(
         'inline-flex h-6 w-6 items-center justify-center rounded-md border transition-colors duration-150',
-        'focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent-line',
         variant === 'dark'
           ? 'border-white/10 bg-white/5 text-slate-400 hover:bg-white/10 hover:text-slate-200'
           : 'border-rule-2 bg-surface/80 text-ink-4 hover:bg-paper-sunk hover:text-ink-2',
@@ -273,7 +272,9 @@ export function CodeEditor({
         </div>
         <textarea
           className={cn(
-            'absolute inset-0 h-full w-full resize-none border-0 bg-transparent outline-none',
+            // 满出血字段：焦点交给外层卡片的 focus-within 实心 accent 边框（4.08:1 压两种
+            // 变体的填色）。这里的方框会落在圆角卡片内侧，且被 overflow-hidden 削成残线
+            'focus-by-container absolute inset-0 h-full w-full resize-none border-0 bg-transparent',
             fixed ? 'overflow-y-auto' : 'overflow-hidden',
           )}
           onChange={(event) => onChange(event.target.value)}
@@ -285,7 +286,8 @@ export function CodeEditor({
             padding: EDITOR_PAD,
             ...EDITOR_TYPE,
             color: 'transparent',
-            caretColor: dark ? '#e2e8f0' : '#0f172a',
+            // 深色那半配的是 oneDark 的前景色，项目 token 里没有这一档
+            caretColor: dark ? '#e2e8f0' : 'var(--color-ink)',
           }}
           value={value}
         />

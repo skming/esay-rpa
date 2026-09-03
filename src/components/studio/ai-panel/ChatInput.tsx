@@ -196,8 +196,10 @@ export function ChatInput({
 
       <div
         className={cn(
-          'rounded-2xl border bg-slate-50/80 transition-all duration-150',
-          'focus-within:border-accent-line focus-within:bg-white focus-within:shadow-[0_1px_2px_rgba(15,23,42,0.04),0_0_0_3px_rgba(55,51,230,0.10)]',
+          'rounded-2xl border bg-slate-50/80 transition-[border-color,box-shadow] duration-150',
+          // 焦点态由卡片承担，所以 border 必须是实心 accent(4.47:1)——textarea 自己那圈方框
+          // 落在圆角卡片内侧，看着像框错了东西，已由 .focus-by-container 压掉
+          'focus-within:border-accent focus-within:bg-white focus-within:shadow-[0_1px_2px_rgba(15,23,42,0.04),0_0_0_3px_rgba(55,51,230,0.10)]',
           dragOver ? 'border-accent-line border-dashed bg-accent-soft' : 'border-slate-200',
           pending && !dragOver && 'border-accent-line animate-breath-glow'
         )}
@@ -221,8 +223,11 @@ export function ChatInput({
                   </span>
                 )}
                 <span className="min-w-0 truncate text-[11px] text-slate-600">{att.name}</span>
+                {/* 24px 是指针环境下的目标下限；靠 h-6 与缩略图同高，不会把 chip 撑开。
+                    名字要进可访问名——一次会话可以挂多个附件，光念「按钮」分不出删的是哪个。 */}
                 <button
-                  className="flex h-4 w-4 shrink-0 items-center justify-center rounded text-slate-300 transition-colors hover:bg-slate-100 hover:text-red-500"
+                  aria-label={`移除附件 ${att.name}`}
+                  className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-slate-500 transition-colors hover:bg-slate-100 hover:text-red-600"
                   onClick={() => setAttachments(prev => prev.filter(a => a.id !== att.id))}
                   type="button"
                 >
@@ -235,7 +240,7 @@ export function ChatInput({
 
         <textarea
           ref={textareaRef}
-          className="block w-full resize-none bg-transparent px-3.5 pt-3 text-[12.5px] leading-relaxed text-slate-700 outline-none placeholder:text-slate-500"
+          className="focus-by-container block w-full resize-none bg-transparent px-3.5 pt-3 text-[12.5px] leading-relaxed text-slate-700 placeholder:text-slate-500"
           onChange={e => handleTextChange(e.target.value)}
           onKeyDown={handleKeyDown}
           onPaste={e => void handlePaste(e)}
@@ -248,7 +253,7 @@ export function ChatInput({
 
         <div className="flex items-center gap-1 px-2 pb-2 pt-1">
           <button
-            className="flex h-7 w-7 items-center justify-center rounded-lg text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-600 disabled:opacity-40"
+            className="flex h-7 w-7 items-center justify-center rounded-lg text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-600 disabled:opacity-40"
             disabled={pending}
             onClick={() => fileInputRef.current?.click()}
             title="附加文件或图片"
@@ -260,7 +265,7 @@ export function ChatInput({
           <ModelSelector disabled={pending} onChange={onModelChange} placement="up" value={model} variant="ghost" />
 
           {pending && thinking && (
-            <div className="flex items-center gap-1 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] text-slate-500">
+            <div className="flex items-center gap-1 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] text-slate-600">
               <span className="animate-thinking-dot inline-block h-1 w-1 rounded-full bg-slate-400 [animation-delay:0ms]" />
               <span className="animate-thinking-dot inline-block h-1 w-1 rounded-full bg-slate-400 [animation-delay:150ms]" />
               <span className="animate-thinking-dot inline-block h-1 w-1 rounded-full bg-slate-400 [animation-delay:300ms]" />
@@ -282,7 +287,7 @@ export function ChatInput({
           ) : (
             <button
               className={cn(
-                'flex h-7 w-7 items-center justify-center rounded-full transition-all',
+                'flex h-7 w-7 items-center justify-center rounded-full transition-[background-color,color,transform]',
                 canSend
                   ? 'bg-accent text-white hover:bg-accent-strong active:scale-95'
                   : 'cursor-not-allowed bg-slate-200 text-slate-400'

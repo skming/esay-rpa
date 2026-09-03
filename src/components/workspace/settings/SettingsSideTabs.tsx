@@ -53,7 +53,7 @@ function SettingsTabButton({
       aria-controls={settingsPanelId(section)}
       aria-selected={active}
       className={cn(
-        'flex h-9 w-full items-center gap-2 rounded-md pl-2.5 pr-3 text-left text-[12px] font-medium transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-soft',
+        'flex h-9 w-full items-center gap-2 rounded-md pl-2.5 pr-3 text-left text-[12px] font-medium transition-colors duration-150',
         active
           ? 'bg-surface text-ink shadow-xs ring-1 ring-rule'
           : 'text-ink-2 hover:bg-surface/70 hover:text-ink',

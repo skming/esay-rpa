@@ -83,10 +83,10 @@ export function NodeValidationSummary({
               >
                 <span className="font-mono text-red-700">{name}</span>
                 {existingNames.has(name) ? (
-                  <span className="text-[10px] text-emerald-600">已在变量列表中</span>
+                  <span className="text-[10px] text-emerald-700">已在变量列表中</span>
                 ) : (
                   <button
-                    className="flex items-center gap-1 rounded bg-accent px-2 py-0.5 text-[10px] font-medium text-white transition hover:bg-accent-press"
+                    className="flex items-center gap-1 rounded bg-accent-strong px-2 py-0.5 text-[10px] font-medium text-white transition hover:bg-accent-press"
                     onClick={() => addNamedInputVariable(name)}
                     title={`添加 ${name} 到流程变量`}
                     type="button"
@@ -98,7 +98,7 @@ export function NodeValidationSummary({
               </div>
             ))}
           </div>
-          <p className="mt-1.5 text-[10px] text-red-600">
+          <p className="mt-1.5 text-[10px] text-red-700">
             添加后请在「输入变量」面板设置默认值，或由上游节点输出该变量。
           </p>
         </div>
@@ -118,7 +118,7 @@ export function NodeValidationSummary({
             {visibleSummaryIssues.map((issue) => <ValidationIssueRow issue={issue} key={issueKey(issue)} />)}
             {remainingSummaryIssues.length > 0 && (
               <details className="group">
-                <summary className="cursor-pointer rounded-md border border-black/5 bg-white/70 px-2 py-1.5 text-[10px] font-medium transition hover:bg-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40">
+                <summary className="cursor-pointer rounded-md border border-black/5 bg-white/70 px-2 py-1.5 text-[10px] font-medium transition hover:bg-white">
                   还有 {remainingSummaryIssues.length} 项，展开查看
                 </summary>
                 <div className="mt-1.5 space-y-1.5">

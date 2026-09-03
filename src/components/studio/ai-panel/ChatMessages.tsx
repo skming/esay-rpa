@@ -54,7 +54,7 @@ export function ChatMessages({
           <div className="mt-4 flex max-w-72 flex-wrap items-center justify-center gap-1.5">
             {CAPABILITIES.filter((c) => !c.needsFlow || hasFlow).map((c) => (
               <button
-                className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[10.5px] text-slate-600 transition-colors hover:border-accent-line hover:bg-accent-soft hover:text-accent-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-soft"
+                className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[10.5px] text-slate-600 transition-colors hover:border-accent-line hover:bg-accent-soft hover:text-accent-strong"
                 key={c.label}
                 onClick={() => onSuggestion(c.prompt)}
                 type="button"

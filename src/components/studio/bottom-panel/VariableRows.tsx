@@ -108,7 +108,7 @@ export function VariableRows({ rows }: { rows: RuntimeVariableView[] }): ReactEl
           {isEditing ? (
             <input
               autoFocus
-              className="h-6 w-full rounded border border-amber-300 bg-white px-1.5 font-mono text-[11px] text-slate-800 outline-none focus:border-accent-linefocus:ring-1 focus:ring-accent-soft"
+              className="h-6 w-full rounded border border-amber-300 bg-white px-1.5 font-mono text-[11px] text-slate-800 outline-none focus-visible:border-accent-line focus-visible:ring-1 focus-visible:ring-accent-soft"
               onBlur={() => commitEdit(row.name)}
               onChange={(e) => setEditDraft(e.target.value)}
               onKeyDown={(e) => handleKeyDown(e, row.name)}
@@ -121,7 +121,7 @@ export function VariableRows({ rows }: { rows: RuntimeVariableView[] }): ReactEl
               <Tooltip>
                 <TooltipTrigger asChild>
                   <span className={cn('block min-w-0 truncate cursor-default font-mono text-[11px]', canEdit ? 'text-slate-700' : 'text-slate-500')}>
-                    {displayVal !== '' ? displayVal : <span className="italic text-slate-300">空</span>}
+                    {displayVal !== '' ? displayVal : <span className="italic text-slate-500">空</span>}
                   </span>
                 </TooltipTrigger>
                 {displayVal !== '' && (
@@ -174,7 +174,7 @@ export function VariableRows({ rows }: { rows: RuntimeVariableView[] }): ReactEl
             )}
             <Button
               aria-pressed={watched}
-              className={cn('h-6 px-1.5 text-[10px]', watched ? 'text-accent hover:text-slate-500' : 'text-slate-500 hover:text-accent')}
+              className={cn('h-6 px-1.5 text-[10px]', watched ? 'text-accent-strong hover:text-slate-500' : 'text-slate-500 hover:text-accent-strong')}
               onClick={() => toggleWatched(row.name)}
               title={watched ? '取消监视' : '监视此变量'}
               variant="ghost"
