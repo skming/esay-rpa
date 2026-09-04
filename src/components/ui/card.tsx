@@ -1,41 +1,36 @@
-import type { HTMLAttributes, ReactElement } from 'react';
-import { forwardRef } from 'react';
+import type { ComponentProps, ReactElement } from 'react';
 
 import { cn } from '../../lib/utils';
 
-const Card = forwardRef<HTMLDivElement, HTMLAttributes<HTMLDivElement>>(
-  ({ className, ...props }, ref): ReactElement => (
+function Card({ className, ...props }: ComponentProps<'div'>): ReactElement {
+  return (
     <div
       className={cn(
         'rounded-xl border border-slate-200/70 bg-white',
         className,
       )}
-      ref={ref}
+      data-slot="card"
       {...props}
     />
-  ),
-);
-Card.displayName = 'Card';
+  );
+}
 
-const CardHeader = forwardRef<HTMLDivElement, HTMLAttributes<HTMLDivElement>>(
-  ({ className, ...props }, ref): ReactElement => (
-    <div className={cn('flex flex-col space-y-1 p-4', className)} ref={ref} {...props} />
-  ),
-);
-CardHeader.displayName = 'CardHeader';
+function CardHeader({ className, ...props }: ComponentProps<'div'>): ReactElement {
+  return <div className={cn('flex flex-col space-y-1 p-4', className)} data-slot="card-header" {...props} />;
+}
 
-const CardTitle = forwardRef<HTMLHeadingElement, HTMLAttributes<HTMLHeadingElement>>(
-  ({ className, ...props }, ref): ReactElement => (
-    <h3 className={cn('text-[12px] font-semibold leading-none tracking-tight text-slate-700', className)} ref={ref} {...props} />
-  ),
-);
-CardTitle.displayName = 'CardTitle';
+function CardTitle({ className, ...props }: ComponentProps<'h3'>): ReactElement {
+  return (
+    <h3
+      className={cn('text-[12px] font-semibold leading-none tracking-tight text-slate-700', className)}
+      data-slot="card-title"
+      {...props}
+    />
+  );
+}
 
-const CardContent = forwardRef<HTMLDivElement, HTMLAttributes<HTMLDivElement>>(
-  ({ className, ...props }, ref): ReactElement => (
-    <div className={cn('p-4 pt-0', className)} ref={ref} {...props} />
-  ),
-);
-CardContent.displayName = 'CardContent';
+function CardContent({ className, ...props }: ComponentProps<'div'>): ReactElement {
+  return <div className={cn('p-4 pt-0', className)} data-slot="card-content" {...props} />;
+}
 
 export { Card, CardContent, CardHeader, CardTitle };

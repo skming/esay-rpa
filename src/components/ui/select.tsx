@@ -1,7 +1,6 @@
 import * as SelectPrimitive from '@radix-ui/react-select';
 import { Check, ChevronDown, ChevronUp } from 'lucide-react';
-import type { ComponentPropsWithoutRef, ElementRef, ReactElement } from 'react';
-import { forwardRef } from 'react';
+import type { ComponentProps, ReactElement } from 'react';
 
 import { cn } from '../../lib/utils';
 
@@ -9,14 +8,14 @@ const Select = SelectPrimitive.Root;
 const SelectGroup = SelectPrimitive.Group;
 const SelectValue = SelectPrimitive.Value;
 
-const SelectTrigger = forwardRef<ElementRef<typeof SelectPrimitive.Trigger>, ComponentPropsWithoutRef<typeof SelectPrimitive.Trigger>>(
-  ({ children, className, ...props }, ref): ReactElement => (
+function SelectTrigger({ children, className, ...props }: ComponentProps<typeof SelectPrimitive.Trigger>): ReactElement {
+  return (
     <SelectPrimitive.Trigger
       className={cn(
         'flex h-8 w-full items-center justify-between rounded-md border border-slate-200 bg-white px-2 text-[11px] text-slate-700 outline-none transition focus-visible:border-accent-line focus-visible:ring-2 focus-visible:ring-accent-soft disabled:cursor-not-allowed disabled:opacity-50',
         className
       )}
-      ref={ref}
+      data-slot="select-trigger"
       {...props}
     >
       {children}
@@ -24,30 +23,40 @@ const SelectTrigger = forwardRef<ElementRef<typeof SelectPrimitive.Trigger>, Com
         <ChevronDown className="h-3.5 w-3.5 text-slate-400" strokeWidth={1.5} />
       </SelectPrimitive.Icon>
     </SelectPrimitive.Trigger>
-  )
-);
-SelectTrigger.displayName = SelectPrimitive.Trigger.displayName;
+  );
+}
 
-const SelectScrollUpButton = forwardRef<ElementRef<typeof SelectPrimitive.ScrollUpButton>, ComponentPropsWithoutRef<typeof SelectPrimitive.ScrollUpButton>>(
-  ({ className, ...props }, ref): ReactElement => (
-    <SelectPrimitive.ScrollUpButton className={cn('flex cursor-default items-center justify-center py-1', className)} ref={ref} {...props}>
+function SelectScrollUpButton({ className, ...props }: ComponentProps<typeof SelectPrimitive.ScrollUpButton>): ReactElement {
+  return (
+    <SelectPrimitive.ScrollUpButton
+      className={cn('flex cursor-default items-center justify-center py-1', className)}
+      data-slot="select-scroll-up-button"
+      {...props}
+    >
       <ChevronUp className="h-3.5 w-3.5" strokeWidth={1.5} />
     </SelectPrimitive.ScrollUpButton>
-  )
-);
-SelectScrollUpButton.displayName = SelectPrimitive.ScrollUpButton.displayName;
+  );
+}
 
-const SelectScrollDownButton = forwardRef<ElementRef<typeof SelectPrimitive.ScrollDownButton>, ComponentPropsWithoutRef<typeof SelectPrimitive.ScrollDownButton>>(
-  ({ className, ...props }, ref): ReactElement => (
-    <SelectPrimitive.ScrollDownButton className={cn('flex cursor-default items-center justify-center py-1', className)} ref={ref} {...props}>
+function SelectScrollDownButton({ className, ...props }: ComponentProps<typeof SelectPrimitive.ScrollDownButton>): ReactElement {
+  return (
+    <SelectPrimitive.ScrollDownButton
+      className={cn('flex cursor-default items-center justify-center py-1', className)}
+      data-slot="select-scroll-down-button"
+      {...props}
+    >
       <ChevronDown className="h-3.5 w-3.5" strokeWidth={1.5} />
     </SelectPrimitive.ScrollDownButton>
-  )
-);
-SelectScrollDownButton.displayName = SelectPrimitive.ScrollDownButton.displayName;
+  );
+}
 
-const SelectContent = forwardRef<ElementRef<typeof SelectPrimitive.Content>, ComponentPropsWithoutRef<typeof SelectPrimitive.Content>>(
-  ({ children, className, position = 'popper', ...props }, ref): ReactElement => (
+function SelectContent({
+  children,
+  className,
+  position = 'popper',
+  ...props
+}: ComponentProps<typeof SelectPrimitive.Content>): ReactElement {
+  return (
     <SelectPrimitive.Portal>
       <SelectPrimitive.Content
         className={cn(
@@ -55,29 +64,31 @@ const SelectContent = forwardRef<ElementRef<typeof SelectPrimitive.Content>, Com
           position === 'popper' && 'data-[side=left]:-translate-x-1 data-[side=right]:translate-x-1',
           className
         )}
+        data-slot="select-content"
         position={position}
-        ref={ref}
         {...props}
       >
         <SelectScrollUpButton />
-        <SelectPrimitive.Viewport className={cn('p-1', position === 'popper' && 'h-(--radix-select-trigger-height) min-w-(--radix-select-trigger-width)')}>
+        <SelectPrimitive.Viewport
+          className={cn('p-1', position === 'popper' && 'h-(--radix-select-trigger-height) min-w-(--radix-select-trigger-width)')}
+          data-slot="select-viewport"
+        >
           {children}
         </SelectPrimitive.Viewport>
         <SelectScrollDownButton />
       </SelectPrimitive.Content>
     </SelectPrimitive.Portal>
-  )
-);
-SelectContent.displayName = SelectPrimitive.Content.displayName;
+  );
+}
 
-const SelectItem = forwardRef<ElementRef<typeof SelectPrimitive.Item>, ComponentPropsWithoutRef<typeof SelectPrimitive.Item>>(
-  ({ children, className, ...props }, ref): ReactElement => (
+function SelectItem({ children, className, ...props }: ComponentProps<typeof SelectPrimitive.Item>): ReactElement {
+  return (
     <SelectPrimitive.Item
       className={cn(
         'relative flex h-7 w-full cursor-default select-none items-center rounded-sm py-1.5 pl-7 pr-2 text-[11px] outline-none focus:bg-accent-soft focus:text-accent-strong data-[state=checked]:font-medium data-[state=checked]:text-accent-strong data-disabled:pointer-events-none data-disabled:opacity-50',
         className
       )}
-      ref={ref}
+      data-slot="select-item"
       {...props}
     >
       <span className="absolute left-2 flex h-3.5 w-3.5 items-center justify-center">
@@ -87,8 +98,7 @@ const SelectItem = forwardRef<ElementRef<typeof SelectPrimitive.Item>, Component
       </span>
       <SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText>
     </SelectPrimitive.Item>
-  )
-);
-SelectItem.displayName = SelectPrimitive.Item.displayName;
+  );
+}
 
 export { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue };

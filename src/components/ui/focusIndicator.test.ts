@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest';
 /** 全站只有一个焦点指示器：styles.css 里那条无 layer 的 2px 实心 accent 轮廓。
  *  组件自己写 focus-visible:outline-none 压不掉它（无 layer 规则赢过所有工具类），
  *  但那行字会让下一个人以为「这里自带焦点样式」——而配套的 ring 清一色是
- *  accent-soft(1.07:1) / rule(1.13) / accent-line(1.65) / accent-40(1.68)，没有一个够 3:1。
+ *  accent-soft(1.07:1) / rule(1.13) / accent-line(1.65)，没有一个够 3:1。
  *  所以这里钉的是「还允许在哪里写 outline-none」：清单之外新增一处就红。 */
 
 const SRC = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
@@ -16,10 +16,7 @@ const SUPPRESS = /(?:focus|focus-visible):outline-none/;
 /** 相对 src/ 的路径 → 这一处为什么必须留着。 */
 const ALLOWED: Record<string, string> = {
   'components/ui/tabs.tsx':
-    'TabsContent 是 <div tabIndex=0>，不在全局规则的元素清单里，去掉这行 UA 会给整个面板画一个大方框。'
-    + '同文件 TabsTrigger 上那处是 shadcn 源码，不改——它的 ring-rule 是死的，靠全局轮廓兜。',
-  'components/ui/switch.tsx': 'shadcn 源码，不改。ring-accent-soft 是死的，靠全局轮廓兜。',
-  'components/ui/input.tsx': 'shadcn 源码，不改。与同串的基础 outline-none 重复，同样是死的。',
+    'TabsContent 是 <div tabIndex=0>，不在全局规则的元素清单里，去掉这行 UA 会给整个面板画一个大方框。',
 };
 
 const walk = (dir: string): string[] =>

@@ -1,5 +1,5 @@
 import { cva, type VariantProps } from 'class-variance-authority';
-import type { HTMLAttributes, ReactElement } from 'react';
+import type { ComponentProps, ReactElement } from 'react';
 
 import { cn } from '../../lib/utils';
 
@@ -25,10 +25,10 @@ const badgeVariants = cva('inline-flex shrink-0 items-center whitespace-nowrap r
   }
 });
 
-export type BadgeProps = HTMLAttributes<HTMLSpanElement> & VariantProps<typeof badgeVariants>;
+export type BadgeProps = ComponentProps<'span'> & VariantProps<typeof badgeVariants>;
 
 export function Badge({ className, variant, ...props }: BadgeProps): ReactElement {
-  return <span className={cn(badgeVariants({ className, variant }))} {...props} />;
+  return <span className={cn(badgeVariants({ className, variant }))} data-slot="badge" {...props} />;
 }
 
 export { badgeVariants };

@@ -135,8 +135,9 @@ button {
 }
 
 /* 全局唯一的焦点指示器，实心 accent 4.47:1（accent-line 只有 1.65:1，画得出来看不见）。
-   刻意不进 @layer：组件自己那圈 ring 是 accent-soft(1.07)/rule(1.13)/accent-40(1.68)，
-   进了 layer 就压不过它们的 focus-visible:outline-none，那些控件会重新失去焦点态。
+   刻意不进 @layer：Tailwind 的工具类全在 layer 里，无 layer 规则整体赢过它们，于是
+   组件写 focus-visible:outline-none 也关不掉焦点态——这是要的效果，不是巧合。
+   代价是想让位也只能同样无 layer，见下面的 .focus-by-container。
    不加 [tabindex] 分支——React Flow 的节点/连线和 Radix 的 TabsContent 都挂 tabIndex=0，
    会圈到画布和整个面板；画布的焦点态在下面单独给。 */
 button:focus-visible,
@@ -155,10 +156,12 @@ summary:focus-visible {
   outline: none;
 }
 
-/* ── Vendored shadcn primitives: contrast fixes without forking ──────────────
-   button.tsx / badge.tsx 是 vendored 源码，不改。Tailwind v4 把工具类全放进
-   @layer，本文件这些无 layer 规则因此稳定压过它们。挂的是「失败的那组配色签名」，
-   写出同一组合的元素都会一并修好。十六进制取自 Tailwind v4 的 oklch 调色板。 */
+/* ── 对比度覆盖：挂配色签名，不挂组件 ────────────────────────────────────────
+   button.tsx / badge.tsx 是项目自己的代码，改得动；这几个值仍然放在这里，是因为签名
+   选择器同时修好了别处写出同一组合的裸元素——FlowNodes 的状态 pill（待运行/跳过/失败）
+   和 DashboardPage 的异常事件图标都不经过 Badge。搬回 cva 变体表会静默漏掉它们。
+   Tailwind v4 把工具类全放进 @layer，本文件这些无 layer 规则因此稳定压过它们。
+   十六进制取自 Tailwind v4 的 oklch 调色板。 */
 
 /* danger 变体：白字压 red-500 是 3.82，抬到 red-600（4.76）。hover/active 必须一起抬，
    否则它们的工具类落在 layer 里、被这条规则吃掉，按钮就没有按下反馈了。
