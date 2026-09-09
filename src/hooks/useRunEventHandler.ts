@@ -57,6 +57,9 @@ export function useRunEventHandler({
   return useCallback(
     (event: RunEvent): void => {
       if (event.type === 'run:start') {
+        // 桥接层会连续派发开始和节点事件，不能等 React effect 才切换事件归属。
+        activeRunIdRef.current = event.payload.runId;
+        lastRunIdRef.current = event.payload.runId;
         // 优先用调用方（actions hook）已写入的名字，调度器等外部触发的运行才用事件里的
         if (!activeFlowNameRef.current && event.payload.flowName) {
           activeFlowNameRef.current = event.payload.flowName;
@@ -147,6 +150,8 @@ export function useRunEventHandler({
       }
 
       if (event.type === 'run:finish') {
+        lastRunIdRef.current = event.payload.runId;
+        activeRunIdRef.current = null;
         setLastRunId(event.payload.runId);
         setActiveRunId(null);
         setActiveRunFlowId(null);
@@ -155,7 +160,7 @@ export function useRunEventHandler({
         setPausedPageUrl(null);
         setRuntimeStatus(event.payload.status);
         void callBridge((api) => api.listTaskVariables(event.payload.runId), undefined, { silent: true }).then((result) => {
-          if (result !== null) {
+          if (result !== null && isCurrentRunEvent(event, activeRunIdRef.current, lastRunIdRef.current)) {
             setVariables(result);
           }
         });
@@ -166,7 +171,7 @@ export function useRunEventHandler({
           }
         });
         void callBridge((api) => api.listArtifacts(event.payload.runId), undefined, { silent: true }).then((result) => {
-          if (result !== null) {
+          if (result !== null && isCurrentRunEvent(event, activeRunIdRef.current, lastRunIdRef.current)) {
             setArtifacts(result);
             if (result.length > 0) {
               onArtifactsReady?.();
@@ -226,5 +231,5 @@ export function useRunEventHandler({
 
 function isCurrentRunEvent(event: Exclude<RunEvent, { type: 'run:start' }>, activeRunId: string | null, lastRunId: string | null): boolean {
   const eventRunId = event.payload.runId;
-  return eventRunId === activeRunId || eventRunId === lastRunId;
+  return eventRunId === (activeRunId ?? lastRunId);
 }

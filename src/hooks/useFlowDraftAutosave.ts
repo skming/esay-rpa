@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Edge, Node } from '@xyflow/react';
 
 import { buildFlowDefinition, readFlowInputVariables, restoreFlowCanvas } from '../lib/flowDefinition';
+import { createDefinitionSignature } from '../lib/flowVersioning';
 import { useFlowDraftStore, type StoredFlowDraft } from '../stores/useFlowDraftStore';
 import { useFlowVariableStore } from '../stores/useFlowVariableStore';
 import type { FlowSnapshot } from '../types/electron';
@@ -103,8 +104,8 @@ export function useFlowDraftAutosave({
 
   const currentSignature = useMemo(() => createCanvasSignature(nodes, edges, inputVariables), [edges, inputVariables, nodes]);
   const savedSignature = useMemo(
-    () => currentFlow === null ? null : createDefinitionSignature(buildFlowDefinition(nodes, edges, currentFlow.inputVariables, currentFlow.name)),
-    [currentFlow, edges, nodes]
+    () => createSavedFlowSignature(currentFlow),
+    [currentFlow]
   );
 
   // 未保存流程的基线必须冻结在首帧：跟着 currentSignature 走则两者恒等，dirty 永远为假，自动保存不再触发。
@@ -174,29 +175,18 @@ export function useFlowDraftAutosave({
   return { dirty, hydrated, lastAutosavedAt, restoredAt, restoredFlowId };
 }
 
-function createCanvasSignature(nodes: Node<RpaNodeData>[], edges: Edge[], inputVariables: RuntimeVariable[]): string {
-  return createDefinitionSignature(buildFlowDefinition(nodes, edges, inputVariables));
+export function createSavedFlowSignature(flow: FlowSnapshot | null): string | null {
+  if (flow === null) return null;
+  const canvas = restoreFlowCanvas(flow.definition);
+  return canvas === null ? null : createCanvasSignature(canvas.nodes, canvas.edges, flow.inputVariables);
 }
 
-function createDefinitionSignature(definition: Record<string, unknown>): string {
-  const stableDefinition = { ...definition };
-  // name and exportedAt are metadata — exclude so renaming a flow doesn't mark it dirty
-  delete stableDefinition.name;
-  delete stableDefinition.exportedAt;
-  return stableStringify(stableDefinition);
-}
-
-function stableStringify(value: unknown): string {
-  if (value === null || typeof value !== 'object') {
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map((item) => stableStringify(item)).join(',')}]`;
-  }
-
-  const entries = Object.entries(value as Record<string, unknown>)
-    .filter(([, item]) => item !== undefined)
-    .sort(([left], [right]) => left.localeCompare(right));
-
-  return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableStringify(item)}`).join(',')}}`;
+export function createCanvasSignature(nodes: Node<RpaNodeData>[], edges: Edge[], inputVariables: RuntimeVariable[]): string {
+  // 运行状态由日志回填，不是用户编辑；恢复快照和实时画布必须使用相同的默认字段与签名规则。
+  const definition = buildFlowDefinition(nodes.map((node) => ({
+    ...node,
+    data: { ...node.data, status: 'pending' }
+  })), edges, inputVariables);
+  delete definition.name;
+  return createDefinitionSignature(definition);
 }

@@ -384,6 +384,7 @@ export function useElectronBridgeActions({
         setCurrentFlow(createLocalDraftFlow(flowName));
         setFlowNodes(restoreInitialNodes());
         setFlowEdges(restoreInitialEdges());
+        setInputVariables([]);
         clearLastRunOverrides();
         pushToast('info', `已创建草稿：${flowName}`);
       },
@@ -1086,7 +1087,7 @@ function createLocalDraftFlow(name: string): FlowSnapshot {
   const now = new Date().toISOString();
   return {
     createdAt: now,
-    definition: {},
+    definition: buildFlowDefinition(initialNodes, initialEdges, [], name),
     flowId: `local-${Date.now()}`,
     folderPath: '默认目录',
     inputVariables: [],

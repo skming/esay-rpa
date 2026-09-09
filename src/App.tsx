@@ -47,7 +47,7 @@ export default function App(): ReactElement {
     if (draftAutosave.restoredFlowId) {
       // 草稿已恢复画布，只需补 currentFlow 元数据
       void electron.silentlyRestoreCurrentFlow(draftAutosave.restoredFlowId);
-    } else if (lastOpenedFlowId) {
+    } else if (draftAutosave.restoredAt === null && lastOpenedFlowId) {
       // 无草稿时需同时恢复 currentFlow 和画布节点
       void electron.silentlyRestoreCurrentFlow(lastOpenedFlowId, { restoreCanvas: true });
     }

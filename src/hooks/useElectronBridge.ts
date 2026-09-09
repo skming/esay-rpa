@@ -184,6 +184,8 @@ export function useElectronBridge({
   }, [setBottomPanelOpen]);
 
   const resetRunView = useCallback((): void => {
+    activeRunIdRef.current = null;
+    lastRunIdRef.current = null;
     setActiveRunId(null);
     setActiveRunFlowId(null);
     setLastRunId(null);
@@ -267,14 +269,6 @@ export function useElectronBridge({
     setPickerActive,
     setCanvasFitVersion
   });
-
-  // 故意不依赖 currentFlow.inputVariables：AI 改完节点调 setCurrentFlow() 会覆盖用户未保存的本地编辑
-  useEffect(() => {
-    if (currentFlow?.flowId != null) {
-      replaceAllInputVariables(currentFlow.inputVariables ?? []);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentFlow?.flowId]);
 
   useEffect(() => {
     if (currentFlow?.flowId != null) {
