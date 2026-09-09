@@ -40,6 +40,7 @@ _FRAMEWORK_HINTS = (
 
 _MAX_SELECTORS_PER_TYPE = 12  # 每种节点类型只留最近验证过的若干个，避免画像随流程迭代无限膨胀
 _MAX_DOMAINS = 200  # 超出后淘汰最久未更新的域名，防止 JSON 文件无限增长
+_MAX_PAGES_PER_DOMAIN = 20  # 同一域名下只留最近验证过的若干个页面
 _MAX_FAILED_SELECTORS = 20
 # 失败比成功过期得快：selector 跑通说明它当时确实指对了元素，而跑挂可能只是页面那天在改版。
 # 两周后还拿它当禁令，就会挡住页面已经改回去的正确答案。
@@ -56,6 +57,91 @@ def _domain_of(url: str) -> str | None:
     except Exception:
         return None
     return host.lower() if host else None
+
+
+def _page_key(url: str) -> str | None:
+    """页面粒度的归属键：host + path + hash。
+
+    只按域名记经验，会把同一站点的「订单列表」和「报表」当成同一个页面。这两页的查询按钮
+    常常 class 同名而结构不同，把订单页验证过的 selector 直接给报表页用，运行时报的是元素
+    超时，从报错里看不出「这条经验本来就不属于这个页面」。SPA 后台的路由多半在 hash 里，
+    所以 hash 必须算进键，否则整个后台仍然只有一个页面。query 不算：翻页、排序参数会把同
+    一个页面拆成无数个键。
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+    host = parsed.hostname
+    if not host:
+        return None
+    path = (parsed.path or "/").rstrip("/") or "/"
+    fragment = parsed.fragment.split("?")[0].rstrip("/") if parsed.fragment else ""
+    key = f"{host.lower()}{path}" + (f"#{fragment}" if fragment else "")
+    return key[:160]
+
+
+def _pages_by_node(nodes: list[Any], edges: Any) -> dict[str, str | None]:
+    """每个节点执行时停在哪个页面。
+
+    节点自己带 targetUrl 就以它为准；否则沿边继承上游的页面——browser.click 这类节点不带
+    URL，它所在的页面是上一次导航留下的。两条分支汇合处继承到的页面不一致就归属为 None，
+    退回域名级：记错页面比没记更糟，模型会拿着「已验证」的字样把 selector 写进另一个页面。
+    """
+    nodes_by_id: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for node in nodes:
+        if isinstance(node, dict) and node.get("id"):
+            nodes_by_id[str(node["id"])] = node
+            order.append(str(node["id"]))
+
+    def own_page(node: dict[str, Any]) -> str | None:
+        target = node.get("targetUrl")
+        if isinstance(target, str) and target.startswith("http"):
+            return _page_key(target)
+        return None
+
+    adjacency: dict[str, list[str]] = {}
+    for edge in edges if isinstance(edges, list) else []:
+        if isinstance(edge, dict) and edge.get("source") and edge.get("target"):
+            adjacency.setdefault(str(edge["source"]), []).append(str(edge["target"]))
+
+    reached: dict[str, set[str | None]] = {}
+    if adjacency:
+        targets = {t for outs in adjacency.values() for t in outs}
+        # 入口 = 没有任何边指向它的节点，不写死 start：分支流程里入口不一定叫 start。
+        stack: list[tuple[str, str | None]] = [(nid, None) for nid in order if nid not in targets]
+        # 以 (节点, 继承页面) 去重而不是只按节点：foreach 的回边会绕回同一节点，
+        # 只按节点去重会漏掉「同一节点在另一条分支上属于另一个页面」这个歧义。
+        seen: set[tuple[str, str | None]] = set()
+        while stack:
+            nid, inherited = stack.pop()
+            if (nid, inherited) in seen:
+                continue
+            seen.add((nid, inherited))
+            node = nodes_by_id.get(nid)
+            if node is None:
+                continue
+            page = own_page(node) or inherited
+            reached.setdefault(nid, set()).add(page)
+            for nxt in adjacency.get(nid, []):
+                stack.append((nxt, page))
+    else:
+        # 没有边时按节点顺序推断：这是流程定义里仅剩的顺序信息。
+        current: str | None = None
+        for nid in order:
+            current = own_page(nodes_by_id[nid]) or current
+            reached[nid] = {current}
+
+    return {nid: (next(iter(pages)) if len(pages) == 1 else None) for nid, pages in reached.items()}
+
+
+def extract_urls(text: str) -> list[str]:
+    seen: list[str] = []
+    for m in _URL_RE.findall(text or ""):
+        if m not in seen:
+            seen.append(m)
+    return seen
 
 
 def extract_domains(text: str) -> list[str]:
@@ -122,6 +208,7 @@ class SiteKnowledgeStore:
 
         domains: list[str] = []
         urls: list[str] = []
+        url_by_page: dict[str, str] = {}
         for node in nodes:
             if not isinstance(node, dict):
                 continue
@@ -132,10 +219,15 @@ class SiteKnowledgeStore:
                     urls.append(target)
                     if d not in domains:
                         domains.append(d)
+                    key = _page_key(target)
+                    if key:
+                        url_by_page.setdefault(key, target)
         if not domains:
             return
 
+        pages_by_node = _pages_by_node(nodes, flow_definition.get("edges"))
         selectors_by_type: dict[str, list[str]] = {}
+        selectors_by_page: dict[str, dict[str, list[str]]] = {}
         all_selectors: list[str] = []
         has_login_fill = False
         for node in nodes:
@@ -148,6 +240,11 @@ class SiteKnowledgeStore:
                 if sel not in bucket:
                     bucket.append(sel)
                 all_selectors.append(sel)
+                page = pages_by_node.get(str(node.get("id") or ""))
+                if page:
+                    page_bucket = selectors_by_page.setdefault(page, {}).setdefault(ntype, [])
+                    if sel not in page_bucket:
+                        page_bucket.append(sel)
             if ntype == "browser.fill":
                 value = str(node.get("inputValue") or "")
                 if "password" in str(sel or "") or "${var.password}" in value:
@@ -191,6 +288,30 @@ class SiteKnowledgeStore:
                             bucket.append(sel)
                     merged[ntype] = bucket[-_MAX_SELECTORS_PER_TYPE:]  # 保留最近的
                 profile["selectors"] = merged
+                pages: dict[str, Any] = profile.get("pages") or {}
+                for page_key, sels in selectors_by_page.items():
+                    if not page_key.startswith(domain + "/"):
+                        continue  # 跨域流程：另一个域名的页面不能记到这个域名的档案里
+                    entry = pages.get(page_key) or {"selectors": {}, "success_count": 0}
+                    entry["success_count"] = int(entry.get("success_count", 0)) + 1
+                    entry["updated_at"] = _now_iso()
+                    if url_by_page.get(page_key):
+                        entry["url"] = url_by_page[page_key]
+                    page_merged: dict[str, list[str]] = entry.get("selectors") or {}
+                    for ntype, page_sels in sels.items():
+                        bucket = page_merged.setdefault(ntype, [])
+                        for sel in page_sels:
+                            if sel not in bucket:
+                                bucket.append(sel)
+                        page_merged[ntype] = bucket[-_MAX_SELECTORS_PER_TYPE:]
+                    entry["selectors"] = page_merged
+                    pages[page_key] = entry
+                if len(pages) > _MAX_PAGES_PER_DOMAIN:
+                    ordered_pages = sorted(
+                        pages.items(), key=lambda kv: str(kv[1].get("updated_at") or ""), reverse=True
+                    )
+                    pages = dict(ordered_pages[:_MAX_PAGES_PER_DOMAIN])
+                profile["pages"] = pages
                 # 跑通即撤销禁令：能跑通说明当时挂的是别的原因（时序、登录态、页面在改版），
                 # 禁令留着会让模型绕开这个正确答案去猜别的写法。
                 profile["failed_selectors"] = [
@@ -266,7 +387,13 @@ class SiteKnowledgeStore:
         return [data[d] for d in domains if d in data]
 
     @staticmethod
-    def build_context_message(profiles: list[dict[str, Any]]) -> str:
+    def build_context_message(profiles: list[dict[str, Any]], urls: list[str] | None = None) -> str:
+        """urls 是本轮对话里出现的 URL，用来把经验分成「当前页面验证过」和「同域其它页面验证过」。
+
+        不传就退回域名级展示（旧档案没有 pages 字段时也走这条），此时不会声称任何 selector
+        属于当前页面。
+        """
+        wanted_pages = [k for k in (_page_key(u) for u in urls or []) if k]
         lines = [
             "## 站点经验档案（来自该站点历史成功运行，优先复用以下已验证信息）",
             "",
@@ -285,10 +412,50 @@ class SiteKnowledgeStore:
             verified = p.get("verified_urls") or []
             if verified:
                 lines.append("- 已验证可达的 URL：" + "、".join(f"`{u}`" for u in verified[-5:]))
-            selectors = p.get("selectors") or {}
-            if selectors:
-                lines.append("- 已验证有效的 selector（按节点类型）：")
-                for ntype, sels in selectors.items():
+            pages = p.get("pages") or {}
+            current_keys = [k for k in wanted_pages if k in pages]
+            for key in current_keys:
+                entry = pages.get(key) or {}
+                page_sels = entry.get("selectors") or {}
+                if not page_sels:
+                    continue
+                lines.append(
+                    f"- **当前页面** `{entry.get('url') or key}` 上已验证的 selector"
+                    f"（在这个页面跑通 {int(entry.get('success_count') or 1)} 次，可直接复用）："
+                )
+                for ntype, sels in page_sels.items():
+                    lines.append(f"  - {ntype}: " + "、".join(f"`{s}`" for s in sels[-4:]))
+            others = [k for k in pages if k not in set(current_keys)]
+            if others:
+                lines.append(
+                    "- 同域**其它页面**验证过的 selector（**未必适用当前页**：同一站点不同页面"
+                    "常常 class 同名而结构不同，照抄前必须 inspect_page 确认它在当前页面存在）："
+                )
+                for key in sorted(
+                    others, key=lambda k: str((pages.get(k) or {}).get("updated_at") or ""), reverse=True
+                )[:4]:
+                    flat = [
+                        s for sels in ((pages.get(key) or {}).get("selectors") or {}).values() for s in sels
+                    ][-3:]
+                    if flat:
+                        lines.append(f"  - `{key}`：" + "、".join(f"`{s}`" for s in flat))
+            # 页面级已经展示过的不再重复；剩下的是归属不到具体页面的（分支汇合处、旧档案）。
+            shown_selectors = {
+                s
+                for entry in pages.values()
+                for sels in ((entry or {}).get("selectors") or {}).values()
+                for s in sels
+            }
+            residual = {
+                ntype: [s for s in sels if s not in shown_selectors]
+                for ntype, sels in (p.get("selectors") or {}).items()
+            }
+            residual = {ntype: sels for ntype, sels in residual.items() if sels}
+            if residual:
+                # 判据是「这条 selector 的页面未知」，不是「这个档案有没有页面记录」：分支汇合处的
+                # selector 两个页面都可能，这份不确定不写进标签，模型就会当成当前页面已验证。
+                lines.append("- 同域已验证、但归属不到具体页面的 selector（用前先确认它在当前页面存在）：")
+                for ntype, sels in residual.items():
                     shown = "、".join(f"`{s}`" for s in sels[-4:])
                     lines.append(f"  - {ntype}: {shown}")
             failures = _fresh_failures(p.get("failed_selectors"))
@@ -300,8 +467,8 @@ class SiteKnowledgeStore:
                     lines.append(f"  - `{f['selector']}` — {f.get('kind') or '运行失败'}{suffix}")
             lines.append("")
         lines.append(
-            "以上 selector 均来自真实运行结果。构建/修复同站点流程时**优先直接复用已验证的**，"
-            "只有页面确实改版（inspect_page 证实旧 selector 不存在）时才替换；"
+            "以上 selector 均来自真实运行结果。构建/修复同站点流程时**先用当前页面那一组**，"
+            "只有页面确实改版（inspect_page 证实旧 selector 不存在）时才替换；其它页面那一组只是候选，"
             "**已证伪的不要再写进流程**，除非这次 inspect_page 亲眼看到它确实存在。"
         )
         return "\n".join(lines)

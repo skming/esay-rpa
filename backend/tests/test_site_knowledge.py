@@ -120,3 +120,94 @@ def test_missing_domain_is_a_no_op(store: SiteKnowledgeStore) -> None:
     store.record_selector_failure(None, ".btn", diagnostic_kind="selector_zero_match")
     store.record_selector_failure("not-a-url", ".btn", diagnostic_kind="selector_zero_match")
     assert store.get_profile("shop.test") is None
+
+
+def _two_page_flow() -> dict[str, Any]:
+    """一条流程先在订单页点导出、再导航到报表页点查询：两个 selector 属于两个页面。"""
+    return {
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {"id": "n1", "type": "browser.open", "targetUrl": "https://shop.test/orders"},
+            {"id": "n2", "type": "browser.click", "selector": ".order-export"},
+            {"id": "n3", "type": "browser.open", "targetUrl": "https://shop.test/reports"},
+            {"id": "n4", "type": "browser.click", "selector": ".report-search"},
+        ],
+        "edges": [
+            {"source": "start", "target": "n1"},
+            {"source": "n1", "target": "n2"},
+            {"source": "n2", "target": "n3"},
+            {"source": "n3", "target": "n4"},
+        ],
+    }
+
+
+def test_selector_verified_on_one_page_is_not_presented_as_current_page_knowledge(
+    store: SiteKnowledgeStore,
+) -> None:
+    """同域不同页面最容易踩：两页的按钮 class 常常同名而结构不同，
+    把订单页跑通的 selector 当成报表页「已验证」，运行时只报元素超时，看不出经验本来就用错了页面。"""
+    store.record_flow_success(_two_page_flow(), flow_name="订单与报表")
+    profile = store.get_profile("shop.test")
+    assert profile is not None
+    pages = profile["pages"]
+    assert pages["shop.test/orders"]["selectors"]["browser.click"] == [".order-export"]
+    assert pages["shop.test/reports"]["selectors"]["browser.click"] == [".report-search"]
+
+    msg = SiteKnowledgeStore.build_context_message([profile], ["https://shop.test/orders"])
+    current, other = msg.split("其它页面", 1)
+    assert ".order-export" in current and ".order-export" not in other
+    assert ".report-search" in other and ".report-search" not in current
+    assert "未必适用当前页" in other
+
+
+def test_hash_route_pages_are_kept_apart(store: SiteKnowledgeStore) -> None:
+    """SPA 后台的路由在 hash 里，只按 path 分组会把整个后台当成同一个页面。"""
+    store.record_flow_success(_flow(".a-btn", url="https://admin.test/#/order/list"))
+    store.record_flow_success(_flow(".b-btn", url="https://admin.test/#/report/daily"))
+    profile = store.get_profile("admin.test")
+    assert profile is not None
+    assert set(profile["pages"]) == {"admin.test/#/order/list", "admin.test/#/report/daily"}
+    assert profile["pages"]["admin.test/#/order/list"]["selectors"]["browser.click"] == [".a-btn"]
+
+
+def test_selector_after_a_branch_merge_falls_back_to_domain_scope(store: SiteKnowledgeStore) -> None:
+    """两条分支停在不同页面、汇合后再点：这个 selector 属于哪个页面无从判断，
+    只能退回域名级并如实标注，不能挑一条分支说它已在那个页面验证过。"""
+    flow = {
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {"id": "n_if", "type": "control.condition"},
+            {"id": "n_a", "type": "browser.open", "targetUrl": "https://shop.test/orders"},
+            {"id": "n_b", "type": "browser.open", "targetUrl": "https://shop.test/reports"},
+            {"id": "n_merge", "type": "browser.click", "selector": ".shared-export"},
+        ],
+        "edges": [
+            {"source": "start", "target": "n_if"},
+            {"source": "n_if", "target": "n_a", "sourceHandle": "true"},
+            {"source": "n_if", "target": "n_b", "sourceHandle": "false"},
+            {"source": "n_a", "target": "n_merge"},
+            {"source": "n_b", "target": "n_merge"},
+        ],
+    }
+    store.record_flow_success(flow)
+    profile = store.get_profile("shop.test")
+    assert profile is not None
+    assert all(
+        ".shared-export" not in sels
+        for page in profile["pages"].values()
+        for sels in page["selectors"].values()
+    )
+    assert profile["selectors"]["browser.click"] == [".shared-export"]
+
+    msg = SiteKnowledgeStore.build_context_message([profile], ["https://shop.test/orders"])
+    assert "归属不到具体页面" in msg and ".shared-export" in msg
+
+
+def test_context_message_without_urls_never_claims_a_current_page(store: SiteKnowledgeStore) -> None:
+    """对话里没出现 URL 时不知道模型在看哪个页面，一条都不能标成「当前页面已验证」。"""
+    store.record_flow_success(_two_page_flow())
+    profile = store.get_profile("shop.test")
+    assert profile is not None
+    msg = SiteKnowledgeStore.build_context_message([profile])
+    assert "**当前页面**" not in msg  # 只钉住声称句式，正文里的「确认它在当前页面存在」是提醒不是声称
+    assert ".order-export" in msg and ".report-search" in msg
