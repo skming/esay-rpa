@@ -1,0 +1,39 @@
+<!doctype html>
+<meta charset="utf-8"><title>文本日期区间 · change 提交</title>
+<body>
+  <div class="cond">
+    <label>起始时间 <input class="cond-input" id="from-time" placeholder="起始时间 yyyy/MM/dd" autocomplete="off"></label>
+    <label>截止时间 <input class="cond-input" id="to-time" placeholder="截止时间 yyyy/MM/dd" autocomplete="off"></label>
+    <!-- 与筛选无关的日期输入框：配方选错了 trigger，替换数据那一轮才会暴露 -->
+    <label>生日 <input type="date" id="birthday"></label>
+  </div>
+  <table id="voucher-table">
+    <thead><tr><th>票据号</th><th>记账日期</th><th>金额</th></tr></thead>
+    <tbody id="voucher-body"></tbody>
+  </table>
+  <script>
+    const ROWS = [
+      ['V-01', '2026/05/28', '100'],
+      ['V-02', '2026/06/02', '200'],
+      ['V-03', '2026/06/15', '300'],
+      ['V-04', '2026/07/03', '400'],
+    ];
+    // 这一页在 change 上提交：browser.fill 的 type 模式自己会派发 change，
+    // 所以同一份配方在这里不按 Enter 也能筛出来。两页的提交时机必须不同，
+    // 否则「换一种组件实现照样能用」只是同一种页面测了两遍。
+    const norm = (s) => s.trim().replace(/\//g, '-');
+    function render() {
+      const from = norm(document.getElementById('from-time').value);
+      const to = norm(document.getElementById('to-time').value);
+      const rows = ROWS.filter((r) => {
+        const d = norm(r[1]);
+        return (!from || d >= from) && (!to || d <= to);
+      });
+      document.getElementById('voucher-body').innerHTML = rows
+        .map(r => '<tr><td>' + r[0] + '</td><td>' + r[1] + '</td><td>' + r[2] + '</td></tr>')
+        .join('');
+    }
+    for (const el of document.querySelectorAll('.cond-input')) el.addEventListener('change', render);
+    render();
+  </script>
+</body>

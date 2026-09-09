@@ -1,0 +1,27 @@
+<!doctype html>
+<meta charset="utf-8"><title>虚拟列表</title>
+<style>#scroller{height:120px;overflow:auto}</style>
+<body>
+  <div id="scroller"><table id="rows"><tbody></tbody></table></div>
+  <script>
+    const body = document.querySelector('#rows tbody');
+    let loaded = 0;
+    const TOTAL = 30;
+    function append() {
+      for (let i = 0; i < 10 && loaded < TOTAL; i++) {
+        loaded++;
+        const tr = document.createElement('tr');
+        tr.innerHTML = '<td>行 ' + loaded + '</td><td>' + loaded * 10 + '</td>';
+        body.appendChild(tr);
+      }
+      // 加载完必须有可判定的终止信号：没有它，翻页循环只能靠写死次数，
+      // 写死的次数只在生成当天成立。
+      if (loaded >= TOTAL) document.body.insertAdjacentHTML('beforeend', '<div id="list-end">没有更多了</div>');
+    }
+    append();
+    document.getElementById('scroller').addEventListener('scroll', (e) => {
+      const el = e.target;
+      if (el.scrollTop + el.clientHeight >= el.scrollHeight - 4) append();
+    });
+  </script>
+</body>

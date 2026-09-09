@@ -1,0 +1,18 @@
+<!doctype html>
+<meta charset="utf-8"><title>原生日期 + 重复按钮</title>
+<body>
+  <div class="filter-bar">
+    <label for="start-date">开始日期</label>
+    <input type="date" id="start-date" name="开始日期" value="2026-01-01">
+    <label for="end-date">结束日期</label>
+    <input type="date" id="end-date" name="结束日期" value="2026-01-31">
+    <button class="btn-primary" id="do-search">查询</button>
+  </div>
+  <table id="order-table">
+    <thead><tr><th>单号</th><th>金额</th><th>操作</th></tr></thead>
+    <tbody>
+      <tr><td>SO-1</td><td>100</td><td><button class="btn-link">查询</button><button class="btn-link">编辑</button></td></tr>
+      <tr><td>SO-2</td><td>200</td><td><button class="btn-link">查询</button><button class="btn-link">编辑</button></td></tr>
+    </tbody>
+  </table>
+</body>

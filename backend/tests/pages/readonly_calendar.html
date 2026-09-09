@@ -1,0 +1,18 @@
+<!doctype html>
+<meta charset="utf-8"><title>只读日历</title>
+<style>.cal-panel{position:absolute;top:40px;left:0;background:#fff;border:1px solid #ccc}</style>
+<body>
+  <input class="date-trigger" id="pick-date" placeholder="选择日期" readonly>
+  <script>
+    // readonly：组件不接受手输，键入路线整条不可用，只能点开面板点格子。
+    document.getElementById('pick-date').addEventListener('click', () => {
+      if (document.querySelector('.cal-panel')) return;
+      const p = document.createElement('div');
+      p.className = 'cal-panel';
+      p.innerHTML = '<button class="cal-prev">上月</button><span class="cal-title">2026年9月</span>'
+        + '<button class="cal-next">下月</button>'
+        + '<div class="cal-grid"><a class="cal-day">1</a><a class="cal-day">2</a><a class="cal-day">3</a></div>';
+      document.body.appendChild(p);
+    });
+  </script>
+</body>

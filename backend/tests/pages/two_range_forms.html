@@ -1,0 +1,23 @@
+<!doctype html>
+<meta charset="utf-8"><title>查询区与编辑区各一套日期区间</title>
+<body>
+  <!-- 查询区：文本输入框式区间（未知组件库的常见形态） -->
+  <form class="search-form" id="search-form">
+    <label for="search-start">开始日期</label>
+    <input class="cond-date" id="search-start" placeholder="开始日期 yyyy-MM-dd" autocomplete="off">
+    <label for="search-end">结束日期</label>
+    <input class="cond-date" id="search-end" placeholder="结束日期 yyyy-MM-dd" autocomplete="off">
+    <button type="button" id="do-search">查询</button>
+  </form>
+
+  <!-- 编辑区：原生 input[type=date] 式区间 + 一个与筛选无关的生日框 -->
+  <div class="edit-drawer" id="edit-drawer">
+    <label for="edit-start">生效开始日期</label>
+    <input type="date" id="edit-start" name="生效开始日期" value="2026-06-01">
+    <label for="edit-end">生效结束日期</label>
+    <input type="date" id="edit-end" name="生效结束日期" value="2026-06-30">
+    <label for="edit-birthday">生日</label>
+    <input type="date" id="edit-birthday" name="生日">
+    <button type="button" id="do-save">保存</button>
+  </div>
+</body>

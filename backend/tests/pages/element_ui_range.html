@@ -1,0 +1,26 @@
+<!doctype html>
+<meta charset="utf-8"><title>Element UI 区间选择</title>
+<style>.el-picker-panel{position:absolute;top:60px;left:0;background:#fff;border:1px solid #ddd}</style>
+<body>
+  <div class="el-date-editor el-date-editor--daterange el-input__inner" id="range-editor">
+    <input class="el-range-input" placeholder="开始日期">
+    <span class="el-range-separator">至</span>
+    <input class="el-range-input" placeholder="结束日期">
+  </div>
+  <script>
+    // 面板不在初始 DOM 里：日期弹层的真实结构只有点开之后才存在，
+    // 这正是「先 interact_page 点开、再观察」这条路线必须在真浏览器上验证的原因。
+    document.getElementById('range-editor').addEventListener('click', () => {
+      if (document.querySelector('.el-picker-panel')) return;
+      const p = document.createElement('div');
+      p.className = 'el-picker-panel el-date-range-picker';
+      p.innerHTML = '<button class="el-icon-arrow-left">‹</button>'
+        + '<span class="el-date-range-picker__header">2026 年 9 月</span>'
+        + '<button class="el-icon-arrow-right">›</button>'
+        + '<table class="el-date-table"><tr>'
+        + '<td class="available"><span>1</span></td><td class="available"><span>2</span></td>'
+        + '</tr></table>';
+      setTimeout(() => document.body.appendChild(p), 120);
+    });
+  </script>
+</body>

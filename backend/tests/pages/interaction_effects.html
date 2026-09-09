@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>动作生效判据留证页</title>
+<style>
+  body { font: 14px/1.6 system-ui; margin: 24px; }
+  .row { margin: 12px 0; }
+  #static-scroller { height: 120px; overflow: auto; border: 1px solid #ccc; width: 260px; }
+  #static-scroller div { padding: 4px 8px; }
+</style>
+</head>
+<body>
+<h1>动作生效判据留证页</h1>
+
+<!-- 这页上每个控件都对应一条「页面指纹看不见、但动作确实生效（或确实没生效）」的判据。
+     少了它们，判据只能在假对象上验证，而假对象里 focus、原生 select 的选中、滚动容器
+     的 scrollTop 全是我自己写的返回值——测的是测试自己。 -->
+
+<!-- 已聚焦的输入框再填一次：焦点没变、DOM 没变，指纹一动不动 -->
+<div class="row"><label>关键词 <input id="keyword" type="text" placeholder="关键词"></label></div>
+
+<!-- 原生 select 换选项：不新增任何 DOM，指纹只会因为第一次的焦点变化而动一次。
+     option 的 value 与可见文本写成一样，避免测试依赖 select_option 按 value 还是按 label 匹配 -->
+<div class="row"><label>城市
+  <select id="city">
+    <option value="北京">北京</option>
+    <option value="上海">上海</option>
+    <option value="广州">广州</option>
+  </select>
+</label></div>
+
+<!-- 静态长列表：滚动不触发加载，滚到底之后再滚就是幂等动作 -->
+<div class="row" id="static-scroller">
+  <script>
+    for (let i = 1; i <= 40; i++) document.write('<div>静态第 ' + i + ' 行</div>');
+  </script>
+</div>
+
+<!-- 没绑任何事件的按钮：点它只会拿到焦点。这是「只有焦点变化」与「状态变化」必须分开的原因 -->
+<div class="row"><button id="dead-btn" type="button">没有绑定事件</button></div>
+
+<!-- 不可聚焦的行内文本：点它什么都不会发生，连焦点都不会变 -->
+<div class="row"><span id="inert-label">纯文本标签</span></div>
+</body>
+</html>

@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8"><title>SPA 异步加载</title>
+<body>
+  <div id="app"><div class="ant-spin ant-spin-spinning"><span class="ant-spin-dot"></span>加载中</div></div>
+  <script>
+    // 4.5s 才渲染：executor 在带 url 时固定等 3s，渲染太快就测不到 spa_loading=true 这条判据，
+    // 而这条判据错了，模型会把加载态页面当成「页面上没有元素」去改流程拓扑。
+    setTimeout(() => {
+      document.getElementById('app').innerHTML =
+        '<input id="kw" placeholder="关键字"><table id="report-table"><thead><tr><th>项目</th><th>金额</th></tr></thead>'
+        + '<tbody><tr><td>A</td><td>1</td></tr></tbody></table>';
+    }, 4500);
+  </script>
+</body>

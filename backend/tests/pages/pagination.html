@@ -1,0 +1,25 @@
+<!doctype html>
+<meta charset="utf-8"><title>分页</title>
+<body>
+  <table id="grid"><thead><tr><th>单号</th></tr></thead><tbody id="grid-body"><tr><td>P1-A</td></tr></tbody></table>
+  <div class="pager">
+    <span class="page-total">共 3 页</span>
+    <a class="page-num active" data-p="1">1</a><a class="page-num" data-p="2">2</a><a class="page-num" data-p="3">3</a>
+    <button class="next-page">下一页</button>
+  </div>
+  <script>
+    let page = 1;
+    function render() {
+      document.getElementById('grid-body').innerHTML = '<tr><td>P' + page + '-A</td></tr>';
+      document.querySelectorAll('.page-num').forEach(a =>
+        a.classList.toggle('active', Number(a.dataset.p) === page));
+      // 最后一页只把按钮置灰：hidden/disabled 都不等于「没有下一页」，
+      // 判终止必须看页码或记录变化。
+      document.querySelector('.next-page').disabled = page >= 3;
+    }
+    document.querySelector('.next-page').addEventListener('click', () => { if (page < 3) { page++; render(); } });
+    document.querySelectorAll('.page-num').forEach(a =>
+      a.addEventListener('click', () => { page = Number(a.dataset.p); render(); }));
+    render();
+  </script>
+</body>

@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8"><title>开放 shadow root</title>
+<body>
+  <div id="open-host"></div>
+  <closed-widget id="closed-host"></closed-widget>
+  <script>
+    document.getElementById('open-host').attachShadow({ mode: 'open' }).innerHTML =
+      '<input class="sd-start" placeholder="开始日期"><button class="sd-search">影子查询</button>';
+    // 闭合 root 在页面脚本里与「没有 shadow root」无法区分：探测只能把这个自定义元素
+    // 报成可疑，不能宣称支持闭合 shadow DOM。
+    document.getElementById('closed-host').attachShadow({ mode: 'closed' }).innerHTML =
+      '<input class="hidden-input" placeholder="看不见的输入框">';
+  </script>
+</body>

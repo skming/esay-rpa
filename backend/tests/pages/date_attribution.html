@@ -1,0 +1,23 @@
+<!doctype html>
+<meta charset="utf-8"><title>日期控件归属证据</title>
+<body>
+  <!-- 查询卡片与导出卡片各只有一个日期框，却复用同一套包装类名：
+       两者唯一的共同祖先是 body。按类名相同配对，导出区的框会被当成查询区的另一端。 -->
+  <div class="field-cell">
+    <label for="query-start">开始日期</label>
+    <input class="d-input" id="query-start" placeholder="开始日期 yyyy-MM-dd" autocomplete="off">
+  </div>
+  <div class="field-cell">
+    <label for="export-end">结束日期</label>
+    <input class="d-input" id="export-end" placeholder="结束日期 yyyy-MM-dd" autocomplete="off">
+  </div>
+
+  <!-- 真的一对，但唯一装着两端的层是个没有 id 也没有类名的 form：
+       探测端对它照样留 uid、只把 selector 记成 None。配对与拆开都拿不出证据。 -->
+  <form>
+    <label for="anon-start">开始日期</label>
+    <input class="d-input" id="anon-start" placeholder="开始日期 yyyy-MM-dd" autocomplete="off">
+    <label for="anon-end">结束日期</label>
+    <input class="d-input" id="anon-end" placeholder="结束日期 yyyy-MM-dd" autocomplete="off">
+  </form>
+</body>

@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8"><title>文本日期区间 · Enter 提交</title>
+<body>
+  <div class="query-bar">
+    <input class="q-date" id="q-start" placeholder="开始日期 yyyy-MM-dd" autocomplete="off">
+    <input class="q-date" id="q-end" placeholder="结束日期 yyyy-MM-dd" autocomplete="off">
+  </div>
+  <table id="bill-table">
+    <thead><tr><th>单号</th><th>日期</th><th>金额</th></tr></thead>
+    <tbody id="bill-body"></tbody>
+  </table>
+  <script>
+    const ROWS = [
+      ['B-01', '2026-05-28', '100'],
+      ['B-02', '2026-06-02', '200'],
+      ['B-03', '2026-06-15', '300'],
+      ['B-04', '2026-07-03', '400'],
+    ];
+    // 只监听 keydown Enter：把文本写进输入框不触发筛选。「回读到值 ≠ 组件已提交」
+    // 这条判据要能被证伪，就得有一个页面在少了提交动作时照样把全量数据交出来。
+    function render(from, to) {
+      const rows = ROWS.filter(r => (!from || r[1] >= from) && (!to || r[1] <= to));
+      document.getElementById('bill-body').innerHTML = rows
+        .map(r => '<tr><td>' + r[0] + '</td><td>' + r[1] + '</td><td>' + r[2] + '</td></tr>')
+        .join('');
+    }
+    for (const el of document.querySelectorAll('.q-date')) {
+      el.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter') return;
+        render(document.getElementById('q-start').value.trim(), document.getElementById('q-end').value.trim());
+      });
+    }
+    render('', '');
+  </script>
+</body>
