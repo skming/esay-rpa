@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import copy
 import json
@@ -12,6 +13,7 @@ from datetime import UTC, datetime
 from importlib.util import find_spec
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from collections.abc import Awaitable
 
 from app.core import storage
 from app.models.schemas import FlowAcceptanceContract, FlowUpdateRequest
@@ -21,6 +23,8 @@ from app.services.ai_guards import exposed_credential_values
 from app.services import browser_profile_lock
 from app.services import ai_repair_ledger as repair_ledger
 from app.services.browser_action_runner import detect_blocking_interstitial, persistent_browser_context
+from app.services.extension_executor import ExtensionBusyError, extension_busy_message
+import app.services.ai_tools.extension_page_channel as _extension_page
 from app.services.ai_tools.catalog import select_node_types
 from app.services.ai_tools.diagnostics import (
     SELECTOR_MATCH_HIDDEN_OR_NOT_VISIBLE,
@@ -46,7 +50,21 @@ from app.services.ai_tools.normalize import (
     _read_node_x,
     _read_node_y,
 )
+from app.services.ai_tools.page_observation import (
+    annotate_observation,
+    build_interaction_result,
+    ambiguous_selector_error,
+    element_not_found_error,
+    stale_ref_error,
+    EFFECT_SIGNATURE_JS,
+    TARGET_STATE_JS,
+    describe_action_effect as _describe_action_effect,
+    describe_effect as _describe_effect,
+)
 from app.services.ai_tools.page_probe_js import PAGE_PROBE_JS
+# 不写 `from app.services.ai_tools import page_session`：那样加载期先跑包 __init__，
+# 而 __init__ 又导入本模块，test_ai_module_layering 会判定成循环 import。
+import app.services.ai_tools.page_session as _page_session
 from app.services.ai_tools.static_page_probe import inspect_static_page
 from app.services.ai_tools.variables import _RUNTIME_BUILTINS, _collect_defined_vars, _validate_variable_refs
 
@@ -54,6 +72,25 @@ if TYPE_CHECKING:
     from app.services.flow_service import FlowService
     from app.services.scheduler_service import ScheduleService
     from app.services.task_manager import TaskManager
+
+
+async def _observe_wait(wait: Awaitable[Any], selector: str) -> dict[str, Any]:
+    """等待条件超时仍可取证；传输超时不能证明元素未出现。"""
+    try:
+        result = await wait
+        if isinstance(result, dict) and result.get("status") in {"satisfied", "timed_out"}:
+            return {"status": result["status"], "selector": selector}
+    except TimeoutError:
+        return {"status": "unknown", "selector": selector}
+    except Exception as exc:
+        if find_spec("playwright") is None:
+            raise
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+        if not isinstance(exc, PlaywrightTimeoutError):
+            raise
+        return {"status": "timed_out", "selector": selector}
+    return {"status": "satisfied", "selector": selector}
 
 
 _LOGIN_URL_TOKENS = ("login", "signin", "sign-in", "auth", "sso", "passport")
@@ -140,16 +177,56 @@ def _splice_branch_placeholder_noops(
     return remaining_nodes, kept, spliced
 
 
-def _profile_busy_block(tool_name: str) -> dict[str, Any] | None:
+def _foreign_session_block(tool_name: str) -> dict[str, Any] | None:
+    """探索会话属于另一轮对话时的阻断结果；没有这种会话返回 None。
+
+    必须和「还没打开页面」分开：那条提示让模型去调 inspect_page(url=...)，而这里再调一次
+    只会拿到同一个拒绝，模型于是换 url、换工具反复试。也不能让它接管——两轮各自翻页、
+    各自关浏览器，双方看到的都是自己没做过的页面变化。
+    """
+    other = _page_session.foreign_session()
+    if other is None:
+        return None
+    return {
+        "status": "blocked_page_session_busy",
+        "holder": _page_session.SESSION_OWNER,
+        "error": (
+            f"{tool_name} 需要浏览器探索会话，但当前会话属于另一轮对话"
+            f"（已空闲 {int(other.idle_seconds)}s，最长 {int(_page_session.IDLE_TTL_SECONDS)}s 后自动释放）。"
+        ),
+        "user_message": (
+            "另一个助手会话正在用浏览器探索页面。请等它结束或停止那轮对话，"
+            "浏览器释放后回复“继续”，我会重新检查页面。"
+        ),
+        "message": (
+            "这是会话被另一轮对话占用，不是流程配置有问题：不要改流程、不要换 url 重试，"
+            "把上面这句话转告用户。"
+        ),
+    }
+
+
+def _profile_busy_block(tool_name: str, *, allow_page_session: bool = False) -> dict[str, Any] | None:
     """浏览器 profile 被别的运行占着时，返回一份「别修流程、去找用户」的阻断结果。
 
     按任务状态自查（原来只看 status == "running"）会漏掉 paused_for_human：等人工接管的运行
     照样开着浏览器窗口，此时 inspect_page 会拿到一屏 Chrome 启动参数当报错，模型接着去改
     selector——错的方向。占用登记表是唯一知道「谁开着浏览器」的地方。
+
+    allow_page_session：探索会话自己也在登记表里，所以「占用方是不是别人」必须区分出自己。
+    不区分的后果是第一次 inspect_page(url=...) 之后，任何不带 url 的再次观察和同会话截图都被
+    自己的登记挡成 blocked_browser_profile_busy——而通用日期配方的 fallback 正是让模型点开
+    弹层后再看一次当前页面。登记名是所有探索会话共用的，光比登记名会把另一轮对话的会话
+    也认成自己的，所以放行只认「本轮归属的会话确实存在」。
     """
     held = browser_profile_lock.holder(str(storage.resolve_browser_profile_dir()))
     if held is None:
         return None
+    if held == _page_session.SESSION_OWNER:
+        if allow_page_session and _page_session.get_session() is not None:
+            return None
+        foreign = _foreign_session_block(tool_name)
+        if foreign is not None:
+            return foreign
     return {
         "status": "blocked_browser_profile_busy",
         "holder": held,
@@ -262,6 +339,8 @@ class RpaToolExecutor:
                 return await self._inspect_page(**args)
             case "inspect_screenshot":
                 return await self._inspect_screenshot(**args)
+            case "interact_page":
+                return await self._interact_page(**args)
             case _:
                 return {"error": f"未知工具: {name}"}
 
@@ -1298,6 +1377,13 @@ class RpaToolExecutor:
         if flow is None:
             return {"error": f"流程 {flow_id} 不存在"}
 
+        # 探索会话占着同一个 browser profile 的进程内互斥锁，不先让开，这次运行会被自己刚才的
+        # 观察挡成 blocked_browser_profile_busy——那个状态禁止改流程，模型会卡在无解的死局里。
+        # 只让开本轮自己的会话：另一轮对话正在探索时把它的浏览器关掉，那轮的下一次操作
+        # 会落在一个已经消失的页面上，报出来的却是「元素不存在」。
+        await _page_session.close_current("run_flow")
+        await _extension_page.close_current("run_flow")
+
         if browser_executor == "extension" and not self._task_manager.is_extension_enabled():
             return {
                 "status": "extension_disabled",
@@ -1315,6 +1401,25 @@ class RpaToolExecutor:
                     "请提示用户打开 Chrome 扩展并确认目标网站标签页已登录，不要静默改用 Playwright 执行器。"
                 ),
             }
+
+        # 起跑前判：扩展借的是用户那一个浏览器窗口，两次运行交错会互相踩掉跳转和输入，
+        # 报出来却只是「选择器找不到元素」，模型会照着这个假象一路改流程。
+        if browser_executor == "extension":
+            holder = self._task_manager.extension_run_holder()
+            if holder is not None:
+                busy_text = extension_busy_message(holder)
+                return {
+                    "status": "blocked_extension_busy",
+                    "holder": holder,
+                    "error": f"run_flow 需要操作用户的浏览器，但{busy_text}",
+                    "user_message": (
+                        f"{busy_text}处理完后回复“继续”，我会重新发起本次运行。"
+                    ),
+                    "message": (
+                        "这是扩展被另一次运行占用，不是流程配置有问题：不要改流程、"
+                        "不要改用 Playwright 执行器绕开，把上面这句话转告用户，等他处理完再继续。"
+                    ),
+                }
 
         # 起跑前判：profile 被占时浏览器根本起不来，失败现场是一屏 Chrome 启动参数，
         # 模型会当成 selector 问题一路改流程。插件执行器借用用户自己的浏览器，不受此限。
@@ -2119,17 +2224,124 @@ class RpaToolExecutor:
             ],
         }
 
+    def _extension_access_error(self) -> dict[str, Any] | None:
+        if not self._task_manager.is_extension_enabled():
+            return {"status": "blocked_extension_disabled", "error": "插件执行器已在设置中关闭"}
+        if not self._task_manager.is_extension_connected():
+            return {"status": "blocked_extension_disconnected", "error": "没有已连接的浏览器扩展"}
+        if _extension_page.foreign_channel() is not None:
+            return {"status": "blocked_extension_busy", "error": "扩展探索会话属于另一轮对话"}
+        return None
+
+    async def _inspect_page_via_extension(
+        self, url: str | None, wait_selector: str | None, scope_selector: str | None,
+        frame_selector: str | None, tab_index: int | None,
+    ) -> dict[str, Any]:
+        if frame_selector not in (None, "main") or tab_index is not None:
+            return {"status": "unsupported_capability", "error": "扩展探索仅支持绑定标签页的主文档，不支持 frame_selector 或 tab_index"}
+        if url is not None:
+            return {"status": "unsupported_capability", "error": "扩展探索读取当前活动网页。请在 Chrome 打开目标网页，然后省略 url 调用。"}
+        blocked = self._extension_access_error()
+        if blocked is not None:
+            return blocked
+        try:
+            async with _page_session.guard:
+                await _page_session.close_current("switch_to_extension")
+                channel = await _extension_page.open_channel(self._task_manager.extension_exploration_executor())
+                wait_result = None
+                if wait_selector:
+                    wait_result = await _observe_wait(channel.wait_for(wait_selector), wait_selector)
+                result = await channel.observe(scope_selector)
+                annotate_observation(result)
+                if wait_result is not None:
+                    result["wait_result"] = wait_result
+                result["inspection_source"] = "extension"
+                result["scope_selector"] = scope_selector
+                result["capabilities"] = channel.capability_report()
+                result["session"] = {"channel": "extension", "tab_id": channel.tab_id,
+                                     "document_id": channel.document_id,
+                                     "idle_close_seconds": int(_page_session.IDLE_TTL_SECONDS)}
+                return result
+        except (ExtensionBusyError, _page_session.SessionOwnershipError) as exc:
+            return {"status": "blocked_extension_busy", "error": str(exc)}
+        except Exception as exc:
+            await _extension_page.close_current("inspect_failed")
+            return {"status": "extension_observation_failed", "error": str(exc)}
+
+    async def _interact_page_via_extension(
+        self, action: str, element_ref: str | None, selector: str | None, value: str | None,
+        observation_version: int | None, scope_selector: str | None,
+        wait_selector: str | None, wait_ms: int | None,
+    ) -> dict[str, Any]:
+        blocked = self._extension_access_error()
+        if blocked is not None:
+            return blocked
+        try:
+            async with _page_session.guard:
+                channel = _extension_page.get_channel()
+                if channel is None:
+                    return {"error": "扩展探索会话已结束，请重新 inspect_page(browser_executor='extension')"}
+                ref = None
+                if action != "scroll" or element_ref or selector:
+                    ref, error = await channel.resolve_target(element_ref, selector, observation_version)
+                    if error is not None:
+                        return error
+                before = await channel.effect_signature()
+                state_before = await channel.target_state(ref, None)
+                await channel.apply_action(action, ref, None, value)
+                wait_result = None
+                if wait_selector:
+                    wait_result = await _observe_wait(channel.wait_for(wait_selector), wait_selector)
+                else:
+                    await asyncio.sleep(min(max(wait_ms if wait_ms is not None else 600, 0), 5000) / 1000)
+                state_after = await channel.target_state(ref, None)
+                # 点击可能导航；先重新观察文档，再取整页变化，旧目标回读不得落到新文档。
+                observation = await channel.observe(scope_selector)
+                after = await channel.effect_signature()
+                annotate_observation(observation)
+                observation["inspection_source"] = "extension"
+                observation["capabilities"] = channel.capability_report()
+                effect = _describe_effect(before, after)
+                action_effect = _describe_action_effect(action, value, state_before, state_after, page_diff=effect.get("diff"))
+                return build_interaction_result(
+                    action, element_ref, selector, action_effect, effect, observation, wait_result,
+                )
+        except Exception as exc:
+            return {"status": "extension_interaction_failed", "error": str(exc), "required_action": "call_inspect_page_again"}
+
     async def _inspect_page(
         self,
-        url: str,
+        url: str | None = None,
         wait_selector: str | None = None,
         scope_selector: str | None = None,
+        frame_selector: str | None = None,
+        tab_index: int | None = None,
+        browser_executor: str | None = None,
     ) -> dict[str, Any]:
-        """浏览器通道拿不到真实页面时降级为静态抓取；两条通道都失败才终止。"""
-        outcome = await self._inspect_page_via_browser(url, wait_selector, scope_selector)
+        """浏览器通道拿不到真实页面时降级为静态抓取；两条通道都失败才终止。
+
+        不传 url 时观察探索会话当前所在的页面，不重新导航——点开的下拉/日历/弹窗只存在于
+        那一刻的页面上，重新 goto 会把它们全部关掉。
+        """
+        if browser_executor not in (None, "playwright", "extension"):
+            return {"error": "browser_executor 必须为 playwright 或 extension"}
+        if browser_executor == "extension" or (browser_executor is None and _extension_page.get_channel() is not None):
+            return await self._inspect_page_via_extension(url, wait_selector, scope_selector, frame_selector, tab_index)
+        if browser_executor == "playwright":
+            await _extension_page.close_current("switch_to_playwright")
+        outcome = await self._inspect_page_via_browser(
+            url, wait_selector, scope_selector, frame_selector, tab_index
+        )
         blocked = outcome.get("_browser_blocked")
         if not isinstance(blocked, dict):
             return outcome
+        if url is None:
+            # 观察当前页面时没有可降级的目标：静态抓取要求一个 URL，拿会话里的当前 URL 去抓
+            # 只会丢掉登录态与交互状态，抓回一份和模型正在看的页面无关的 HTML。
+            return {key: value for key, value in blocked.items() if key != "kind"} | {
+                "status": blocked.get("status") or "blocked",
+                "required_action": "reopen_with_url",
+            }
 
         # 静态降级刻意放在浏览器 profile 锁和 browser context 之外：这是一次纯 HTTP 请求，
         # 既不需要浏览器进程，也不该占着跨进程的 profile 锁——最长占 20s，
@@ -2179,7 +2391,7 @@ class RpaToolExecutor:
             ),
             "required_action": "report_to_user_and_stop",
             "user_message": (
-                "已依次尝试 Stealth Browser 和 Scrapling 静态抓取。当前工具不能读取 Chrome 扩展当前标签页。"
+                "已依次尝试 Stealth Browser 和 Scrapling 静态抓取。可以使用 inspect_page(browser_executor='extension') 读取 Chrome 当前标签页。"
                 "请通过页面选择器或同一 Playwright Profile 的有头会话完成登录/验证后回复“已完成”，"
                 "或提供一个当前环境可访问的 URL。"
             ),
@@ -2187,55 +2399,85 @@ class RpaToolExecutor:
 
     async def _inspect_page_via_browser(
         self,
-        url: str,
+        url: str | None = None,
         wait_selector: str | None = None,
         scope_selector: str | None = None,
+        frame_selector: str | None = None,
+        tab_index: int | None = None,
     ) -> dict[str, Any]:
-        """Navigate to a URL with the persistent browser profile and return structured DOM info.
+        """在探索会话里观察页面：有 url 就先导航，没有就直接看当前页面。
 
         判定浏览器通道拿不到真实页面时返回 {"_browser_blocked": {...}}，由调用方在锁外决定降级；
         就地抓静态页会把一次纯 HTTP 请求压在 profile 锁和 browser context 里。
         """
-        busy = _profile_busy_block("inspect_page")
+        busy = _profile_busy_block("inspect_page", allow_page_session=True)
         if busy is not None:
             return busy
 
         if find_spec("playwright") is None:
             return {"error": "未安装 Playwright，请执行 uv pip install playwright"}
 
+        if url is None and _page_session.get_session() is None:
+            foreign = _foreign_session_block("inspect_page")
+            if foreign is not None:
+                return foreign
+            return {
+                "error": "当前没有正在探索的页面，第一次调用必须带 url。",
+                "required_action": "call_inspect_page_with_url",
+            }
+
         browser_profile = str(storage.resolve_browser_profile_dir())
-        # 自己也要登记：检查页面期间用户点了运行，那次运行才能拿到「被 inspect_page 占用」而不是天书
-        owner = "AI 助手 · inspect_page"
+        # 自己也要登记：检查页面期间用户点了运行，那次运行才能拿到「被谁占用」而不是天书
+        owner = _page_session.SESSION_OWNER
         try:
-            browser_profile_lock.acquire(browser_profile, owner)
+            session = await _page_session.open_session(
+                profile=browser_profile,
+                owner=owner,
+                context_factory=persistent_browser_context,
+                headless=True,
+            )
+        except _page_session.SessionOwnershipError:
+            return _foreign_session_block("inspect_page") or {"error": "浏览器探索会话被占用"}
         except browser_profile_lock.BrowserProfileBusyError:
             return _profile_busy_block("inspect_page") or {"error": "浏览器被占用"}
+        except Exception as exc:
+            translated = browser_profile_lock.translate_launch_error(browser_profile, exc)
+            return {"error": translated or f"打开浏览器失败：{exc}"}
 
         try:
-            async with persistent_browser_context(browser_profile, headless=True) as ctx:
-                page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-                response = await page.goto(url, wait_until="load", timeout=30_000)
-                http_status = getattr(response, "status", None)
-                if isinstance(http_status, int) and http_status >= 400:
-                    return {
-                        "_browser_blocked": {
-                            "kind": "http_error",
-                            "status": "blocked",
-                            "http_status": http_status,
-                            "url": str(getattr(page, "url", "") or url),
+            async with _page_session.guard:
+                if tab_index is not None:
+                    await session.switch_tab(tab_index)
+                page = await session.page()
+                if url is not None:
+                    response = await page.goto(url, wait_until="load", timeout=30_000)
+                    await session.switch_frame(None)  # 新文档，旧的 iframe 选择与 ref 表都作废
+                    http_status = getattr(response, "status", None)
+                    if isinstance(http_status, int) and http_status >= 400:
+                        await _page_session.close_current("http_error")
+                        return {
+                            "_browser_blocked": {
+                                "kind": "http_error",
+                                "status": "blocked",
+                                "http_status": http_status,
+                                "url": str(getattr(page, "url", "") or url),
+                            }
                         }
-                    }
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=6_000)
-                except Exception:
-                    pass
-
-                if wait_selector:
                     try:
-                        await page.wait_for_selector(wait_selector, timeout=12_000)
+                        await page.wait_for_load_state("networkidle", timeout=6_000)
                     except Exception:
-                        pass  # best-effort; still extract what's there
-                else:
+                        pass
+
+                if frame_selector is not None:
+                    await session.switch_frame(None if frame_selector in ("", "main") else frame_selector)
+
+                wait_result = None
+                if wait_selector:
+                    target = await session.target()
+                    wait_result = await _observe_wait(
+                        target.wait_for_selector(wait_selector, timeout=12_000), wait_selector,
+                    )
+                elif url is not None:
                     await page.wait_for_timeout(3_000)
 
                 # 拦截页要在探测结果之前判掉：它的元素数量通常是 0，落到下面就会被当成
@@ -2243,102 +2485,26 @@ class RpaToolExecutor:
                 # 用户看到的「第一次助手被 cloudflare 拦截、什么也没生成」就是这么来的。
                 challenge = await detect_blocking_interstitial(page)
                 if challenge is not None:
+                    # 会话留着也没用（每次观察都会撞同一堵墙），关掉还能把 profile 让给
+                    # 用户自己的有头浏览器去过验证。
+                    await _page_session.close_current("challenge_page")
                     return {
                         "_browser_blocked": {
                             "kind": "challenge",
                             "status": "blocked_challenge_page",
                             "challenge_label": challenge.label,
                             "challenge": challenge.summary,
-                            "url": str(getattr(page, "url", "") or url),
+                            "url": str(getattr(page, "url", "") or url or ""),
                         }
                     }
 
-                result = await page.evaluate(PAGE_PROBE_JS, scope_selector)
+                result = await session.observe(PAGE_PROBE_JS, scope_selector)
                 result["scope_selector"] = scope_selector
-                result["requested_url"] = url
-                result["note"] = (
-                    "selector 字段为推荐选择器，可直接用于 browser.click / browser.fill 等节点。"
-                    ":has-text() 为 Playwright 伪选择器，合法可用。"
-                    "若 date_controls 字段存在，按 interaction_recipe.steps 构建节点（selector 直接用，"
-                    "日期文本/目标年月/节点数量按本次任务改写）；主路线走不通时才看 fallback_steps，"
-                    "notes 里是该框架与执行器的已知限制。"
-                )
-
-                # 必须在 total_elements 判空之前检测加载态类名，否则只有 logo 的页面
-                # （total_elements=1）会漏报 SPA 仍在渲染中
-                # page_classes 是给模型看的前 120 个；all_classes 是未截断的全量集合。
-                # 加载态指示类名一般挂在靠前的容器上，模糊匹配（loading/skeleton 子串）
-                # 在全量集合上误报率高，所以只有精确指示类名和组件识别用全量。
-                page_classes: list[str] = result.get("page_classes", [])
-                all_classes: list[str] = result.pop("all_classes", None) or page_classes
-                spa_loading = (
-                    "nprogress-busy" in all_classes
-                    or any(
-                        cls in all_classes
-                        for cls in ("v-loading", "el-loading-mask", "ant-spin-spinning", "arco-spin")
-                    )
-                    or any(
-                        "loading" in cls or "skeleton" in cls
-                        for cls in page_classes
-                        if cls not in ("el-loading-fade-enter", "el-loading-fade-leave")
-                    )
-                )
-                # 识别已知组件库控件并注入 interaction_recipe，模型无需猜 selector
-                try:
-                    from app.services.skills.registry import match_skills as _match_skills
-                    from app.services.skills.registry import build_skill_recipe as _build_skill_recipe
-                    _matched = _match_skills(all_classes)
-                    _controls = [
-                        {
-                            "type": f"{s.library}/{s.component}",
-                            "library": s.library,
-                            "component": s.component,
-                            "description": s.description,
-                            "interaction_recipe": _build_skill_recipe(s, result.get("inputs", [])),
-                        }
-                        for s in _matched
-                    ]
-                    # 页面用的是没写过配方的组件库（Arco/Vant/iView/自研）时，指纹匹配一无所获，
-                    # 模型就只能凭空猜交互方式。退回到与组件库无关的日期特征识别，
-                    # 至少保证任何框架下都拿得到真实 selector + 通用交互路线。
-                    if not any("date" in c["component"] for c in _controls):
-                        from app.services.skills.generic import build_generic_date_recipe
-                        _generic = build_generic_date_recipe(result.get("inputs", []))
-                        if _generic:
-                            _controls.append(_generic)
-                    if _controls:
-                        result["date_controls"] = _controls
-                except Exception:
-                    pass  # skill matching is best-effort; never break inspect_page
-
-                if spa_loading:
-                    result["spa_loading"] = True
-                    result["warning"] = (
-                        "⚠️ SPA 页面正在加载（检测到 nprogress-busy 或加载指示器类名）。"
-                        "页面内容尚未渲染，当前返回的元素列表不可靠。\n"
-                        "必须执行以下诊断（按顺序，不可跳过）：\n"
-                        "1. 检查流程拓扑：列出所有 browser.open 节点的 URL，确认是否有导航节点跳转到目标页面\n"
-                        "2. 若只有一个 browser.open（登录页），先添加第二个 browser.open（目标页，delayMs:3000）再重试\n"
-                        "3. 若导航节点存在，增加其 delayMs 到 3000-5000ms 等待 SPA 渲染\n"
-                        "4. 修复前置节点后，再重新调用 inspect_page 获取真实 DOM\n"
-                        "禁止在 spa_loading:true 时对 browser.wait/browser.extract 节点写 selector。"
-                    )
-                else:
-                    result["spa_loading"] = False
-
-                total_elements = (
-                    len(result.get("inputs", []))
-                    + len(result.get("buttons", []))
-                    + len(result.get("links", []))
-                    + len(result.get("tables", []))
-                )
-                if total_elements == 0 and not spa_loading:
-                    result["warning"] = (
-                        "⚠️ 页面元素为空——SPA 可能未渲染完毕。"
-                        "请重新调用 inspect_page，并指定 wait_selector 参数等待页面核心元素出现，"
-                        "例如 wait_selector='nav, table, [role=grid], [role=navigation], main'。"
-                        "如果多次重试仍为空，请检查 url 是否正确、是否需要重新登录。"
-                    )
+                if url is not None:
+                    result["requested_url"] = url
+                annotate_observation(result)
+                if wait_result is not None:
+                    result["wait_result"] = wait_result
 
                 # 子 frame 对主文档抽取不可见，需单独统计并告知 AI
                 try:
@@ -2372,27 +2538,253 @@ class RpaToolExecutor:
                     pass  # frame census is best-effort
 
                 # 放在最后：登录重定向比 spa_loading / 空元素更能解释异常，warning 以它为准
-                _annotate_login_redirect(result, url)
+                if url is not None:
+                    _annotate_login_redirect(result, url)
+                result["session"] = {
+                    "tab_count": session.tab_count(),
+                    "frame_selector": session.frame_selector,
+                    "idle_close_seconds": int(_page_session.IDLE_TTL_SECONDS),
+                    "hint": "可直接 interact_page 操作本次观察的 ref，再不带 url 调 inspect_page 看变化。",
+                }
                 return result
         except Exception as exc:
+            # 会话已经不可用（页面关了、上下文崩了）就别留着占 profile 锁，
+            # 否则用户点运行只会看到「被 AI 助手占用」，而助手手上是个死会话。
+            await _page_session.close_current("inspect_failed")
             translated = browser_profile_lock.translate_launch_error(browser_profile, exc)
             return {"error": translated or f"页面检查失败：{exc}"}
         finally:
-            browser_profile_lock.release(browser_profile, owner)
+            current = _page_session.get_session()
+            if current is not None:
+                current.touch()
+
+    async def _resolve_interaction_target(
+        self,
+        session: Any,
+        element_ref: str | None,
+        selector: str | None,
+        observation_version: int | None,
+    ) -> tuple[Any, dict[str, Any] | None]:
+        """返回 (元素句柄, 错误)。定位不唯一时交出错误而不是取第一个。"""
+        target = await session.target()
+        if element_ref:
+            try:
+                return await session.element_for_ref(element_ref, observation_version), None
+            except _page_session.StaleRefError as exc:
+                return None, stale_ref_error(str(exc))
+        if not selector:
+            return None, {"error": "必须提供 element_ref 或 selector"}
+        found = await target.query_selector_all(selector)
+        if not found:
+            return None, element_not_found_error(selector)
+        if len(found) > 1:
+            return None, ambiguous_selector_error(selector, len(found))
+        return found[0], None
+
+    async def _interact_page(
+        self,
+        action: str,
+        element_ref: str | None = None,
+        selector: str | None = None,
+        value: str | None = None,
+        observation_version: int | None = None,
+        scope_selector: str | None = None,
+        wait_selector: str | None = None,
+        wait_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """在探索会话的当前页面上操作一次，并把操作前后的变化和新的观察一起返回。
+
+        一次调用同时给出「做了什么」和「页面因此变成什么样」：分成两个工具时，模型经常
+        操作完就去写节点，从没确认过下拉面板到底打开了没有。
+        """
+        if _extension_page.get_channel() is not None or _extension_page.foreign_channel() is not None:
+            return await self._interact_page_via_extension(action, element_ref, selector, value,
+                                                         observation_version, scope_selector, wait_selector, wait_ms)
+        session = _page_session.get_session()
+        if session is None:
+            foreign = _foreign_session_block("interact_page")
+            if foreign is not None:
+                return foreign
+            return {
+                "error": "当前没有正在探索的页面，先调用 inspect_page(url=...) 打开。",
+                "required_action": "call_inspect_page_with_url",
+            }
+        supported = ("click", "fill", "select_option", "press", "hover", "scroll")
+        if action not in supported:
+            return {"error": f"不支持的 action：{action}，可用：{', '.join(supported)}"}
+
+        try:
+            async with _page_session.guard:
+                page = await session.page()
+                target = await session.target()
+                before = await self._page_effect_signature(target)
+                element: Any = None
+                if action != "scroll" or element_ref or selector:
+                    element, err = await self._resolve_interaction_target(
+                        session, element_ref, selector, observation_version
+                    )
+                    if err is not None:
+                        return err
+
+                # 目标状态要在动作之前读：动作之后再读就分不出「本来就是这个值」和「这次填进去的」，
+                # 幂等动作会被报成成功，而已经聚焦的输入框填失败会被报成「页面没变化」。
+                state_before = await self._target_state(element if element is not None else page)
+
+                acted = await self._apply_page_action(page, element, action, value)
+                if isinstance(acted, dict):
+                    return acted
+                wait_result = None
+                if wait_selector:
+                    target = await session.target()
+                    wait_result = await _observe_wait(
+                        target.wait_for_selector(wait_selector, timeout=10_000), wait_selector,
+                    )
+                else:
+                    await page.wait_for_timeout(min(max(int(wait_ms if wait_ms is not None else 600), 0), 5_000))
+
+                state_after = await self._target_state(element if element is not None else page)
+
+                after = await self._page_effect_signature(await session.target())
+                observation = await session.observe(PAGE_PROBE_JS, scope_selector)
+                annotate_observation(observation)
+
+                effect = _describe_effect(before, after)
+                action_effect = _describe_action_effect(
+                    action, value, state_before, state_after,
+                    page_diff=effect.get("diff"),
+                )
+                return build_interaction_result(
+                    action, element_ref, selector, action_effect, effect, observation, wait_result,
+                )
+        except _page_session.SessionExpiredError as exc:
+            return {"error": str(exc), "required_action": "call_inspect_page_with_url"}
+        except Exception as exc:
+            return {"error": f"页面操作失败：{exc}"}
+        finally:
+            current = _page_session.get_session()
+            if current is not None:
+                current.touch()
+
+    async def _page_effect_signature(self, target: Any) -> dict[str, Any]:
+        try:
+            value = await target.evaluate(EFFECT_SIGNATURE_JS)
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
+
+    async def _target_state(self, handle: Any) -> dict[str, Any]:
+        """回读动作目标自己的状态。传 page 时读文档滚动容器（整页滚动没有元素可读）。"""
+        try:
+            value = await handle.evaluate(TARGET_STATE_JS)
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
+
+    async def _apply_page_action(
+        self,
+        page: Any,
+        element: Any,
+        action: str,
+        value: str | None,
+    ) -> dict[str, Any] | None:
+        """执行一次操作。失败返回错误字典，成功返回 None。"""
+        needs_value = {"fill", "select_option", "press"}
+        if action in needs_value and (value is None or value == ""):
+            return {"error": f"{action} 需要 value 参数"}
+        try:
+            if action == "click":
+                await element.click(timeout=8_000)
+            elif action == "hover":
+                await element.hover(timeout=8_000)
+            elif action == "fill":
+                # 先清空再逐字输入：组件的旧值不清会拼成 "2026-01-012026-02-01"，
+                # 而 fill() 一次性赋值只触发 input 事件，靠 keydown 更新内部状态的组件收不到。
+                await element.fill("")
+                await element.type(str(value), delay=20)
+            elif action == "select_option":
+                await element.select_option(str(value))
+            elif action == "press":
+                if element is not None:
+                    await element.press(str(value))
+                else:
+                    await page.keyboard.press(str(value))
+            elif action == "scroll":
+                if element is not None:
+                    # 虚拟列表的滚动容器本来就在视口里，scroll_into_view 是空操作：模型只会拿到
+                    # 「页面没有可观测变化」，而滚动加载正是它唯一能触发新记录的动作。
+                    # 元素自己能滚就滚它的内容，滚不动才退回把元素带进视口（滚到某一行用得上）。
+                    try:
+                        delta = int(str(value)) if value else 0
+                    except ValueError:
+                        delta = 0  # value 是给「滚多少像素」的可选提示，写歪了就滚到底
+                    scrolled = await element.evaluate(
+                        "(el, d) => { const room = el.scrollHeight - el.clientHeight;"
+                        " if (room <= 4) return false;"
+                        " el.scrollTop = d > 0 ? Math.min(el.scrollTop + d, room) : room;"
+                        " return true; }",
+                        delta,
+                    )
+                    if not scrolled:
+                        await element.scroll_into_view_if_needed(timeout=8_000)
+                else:
+                    await page.mouse.wheel(0, int(value or 800))
+        except Exception as exc:
+            return {
+                "status": "action_failed",
+                "action": action,
+                "error": f"{action} 执行失败：{exc}",
+                "required_action": "call_inspect_page_again",
+            }
+        return None
 
     async def _inspect_screenshot(
         self,
-        url: str,
+        url: str | None = None,
         wait_selector: str | None = None,
         full_page: bool = False,
+        browser_executor: str | None = None,
     ) -> dict[str, Any]:
-        """Navigate with the persistent profile and return a JPEG screenshot.
+        """Screenshot the exploration session's current page, navigating only if `url` is given.
 
         The orchestrator strips `image_base64` from the tool message and
         re-injects it as a vision content block, so the model actually *sees*
         the page instead of reading base64 noise.
+
+        截图必须落在 inspect_page 用的同一个页面会话上：另开一个上下文重新 goto，
+        点开的下拉、日历、弹窗全部消失，模型看到的图和它刚读到的 DOM 不是同一刻的页面。
         """
-        busy = _profile_busy_block("inspect_screenshot")
+        if browser_executor not in (None, "playwright", "extension"):
+            return {"error": "browser_executor 必须为 playwright 或 extension"}
+        if browser_executor == "extension" or (browser_executor is None and _extension_page.get_channel() is not None):
+            if full_page or url is not None:
+                return {"status": "unsupported_capability", "error": "扩展截图仅支持当前绑定标签页的可见视口，请省略 url 和 full_page"}
+            blocked = self._extension_access_error()
+            if blocked is not None:
+                return blocked
+            try:
+                async with _page_session.guard:
+                    await _page_session.close_current("switch_to_extension")
+                    channel = await _extension_page.open_channel(self._task_manager.extension_exploration_executor())
+                    wait_result = None
+                    if wait_selector:
+                        wait_result = await _observe_wait(channel.wait_for(wait_selector), wait_selector)
+                    if channel.document_id is None:
+                        await channel.observe(None)
+                    shot = await channel.screenshot()
+                    prefix, _, encoded = shot["dataUrl"].partition(",")
+                    if not encoded or prefix not in ("data:image/png;base64", "data:image/jpeg;base64"):
+                        raise RuntimeError("扩展截图格式无效")
+                    return {"url": channel.last_url, "image_base64": encoded,
+                            "image_media_type": prefix[5:].split(";")[0],
+                            **({"wait_result": wait_result} if wait_result is not None else {}),
+                            "inspection_source": "extension", "tab_id": channel.tab_id,
+                            "document_id": channel.document_id, "observation_version": channel.version,
+                            "note": "截图与 DOM 为同一标签页的独立取证，页面可能在两次取证之间变化。"}
+            except Exception as exc:
+                return {"status": "extension_screenshot_failed", "error": str(exc)}
+        if browser_executor == "playwright":
+            await _extension_page.close_current("switch_to_playwright")
+        busy = _profile_busy_block("inspect_screenshot", allow_page_session=True)
         if busy is not None:
             return busy
 
@@ -2401,35 +2793,58 @@ class RpaToolExecutor:
 
         import base64
 
+        session = _page_session.get_session()
+        if session is None and url is None:
+            foreign = _foreign_session_block("inspect_screenshot")
+            if foreign is not None:
+                return foreign
+            return {
+                "error": "还没有打开的页面会话，截图需要先给出 url",
+                "required_action": "call_inspect_page_with_url",
+            }
+
         browser_profile = str(storage.resolve_browser_profile_dir())
-        owner = "AI 助手 · inspect_screenshot"
         try:
-            browser_profile_lock.acquire(browser_profile, owner)
+            session = await _page_session.open_session(
+                profile=browser_profile,
+                owner=_page_session.SESSION_OWNER,
+                context_factory=persistent_browser_context,
+                headless=True,
+            )
+        except _page_session.SessionOwnershipError:
+            return _foreign_session_block("inspect_screenshot") or {"error": "浏览器探索会话被占用"}
         except browser_profile_lock.BrowserProfileBusyError:
             return _profile_busy_block("inspect_screenshot") or {"error": "浏览器被占用"}
+        except Exception as exc:
+            translated = browser_profile_lock.translate_launch_error(browser_profile, exc)
+            return {"error": translated or f"页面截图失败：{exc}"}
 
         try:
-            async with persistent_browser_context(browser_profile, headless=True) as ctx:
-                page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            async with _page_session.guard:
+                page = await session.page()
                 # 视口设在页面上而不是上下文上：隐身会话不接受上下文级 viewport，
                 # 传进去会被静默忽略，截出来的是默认尺寸
                 await page.set_viewport_size({"width": 1280, "height": 800})
-                await page.goto(url, wait_until="load", timeout=30_000)
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=6_000)
-                except Exception:
-                    pass
-                if wait_selector:
+                if url is not None:
+                    await page.goto(url, wait_until="load", timeout=30_000)
+                    await session.switch_frame(None)
                     try:
-                        await page.wait_for_selector(wait_selector, timeout=12_000)
+                        await page.wait_for_load_state("networkidle", timeout=6_000)
                     except Exception:
                         pass
-                else:
+                wait_result = None
+                if wait_selector:
+                    target = await session.target()
+                    wait_result = await _observe_wait(
+                        target.wait_for_selector(wait_selector, timeout=12_000), wait_selector,
+                    )
+                elif url is not None:
                     await page.wait_for_timeout(2_000)
 
                 raw = await page.screenshot(
                     type="jpeg", quality=60, full_page=bool(full_page)
                 )
+                observation_version = await session.probe_version()
 
                 saved_path: str | None = None
                 try:
@@ -2446,16 +2861,22 @@ class RpaToolExecutor:
                 except Exception:
                     pass
 
-                return {
+                result: dict[str, Any] = {
                     "url": page.url,
                     "title": await page.title(),
                     "image_base64": base64.b64encode(raw).decode("ascii"),
                     "image_media_type": "image/jpeg",
                     "image_saved_to": saved_path,
+                    **({"wait_result": wait_result} if wait_result is not None else {}),
                     "note": "截图已作为图片提供给模型查看。",
                 }
+                if observation_version is not None:
+                    result["observation_version"] = observation_version
+                return result
         except Exception as exc:
+            await _page_session.close_current("screenshot_failed")
             translated = browser_profile_lock.translate_launch_error(browser_profile, exc)
             return {"error": translated or f"页面截图失败：{exc}"}
         finally:
-            browser_profile_lock.release(browser_profile, owner)
+            if not session.closed:
+                session.touch()

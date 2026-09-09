@@ -50,6 +50,10 @@ EVIDENCE_TOOLS = frozenset({
     "inspect_page", "inspect_screenshot", "get_run_error", "get_run_logs", "get_run_output",
 })
 
+# 探索页面的最小工具组。interact_page 不算纯取证：它会改变页面状态，所以不进
+# EVIDENCE_TOOLS——「点开面板再看一次」是两个不同的观察，重复取证判据不该拦第二次。
+PAGE_EXPLORE_TOOLS = frozenset({"inspect_page", "interact_page"})
+
 # 受阶段约束的工具。publish_flow / create_schedule / toggle_schedule / stop_run 不在内：
 # 它们不是「构建—验证」这条主线上的动作，用户随时可能单独要求，挡掉只会答不上话。
 # stop_run 尤其不能挡——它是运行失控时唯一的出路。
@@ -190,8 +194,10 @@ def admitted_tool_names(all_names: frozenset[str], state: GuardState) -> frozens
     phase = resolve_phase(state)
     if phase is Phase.DISCOVER and not state.flow_has_nodes:
         # 流程还不存在时，除了「去看页面」没有任何别的动作能推进——
-        # 连 get_run_error 都没有 run 可读。窄到一个工具是为了省 schema token。
-        return all_names & frozenset({"inspect_page"})
+        # 连 get_run_error 都没有 run 可读。窄到这两个工具是为了省 schema token；
+        # interact_page 必须在内：下拉、日历、级联的选项只在点开之后才存在，
+        # 少了它模型在最需要看清页面的这一刻只能照着加载态的 DOM 猜 selector。
+        return all_names & PAGE_EXPLORE_TOOLS
     return (all_names - PHASE_GATED_TOOLS) | (all_names & _ADMISSION[phase])
 
 

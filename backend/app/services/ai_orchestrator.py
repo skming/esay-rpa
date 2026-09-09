@@ -55,6 +55,7 @@ from app.services.ai_flow_state import (
 from app.services.ai_tool_events import attach_tool_events, current_verification_status, reduce_evidence_state
 from app.services.ai_evidence_ledger import load_verification_state, record_events
 from app.services.ai_tools import TOOL_SCHEMAS, RpaToolExecutor
+from app.services.ai_tools import page_session as _page_session
 from app.services.ai_tools.diagnostics import SELECTOR_DIAGNOSTIC_KINDS
 from app.services.node_semantics import TRANSFORM_NODE_TYPES
 from app.services.ai_tools.lint import is_blocking_finding
@@ -134,6 +135,8 @@ _TERMINAL_TOOL_STATUSES = frozenset({
     "blocked_page_access",
     "blocked_challenge_page",
     "blocked_browser_profile_busy",
+    "blocked_page_session_busy",
+    "blocked_extension_busy",
 })
 
 
@@ -882,7 +885,7 @@ def _site_knowledge_message(
 ) -> dict[str, Any] | None:
     """用户消息或当前流程含已知域名时，注入该站点沉淀的 selector/框架/登录特征与已证伪的写法。"""
     try:
-        from app.services.site_knowledge import get_site_knowledge_store
+        from app.services.site_knowledge import extract_urls, get_site_knowledge_store
         store = get_site_knowledge_store()
         text = "\n".join(str(m.get("content") or "") for m in messages if m.get("role") == "user")
         if flow_state.nodes:
@@ -892,7 +895,9 @@ def _site_knowledge_message(
         profiles = store.match_text(text)
         if not profiles:
             return None
-        return {"role": "system", "content": store.build_context_message(profiles)}
+        # 把本轮出现的 URL 一并传下去：经验按页面存，不告诉它当前在哪个页面，
+        # 就只能整域摊开，同域另一个页面的 selector 会被当成当前页面已验证的答案。
+        return {"role": "system", "content": store.build_context_message(profiles, extract_urls(text))}
     except Exception:
         return None  # 经验注入失败不影响正常对话
 
@@ -1242,7 +1247,37 @@ class AiOrchestrator:
 
         read_only=True 用于自愈诊断等无人值守场景：允许全部诊断类工具，
         阻断 create_flow / update_flow / apply_node_fix / run_flow / publish_flow。
+
+        探索用的浏览器会话在本轮结束时一定要关掉：它按 owner 登记着 browser profile
+        的进程内互斥锁，留着会让用户在界面上手动点运行时被判成「浏览器被占用」。
+        finally 也覆盖 GeneratorExit——前端断开连接是最常走到的那条退出路径。
+
+        会话归属挂在本轮的 token 上：同一个 orchestrator 实例同时服务聊天流与自愈流，
+        不带归属就会关掉另一轮正在用的浏览器。close 显式传 token 而不是读 contextvar，
+        因为 aclose() 由调用方的上下文触发，那里的 contextvar 未必还是本轮的值。
         """
+        token = _page_session.new_owner_token()
+        reset = _page_session.set_owner(token)
+        try:
+            async for event in self._stream_inner(messages, model, flow_id, read_only):
+                yield event
+        finally:
+            from app.services.ai_tools import extension_page_channel
+            try:
+                await _page_session.close_current("turn_end", token=token)
+            finally:
+                try:
+                    await extension_page_channel.close_current("turn_end", token=token)
+                finally:
+                    _page_session.reset_owner(reset)
+
+    async def _stream_inner(
+        self,
+        messages: list[dict[str, Any]],
+        model: str,
+        flow_id: str | None,
+        read_only: bool,
+    ) -> AsyncIterator[dict[str, Any]]:
         try:
             import litellm
         except ImportError:
@@ -1855,6 +1890,7 @@ _RUN_WAITING_STATUSES = frozenset({"paused_for_human", "waiting_for_user_input",
 _RUN_NOT_STARTED_STATUSES = frozenset({
     "blocked_by_failure_budget",
     "blocked_browser_profile_busy",
+    "blocked_extension_busy",
     "extension_not_connected",
     "extension_disabled",
     "empty_credential_variables",
@@ -2334,6 +2370,22 @@ def _after_inspect_screenshot(result: dict[str, Any], state: GuardState) -> None
         _note_page_evidence("inspect_screenshot", result, state)
 
 
+def _after_interact_page(result: dict[str, Any], state: GuardState) -> None:
+    if result.get("error") or result.get("status") != "ok":
+        return
+    # ok 只证明工具执行完成；重复点击或幂等操作不能清除已取证记录。
+    if (result.get("action_effect") or {}).get("status") in {"target_reached", "state_changed"}:
+        note_progress(state)
+    observation = result.get("observation")
+    if isinstance(observation, dict) and not observation.get("error"):
+        # 刻意不记取证指纹：指纹按工具名+参数比对，把 interact_page 的参数记成
+        # inspect_page 的取证记录，会让后面一次真正的 inspect_page 被误判成重复。
+        if not observation.get("redirected_to_login"):
+            state.fresh_page_evidence = True
+        state.page_evidence_source = observation.get("inspection_source") or "browser_dom"
+        state.page_evidence_done = True
+
+
 def _note_acceptance_audit(audit: dict[str, Any], state: GuardState) -> None:
     if audit.get("passed"):
         state.audit_passed = True
@@ -2620,6 +2672,7 @@ _AFTER_TOOL_HANDLERS: dict[str, Callable[[dict[str, Any], GuardState], None]] = 
     "get_run_output": _after_get_run_output,
     "inspect_page": _after_inspect_page,
     "inspect_screenshot": _after_inspect_screenshot,
+    "interact_page": _after_interact_page,
     "run_flow": _after_run_flow,
     "set_acceptance_contract": _after_set_acceptance_contract,
     "update_flow": _after_update_flow,

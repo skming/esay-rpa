@@ -24,6 +24,7 @@ from app.services.ai_orchestrator import (
 )
 from app.services.ai_tools.executor import (
     _annotate_login_redirect,
+    _profile_busy_block,
     _splice_branch_placeholder_noops,
 )
 from app.services.ai_tools import RpaToolExecutor
@@ -361,6 +362,69 @@ def test_lint_flow_reports_long_wait_and_login_detection_risk() -> None:
     assert any(finding["issue"] == "login_detection_timeout_may_skip_login" for finding in findings)
 
 
+def test_lint_flow_rejects_temporary_element_refs_written_into_the_flow() -> None:
+    """interact_page 的 ref 只在那一次观察里有效，存进流程等于每次运行都找不到元素。
+
+    而它长得像 selector，运行时报的是普通的元素超时，排查会一路往「selector 写错了」走，
+    没人会想到这串字符本来就不是选择器。
+    """
+    nodes = [
+        {"id": "start", "type": "start", "position": {"x": 560, "y": 20}},
+        {
+            "id": "n_click",
+            "type": "browser.click",
+            "title": "点开日期面板",
+            "selector": "e12",
+            "position": {"x": 560, "y": 140},
+        },
+        {
+            "id": "n_fill",
+            "type": "browser.fill",
+            "title": "填开始日期",
+            "selector": "#start-date",
+            "fallbackSelectors": "input[placeholder='开始日期']\ne7",
+            "inputValue": "2026-06-01",
+            "position": {"x": 560, "y": 260},
+        },
+        {"id": "end", "type": "end", "position": {"x": 560, "y": 380}},
+    ]
+    edges = [
+        {"source": "start", "target": "n_click"},
+        {"source": "n_click", "target": "n_fill"},
+        {"source": "n_fill", "target": "end"},
+    ]
+
+    findings = _lint_flow(nodes, edges)
+    refs = [f for f in findings if f["issue"] == "temp_element_ref_in_flow"]
+
+    assert {f["node_id"] for f in refs} == {"n_click", "n_fill"}
+    assert all(f["severity"] == "error" for f in refs)
+    # 同一节点里合法的那条 fallback 不该被牵连报出来
+    assert all("placeholder" not in f["message"] for f in refs)
+
+
+def test_lint_flow_keeps_quiet_on_selectors_that_merely_look_like_refs() -> None:
+    """真实 selector 里也会出现 e 开头的类名/元素名，判据必须是整串就是 ref。"""
+    nodes = [
+        {"id": "start", "type": "start", "position": {"x": 560, "y": 20}},
+        {
+            "id": "n_click",
+            "type": "browser.click",
+            "title": "查询",
+            "selector": ".el-button--primary",
+            "fallbackSelectors": "#e2e-search\nform e12 button",
+            "position": {"x": 560, "y": 140},
+        },
+        {"id": "end", "type": "end", "position": {"x": 560, "y": 260}},
+    ]
+    edges = [
+        {"source": "start", "target": "n_click"},
+        {"source": "n_click", "target": "end"},
+    ]
+
+    assert not any(f["issue"] == "temp_element_ref_in_flow" for f in _lint_flow(nodes, edges))
+
+
 def test_lint_flow_reports_foreach_ambiguous_edges_and_missing_excel_row_data() -> None:
     nodes = [
         {"id": "start", "type": "start", "position": {"x": 560, "y": 20}},
@@ -486,12 +550,20 @@ class FakeFlowService:
 
 
 class FakeTaskManager:
-    def __init__(self, *, with_failing_tasks: bool = True, extension_connected: bool = False, extension_enabled: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        with_failing_tasks: bool = True,
+        extension_connected: bool = False,
+        extension_enabled: bool = True,
+        extension_holder: str | None = None,
+    ) -> None:
         now = datetime.now(UTC)
         self.started = False
         self.started_request = None
         self.extension_connected = extension_connected
         self.extension_enabled = extension_enabled
+        self.extension_holder = extension_holder
         self.tasks = (
             [
                 TaskSnapshot(
@@ -554,6 +626,9 @@ class FakeTaskManager:
 
     def is_extension_enabled(self) -> bool:
         return self.extension_enabled
+
+    def extension_run_holder(self) -> str | None:
+        return self.extension_holder
 
 
 async def test_run_flow_blocks_after_repeated_similar_failures() -> None:
@@ -843,6 +918,67 @@ async def test_run_flow_blocks_when_another_run_holds_the_browser_profile() -> N
         assert extension_result.get("status") != "blocked_browser_profile_busy"
     finally:
         browser_profile_lock.release(profile, "抓取 NodeSeek 帖子内容 · 运行 t_1")
+
+
+async def test_inspect_page_is_not_blocked_by_its_own_exploration_session() -> None:
+    """探索会话自己也在占用登记表里，「占用方是不是别人」必须区分出自己。
+
+    不区分的后果：第一次 inspect_page(url=...) 打开会话之后，任何不带 url 的再次观察和
+    同会话截图都被自己的登记挡成 blocked_browser_profile_busy——而通用日期配方的 fallback
+    正是让模型点开弹层后再看一次当前页面，提示词描述的那条路整条走不通。
+    """
+    from app.core import storage
+    from app.services import browser_profile_lock
+    from app.services.ai_tools import page_session
+
+    profile = str(storage.resolve_browser_profile_dir())
+
+    @asynccontextmanager
+    async def _fake_context(_profile: str, *, headless: bool = True) -> Any:
+        yield SimpleNamespace(pages=[])
+
+    await page_session.open_session(
+        profile=profile, owner=page_session.SESSION_OWNER, context_factory=_fake_context
+    )
+    try:
+        assert _profile_busy_block("inspect_page", allow_page_session=True) is None
+        # run_flow 不能跟着放行：它在检查之前先关掉探索会话，此时还占着 profile 的只可能是别人
+        blocked = _profile_busy_block("run_flow")
+        assert blocked is not None and blocked["status"] == "blocked_browser_profile_busy"
+    finally:
+        await page_session.close_current("test_cleanup")
+
+    # 登记名是所有探索会话共用的，所以放行不能只看登记名：会话已被空闲超时收走、或属于另一轮
+    # 对话时，占用登记仍写着同一个名字。认成自己就会照常起跑去抢同一个 profile。
+    browser_profile_lock.acquire(profile, page_session.SESSION_OWNER)
+    try:
+        stale = _profile_busy_block("inspect_page", allow_page_session=True)
+        assert stale is not None and stale["status"] == "blocked_browser_profile_busy"
+    finally:
+        browser_profile_lock.release(profile, page_session.SESSION_OWNER)
+
+
+async def test_run_flow_blocks_when_another_run_holds_the_extension() -> None:
+    """两次运行交错操作用户那一个浏览器窗口，症状只是「选择器找不到元素」，模型会照着这个假象
+    一路改流程。必须在起跑前拦住并点名占用方。"""
+    task_manager = FakeTaskManager(
+        with_failing_tasks=False,
+        extension_connected=True,
+        extension_holder="抓取订单 · 运行 t_1",
+    )
+    executor = RpaToolExecutor(flow_service=FakeFlowService(), task_manager=task_manager)  # type: ignore[arg-type]
+
+    result = await executor._run_flow("flow-1", browser_executor="extension")
+
+    assert result["status"] == "blocked_extension_busy"
+    assert result["holder"] == "抓取订单 · 运行 t_1"
+    assert "抓取订单 · 运行 t_1" in result["user_message"]
+    assert "不要改流程" in result["message"]
+    assert not task_manager.started
+
+    # Playwright 执行器用的是应用自己的 profile，扩展被占不该拦它
+    playwright_result = await executor._run_flow("flow-1")
+    assert playwright_result.get("status") != "blocked_extension_busy"
 
 
 async def test_inspect_page_stops_immediately_on_http_403(monkeypatch) -> None:
@@ -2740,15 +2876,18 @@ def test_generic_date_recipe_covers_unknown_component_libraries() -> None:
     只按 class 指纹匹配时，Arco/Vant/iView/自研组件一律返回不了配方，
     模型只能凭空猜 selector 和交互方式。识别改用与框架无关的日期特征。
     """
-    from app.services.skills.generic import build_generic_date_recipe
+    from app.services.skills.generic import build_generic_date_controls
 
-    control = build_generic_date_recipe([
-        {"placeholder": "开始日期", "label": "签约时间", "selector": ".arco-picker input:nth-child(1)"},
-        {"placeholder": "结束日期", "label": "签约时间", "selector": ".arco-picker input:nth-child(2)"},
+    picker = [{"uid": 1, "ident": ".arco-picker", "selector": ".arco-picker"}]
+    controls = build_generic_date_controls([
+        {"placeholder": "开始日期", "label": "签约时间", "selector": ".arco-picker input:nth-child(1)",
+         "containers": picker},
+        {"placeholder": "结束日期", "label": "签约时间", "selector": ".arco-picker input:nth-child(2)",
+         "containers": picker},
         {"placeholder": "关键词", "selector": "input[name='kw']"},
     ])
-    assert control is not None
-    recipe = control["interaction_recipe"]
+    assert len(controls) == 1
+    recipe = controls[0]["interaction_recipe"]
     assert recipe["trigger"] == ".arco-picker input:nth-child(1)"
     assert recipe["end_input"] == ".arco-picker input:nth-child(2)"
     # Enter 必须打在输入框上；打在 body 上不会冒泡到组件的按键处理
@@ -2759,7 +2898,7 @@ def test_generic_date_recipe_covers_unknown_component_libraries() -> None:
     # 回读硬门控不能因为是通用配方就省掉
     assert any("raise SystemExit" in step for step in recipe["steps"])
 
-    assert build_generic_date_recipe([{"placeholder": "用户名", "selector": "#u"}]) is None
+    assert build_generic_date_controls([{"placeholder": "用户名", "selector": "#u"}]) == []
 
 
 def test_client_side_filter_is_blocked_as_masking_for_any_field() -> None:

@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from app.services.ai_tools.graph import _collect_ancestor_node_ids, _collect_downstream_nodes, _unreachable_node_ids
@@ -90,6 +91,24 @@ def annotate_lint_findings(findings: list[dict[str, Any]]) -> tuple[list[dict[st
     else:
         text += "没有会阻断运行的项。"
     return marked, text
+
+
+# interact_page 返回的临时元素引用形如 e12。它不是任何合法 CSS 选择器（HTML 没有 e 元素），
+# 所以整串就是 ref 时可以直接判定，不会误伤真实 selector。
+_TEMP_ELEMENT_REF = re.compile(r"e\d+")
+
+_LOCATOR_FIELDS = ("selector", "targetSelector", "fallbackSelectors", "waitSelector", "rowSelector")
+
+
+def _locator_fields(node: dict[str, Any]) -> list[tuple[str, list[str]]]:
+    """节点上所有会被当成元素定位用的字段，多行 fallbackSelectors 拆成逐条。"""
+    out: list[tuple[str, list[str]]] = []
+    for field in _LOCATOR_FIELDS:
+        value = node.get(field)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        out.append((field, [part.strip() for part in value.replace(",", "\n").splitlines() if part.strip()]))
+    return out
 
 
 def _lint_flow(
@@ -304,6 +323,25 @@ def _lint_flow(
                         "与其他 CSS 选择器保持统一语法，不要在一个 selector 字段内用逗号混合两种语法。"
                     ),
                 })
+
+        # 7c. interact_page 的临时元素引用被写进了流程
+        for field, raw in _locator_fields(node):
+            ref = next((v for v in raw if _TEMP_ELEMENT_REF.fullmatch(v)), None)
+            if ref is None:
+                continue
+            findings.append({
+                "severity": "error", "node_id": nid, "node_title": ntitle,
+                "issue": "temp_element_ref_in_flow",
+                "message": (
+                    f"节点 `{nid}` 的 {field} 写成了 `{ref}`，这是 inspect_page/interact_page 那一次观察"
+                    "内部的临时引用，只在当次观察的页面上成立。存进流程后每次运行都会找不到元素——"
+                    "而它长得像 selector，报错只会是普通的元素超时，排查会往 selector 写错的方向走。"
+                ),
+                "fix": (
+                    "换成观察结果里该元素的 selector 字段（稳定的 id/name/placeholder/aria 属性优先）；"
+                    "拿不到就用 interact_page 点开控件重新观察一次再取。"
+                ),
+            })
 
         findings.extend(_lint_variable_contract_for_node(node, nid=nid, ntitle=ntitle, ntype=ntype))
 

@@ -114,7 +114,7 @@ _SEC['step1_selectors'] = """**选择器可靠性规范（构建流程时必须�
 
 **页面检查工具 `inspect_page`**（创建流程前强制调用，见第零步）：
 
-它使用持久化浏览器 Profile 访问页面，返回：
+默认使用持久化 Playwright Profile。用户要求操作已登录的 Chrome 当前页或使用 extension 执行时，调用 `inspect_page(browser_executor="extension")` 并省略 url；后续交互和截图沿用该会话。两条通道的登录态不同，不能互作证据；按返回的 capabilities 判断 iframe、截图和选择器能力。返回：
 - `inputs`：所有输入框（type / name / placeholder / label / selector）
 - `buttons`：所有按钮及其文本
 - `links`：页面上所有有文字的链接（text / href / selector / cls）——AI 自行判断哪些是导航、哪些是操作入口
@@ -166,6 +166,14 @@ inspect_page(url="...", scope_selector=".search-form")  // 只看筛选区域
    - **第二层（真正的证据）**：抓完数据后用 `script.python` 断言每一行都符合筛选条件（日期在范围内、枚举在允许集合里、关键词命中），不符合就 `raise SystemExit`。
    - **⚠️ 断言不是过滤**：**禁止把不合条件的行删掉或覆盖结果变量**，否则会掩盖筛选失效（输出全合规、审计通过，数据却来自未筛选结果的前几页）。
 4. **选择器精度**：用 `inspect_page` 返回的精确 selector，不要用 `.xxx:first-of-type input` 这类模糊定位。
+
+**页面探索循环**（下拉面板、日历、级联的选项在页面加载时并不存在，只调 `inspect_page` 永远看不到）：
+- `inspect_page(url=…)` 打开页面并观察；之后 `interact_page(action=…, element_ref=…)` 做一步操作，它会自动重新观察并返回 `effect`。不带 url 的 `inspect_page` 观察当前状态，不会重新加载页面（点开的面板还在）。
+- 交互结果分三层，不能互相替代：`effect.changed` 只说整页有没有可观测变化（false 不等于失败——已聚焦的 fill、原生 select 换选项、不新增 DOM 的滚动都不动它；true 也不等于业务成功）；`action_effect.status` 说这个动作自己的目标状态（`target_reached` 达到 / `already_in_target_state` 本来就是目标状态，**不要换目标重试** / `target_not_reached` 回读证明没达到 / `state_changed` / `focus_only` 只变了焦点 / `no_observable_change` 只是缺证据，先确认目标元素与前置条件，别加 delayMs / `unknown` 读不到状态）；`business_check` 一律未验证——筛选真的生效、表单真的提交，只能靠抓回的数据断言。
+- `date_controls[].actionable: false` 说明槽位没解析干净（`unresolved_slots` 写了原因）：用 `interact_page` 点开控件看清真实结构。**禁止把 `panel_selectors_unverified` 里的 selector 抄进流程**——那是组件库模板的猜测，不是这个页面的观察结果。
+- 元素带 `matches > 1` 表示同一个 selector 命中多个：用 `container`/更精确的属性收窄，或改用 `element_ref`。同名「查询」按钮点错一个，运行结果照样是绿的。
+- `scope_missing: true` 表示 `scope_selector` 在页面上不存在，此时**没有**退回整页观察：先确认作用域 selector 再重试。
+- **`ref` 只是本次观察内的临时引用，只能传给 `interact_page`；写进流程节点的必须是验证过的稳定 selector。**
 
 **登录态优先原则**：默认保留 Cookies/localStorage，不清理（只有用户要求重置登录态、或有证据表明过期 token 卡死时才清理）。
 

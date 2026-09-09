@@ -37,8 +37,17 @@ def _context_char_budget(model: str) -> int:
     return int(min(derived, _MAX_CONTEXT_CHARS))
 
 
+# 只保留工具已判定的嵌套事实，不把表单值或业务数据复制进历史摘要。
+_EVIDENCE_FIELDS = {
+    "action_effect": ("status",),
+    "wait_result": ("status", "selector"),
+    "observation": ("url", "observation_version", "inspection_source", "scope_selector", "spa_loading", "error"),
+    "acceptance_audit": ("passed", "status"),
+}
+
+
 def _summarize_tool_json(content: str) -> str:
-    """压缩大体积工具结果 JSON：保留标量，列表/字典折叠为数量。"""
+    """压缩大体积结果：保留状态证据，其他嵌套数据折叠为数量。"""
     try:
         data = json.loads(content)
     except (json.JSONDecodeError, TypeError):
@@ -53,7 +62,22 @@ def _summarize_tool_json(content: str) -> str:
         elif isinstance(value, list):
             summary[key] = f"<list[{len(value)}] 已压缩>"
         elif isinstance(value, dict):
-            summary[key] = f"<dict[{len(value)}键] 已压缩>"
+            evidence: dict[str, Any] = {}
+            for name in _EVIDENCE_FIELDS.get(key, ()):
+                if name not in value:
+                    continue
+                item = value[name]
+                if isinstance(item, (str, int, float, bool)) or item is None:
+                    evidence[name] = item[:300] + "…" if isinstance(item, str) and len(item) > 300 else item
+            if key == "acceptance_audit" and isinstance(value.get("issues"), list):
+                issues = value["issues"]
+                evidence["issue_count"] = len(issues)
+                evidence["issues"] = [
+                    {name: str(issue[name])[:120] for name in ("issue", "node_id", "deliverable_id", "field")
+                     if isinstance(issue.get(name), str)}
+                    for issue in issues[:5] if isinstance(issue, dict)
+                ]
+            summary[key] = evidence or f"<dict[{len(value)}键] 已压缩>"
     summary["_note"] = "此为历史工具结果摘要；如需完整数据请重新调用该工具。"
     return json.dumps(summary, ensure_ascii=False)
 

@@ -36,6 +36,9 @@ if TYPE_CHECKING:
 WRITE_TOOLS = frozenset({
     "create_flow", "update_flow", "apply_node_fix", "set_acceptance_contract", "run_flow", "publish_flow",
     "stop_run", "create_schedule", "toggle_schedule",
+    # interact_page 是真的在用户已登录的浏览器上点、填、回车，不是读页面：
+    # 无人值守自愈时它可能替用户提交一张表单，所以按写入类工具收掉。
+    "interact_page",
 })
 
 FLOW_WRITE_TOOLS = frozenset({"create_flow", "update_flow", "apply_node_fix", "set_acceptance_contract"})
@@ -500,7 +503,7 @@ GUARDS: tuple[Guard, ...] = (
     Guard(
         id="challenge_page_lock",
         summary="探测到人机验证拦截页后，禁止改流程或重跑，只能转为向用户说明",
-        scope=ToolScope(include=FLOW_WRITE_TOOLS | {"run_flow", "inspect_page", "inspect_screenshot"}),
+        scope=ToolScope(include=FLOW_WRITE_TOOLS | {"run_flow", "inspect_page", "inspect_screenshot", "interact_page"}),
         requires_state=("challenge_page_lock",),
         check=_check_challenge_page_lock,
         contract=(
@@ -514,7 +517,8 @@ GUARDS: tuple[Guard, ...] = (
         # 模型只能在剩下几个工具间空转（list_node_types 被挡就是这么来的）。
         summary="运行侧 failure budget 触发后，只放行诊断类工具与单节点修复",
         scope=ToolScope(
-            exclude=PARALLEL_SAFE_TOOLS | {"get_run_error", "inspect_page", "inspect_screenshot", "apply_node_fix"},
+            exclude=PARALLEL_SAFE_TOOLS
+            | {"get_run_error", "inspect_page", "inspect_screenshot", "interact_page", "apply_node_fix"},
         ),
         requires_state=("failure_budget_lock",),
         check=_check_failure_budget_lock,

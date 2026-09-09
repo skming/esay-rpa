@@ -230,7 +230,9 @@ def test_tool_schemas_follow_the_current_phase() -> None:
         page_evidence_done=False,
     )
     schemas = _tool_schemas_for_round(discovering, inspecting)
-    assert [schema["function"]["name"] for schema in schemas] == ["inspect_page"]
+    # 取证阶段两个都给：inspect_page 只能看静态页面，下拉/日历/弹层里的结构必须先点开，
+    # 只给 inspect_page 会让模型在「看不到」和「猜」之间只剩后者。
+    assert [schema["function"]["name"] for schema in schemas] == ["inspect_page", "interact_page"]
 
     assert _tool_schemas_for_round(GuardState(terminal_response_only=True), inspecting) == []
     # 改动已落盘、只剩「要不要运行」这个决定时同样收工具，逼出收尾正文
@@ -333,7 +335,7 @@ async def test_stream_sends_only_phase_relevant_tool_schemas(monkeypatch) -> Non
         model="test-model",
     ):
         pass
-    assert [item["function"]["name"] for item in captured[-1]["tools"]] == ["inspect_page"]
+    assert [item["function"]["name"] for item in captured[-1]["tools"]] == ["inspect_page", "interact_page"]
 
     continuation = [
         {"role": "user", "content": "https://example.com/post/1，帖子主题及回帖"},
@@ -353,7 +355,7 @@ async def test_stream_sends_only_phase_relevant_tool_schemas(monkeypatch) -> Non
     ]
     async for _ in orchestrator.stream(messages=continuation, model="test-model"):
         pass
-    assert [item["function"]["name"] for item in captured[-1]["tools"]] == ["inspect_page"]
+    assert [item["function"]["name"] for item in captured[-1]["tools"]] == ["inspect_page", "interact_page"]
     assert any("当前可恢复任务状态" in str(message.get("content")) for message in captured[-1]["messages"])
 
 
@@ -1886,3 +1888,39 @@ def test_client_rejection_is_not_reported_as_a_bad_api_key() -> None:
 
     # 真正的鉴权失败仍然要翻译，别为了修上面那条把整条分支废掉
     assert "无效或已过期" in clean_litellm_error("Invalid API key provided")
+
+
+@pytest.mark.parametrize("verdict,progress", [
+    ("no_observable_change", False), ("focus_only", False), ("unknown", False),
+    ("target_not_reached", False), ("already_in_target_state", False),
+    ("target_reached", True), ("state_changed", True),
+])
+def test_interaction_only_invalidates_old_evidence_after_observed_progress(verdict, progress):
+    from app.services.ai_orchestrator import _after_interact_page
+
+    state = GuardState(evidence_collected=["prior"])
+    _after_interact_page({
+        "status": "ok", "action_effect": {"status": verdict},
+        "observation": {"inspection_source": "extension"},
+    }, state)
+    assert state.evidence_collected == ([] if progress else ["prior"])
+    assert state.page_evidence_done is True
+    assert state.page_evidence_source == "extension"
+
+
+def test_compaction_retains_nested_failure_evidence_without_form_values():
+    from app.services.ai_context_window import _summarize_tool_json
+
+    source = {
+        "status": "ok", "action_effect": {"status": "target_not_reached", "target_state": {"value": "secret-fixture"}},
+        "wait_result": {"status": "timed_out", "selector": "#panel"},
+        "observation": {"url": "https://example.test", "spa_loading": True, "inputs": [{"value": "secret-fixture"}]},
+        "acceptance_audit": {"passed": False, "issues": [{"issue": "missing_rows", "actual": "secret-fixture"}]},
+    }
+    result = json.loads(_summarize_tool_json(json.dumps(source)))
+    assert result["action_effect"]["status"] == "target_not_reached"
+    assert result["wait_result"]["status"] == "timed_out"
+    assert result["observation"]["spa_loading"] is True
+    assert result["acceptance_audit"]["passed"] is False
+    assert result["acceptance_audit"]["issues"] == [{"issue": "missing_rows"}]
+    assert "secret-fixture" not in json.dumps(result)

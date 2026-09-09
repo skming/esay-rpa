@@ -457,7 +457,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "inspect_page",
             "description": (
-                "使用持久化浏览器 Profile 打开 URL；浏览器收到 HTTP 错误时自动降级为 Scrapling 静态抓取。"
+                "观察页面。给 url 就在持久化浏览器 Profile 里打开它；不给 url 则观察当前已打开的页面"
+                "（点开的下拉、日历、弹窗都还在，不会重新加载），配合 interact_page 形成"
+                "「看→操作→再看」的循环。浏览器收到 HTTP 错误时自动降级为 Scrapling 静态抓取（需要 url）。"
                 "浏览器成功时返回客观 DOM 事实：inputs、buttons、selects、"
                 "links、tables、visible_options、page_classes、page_layout 和 frames。构建或修复"
                 "selector 时优先使用返回值；tables[].row_selector 可直接用于表格抽取。元素为空时"
@@ -467,9 +469,13 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "browser_executor": {
+                        "type": "string", "enum": ["playwright", "extension"],
+                        "description": "指定观察通道；省略沿用当前会话，初次默认 playwright。extension 读取 Chrome 当前活动网页和登录态，须省略 url；不支持 frame_selector/tab_index/full_page。",
+                    },
                     "url": {
                         "type": "string",
-                        "description": "要检查的页面 URL",
+                        "description": "要打开的页面 URL；省略则观察当前页面当前状态（必须已经打开过页面）",
                     },
                     "wait_selector": {
                         "type": "string",
@@ -483,8 +489,80 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "type": "string",
                         "description": "只在该选择器范围内提取元素，适合聚焦表单区域或弹窗（如 .search-form、.el-dialog）",
                     },
+                    "frame_selector": {
+                        "type": "string",
+                        "description": "改到该 iframe 内观察（传 'main' 回主文档）；后续 interact_page 也作用于该 frame",
+                    },
+                    "tab_index": {
+                        "type": "integer",
+                        "description": "先切到第几个标签页（0 起）；点击弹出新窗口后用它跟过去",
+                    },
                 },
-                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "interact_page",
+            "description": (
+                "在 inspect_page 打开的同一个页面上做一次操作，然后自动重新观察并返回变化。"
+                "用它确认「点开日期面板后面板里有什么」「选完城市后区县选项变了没有」这类"
+                "只在交互之后才存在的事实——这些 DOM 在页面加载时不存在，光调 inspect_page 永远看不到。\n"
+                "目标优先用 element_ref（inspect_page 返回的 ref），它避开了同名按钮的歧义；"
+                "ref 只在返回它的那次观察内有效，页面变过就要重新 inspect_page。\n"
+                "返回分三层，不能互相替代：\n"
+                "- effect.changed：整页有没有可观测变化。false 不代表失败（已聚焦的 fill、原生 select "
+                "换选项、不新增 DOM 的滚动都不动它），true 也不代表业务成功。\n"
+                "- action_effect.status：这个动作自己的目标状态。target_reached=已达到；"
+                "already_in_target_state=本来就是这个状态（幂等，别换目标重试）；target_not_reached=回读"
+                "证明没达到；state_changed=没有指定目标状态但状态确实变了；focus_only=只变了焦点；"
+                "no_observable_change=什么都没观察到（是缺证据，不是失败，先确认目标元素与前置条件）；"
+                "unknown=读不到目标状态。\n"
+                "- wait_result（指定 wait_selector 时）：satisfied=等到目标；timed_out=等待条件超时；"
+                "unknown=通道超时，无法确认条件。超时后仍返回可获取的当前观察，不要重复执行原动作来取证。\n"
+                "- business_check：业务后置条件一律未验证。筛选真的生效、表单真的提交，只能靠抓回的"
+                "数据断言，不能拿 effect.changed=true 当结论。\n"
+                "注意：ref 是临时的，绝不能写进流程节点；流程里只能用验证过的稳定 selector。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["click", "fill", "select_option", "press", "hover", "scroll"],
+                        "description": "press 时 value 是键名（如 Enter）；scroll 不需要目标，滚动整页",
+                    },
+                    "element_ref": {
+                        "type": "string",
+                        "description": "inspect_page 返回的元素 ref（如 e12），优先用它",
+                    },
+                    "selector": {
+                        "type": "string",
+                        "description": "没有 ref 时用 CSS 选择器；命中多个会被拒绝，需要收窄",
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "fill 的文本、select_option 的选项 value、press 的键名",
+                    },
+                    "observation_version": {
+                        "type": "integer",
+                        "description": "element_ref 来自哪次观察（inspect_page 返回的 observation_version）",
+                    },
+                    "scope_selector": {
+                        "type": "string",
+                        "description": "操作后重新观察时只看这个范围（可选）",
+                    },
+                    "wait_selector": {
+                        "type": "string",
+                        "description": "操作后等待该选择器出现再观察，比等固定时间可靠（如 .ant-picker-dropdown）",
+                    },
+                    "wait_ms": {
+                        "type": "integer",
+                        "description": "没有可等的选择器时才用，默认 600ms",
+                    },
+                },
+                "required": ["action"],
             },
         },
     },
@@ -493,7 +571,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "inspect_screenshot",
             "description": (
-                "用 Playwright 访问指定 URL 并截取页面截图，以图片形式返回给模型直接查看。\n\n"
+                "在当前探索通道截取页面截图，以图片形式返回给模型直接查看。\n\n"
                 "**何时使用**（仅限支持视觉的模型）：\n"
                 "• inspect_page 返回的 DOM 信息不足以判断页面状态（canvas 渲染、复杂弹层、视觉布局问题）\n"
                 "• 同一 selector 已失败 2 次且 inspect_page 无法解释原因，需要亲眼确认页面长什么样\n"
@@ -506,9 +584,13 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "browser_executor": {
+                        "type": "string", "enum": ["playwright", "extension"],
+                        "description": "指定观察通道；省略沿用当前会话，初次默认 playwright。extension 读取 Chrome 当前活动网页和登录态，须省略 url；不支持 frame_selector/tab_index/full_page。",
+                    },
                     "url": {
                         "type": "string",
-                        "description": "要截图的页面 URL",
+                        "description": "要打开的页面 URL；省略则截当前页面当前状态（与 inspect_page 同一个页面）",
                     },
                     "wait_selector": {
                         "type": "string",
@@ -519,7 +601,6 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "description": "是否截取整个页面（默认只截取当前视口 1280x800）",
                     },
                 },
-                "required": ["url"],
             },
         },
     },
