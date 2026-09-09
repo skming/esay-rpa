@@ -15,7 +15,9 @@
 需要比较历史提示词时，在对应 Git revision 分别运行并对比报告，不把旧提示词留在生产代码中。
 
 工具全部 mock（不启动浏览器、不真正运行流程），只消耗 LLM tokens。
-未配置 API Key 时自动跳过（exit 0），可安全挂进 CI。
+未配置 API Key 时标记为【未运行】并 exit 0，可安全挂进 CI——未运行不是通过，
+这一档量的是模型行为，替代不了 tests/ 里的确定性回归（真实浏览器回放见
+tests/test_real_page_flow_replay.py）。
 """
 from __future__ import annotations
 
@@ -26,7 +28,7 @@ import hashlib
 import json
 import os
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -64,7 +66,38 @@ from evals.metrics import (  # noqa: E402
 # 模型手上真正有的工具。其余进 executor 的调用都来自平台（每轮重建状态块），判分不该看见。
 _MODEL_FACING_TOOLS = frozenset(item["function"]["name"] for item in TOOL_SCHEMAS)
 
-_DEFAULT_TOOL_RESULTS: dict[str, dict[str, Any]] = {
+# 定时任务简报：三个 schedule 工具共用同一份形状（executor._schedule_brief）。
+_SCHEDULE_BRIEF: dict[str, Any] = {
+    "schedule_id": "eval-sched-0001",
+    "name": "每日抓取",
+    "cron_expression": "0 9 * * *",
+    "timezone": "Asia/Shanghai",
+    "status": "active",
+    "flow_id": "eval-flow-0001",
+    "browser_executor": "playwright",
+    "next_run_at": "2026-01-02T09:00:00+08:00",
+    "last_run_at": None,
+}
+
+def _mock_action_effect(args: dict[str, Any]) -> dict[str, Any]:
+    """按模型这次的动作回一份形状一致的目标状态回读。
+
+    生产把「页面变了」「动作目标状态」「业务未验证」分三层回。fixture 少一层，评测里的模型
+    就永远看不到 action_effect / business_check，判不出它会不会拿页面变化当筛选已生效。
+    """
+    action, value = args.get("action"), args.get("value") or ""
+    if action == "fill":
+        return {"status": "target_reached", "target_state": {"value": value},
+                "state_diff": {"value": ["", value]}}
+    if action == "select_option":
+        return {"status": "target_reached", "target_state": {"selected": [value]},
+                "state_diff": {"selected": [[], [value]]}}
+    return {"status": "state_changed", "target_state": {"focused": True}, "state_diff": {}}
+
+
+# 值可以是固定结果，也可以是 (args, calls) -> 结果 的函数：回执必须跟着模型这次的参数走，
+# 否则评测里读到的是一条生产不会出现的反馈。
+_DEFAULT_TOOL_RESULTS: dict[str, dict[str, Any] | Callable[[dict[str, Any], list[Any]], dict[str, Any]]] = {
     "inspect_page": {
         "url": "https://example.com/list",
         "title": "数据列表",
@@ -115,6 +148,37 @@ _DEFAULT_TOOL_RESULTS: dict[str, dict[str, Any]] = {
     "publish_flow": {"flow_id": "eval-flow-0001", "status": "published"},
     "inspect_screenshot": {"url": "https://example.com/list", "title": "数据列表",
                            "note": "截图已作为图片提供给模型查看。"},
+    # 交互后的观察要照着模型这次点的目标回：写死 action="click" 会让模型 fill 完读到一条
+    # 「你点了一下」的反馈，与生产完全不同——评测里最贵的失真就是这种看起来正常的假回执。
+    "interact_page": lambda args, _calls: {
+        "status": "ok",
+        "action": args.get("action"),
+        "target": {"element_ref": args.get("element_ref"), "selector": args.get("selector")},
+        # changed=true 才是探索能往下走的前提；这份 fixture 只声明「操作生效了」，
+        # 面板内容仍按加载态的观察给，评测判的是模型有没有据此往下取证
+        "effect": {"changed": True, "diff": {"layers": [0, 1]}},
+        "action_effect": _mock_action_effect(args),
+        "business_check": (
+            "未验证：动作被页面接收 ≠ 业务后置条件成立（筛选真的生效、表单真的提交）。"
+            "业务结论只能靠抓回的数据断言，或提交后回读服务端返回的内容。"
+        ),
+        "observation": _DEFAULT_TOOL_RESULTS["inspect_page"],
+        **({"input_value_after": args.get("value") or ""} if args.get("action") == "fill" else {}),
+    },
+    # 契约要按模型提交的原文回。回一份固定契约会让「提交了什么」和「平台接受了什么」脱钩，
+    # 模型据此以为自己写的要求已经存档，而评测看的是另一份。
+    "set_acceptance_contract": lambda args, _calls: {
+        "status": "applied",
+        "flow_id": args.get("flow_id") or "eval-flow-0001",
+        "revision": 2,
+        "acceptance_contract": args.get("acceptance_contract") or {},
+    },
+    "stop_run": {"task_id": "eval-task-0001", "status": "cancelled", "message": "运行已停止。"},
+    "check_extension_connection": {"enabled": False, "connected": False,
+                                   "message": "浏览器扩展未启用，当前只能用 Playwright 执行。"},
+    "list_schedules": {"schedules": [], "count": 0},
+    "create_schedule": {**_SCHEDULE_BRIEF, "message": "定时任务已创建。"},
+    "toggle_schedule": {**_SCHEDULE_BRIEF, "status": "paused", "message": "定时任务已暂停。"},
 }
 
 
@@ -265,7 +329,12 @@ class MockToolExecutor:
             return override(args, self.calls)
         if override is not None:
             return override
-        return dict(_DEFAULT_TOOL_RESULTS.get(name, {"error": f"未知工具: {name}"}))
+        default = _DEFAULT_TOOL_RESULTS.get(name)
+        if callable(default):
+            return default(args, self.calls)
+        if default is None:
+            return {"error": f"未知工具: {name}"}
+        return dict(default)
 
     def called_tools(self) -> list[str]:
         return [name for name, _ in self.calls]
@@ -916,7 +985,12 @@ async def main() -> int:
     if args.replay and model:
         has_key = True  # 重放不调模型，没 key 也该能判分
     if not model or not has_key:
-        print(f"⚠️  模型 {model or '(未配置)'} 无可用 API Key，跳过评测（exit 0）。")
+        # 「未运行」必须和「通过」在输出里长得完全不一样：这一档量的是助手行为，
+        # 而工具全是 mock，一份 fixture 跑绿证不了模型变好，误读成通过就等于拿假证据结案。
+        print(f"⚠️  真实模型评测【未运行】：模型 {model or '(未配置)'} 无可用 API Key（exit 0，不代表通过）。")
+        print("    确定性那半边在 pytest 里，与这一档互不替代：")
+        print("    tests/test_real_page_flow_replay.py（真实浏览器回放配方生成的流程）")
+        print("    tests/test_evals_harness.py（判据与 fixture 自检）")
         return 0
 
     selected = SCENARIOS

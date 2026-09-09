@@ -171,3 +171,43 @@ async def _fixture_phase(
     state.blocking_diagnostics = _blocking_diagnostics(flow_state, state)
     issues = [f.get("issue") for f in state.blocking_diagnostics or []]
     return resolve_phase(state), issues
+
+
+async def test_every_model_facing_tool_has_a_fixture() -> None:
+    """模型手上的工具必须条条有 fixture，否则评测里读到的是一条生产不存在的失败。
+
+    缺 fixture 时执行器回 `{"error": "未知工具: X"}`：模型据此改流程、换路线，
+    整局判分量的是它对一条假故障的应对。加新工具时最容易漏的就是这一步，
+    所以判据挂在「schema 里有哪些工具」上，不挂人工维护的名单。
+    """
+    from app.services.ai_tools.schemas import TOOL_SCHEMAS
+    from evals.run_evals import _DEFAULT_TOOL_RESULTS, _MODEL_FACING_TOOLS
+
+    # execute() 里显式分支处理、不走 fixture 表的工具
+    handled_inline = {"list_node_types"}
+    missing = sorted(_MODEL_FACING_TOOLS - set(_DEFAULT_TOOL_RESULTS) - handled_inline)
+    assert not missing, f"这些模型可调用的工具没有 fixture，评测会回「未知工具」：{missing}"
+    assert _MODEL_FACING_TOOLS == {item["function"]["name"] for item in TOOL_SCHEMAS}
+
+
+async def test_interact_page_fixture_echoes_the_action_the_model_asked_for() -> None:
+    """回执写死 action 的话，模型 fill 完会读到「你点了一下」——一条生产不会出现的反馈。"""
+    executor = MockToolExecutor()
+    filled = await executor.execute("interact_page", {"action": "fill", "selector": "#d", "value": "2026-06-01"})
+    assert filled["action"] == "fill"
+    assert filled["target"]["selector"] == "#d"
+    assert filled["input_value_after"] == "2026-06-01"
+
+    clicked = await executor.execute("interact_page", {"action": "click", "element_ref": "e7"})
+    assert clicked["action"] == "click" and clicked["target"]["element_ref"] == "e7"
+    assert "input_value_after" not in clicked
+
+
+async def test_acceptance_contract_fixture_echoes_what_was_submitted() -> None:
+    """回一份固定契约会让「提交了什么」和「平台接受了什么」脱钩，模型以为已存档。"""
+    executor = MockToolExecutor()
+    submitted = {"requirements": [{"id": "r1", "description": "抓表格"}], "deliverables": []}
+    applied = await executor.execute(
+        "set_acceptance_contract", {"flow_id": "f1", "acceptance_contract": submitted}
+    )
+    assert applied["acceptance_contract"] == submitted and applied["flow_id"] == "f1"
