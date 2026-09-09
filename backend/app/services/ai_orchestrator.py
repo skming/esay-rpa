@@ -8,7 +8,7 @@ import os
 import re
 import time
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from app.services import ai_repair_ledger as _repair_ledger
@@ -880,6 +880,96 @@ class _ThinkTagFilter:
         return events
 
 
+@dataclass
+class _RoundOutput:
+    """一轮模型输出的全部落点。调用方在流结束后按这些字段决定收尾还是执行工具。"""
+
+    text: list[str] = field(default_factory=list)
+    thinking: list[str] = field(default_factory=list)
+    tool_calls: dict[int, dict[str, str]] = field(default_factory=dict)
+    # 已发出 tool_start 的流式索引，避免工具执行后重复发卡片
+    emitted_tool_starts: set[int] = field(default_factory=set)
+    finish_reason: str | None = None
+    usage: Any = None
+    # 看门狗判定的致命错误。生成器不能带返回值，改由调用方读这个字段决定是否终止整条流。
+    stall_error: str | None = None
+
+
+async def _consume_round_stream(
+    response: Any, output: _RoundOutput, *, model: str, round_num: int
+) -> AsyncIterator[dict[str, Any]]:
+    """把一轮流式响应收进 output，同时把要给前端的增量事件让出去。
+
+    逐 chunk 手动迭代 + 看门狗：中转卡死（无首 token 或流中途停滞）时不再等待，
+    把停滞原因写进 output.stall_error 并结束迭代。
+    """
+    think_filter = _ThinkTagFilter()
+    response_iter = response.__aiter__()
+    got_first_chunk = False
+    while True:
+        chunk_timeout = STALL_TIMEOUT if got_first_chunk else FIRST_TOKEN_TIMEOUT
+        try:
+            chunk = await asyncio.wait_for(response_iter.__anext__(), timeout=chunk_timeout)
+        except StopAsyncIteration:
+            break
+        except asyncio.TimeoutError:
+            if got_first_chunk:
+                output.stall_error = f"模型在输出中途停止响应（超过 {STALL_TIMEOUT}s 无新内容），请重试或更换模型。"
+            else:
+                output.stall_error = (
+                    f"模型 {model} 超过 {FIRST_TOKEN_TIMEOUT}s 未返回任何内容。"
+                    "可能是当前中转服务不可用或该模型已下线，请在设置页更换模型或中转地址后重试。"
+                )
+            logger.warning("LLM stream timeout (model=%s, got_first=%s)", model, got_first_chunk)
+            return
+        got_first_chunk = True
+        output.usage = getattr(chunk, "usage", None) or output.usage
+        if not chunk.choices:
+            continue  # 用量统计块不带 choices
+        choice = chunk.choices[0]
+        delta = choice.delta
+        output.finish_reason = choice.finish_reason or output.finish_reason
+
+        thinking_delta: str | None = getattr(delta, "reasoning_content", None)
+        if thinking_delta:
+            output.thinking.append(thinking_delta)
+            yield {"type": "thinking", "delta": thinking_delta}
+
+        if delta.content:
+            for kind, text in think_filter.feed(delta.content):
+                (output.thinking if kind == "thinking" else output.text).append(text)
+                yield {"type": kind, "delta": text}
+
+        if delta.tool_calls:
+            for tc in delta.tool_calls:
+                idx = tc.index
+                if idx not in output.tool_calls:
+                    # call_id 独立于厂商的 tc.id：后者可能缺失或到得比 tool_start 晚，
+                    # 而前端要靠它把 tool_args/tool_result 对到具体那张卡片上
+                    output.tool_calls[idx] = {
+                        "id": "", "name": "", "arguments": "", "call_id": f"r{round_num}_{idx}",
+                    }
+                entry = output.tool_calls[idx]
+                if tc.id:
+                    entry["id"] = tc.id
+                if tc.function and tc.function.name:
+                    entry["name"] = tc.function.name
+                if tc.function and tc.function.arguments:
+                    entry["arguments"] += tc.function.arguments
+                # 工具名一确定就立即发 tool_start，无需等整个流结束
+                if idx not in output.emitted_tool_starts and entry["name"]:
+                    output.emitted_tool_starts.add(idx)
+                    yield {"type": "tool_start", "tool": entry["name"], "args": "", "call_id": entry["call_id"]}
+    for kind, text in think_filter.flush():
+        (output.thinking if kind == "thinking" else output.text).append(text)
+        yield {"type": kind, "delta": text}
+    # 部分模型/中转流式返回 tool_calls 时不带 id；空 tool_call_id 会让
+    # 严格的 OpenAI 兼容端点在下一轮请求时拒绝整个对话，这里合成兜底 id。
+    for idx, entry in output.tool_calls.items():
+        if not entry["id"]:
+            entry["id"] = f"call_r{round_num}_{idx}"
+
+
 def _site_knowledge_message(
     messages: list[dict[str, Any]], flow_state: FlowState
 ) -> dict[str, Any] | None:
@@ -1271,6 +1361,45 @@ class AiOrchestrator:
                 finally:
                     _page_session.reset_owner(reset)
 
+    def _prefetch_read_only_tools(
+        self, tool_items: list[tuple[int, dict[str, str]]], guard_state: GuardState
+    ) -> dict[int, asyncio.Task[Any]]:
+        """只读工具先并发起跑，串行循环走到它时直接取结果，省掉逐个 await 的串行往返。
+
+        少于两个不预取：单个并发没收益，只多一层任务管理。
+
+        预取跑在串行门之前，所以「这次调用会不会被拒」必须在这里先问一遍：判漏了
+        就是真的多读了一次，事后再取消任务也追不回来（结果还会被丢掉，只留下一条
+        「已阻断」给用户看）。这四个工具唯一会撞上的门是重复取证——判据是指纹，
+        用 ai_phases 的纯查询版问，不能调门本身：门会记账，问第二遍就重复计价。
+        """
+        prefetched: dict[int, asyncio.Task[Any]] = {}
+        if sum(1 for _, call in tool_items if call["name"] in _PARALLEL_SAFE_TOOLS) <= 1:
+            return prefetched
+        # 同一批里参数完全相同的第二次读取不抢跑：取证类的会被串行门以
+        # evidence_already_collected 拒掉（门判的是第一次记账之后的状态），
+        # 其余两个读到的也只会是同一份。跳过不改变结果——真到它那一格时串行分支照旧执行。
+        batch_prints: set[str] = set()
+        for idx, call in tool_items:
+            if call["name"] not in _PARALLEL_SAFE_TOOLS:
+                continue
+            try:
+                args, duplicate_keys = (
+                    _parse_tool_arguments(call["arguments"]) if call["arguments"].strip() else ({}, [])
+                )
+            except json.JSONDecodeError:
+                continue  # 参数非法交给串行分支报错，这里不抢着执行
+            if duplicate_keys:
+                continue
+            if evidence_already_collected(call["name"], args, guard_state):
+                continue
+            fingerprint = call_fingerprint(call["name"], args)
+            if fingerprint in batch_prints:
+                continue
+            batch_prints.add(fingerprint)
+            prefetched[idx] = asyncio.create_task(self._executor.execute(call["name"], args, {}))
+        return prefetched
+
     async def _stream_inner(
         self,
         messages: list[dict[str, Any]],
@@ -1432,12 +1561,7 @@ class AiOrchestrator:
             guard_state.blocking_diagnostics = _blocking_diagnostics(flow_state, guard_state)
             guard_state.flow_has_nodes = not flow_state.is_blank
             _mark_history_cache_anchor(full_messages, model, relayed)
-            collected_tool_calls: dict[int, dict[str, str]] = {}
-            round_usage: Any = None
-            collected_text: list[str] = []
-            think_filter = _ThinkTagFilter()
-            # 记录已发出 tool_start 的流式索引，避免工具执行后重复发卡片
-            emitted_tool_starts: set[int] = set()
+            collected: _RoundOutput = _RoundOutput()
             round_started_at = time.monotonic()
 
             try:
@@ -1477,75 +1601,18 @@ class AiOrchestrator:
                 yield {"type": "done"}
                 return
 
-            finish_reason: str | None = None
-            collected_thinking: list[str] = []
             try:
-                # 逐 chunk 手动迭代 + 看门狗：中转卡死（无首 token 或流中途停滞）时主动
-                # 抛 TimeoutError，避免请求和 UI 无限期挂起。
-                response_iter = response.__aiter__()
-                got_first_chunk = False
-                while True:
-                    chunk_timeout = STALL_TIMEOUT if got_first_chunk else FIRST_TOKEN_TIMEOUT
-                    try:
-                        chunk = await asyncio.wait_for(response_iter.__anext__(), timeout=chunk_timeout)
-                    except StopAsyncIteration:
-                        break
-                    except asyncio.TimeoutError:
-                        if got_first_chunk:
-                            hint = f"模型在输出中途停止响应（超过 {STALL_TIMEOUT}s 无新内容），请重试或更换模型。"
-                        else:
-                            hint = (
-                                f"模型 {effective_model} 超过 {FIRST_TOKEN_TIMEOUT}s 未返回任何内容。"
-                                "可能是当前中转服务不可用或该模型已下线，请在设置页更换模型或中转地址后重试。"
-                            )
-                        logger.warning("LLM stream timeout (model=%s, got_first=%s)", effective_model, got_first_chunk)
-                        yield {"type": "error", "message": hint}
-                        yield {"type": "done"}
-                        return
-                    got_first_chunk = True
-                    round_usage = getattr(chunk, "usage", None) or round_usage
-                    if not chunk.choices:
-                        continue  # 用量统计块不带 choices
-                    choice = chunk.choices[0]
-                    delta = choice.delta
-                    finish_reason = choice.finish_reason or finish_reason
-
-                    thinking_delta: str | None = getattr(delta, "reasoning_content", None)
-                    if thinking_delta:
-                        collected_thinking.append(thinking_delta)
-                        yield {"type": "thinking", "delta": thinking_delta}
-
-                    if delta.content:
-                        for kind, text in think_filter.feed(delta.content):
-                            (collected_thinking if kind == "thinking" else collected_text).append(text)
-                            yield {"type": kind, "delta": text}
-
-                    if delta.tool_calls:
-                        for tc in delta.tool_calls:
-                            idx = tc.index
-                            if idx not in collected_tool_calls:
-                                # call_id 独立于厂商的 tc.id：后者可能缺失或到得比 tool_start 晚，
-                                # 而前端要靠它把 tool_args/tool_result 对到具体那张卡片上
-                                collected_tool_calls[idx] = {
-                                    "id": "", "name": "", "arguments": "", "call_id": f"r{round_num}_{idx}",
-                                }
-                            entry = collected_tool_calls[idx]
-                            if tc.id:
-                                entry["id"] = tc.id
-                            if tc.function and tc.function.name:
-                                entry["name"] = tc.function.name
-                            if tc.function and tc.function.arguments:
-                                entry["arguments"] += tc.function.arguments
-                            # 工具名一确定就立即发 tool_start，无需等整个流结束
-                            if idx not in emitted_tool_starts and entry["name"]:
-                                emitted_tool_starts.add(idx)
-                                yield {"type": "tool_start", "tool": entry["name"], "args": "", "call_id": entry["call_id"]}
-                for kind, text in think_filter.flush():
-                    (collected_thinking if kind == "thinking" else collected_text).append(text)
-                    yield {"type": kind, "delta": text}
+                async for event in _consume_round_stream(
+                    response, collected, model=effective_model, round_num=round_num
+                ):
+                    yield event
+                if collected.stall_error is not None:
+                    yield {"type": "error", "message": collected.stall_error}
+                    yield {"type": "done"}
+                    return
                 round_elapsed = time.monotonic() - round_started_at
-                _log_prompt_cache_usage(effective_model, round_num, round_usage, round_elapsed)
-                meter.add_round(round_usage, round_elapsed)
+                _log_prompt_cache_usage(effective_model, round_num, collected.usage, round_elapsed)
+                meter.add_round(collected.usage, round_elapsed)
                 yield {"type": "usage", "usage": meter.snapshot(effective_max_rounds)}
             except Exception as stream_exc:
                 if not vision_fallback_done and is_vision_error(str(stream_exc)) and _strip_image_messages(full_messages):
@@ -1558,19 +1625,13 @@ class AiOrchestrator:
                 yield {"type": "done"}
                 return
 
-            tool_calls = list(collected_tool_calls.values())
+            tool_calls = list(collected.tool_calls.values())
 
-            # 部分模型/中转流式返回 tool_calls 时不带 id；空 tool_call_id 会让
-            # 严格的 OpenAI 兼容端点在下一轮请求时拒绝整个对话，这里合成兜底 id。
-            for _tc_idx, _tc in collected_tool_calls.items():
-                if not _tc["id"]:
-                    _tc["id"] = f"call_r{round_num}_{_tc_idx}"
-
-            if tool_calls or collected_text or collected_thinking:
+            if tool_calls or collected.text or collected.thinking:
                 consecutive_empty_rounds = 0
 
             if not tool_calls:
-                if not collected_text and not collected_thinking:
+                if not collected.text and not collected.thinking:
                     # 允许连续空响应重试一次：长编排跑到第 N 轮时一次瞬时抖动不该
                     # 废掉整个会话；连续两次空响应才判定为真故障。
                     consecutive_empty_rounds += 1
@@ -1583,12 +1644,12 @@ class AiOrchestrator:
                     yield {"type": "error", "message": "模型连续返回空响应，请检查 API Key 或更换模型。"}
                     yield {"type": "done"}
                     return
-                if not collected_text and collected_thinking:
-                    thinking_text = "".join(collected_thinking)
+                if not collected.text and collected.thinking:
+                    thinking_text = "".join(collected.thinking)
                     yield {"type": "text", "delta": thinking_text}
                     # 这段是用户看到的回复，同样要过证据门
-                    collected_text.append(thinking_text)
-                final_text = "".join(collected_text)
+                    collected.text.append(thinking_text)
+                final_text = "".join(collected.text)
                 # 顺序即优先级：先判「该干的活被推掉了」——模型一旦拿拒答模板收尾，
                 # 后两条会把它误诊成「结论越界」或「没做验证」，给出方向完全错的更正。
                 # 其余两条之间，说法不实比交付不全严重。
@@ -1621,7 +1682,7 @@ class AiOrchestrator:
 
             assistant_msg: dict[str, Any] = {
                 "role": "assistant",
-                "content": "".join(collected_text) or None,
+                "content": "".join(collected.text) or None,
                 "tool_calls": [
                     {
                         "id": tc["id"],
@@ -1633,41 +1694,8 @@ class AiOrchestrator:
             }
             full_messages.append(assistant_msg)
 
-            tool_items = list(collected_tool_calls.items())
-
-            # 只读工具先并发起跑，串行循环走到它时直接取结果，省掉逐个 await 的串行往返。
-            # 少于两个不预取：单个并发没收益，只多一层任务管理。
-            #
-            # 预取跑在串行门之前，所以「这次调用会不会被拒」必须在这里先问一遍：判漏了
-            # 就是真的多读了一次，事后再取消任务也追不回来（结果还会被丢掉，只留下一条
-            # 「已阻断」给用户看）。这四个工具唯一会撞上的门是重复取证——判据是指纹，
-            # 用 ai_phases 的纯查询版问，不能调门本身：门会记账，问第二遍就重复计价。
-            prefetched: dict[int, asyncio.Task[Any]] = {}
-            if sum(1 for _, _tc in tool_items if _tc["name"] in _PARALLEL_SAFE_TOOLS) > 1:
-                # 同一批里参数完全相同的第二次读取不抢跑：取证类的会被串行门以
-                # evidence_already_collected 拒掉（门判的是第一次记账之后的状态），
-                # 其余两个读到的也只会是同一份。跳过不改变结果——真到它那一格时串行分支照旧执行。
-                _pf_batch_prints: set[str] = set()
-                for _pf_idx, _pf_tc in tool_items:
-                    if _pf_tc["name"] not in _PARALLEL_SAFE_TOOLS:
-                        continue
-                    try:
-                        _pf_args, _pf_dups = (
-                            _parse_tool_arguments(_pf_tc["arguments"]) if _pf_tc["arguments"].strip() else ({}, [])
-                        )
-                    except json.JSONDecodeError:
-                        continue  # 参数非法交给下面的串行分支报错，这里不抢着执行
-                    if _pf_dups:
-                        continue
-                    if evidence_already_collected(_pf_tc["name"], _pf_args, guard_state):
-                        continue
-                    _pf_print = call_fingerprint(_pf_tc["name"], _pf_args)
-                    if _pf_print in _pf_batch_prints:
-                        continue
-                    _pf_batch_prints.add(_pf_print)
-                    prefetched[_pf_idx] = asyncio.create_task(
-                        self._executor.execute(_pf_tc["name"], _pf_args, {})
-                    )
+            tool_items = list(collected.tool_calls.items())
+            prefetched = self._prefetch_read_only_tools(tool_items, guard_state)
 
             _stop_after: int | None = None
             terminal_response: str | None = None
@@ -1675,7 +1703,7 @@ class AiOrchestrator:
                 tool_name = tc["name"]
                 raw_args = tc["arguments"]
 
-                if stream_idx in emitted_tool_starts:
+                if stream_idx in collected.emitted_tool_starts:
                     yield {"type": "tool_args", "tool": tool_name, "args": raw_args, "call_id": tc["call_id"]}
                 else:
                     yield {"type": "tool_start", "tool": tool_name, "args": raw_args, "call_id": tc["call_id"]}
@@ -1687,7 +1715,7 @@ class AiOrchestrator:
                     result = {
                         "error": (
                             "工具参数被截断（模型输出达到最大长度），请精简参数或拆分为多次更小的调用后重试。"
-                            if finish_reason == "length"
+                            if collected.finish_reason == "length"
                             else f"工具参数不是合法 JSON：{json_exc}"
                         ),
                         "status": "error",
@@ -1837,7 +1865,7 @@ class AiOrchestrator:
                         "status": "skipped",
                         "message": "该调用未执行：流程刚被创建/修改，请先按系统引导完成后续校验，再视需要重新发起。",
                     }
-                    if _skip_stream_idx not in emitted_tool_starts:
+                    if _skip_stream_idx not in collected.emitted_tool_starts:
                         yield {"type": "tool_start", "tool": _skip_tc["name"], "args": _skip_tc["arguments"], "call_id": _skip_tc["call_id"]}
                     yield {"type": "tool_result", "tool": _skip_tc["name"], "result": _skip_result, "call_id": _skip_tc["call_id"]}
                     full_messages.append({
