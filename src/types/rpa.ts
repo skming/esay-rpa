@@ -66,6 +66,7 @@ export type RpaNodeAction = {
   adaptive?: boolean;
   autoSave?: boolean;
   continueOnError?: boolean;
+  requireConfirmation?: boolean;
   fillMode?: 'js' | 'type';
   timeoutMs?: number;
   inputValue?: string;
@@ -143,6 +144,7 @@ export type RpaNodeConfigDraft = {
   autoSave: boolean;
   breakpoint: boolean;
   continueOnError: boolean;
+  requireConfirmation: boolean;
   debugLog: boolean;
   description: string;
   extractMode: ExtractMode;

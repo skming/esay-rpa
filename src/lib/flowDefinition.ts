@@ -184,6 +184,7 @@ function restoreAction(node: Record<string, unknown>, type: string): RpaNodeActi
     adaptive: typeof node.adaptive === 'boolean' ? node.adaptive : undefined,
     autoSave: typeof node.autoSave === 'boolean' ? node.autoSave : undefined,
     continueOnError: typeof node.continueOnError === 'boolean' ? node.continueOnError : undefined,
+    requireConfirmation: node.requireConfirmation === true ? true : undefined,
     fillMode: node.fillMode === 'js' ? 'js' : node.fillMode === 'type' || node.fillMode === 'keyboard' ? 'type' : undefined,
     timeoutMs: typeof node.timeoutMs === 'number' && Number.isFinite(node.timeoutMs) ? node.timeoutMs : undefined,
     inputValue: readOptionalString(node.inputValue),

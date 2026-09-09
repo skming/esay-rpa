@@ -1,6 +1,7 @@
 import { Clock3, ShieldAlert } from 'lucide-react';
 import type { ReactElement } from 'react';
 
+import { shouldUseRequireConfirmation } from '../../../lib/nodeConfigDraft';
 import type { RpaNodeConfigDraft } from '../../../types/rpa';
 import { Button } from '../../ui/button';
 import { NumberField, ToggleSwitch } from '../../ui/FormControls';
@@ -71,12 +72,28 @@ export function ExecutionStrategySection({
             onCheckedChange={(checked) => onDraftPatch('autoSave', checked)}
           />
         )}
+        {/* 可见条件和 applyNodeConfigDraft 的写回条件必须同一个判据：错开就会出现勾了开关、
+            闸门却没落进定义，而界面上看不出来。 */}
+        {shouldUseRequireConfirmation(actionType) && (
+          <ToggleSwitch
+            checked={draft.requireConfirmation}
+            label="执行前人工确认"
+            onCheckedChange={(checked) => onDraftPatch('requireConfirmation', checked)}
+          />
+        )}
         <ToggleSwitch
           checked={draft.breakpoint}
           label="调试断点"
           onCheckedChange={(checked) => onDraftPatch('breakpoint', checked)}
         />
       </div>
+
+      {draft.requireConfirmation && shouldUseRequireConfirmation(actionType) && (
+        <div className="flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-[10px] leading-4 text-amber-800">
+          <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" strokeWidth={1.5} />
+          <span>仅插件执行器生效：执行前暂停，等你在浏览器顶部横幅点「完成，继续执行」；2 分钟未确认则中止本次运行。</span>
+        </div>
+      )}
 
       {draft.continueOnError && (
         <div className="flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-[10px] leading-4 text-amber-800">

@@ -88,6 +88,31 @@ describe('nodeConfigDraft', () => {
     expect(next.action?.continueOnError).toBe(true);
   });
 
+  it('人工确认闸门只落在插件执行器管得到的浏览器动作上', () => {
+    const clickNode: RpaNodeData = {
+      title: '确认转账',
+      description: '#confirm-transfer',
+      kind: 'browser',
+      status: 'pending',
+      action: { type: 'browser.click', selector: '#confirm-transfer', timeoutMs: 30_000 }
+    };
+
+    expect(createNodeConfigDraft(clickNode).requireConfirmation).toBe(false);
+    expect(applyNodeConfigDraft(clickNode, { ...createNodeConfigDraft(clickNode), requireConfirmation: true }).action?.requireConfirmation).toBe(true);
+
+    const confirmed = applyNodeConfigDraft(clickNode, { ...createNodeConfigDraft(clickNode), requireConfirmation: true });
+    expect(applyNodeConfigDraft(confirmed, { ...createNodeConfigDraft(confirmed), requireConfirmation: false }).action?.requireConfirmation).toBeUndefined();
+
+    const excelNode: RpaNodeData = {
+      title: '写入表格',
+      description: 'out.xlsx',
+      kind: 'data',
+      status: 'pending',
+      action: { type: 'excel.write', filePath: 'out.xlsx' }
+    };
+    expect(applyNodeConfigDraft(excelNode, { ...createNodeConfigDraft(excelNode), requireConfirmation: true }).action?.requireConfirmation).toBeUndefined();
+  });
+
   it('应保存浏览器按键提交配置', () => {
     const data: RpaNodeData = {
       title: '提交搜索',

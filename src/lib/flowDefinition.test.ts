@@ -47,6 +47,20 @@ describe('flowDefinition', () => {
     expect(restored?.nodes[2]?.data.action).toEqual(expect.objectContaining({ outputVariable: 'browser_texts', firstValueVariable: 'browser_text' }));
   });
 
+  it('人工确认标记能穿过保存与重新载入', () => {
+    // restoreAction 是白名单，漏一行这个字段就在重新载入后静默消失：开关弹回未勾选，
+    // 用户以为闸门还在，实际敏感节点已经无人确认直接执行。
+    const clickNode = createFlowNode({ label: '点击元素', nodeType: 'browser' }, { x: 120, y: 180 }, 1);
+    clickNode.data.action = { ...clickNode.data.action, type: 'browser.click', selector: '#confirm-transfer', requireConfirmation: true };
+
+    const definition = buildFlowDefinition([clickNode], []);
+    const nodes = definition.nodes as Array<Record<string, unknown>>;
+    expect(nodes[0]).toEqual(expect.objectContaining({ requireConfirmation: true }));
+
+    const restored = restoreFlowCanvas(definition);
+    expect(restored?.nodes[0]?.data.action?.requireConfirmation).toBe(true);
+  });
+
   it('序列化并恢复累计输出配置', () => {
     const extractNode = createFlowNode({ label: '获取文本', nodeType: 'browser' }, { x: 120, y: 180 }, 1);
     expect(extractNode.data.action).toBeDefined();

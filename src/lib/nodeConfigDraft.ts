@@ -8,6 +8,7 @@ export function createNodeConfigDraft(data: RpaNodeData): RpaNodeConfigDraft {
     autoSave: data.action?.autoSave ?? true,
     breakpoint: data.breakpoint ?? false,
     continueOnError: data.action?.continueOnError ?? false,
+    requireConfirmation: data.action?.requireConfirmation === true,
     debugLog: false,
     description: data.description,
     extractMode: data.action?.extractMode ?? 'text',
@@ -119,6 +120,8 @@ export function applyNodeConfigDraft(data: RpaNodeData, draft: RpaNodeConfigDraf
       ...data.action,
       autoSave: draft.autoSave,
       continueOnError: draft.continueOnError,
+      // 关闭时写 undefined 不留 false：这个标记会跟着流程定义进到 AI 看到的节点上，一个后端永远不读的 false 只是噪声。
+      requireConfirmation: shouldUseRequireConfirmation(actionType) ? (draft.requireConfirmation ? true : undefined) : data.action?.requireConfirmation,
       attribute: shouldUseAttribute(actionType) ? (draft.attribute === '' ? undefined : draft.attribute) : data.action?.attribute,
       extractMode: draft.extractMode,
       inputValue: shouldUseInputValue(actionType) ? draft.inputValue : data.action?.inputValue,
@@ -291,6 +294,12 @@ function shouldUsePath(actionType: string | undefined): boolean {
 
 function shouldUseTargetUrl(actionType: string | undefined): boolean {
   return actionType === 'browser.fetch' || actionType === 'browser.open' || actionType === 'browser.tab.open' || actionType === 'browser.ensureLogin';
+}
+
+/** 人工确认闸门只由插件执行器实现（task_manager._maybe_confirm_sensitive_action），而它只接浏览器
+ *  动作：非浏览器节点打上这个标记不会有任何人被问到。 */
+export function shouldUseRequireConfirmation(actionType: string | undefined): boolean {
+  return actionType !== undefined && (actionType.startsWith('browser.') || actionType.startsWith('ui.'));
 }
 
 function shouldUseAttribute(actionType: string | undefined): boolean {

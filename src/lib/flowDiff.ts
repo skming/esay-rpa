@@ -63,6 +63,7 @@ const FIELD_LABELS: Record<string, string> = {
   condition: '条件',
   content: '内容',
   continueOnError: '出错继续',
+  requireConfirmation: '执行前人工确认',
   countVariable: '计数变量',
   defaultValue: '默认值',
   delayMs: '延时（毫秒）',
