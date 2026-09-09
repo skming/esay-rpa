@@ -1,4 +1,7 @@
 import type { ContentAction, DomElementSummary } from './types';
+// 探测脚本与 Playwright 通道同一个文件，不是各自一份：见该文件头部注释。
+// 路径穿出扩展包是刻意的——它得跟着读它的 Python 一起发布，扩展只在构建期用到它。
+import { PAGE_PROBE } from '../../../backend/app/services/ai_tools/page_probe.js';
 
 const INTERACTIVE_SELECTOR =
   'a, button, input, select, textarea, [role="button"], [role="link"], [role="checkbox"], ' +
@@ -6,10 +9,17 @@ const INTERACTIVE_SELECTOR =
 
 let snapshotRefs = new Map<string, Element>();
 let refCounter = 0;
+let targetCounter = 0;
+// 当前 ref 表来自哪一次 page.observe。query/find 的快照没有版本，记 null。
+// 没有这个编号，模型可以拿上一次观察的 ref 去操作重渲染后的 DOM：编号还在、指向的
+// 已经是同一位置的另一行数据，动作成功、数据全错。
+let refsObservationVersion: number | null = null;
 
 function resetSnapshot(): void {
   snapshotRefs = new Map();
   refCounter = 0;
+  targetCounter = 0;
+  refsObservationVersion = null;
 }
 
 function assignRef(el: Element): string {
@@ -19,7 +29,14 @@ function assignRef(el: Element): string {
   return ref;
 }
 
-function resolveRef(ref: string): Element {
+function resolveRef(ref: string, observationVersion?: number): Element {
+  if (observationVersion !== undefined && observationVersion !== refsObservationVersion) {
+    throw new Error(
+      `ref ${ref} 属于第 ${observationVersion} 次观察，当前 ref 表是` +
+        (refsObservationVersion === null ? '一次 query/find 快照' : `第 ${refsObservationVersion} 次观察`) +
+        '，请重新 inspect_page 再取 ref'
+    );
+  }
   const el = snapshotRefs.get(ref);
   if (el === undefined || !el.isConnected) {
     throw new Error(`ref 已失效或不存在: ${ref}，请重新 query/find 生成快照`);
@@ -249,8 +266,8 @@ export function querySelectorAllDeep(selector: string): Element[] {
   return results;
 }
 
-export function resolveElement(action: Pick<ContentAction, 'ref' | 'selector'>): Element {
-  if (action.ref !== undefined) return resolveRef(action.ref);
+export function resolveElement(action: Pick<ContentAction, 'ref' | 'selector' | 'observationVersion'>): Element {
+  if (action.ref !== undefined) return resolveRef(action.ref, action.observationVersion);
   if (action.selector !== undefined) {
     const el = querySelectorDeep(action.selector);
     if (el === null) throw new Error(`未找到元素: ${action.selector}`);
@@ -260,7 +277,7 @@ export function resolveElement(action: Pick<ContentAction, 'ref' | 'selector'>):
 }
 
 // 同 resolveElement，但定位失败返回 null 而非抛错，供 elementState/ensureLogin 等探测型 action 使用。
-export function tryResolveElement(action: Pick<ContentAction, 'ref' | 'selector'>): Element | null {
+export function tryResolveElement(action: Pick<ContentAction, 'ref' | 'selector' | 'observationVersion'>): Element | null {
   try {
     return resolveElement(action);
   } catch {
@@ -373,6 +390,48 @@ export function captureSnapshot(): DomElementSummary[] {
     .map(summarizeElement)
     .filter((summary) => summary.visible)
     .slice(0, 500);
+}
+
+/**
+ * 跑与 Playwright 通道同一份探测脚本，并把它的 ref 表接到本文件的 ref 表上。
+ *
+ * 探测脚本自己把元素存在 window.__rpaProbe 里（隔离世界的 window，页面脚本碰不到）。
+ * 后续动作走的却是 resolveElement，读的是 snapshotRefs——两张表不接起来，模型拿到的
+ * ref 在动作阶段一律「已失效」，观察到的元素一个都点不了。
+ *
+ * 能力上与 Playwright 通道有两处不等价，必须如实交出而不是静默降级：
+ * - 只能观察内容脚本所在的这个文档。iframe 里的元素由各自的内容脚本持有，本文档
+ *   evaluate 不进去（跨源时连 contentDocument 都读不到），所以 frame 定向观察不支持。
+ * - 闭合 shadow root 与「没有 shadow root」在页面脚本里无法区分，两条通道同样受限。
+ */
+export function observePage(args: { scope?: string | null; version?: number }): Record<string, unknown> {
+  resetSnapshot();
+  const version = args.version ?? 0;
+  const result = PAGE_PROBE({ scope: args.scope ?? null, version });
+  const registry = (window as unknown as { __rpaProbe?: { version: number; els: Element[] } }).__rpaProbe;
+  if (registry !== undefined && Array.isArray(registry.els)) {
+    // 编号规则必须和探测脚本里的 'e' + index 完全一致：这里错一位，模型点的就是相邻那个元素。
+    registry.els.forEach((el, index) => {
+      snapshotRefs.set(`e${index}`, el);
+    });
+    refCounter = registry.els.length;
+  }
+  refsObservationVersion = version;
+  return result;
+}
+
+/**
+ * 给一次动作的目标元素发个临时编号。
+ *
+ * 定位和动作之间页面可能重渲染，只传 selector 就会「校验的是这一个、动作打在另一个」；
+ * Playwright 那条通道持的是 element handle，这里的编号是同一件事。
+ * 它挂在当前观察的 ref 表上，下一次观察连表一起换掉，所以不会被跨观察复用。
+ */
+export function registerActionTarget(el: Element): string {
+  targetCounter += 1;
+  const ref = `t${targetCounter}`;
+  snapshotRefs.set(ref, el);
+  return ref;
 }
 
 function scoreCandidate(query: string, summary: DomElementSummary): number {

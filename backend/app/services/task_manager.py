@@ -173,6 +173,17 @@ class TaskManager:
     def is_extension_connected(self) -> bool:
         return self._extension_executor is not None and self._extension_executor.is_connected
 
+    def extension_run_holder(self) -> str | None:
+        """扩展当前被哪一次运行占着，空闲时为 None。供起跑前门控读取，与 profile 占用登记同一形状。"""
+        return self._extension_executor.lease_holder if self._extension_executor is not None else None
+
+    def extension_exploration_executor(self) -> ExtensionExecutor:
+        if not self.is_extension_enabled():
+            raise ConnectionError("插件执行器已在设置中关闭")
+        if self._extension_executor is None or not self._extension_executor.is_connected:
+            raise ConnectionError("没有已连接的浏览器扩展")
+        return self._extension_executor
+
     def _resolve_browser_executor(self, record: TaskRecord) -> BrowserExecutor:
         # 所有路由到插件执行器的路径（REST、AI 试跑、定时任务）都汇到这里，开关判定只放这一处。
         if record.request.browser_executor == "extension":
@@ -1180,7 +1191,8 @@ class TaskManager:
             if request.target_url is not None:
                 await self._append_log(record, "running", f"扩展打开网页 · {node_title}", str(request.target_url), node_id=node_id)
                 await executor.run(
-                    {"type": "browser.open", "targetUrl": str(request.target_url)},
+                        # 带上 id：桥接审计日志按节点 id 归属，这里是临时拼的节点，不给就只剩运行标签。
+                    {"type": "browser.open", "id": node_id, "targetUrl": str(request.target_url)},
                     record.variables,
                     active_context,
                     timeout_ms=request.timeout_ms,
@@ -1188,6 +1200,7 @@ class TaskManager:
             await self._append_log(record, "running", f"扩展采集页面 · {node_title}", request.selector, node_id=node_id)
             extract_node: dict[str, object] = {
                 "type": "browser.extract",
+                "id": node_id,
                 "selector": request.selector,
                 "extractMode": request.extract_mode,
             }

@@ -4,7 +4,7 @@ import base64
 
 import pytest
 
-from app.services.extension_executor import ExtensionExecutionContext, ExtensionExecutor
+from app.services.extension_executor import ExtensionBusyError, ExtensionExecutionContext, ExtensionExecutor
 from app.services.runtime_variables import RuntimeVariableStore
 
 
@@ -659,3 +659,74 @@ async def test_browser_paginate_next_fails_loudly_when_next_selector_does_not_ex
         )
 
     assert [call for call in bridge.calls if call["type"] == "browser.click"] == []
+
+
+async def test_step_budget_is_per_run_not_shared_across_runs() -> None:
+    """步数预算按运行结算：执行器是单例，计数留在实例上会让后一次运行继承上一次的余额，
+    刚发几个动作就被判成失控循环中止，而流程本身没问题。"""
+    bridge = FakeBridge(responses={"browser.scroll": [{}, {}, {}, {}]})
+    executor = ExtensionExecutor(bridge, max_steps_per_run=2)  # type: ignore[arg-type]
+    variables = RuntimeVariableStore.from_initial({})
+
+    first = await executor.create_context(owner="运行 A")
+    await executor.run({"type": "browser.scroll"}, variables, first, timeout_ms=1000)
+    await executor.run({"type": "browser.scroll"}, variables, first, timeout_ms=1000)
+    await executor.close_context(first)
+
+    second = await executor.create_context(owner="运行 B")
+    await executor.run({"type": "browser.scroll"}, variables, second, timeout_ms=1000)
+    await executor.run({"type": "browser.scroll"}, variables, second, timeout_ms=1000)
+
+
+async def test_second_run_is_refused_while_another_run_holds_the_extension() -> None:
+    """两次运行交错会互相踩掉跳转和输入。必须带上占用方是谁：只说忙，用户不知道该停哪一个运行。"""
+    bridge = FakeBridge()
+    executor = ExtensionExecutor(bridge)  # type: ignore[arg-type]
+    first = await executor.create_context(owner="抓取订单 · 运行 t1")
+
+    with pytest.raises(ExtensionBusyError) as excinfo:
+        await executor.create_context(owner="导出报表 · 运行 t2")
+    assert excinfo.value.holder == "抓取订单 · 运行 t1"
+    assert "抓取订单 · 运行 t1" in str(excinfo.value)
+    assert executor.lease_holder == "抓取订单 · 运行 t1"
+
+    await executor.close_context(first)
+    assert executor.lease_holder is None
+    second = await executor.create_context(owner="导出报表 · 运行 t2")
+    assert executor.lease_holder == "导出报表 · 运行 t2"
+    await executor.close_context(second)
+
+
+async def test_losing_run_cleanup_does_not_release_the_holders_lease() -> None:
+    """抢不到租约的一方照样会走进自己的 finally：那里无条件清空登记，就会把正在跑的那次
+    运行的占用抹掉，第三次运行拿到"空闲"的假象，两次运行同时操作同一个浏览器。"""
+    bridge = FakeBridge()
+    executor = ExtensionExecutor(bridge)  # type: ignore[arg-type]
+    holder_context = await executor.create_context(owner="运行 A")
+
+    with pytest.raises(ExtensionBusyError):
+        await executor.create_context(owner="运行 B")
+    # 抢占失败的一方手里没有上下文，它的 finally 传进来的就是 None
+    await executor.close_context(None)
+    assert executor.lease_holder == "运行 A"
+
+    with pytest.raises(ExtensionBusyError):
+        await executor.create_context(owner="运行 B")
+
+    await executor.close_context(holder_context)
+    assert executor.lease_holder is None
+
+
+async def test_same_run_can_reacquire_without_deadlocking_itself() -> None:
+    """同一次运行里可能出现第二次 create_context（如扩展采集节点自己建上下文）：
+    判据是"占用方是不是别人"，写成"有没有人占"会让运行卡死在自己身上。"""
+    bridge = FakeBridge()
+    executor = ExtensionExecutor(bridge)  # type: ignore[arg-type]
+    first = await executor.create_context(owner="运行 A")
+    second = await executor.create_context(owner="运行 A")
+    assert executor.lease_holder == "运行 A"
+    # 第二个上下文没拿到租约，关掉它不能把还在跑的这次运行放开
+    await executor.close_context(second)
+    assert executor.lease_holder == "运行 A"
+    await executor.close_context(first)
+    assert executor.lease_holder is None

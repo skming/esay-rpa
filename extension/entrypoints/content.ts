@@ -6,10 +6,15 @@ import {
   captureSnapshot,
   findElements,
   isVisible,
+  observePage,
   probeSelectorVisible,
+  querySelectorAllDeep,
+  registerActionTarget,
   resolveElement,
   tryResolveElement,
 } from './content/dom';
+// 取证脚本与 Playwright 通道同一个文件，不是各自一份：见该文件头部注释。
+import { EFFECT_SIGNATURE, TARGET_STATE } from '../../backend/app/services/ai_tools/page_effect.js';
 import { dispatchExtract, dispatchExtractAll } from './content/extract';
 import { markAutomationActivity, moveCursorTo, pulseClickAt, highlightElement, setPageBlocked } from './content/automationVisual';
 import { hideTakeoverBanner, showTakeoverBanner } from './content/takeoverBanner';
@@ -148,10 +153,44 @@ function dispatchDrag(source: Element, target: Element): void {
   pulseClickAt(to.x, to.y);
 }
 
+// 只有真要碰元素的动作才顺手关遮罩：关遮罩是往用户页面上点一下，而 findCloseAffordance 认的是
+// 「大遮罩右上角的小可点元素」这类特征，命中的可能是弹框里别的按钮。只读动作穿透遮罩直接读 DOM，
+// 替它们点一次是流程没要求过的副作用；且每个遮罩只尝试一次，用掉了真要点击的那步就没得关。
+const OVERLAY_DISMISSING_ACTIONS = new Set<string>([
+  'browser.click',
+  'browser.fill',
+  'browser.select',
+  'browser.press',
+  'browser.check',
+  'browser.drag',
+  'browser.hover',
+  // CDP 可信输入的前两步：坐标必须在遮罩关掉之后再算，否则算出来的点仍落在遮罩上。
+  'scrollIntoView',
+  'resolveRect',
+]);
+
+const documentId = crypto.randomUUID();
+
 async function handleAction(action: ContentAction): Promise<unknown> {
+  if (action.documentId !== undefined && action.documentId !== documentId) {
+    throw new Error('文档已导航，旧引用失效，请重新 inspect_page');
+  }
+  const exploring = action.explorationTabId !== undefined || action.type.startsWith('page.');
+  if (exploring && action.type.startsWith('browser.') && action.type !== 'browser.scroll') {
+    const el = resolveElement(action);
+    if (!isVisible(el)) throw new Error('目标元素不可见');
+    if ((el as HTMLInputElement).disabled || el.getAttribute('aria-disabled') === 'true') throw new Error('目标元素已禁用');
+    if (action.type === 'browser.fill') {
+      if (!(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) throw new Error('目标不支持文本输入');
+      if (el.readOnly) throw new Error('目标元素只读');
+      if (el instanceof HTMLInputElement && el.type === 'password') throw new Error('凭据输入必须通过流程凭据变量完成');
+    }
+  }
   markAutomationActivity();
-  if (action.type !== 'takeover.show' && action.type !== 'takeover.hide' && action.type !== 'automation.pageBlock') {
+  if (!exploring && OVERLAY_DISMISSING_ACTIONS.has(action.type)) {
     dismissBlockingOverlays();
+  }
+  if (!exploring && action.type !== 'takeover.show' && action.type !== 'takeover.hide' && action.type !== 'automation.pageBlock') {
     setPageBlocked(true);
   }
   switch (action.type) {
@@ -189,7 +228,13 @@ async function handleAction(action: ContentAction): Promise<unknown> {
       return { ok: true };
     }
     case 'browser.scroll': {
-      window.scrollBy({ top: action.distance ?? 800, behavior: 'auto' });
+      if (exploring && (action.ref !== undefined || action.selector !== undefined)) {
+        const target = resolveElement(action);
+        if (!isVisible(target)) throw new Error('滚动目标不可见');
+        target.scrollBy({ top: action.distance ?? 800, behavior: 'auto' });
+      } else {
+        window.scrollBy({ top: action.distance ?? 800, behavior: 'auto' });
+      }
       return { ok: true };
     }
     case 'browser.check': {
@@ -263,6 +308,43 @@ async function handleAction(action: ContentAction): Promise<unknown> {
         pulseClickAt(action.x, action.y);
       }
       return { ok: true };
+    }
+    case 'page.observe': {
+      return { ...observePage({ scope: action.scope, version: action.observationVersion }), document_id: documentId };
+    }
+    case 'page.end': {
+      setPageBlocked(false);
+      return { ok: true };
+    }
+    case 'page.waitFor': {
+      if (!action.selector) throw new Error('page.waitFor 需要 selector');
+      const deadline = Date.now() + 10000;
+      do {
+        if (querySelectorAllDeep(action.selector).some(isVisible)) return { status: 'satisfied' };
+        await new Promise(resolve => setTimeout(resolve, 100));
+      } while (Date.now() < deadline);
+      return { status: 'timed_out' };
+    }
+    case 'page.effectSignature': {
+      return EFFECT_SIGNATURE();
+    }
+    case 'page.targetState': {
+      // 两个定位字段都没给 = 整页滚动，没有元素可回读，交给脚本自己取文档滚动容器。
+      const el = action.ref === undefined && action.selector === undefined ? null : tryResolveElement(action);
+      return TARGET_STATE(el);
+    }
+    case 'page.resolveTarget': {
+      // 只报事实（命中几个、编号是什么），措辞和 required_action 由后端统一给：
+      // 两条通道各写一份错误文案，模型看到的失败原因就会因通道而异。
+      if (action.ref !== undefined) {
+        resolveElement(action);
+        return { matches: 1, element_ref: action.ref };
+      }
+      if (action.selector === undefined) throw new Error('page.resolveTarget 需要 ref 或 selector');
+      const found = querySelectorAllDeep(action.selector);
+      const only = found.length === 1 ? found[0] : undefined;
+      if (only === undefined) return { matches: found.length };
+      return { matches: 1, element_ref: registerActionTarget(only) };
     }
     case 'takeover.show': {
       if (action.message === undefined || action.taskId === undefined) throw new Error('takeover.show 需要 message 和 taskId');

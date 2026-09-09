@@ -28,6 +28,12 @@ export interface ContentAction {
   | 'browser.elementState'
   | 'browser.extractAll'
   | 'browser.ensureLogin'
+  | 'page.waitFor'
+  | 'page.end'
+  | 'page.observe'
+  | 'page.effectSignature'
+  | 'page.targetState'
+  | 'page.resolveTarget'
   | 'scrollIntoView'
   | 'resolveRect'
   | 'highlight'
@@ -71,4 +77,14 @@ export interface ContentAction {
   pulse?: boolean;
   /** automation.pageBlock 使用：运行中禁用页面交互，人工接管/流程结束时放开 */
   blocked?: boolean;
+  /** page.observe 使用：只观察这个选择器命中的区域；命中不到直接报错，绝不回退整页 */
+  scope?: string | null;
+  /**
+   * page.observe 使用：本次观察的版本号，由后端会话递增；
+   * 其他动作用它声明「我这个 ref 来自第几次观察」，版本不符即报 ref 失效。
+   * 少了这个校验，上一次观察的 ref 会指向重渲染后同一位置的另一行数据。
+   */
+  observationVersion?: number;
+  documentId?: string;
+  explorationTabId?: number;
 }

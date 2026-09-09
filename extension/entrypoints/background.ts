@@ -17,7 +17,7 @@ interface BridgeInstruction {
     targetUrl?: string; // browser.open / tab.open
     clearStorage?: boolean; // 插件模式暂不支持，见 navigateActiveTab
     clearCookies?: boolean;
-    index?: number; // browser.tab.switch：按当前窗口标签页顺序的下标
+    index?: number; // browser.tab.switch：按自动化自己持有的标签页顺序的下标（见 switchTab / ownedTabIds）
     checked?: boolean; // browser.check
     targetRef?: string; // browser.drag 落点 / browser.ensureLogin 登出态探测选择器
     targetSelector?: string;
@@ -26,6 +26,10 @@ interface BridgeInstruction {
     y?: number;
     pulse?: boolean;
     blocked?: boolean; // automation.pageBlock：运行态锁定/解锁页面交互
+    explorationTabId?: number; // page.begin 绑定的用户标签页；探索动作只允许路由到该标签页
+    documentId?: string; // page.observe 返回的文档身份；内容脚本导航重建后自动变化
+    observationVersion?: number;
+    scope?: string | null;
   };
 }
 
@@ -68,9 +72,20 @@ let lastForegroundRetryAt = 0;
 
 // "当前工作标签页"指针，对应 Playwright 的 context.page：锁定后跟着走，不再重读 OS 焦点，避免切页"串台"。
 let controlledTabId: number | null = null;
+// 自动化这次会话里驱动过的标签页，对应 Playwright 的 context.pages：browser.tab.switch 只在这里面选。
+// 不挂 tabs.onRemoved 清理：Chrome 的 tab id 在会话内不复用，死 id 与实时 tabs 求交集时自然落选。
+const ownedTabIds = new Set<number>();
 let controlledTabGroupId: number | null = null;
 // group.start 只登记标题，专用标签延迟到首次导航时按目标 URL 创建，避免预开 about:blank 抢焦点/残留。
 let pendingGroupTitle: string | null = null;
+// AI 页面探索借用用户开始时正在看的标签页，但不把它收进运行专用标签集合。
+// 两根指针必须分开：探索结束后，后续流程仍应复用自己的 controlledTabId。
+let explorationTabId: number | null = null;
+
+function setControlledTab(tabId: number): void {
+  controlledTabId = tabId;
+  ownedTabIds.add(tabId);
+}
 
 type ResolveTabOptions = {
   requireInjectable?: boolean;
@@ -94,7 +109,7 @@ async function resolveControlledTab(options: ResolveTabOptions = {}): Promise<Br
   }
   const tab = options.requireInjectable ? await findInjectableTab() : await findActiveTab();
   if (tab?.id !== undefined) {
-    controlledTabId = tab.id;
+    setControlledTab(tab.id);
     if (options.requireInjectable && tab.active !== true) {
       await browser.tabs.update(tab.id, { active: true });
     }
@@ -107,6 +122,53 @@ async function findActiveTab(): Promise<Browser.tabs.Tab | null> {
   if (current !== undefined) return current;
   const [lastFocused] = await browser.tabs.query({ active: true, lastFocusedWindow: true });
   return lastFocused ?? null;
+}
+
+async function beginPageExploration(): Promise<{ ok: boolean; result?: unknown; error?: string }> {
+  const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+  if (tab?.id === undefined || !isInjectableTabUrl(tab.url)) {
+    return { ok: false, error: '当前活动标签页不是可操作的普通网页，请先切到目标网站页面再重试' };
+  }
+  if (explorationTabId !== null && explorationTabId !== tab.id) {
+    await releasePageExploration(explorationTabId);
+  }
+  explorationTabId = tab.id;
+  return { ok: true, result: { tab_id: tab.id } };
+}
+
+async function resolveExplorationTab(action: BridgeInstruction['action']): Promise<Browser.tabs.Tab> {
+  const requested = action.explorationTabId;
+  if (!Number.isInteger(requested) || requested !== explorationTabId) {
+    throw new Error('探索标签页身份无效或会话已结束，请重新 inspect_page 建立会话');
+  }
+  try {
+    const tab = await browser.tabs.get(requested as number);
+    if (!isInjectableTabUrl(tab.url)) {
+      throw new Error('探索标签页已离开可操作的普通网页，请重新 inspect_page 建立会话');
+    }
+    return tab;
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('探索标签页已离开')) throw error;
+    throw new Error('探索标签页已关闭，请重新 inspect_page 建立会话');
+  }
+}
+
+async function releasePageExploration(tabId: number): Promise<{ ok: boolean; result?: unknown; error?: string }> {
+  if (explorationTabId !== tabId) {
+    return { ok: false, error: '探索标签页身份无效或会话已结束' };
+  }
+  try {
+    const tab = await browser.tabs.get(tabId);
+    if (isInjectableTabUrl(tab.url)) {
+      const released = await sendToTab(tab, { type: 'page.end' });
+      if (!released.ok) return released;
+    }
+    return { ok: true, result: { tab_id: tabId } };
+  } catch {
+    return { ok: false, error: '探索标签页已关闭' };
+  } finally {
+    if (explorationTabId === tabId) explorationTabId = null;
+  }
 }
 
 async function findInjectableTab(): Promise<Browser.tabs.Tab | null> {
@@ -173,7 +235,7 @@ async function openNewTab(action: BridgeInstruction['action']): Promise<{ ok: bo
   if (newTab.id === undefined) {
     return { ok: false, error: '创建新标签页失败' };
   }
-  controlledTabId = newTab.id;
+  setControlledTab(newTab.id);
   await formControlledGroup(newTab.id);
   if (action.targetUrl !== undefined) {
     await waitForTabLoad(newTab.id, NAVIGATION_TIMEOUT_MS);
@@ -187,7 +249,7 @@ async function openNewTab(action: BridgeInstruction['action']): Promise<{ ok: bo
 async function createControlledTab(url: string): Promise<Browser.tabs.Tab | null> {
   const newTab = await browser.tabs.create({ url, active: true });
   if (newTab.id === undefined) return null;
-  controlledTabId = newTab.id;
+  setControlledTab(newTab.id);
   await formControlledGroup(newTab.id);
   return newTab;
 }
@@ -208,15 +270,19 @@ async function formControlledGroup(tabId: number): Promise<void> {
   }
 }
 
+// index 来自流程定义（AI 也写得出来）：拿它索引整个窗口的标签页，等于让流程把用户任意一个已登录
+// 标签页收为受控，之后的 fill/click/extract 全落在那里。
 async function switchTab(action: BridgeInstruction['action']): Promise<{ ok: boolean; result?: unknown; error?: string }> {
   const index = action.index ?? 0;
-  const currentTab = await resolveControlledTab();
-  const tabs = await browser.tabs.query({ windowId: currentTab?.windowId });
-  const target = tabs[index];
+  const tabs = await browser.tabs.query({});
+  const owned = tabs
+    .filter((tab) => tab.id !== undefined && ownedTabIds.has(tab.id))
+    .sort((a, b) => (a.windowId ?? 0) - (b.windowId ?? 0) || a.index - b.index);
+  const target = owned[index];
   if (target?.id === undefined) {
-    return { ok: false, error: '标签页索引超出范围' };
+    return { ok: false, error: `标签页索引超出范围：自动化当前持有 ${owned.length} 个标签页` };
   }
-  controlledTabId = target.id;
+  setControlledTab(target.id);
   await browser.tabs.update(target.id, { active: true });
   if (controlledTabGroupId !== null) {
     await groupControlledTabs([target.id]);
@@ -392,15 +458,29 @@ function connect(): void {
 
   nextSocket.addEventListener('message', (event) => {
     if (socket !== nextSocket) return;
-    let instruction: BridgeInstruction;
+    let payload: unknown;
     try {
-      instruction = JSON.parse(event.data as string) as BridgeInstruction;
+      payload = JSON.parse(event.data as string);
     } catch (error) {
       // 帧解不出来就没有 requestId，回不了错——只能记一条，后端那侧走超时收场
       console.warn('[rpa-studio-bridge] dropped a malformed instruction frame', error);
       return;
     }
-    void handleInstruction(instruction);
+    const requestId = readFrameString(payload, 'requestId');
+    const actionType = readFrameString((payload as { action?: unknown } | null)?.action, 'type');
+    if (requestId === null || actionType === null) {
+      // 形状必须在进 handleInstruction 之前认：它的 `const { action } = instruction` 在 try 之外，
+      // 抛出的是被丢弃的 rejection，回执永远不发，后端等满 30s 报「超时」，真因整个丢掉。
+      const reason = requestId === null ? 'requestId 缺失或不是非空字符串' : 'action.type 缺失或不是非空字符串';
+      console.warn(`[rpa-studio-bridge] rejected an ill-shaped instruction frame: ${reason}`);
+      // 只认信封，各动作的参数留给对应分支——这里再抄一份等于两处白名单，改协议时必漏一处。
+      if (requestId !== null) {
+        const response: BridgeResult = { requestId, ok: false, error: `指令帧格式非法：${reason}` };
+        nextSocket.send(JSON.stringify(response));
+      }
+      return;
+    }
+    void handleInstruction(payload as BridgeInstruction);
   });
 
   nextSocket.addEventListener('close', (event) => {
@@ -430,6 +510,12 @@ function connect(): void {
   });
 }
 
+function readFrameString(source: unknown, key: string): string | null {
+  if (typeof source !== 'object' || source === null) return null;
+  const value = (source as Record<string, unknown>)[key];
+  return typeof value === 'string' && value !== '' ? value : null;
+}
+
 function buildBackendWebSocketUrl(path: string): string {
   const wsBaseUrl = BACKEND_BASE_URL.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:').replace(/\/$/, '');
   return `${wsBaseUrl}${path.startsWith('/') ? path : `/${path}`}`;
@@ -437,10 +523,31 @@ function buildBackendWebSocketUrl(path: string): string {
 
 async function handleInstruction(instruction: BridgeInstruction): Promise<void> {
   const { action } = instruction;
-  void notifyAutomationActivity();
+  if (action.explorationTabId === undefined && !action.type.startsWith('page.')) void notifyAutomationActivity();
   let result: { ok: boolean; result?: unknown; error?: string };
   try {
-    if (action.type === 'browser.screenshot') {
+    if (action.type === 'page.begin') {
+      result = await beginPageExploration();
+    } else if (action.type === 'page.end') {
+      result = await releasePageExploration(action.explorationTabId as number);
+    } else if (action.explorationTabId !== undefined) {
+      const tab = await resolveExplorationTab(action);
+      if (action.type === 'browser.screenshot') {
+        const identity = await sendToTab(tab, { ...action, type: 'page.effectSignature' });
+        if (!identity.ok) throw new Error(identity.error);
+        if (!tab.active) throw new Error('截图要求探索标签页可见，请切回该标签页');
+        const dataUrl = await browser.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+        const [visible] = await browser.tabs.query({ active: true, windowId: tab.windowId });
+        if (visible?.id !== tab.id) throw new Error('截图期间切换了标签页，请重试');
+        const after = await sendToTab(tab, { ...action, type: 'page.effectSignature' });
+        if (!after.ok) throw new Error(after.error);
+        result = { ok: true, result: { dataUrl } };
+      } else {
+        result = await sendToTab(tab, action);
+      }
+    } else if (action.type.startsWith('page.')) {
+      throw new Error('页面探索必须先调用 page.begin 并携带 explorationTabId');
+    } else if (action.type === 'browser.screenshot') {
       result = await captureActiveTabScreenshot();
     } else if (action.type === 'automation.group.start') {
       result = await ensureControlledTabGroup(action.title);
@@ -546,11 +653,20 @@ async function dispatchTrustedInput(action: BridgeInstruction['action']): Promis
 // 截图走 background 的 captureVisibleTab（content script 无权限），只能拍可见视口；返回 data URL 由后端落盘。
 async function captureActiveTabScreenshot(): Promise<{ ok: boolean; result?: unknown; error?: string }> {
   const tab = await resolveControlledTab();
-  if (tab?.windowId === undefined) {
+  if (tab?.id === undefined || tab.windowId === undefined) {
     return { ok: false, error: '未找到可操作的浏览器标签页' };
   }
   try {
-    const dataUrl = await browser.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+    // captureVisibleTab 拍的是那个窗口此刻可见的东西，不是受控标签页：用户随时切到网银或邮箱，
+    // 而这张图会落盘进运行产物、还会喂给模型。所以切到前台后回读确认，确认不了就宁可失败。
+    if (tab.active !== true) {
+      await browser.tabs.update(tab.id, { active: true });
+    }
+    const confirmed = await browser.tabs.get(tab.id);
+    if (confirmed.active !== true) {
+      return { ok: false, error: '受控标签页无法切到前台，已放弃截图，避免截到用户当前正在看的其他页面' };
+    }
+    const dataUrl = await browser.tabs.captureVisibleTab(confirmed.windowId ?? tab.windowId, { format: 'png' });
     return { ok: true, result: { dataUrl } };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
@@ -568,15 +684,22 @@ async function sendToActiveTab(
       error: options.passive ? '专属标签页尚未导航到可交互页面，跳过活跃度提示' : '未找到可操作的普通网页标签页，请先打开目标网站页面',
     };
   }
+  return sendToTab(tab, action);
+}
+
+async function sendToTab(
+  tab: Browser.tabs.Tab, action: BridgeInstruction['action']
+): Promise<{ ok: boolean; result?: unknown; error?: string }> {
+  if (tab.id === undefined) return { ok: false, error: '标签页不存在' };
   const message = { source: 'rpa-studio-bridge', action };
   try {
-    return await browser.tabs.sendMessage(tab.id, message);
+    return await browser.tabs.sendMessage(tab.id, message, { frameId: 0 });
   } catch (error) {
     if (isReceivingEndMissingError(error)) {
       const injected = await injectContentScript(tab);
       if (!injected.ok) return injected;
       try {
-        return await browser.tabs.sendMessage(tab.id, message);
+        return await browser.tabs.sendMessage(tab.id, message, { frameId: 0 });
       } catch (retryError) {
         return { ok: false, error: formatTabMessageError(retryError) };
       }

@@ -812,7 +812,10 @@ async def test_task_manager_routes_fetch_node_to_extension_and_keeps_structured_
 
     assert runner.requests == []
     assert [action["type"] for action in fake_extension.actions] == ["browser.open", "browser.extract"]
-    assert fake_extension.actions[-1] == {"type": "browser.extract", "selector": "table.orders", "extractMode": "table"}
+    # 带 id：这两个节点是取数路径临时拼的，不带的话桥接审计日志只剩运行标签、认不出是哪个节点动的手
+    assert fake_extension.actions[-1] == {
+        "type": "browser.extract", "id": "fetch-table", "selector": "table.orders", "extractMode": "table"
+    }
     assert current.result is not None
     assert current.result.values == ['{"姓名": "张三", "金额": "100"}', '{"姓名": "李四", "金额": "200"}']
     variables = {variable.name: variable.value for variable in current.variables}

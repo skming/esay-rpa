@@ -10,6 +10,9 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 from uuid import uuid4
 
@@ -37,9 +40,38 @@ _RECEIVE_TIMEOUT_SECONDS = 45.0
 # 得由后端在顶替前主动 ping 现任、按存活情况仲裁，而不是让先到者无条件赢。
 _REPLACED_CONNECTION_CLOSE_CODE = 4409
 
+# WS 握手不受同源策略约束：没有这道判断，用户正在浏览的任意网页都能连上本机这条桥，拿到操作
+# 其真实登录态浏览器的完整能力（同一攻击者对 /api 的跨域 POST 反而会被预检挡住）。
+# 上限：Origin 页面伪造不了，但本机的非浏览器进程能任意设置；挡住后者要配对令牌，本次不做。
+_ALLOWED_ORIGIN_PREFIX = "chrome-extension://"
+
 # 插件操作的是用户真实登录态浏览器，单独留痕供事后安全审查；只记录类型/选择器/耗时/成败，
 # 不记录 inputValue 或页面文本（可能含密码、验证码等敏感数据）。
 _AUDIT_LOG_FILENAME = "extension_bridge_audit.jsonl"
+
+# selector 来自流程定义（AI 也写得出来）、error 来自页面原文：不设上限，一条记录就能把事后
+# 唯一能翻的这个文件刷成不可读。保留原长，看得出是被截过。
+_MAX_AUDIT_FIELD_CHARS = 300
+
+# 用 contextvar 不用服务上的字段：服务是单例，还给 /api/extension/bridge/execute 这类不属于任何
+# 运行的路径用，写成字段会给它们盖上上一次运行的标签——错的归属比没有归属更糟。
+_audit_scope: ContextVar[tuple[str | None, str | None]] = ContextVar("extension_audit_scope", default=(None, None))
+
+
+@contextmanager
+def audit_scope(*, run_label: str | None, node_id: str | None) -> Iterator[None]:
+    """把当前动作归属到某次运行的某个节点，退出时还原（嵌套调用不会互相污染）。"""
+    token = _audit_scope.set((run_label, node_id))
+    try:
+        yield
+    finally:
+        _audit_scope.reset(token)
+
+
+def _clip_audit_value(value: Any) -> Any:
+    if isinstance(value, str) and len(value) > _MAX_AUDIT_FIELD_CHARS:
+        return f"{value[:_MAX_AUDIT_FIELD_CHARS]}…（截断，原长 {len(value)}）"
+    return value
 
 
 def _write_audit_record(record: dict[str, Any]) -> None:
@@ -47,7 +79,7 @@ def _write_audit_record(record: dict[str, Any]) -> None:
         path = storage.resolve_logs_dir() / _AUDIT_LOG_FILENAME
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f.write(json.dumps({key: _clip_audit_value(value) for key, value in record.items()}, ensure_ascii=False) + "\n")
     except Exception:
         logger.exception("写入插件执行器审计日志失败")
 
@@ -80,6 +112,13 @@ class ExtensionBridgeService:
 
     async def handle_connection(self, websocket: WebSocket) -> None:
         """接受插件 WS 连接并持续处理响应直到断开；新连接总是立即顶替已注册的旧连接。"""
+        origin = websocket.headers.get("origin") or ""
+        if not origin.startswith(_ALLOWED_ORIGIN_PREFIX):
+            # 判在 accept 和顶替之前：顶替会 fail 掉现任连接上正在跑的动作，放到之后就等于让
+            # 任意网页无需凭据就能打断别人正在跑的运行。
+            logger.warning("拒绝非扩展来源的插件桥接连接：origin=%r", origin)
+            await self._close_quietly(websocket)
+            return
         if self._socket is not None:
             logger.info("新插件桥接连接到达，立即顶替旧连接")
             self._evict_current_socket()
@@ -147,11 +186,15 @@ class ExtensionBridgeService:
 
         request_id = str(uuid4())
         started_at = time.monotonic()
+        run_label, node_id = _audit_scope.get()
+        # runLabel/nodeId 恒定出现（空归属写 null）：日志按行 grep，键时有时无会让筛选静默漏行。
         audit_base = {
             "requestId": request_id,
             "timestamp": time.time(),
             "actionType": action.get("type"),
             "selector": action.get("selector"),
+            "runLabel": run_label,
+            "nodeId": node_id,
         }
         future: asyncio.Future[dict[str, Any]] = asyncio.get_event_loop().create_future()
         self._pending[request_id] = future

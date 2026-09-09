@@ -9,20 +9,23 @@ import pytest
 from fastapi import WebSocketDisconnect
 
 from app.core import storage
-from app.services.extension_bridge_service import ExtensionBridgeService
+from app.services.extension_bridge_service import ExtensionBridgeService, audit_scope
 
 
 class FakeWebSocket:
     """Minimal stand-in for fastapi.WebSocket driven by an asyncio.Queue, so tests can
     push responses and disconnects without a real network connection."""
 
-    def __init__(self) -> None:
+    def __init__(self, origin: str = "chrome-extension://abcdefghijklmnopabcdefghijklmnop") -> None:
         self.sent: list[dict] = []
         self.closed = False
         self.close_code: int | None = None
+        self.accepted = False
+        self.headers = {"origin": origin}
         self._incoming: asyncio.Queue = asyncio.Queue()
 
     async def accept(self) -> None:
+        self.accepted = True
         return None
 
     async def close(self, code: int = 1000, reason: str = "") -> None:
@@ -235,7 +238,9 @@ async def test_audit_log_never_contains_input_value_or_extracted_text() -> None:
     lines = audit_path.read_text(encoding="utf-8").strip().splitlines()
     record = json.loads(lines[-1])
 
-    assert set(record.keys()) == {"requestId", "timestamp", "actionType", "selector", "ok", "error", "durationMs"}
+    assert set(record.keys()) == {
+        "requestId", "timestamp", "actionType", "selector", "runLabel", "nodeId", "ok", "error", "durationMs"
+    }
     assert record["actionType"] == "browser.fill"
     assert record["selector"] == "#password"
     assert "s3cr3t-password" not in json.dumps(record)
@@ -269,7 +274,9 @@ async def test_audit_record_written_when_connection_is_replaced_mid_action() -> 
 
     audit_path = storage.resolve_logs_dir() / "extension_bridge_audit.jsonl"
     record = json.loads(audit_path.read_text(encoding="utf-8").strip().splitlines()[-1])
-    assert set(record.keys()) == {"requestId", "timestamp", "actionType", "selector", "ok", "error", "durationMs"}
+    assert set(record.keys()) == {
+        "requestId", "timestamp", "actionType", "selector", "runLabel", "nodeId", "ok", "error", "durationMs"
+    }
     assert record["actionType"] == "browser.click"
     assert record["selector"] == "#pay"
     assert record["ok"] is False
@@ -292,3 +299,105 @@ async def test_audit_record_written_on_timeout() -> None:
     record = json.loads(audit_path.read_text(encoding="utf-8").strip().splitlines()[-1])
     assert record["ok"] is False
     assert record["error"] == "timeout"
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://evil.example.com",
+        "http://localhost:5173",
+        "",
+        "chrome-extension",
+    ],
+)
+async def test_handshake_from_non_extension_origin_is_refused(origin: str) -> None:
+    """WS 握手不受同源策略约束：任意网页都能连上本机，Origin 是唯一能把它们和扩展分开的信号。
+    放进来的代价是整套操作用户真实登录态浏览器的能力。"""
+    service = ExtensionBridgeService()
+    ws = FakeWebSocket(origin=origin)
+
+    await service.handle_connection(ws)
+
+    assert not ws.accepted
+    assert ws.closed
+    assert not service.is_connected
+
+
+async def test_refused_handshake_does_not_evict_the_live_extension() -> None:
+    """顶替发生在校验之后：否则网页只要发起一次握手，就能打断用户正在跑的运行——
+    连"能不能操作浏览器"都不用赌，中断本身已经是一个无凭据可触发的动作。"""
+    service = ExtensionBridgeService()
+    real = FakeWebSocket()
+    real_task = asyncio.create_task(service.handle_connection(real))
+    await asyncio.sleep(0)
+    assert service.is_connected
+
+    pending_execute = asyncio.create_task(service.execute({"type": "browser.click", "selector": "#pay"}, timeout=2.0))
+    while not real.sent:
+        await asyncio.sleep(0)
+
+    await service.handle_connection(FakeWebSocket(origin="https://evil.example.com"))
+
+    assert service.is_connected
+    assert not real.closed
+    request_id = real.sent[0]["requestId"]
+    real.push_response({"requestId": request_id, "ok": True, "result": {}})
+    assert await pending_execute == {}
+
+    real.disconnect()
+    await real_task
+
+
+async def test_audit_record_carries_run_and_node_attribution() -> None:
+    """一条点了 #pay 必须能落到哪次运行的哪个节点，而不属于任何运行的调用路径（调试接口
+    /api/extension/bridge/execute）不能被盖上上一次运行的标签——错的归属比没有归属更糟。"""
+    service = ExtensionBridgeService()
+    ws = FakeWebSocket()
+    connection_task = asyncio.create_task(service.handle_connection(ws))
+    await asyncio.sleep(0)
+
+    async def respond_to(index: int) -> None:
+        while len(ws.sent) <= index:
+            await asyncio.sleep(0)
+        ws.push_response({"requestId": ws.sent[index]["requestId"], "ok": True, "result": {}})
+
+    responder = asyncio.create_task(respond_to(0))
+    with audit_scope(run_label="报销单流程 · 运行 task-1", node_id="node-7"):
+        await service.execute({"type": "browser.click", "selector": "#pay"}, timeout=2.0)
+    await responder
+
+    responder = asyncio.create_task(respond_to(1))
+    await service.execute({"type": "browser.click", "selector": "#unrelated"}, timeout=2.0)
+    await responder
+
+    ws.disconnect()
+    await connection_task
+
+    audit_path = storage.resolve_logs_dir() / "extension_bridge_audit.jsonl"
+    lines = audit_path.read_text(encoding="utf-8").strip().splitlines()
+    scoped = json.loads(lines[-2])
+    unscoped = json.loads(lines[-1])
+
+    assert (scoped["runLabel"], scoped["nodeId"]) == ("报销单流程 · 运行 task-1", "node-7")
+    assert (unscoped["runLabel"], unscoped["nodeId"]) == (None, None)
+
+
+async def test_audit_record_clips_an_overlong_selector() -> None:
+    """selector 来自流程定义（AI 也写得出来）：几 KB 一条会把这个事后唯一能翻的文件刷成不可读。"""
+    service = ExtensionBridgeService()
+    ws = FakeWebSocket()
+    connection_task = asyncio.create_task(service.handle_connection(ws))
+    await asyncio.sleep(0)
+
+    selector = "div.row " * 800
+    with pytest.raises(TimeoutError):
+        await service.execute({"type": "browser.click", "selector": selector}, timeout=0.01)
+
+    ws.disconnect()
+    await connection_task
+
+    audit_path = storage.resolve_logs_dir() / "extension_bridge_audit.jsonl"
+    record = json.loads(audit_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert record["selector"].startswith("div.row div.row ")
+    assert f"截断，原长 {len(selector)}" in record["selector"]
+    assert len(record["selector"]) < 400

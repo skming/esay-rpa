@@ -31,7 +31,7 @@ from app.services.browser_action_runner import (
     _read_target_selector_config,
     _split_selector_candidates,
 )
-from app.services.extension_bridge_service import ExtensionBridgeService
+from app.services.extension_bridge_service import ExtensionBridgeService, audit_scope
 from app.services.pagination_probe import (
     EXTENSION_EVIDENCE_SELECTORS,
     FIRST_PAGE_STOP_REASONS,
@@ -69,13 +69,40 @@ _SCREENSHOT_MIN_INTERVAL_SECONDS = 1.0
 
 @dataclass
 class ExtensionExecutionContext:
-    """占位上下文：插件执行器没有需要持有的浏览器进程句柄，用户的 Chrome 窗口本身就是上下文。"""
+    """占位上下文：插件执行器没有需要持有的浏览器进程句柄，用户的 Chrome 窗口本身就是上下文。
+
+    step_count 挂在这里而不是执行器实例上：执行器是单例，两次运行交错时计数互相累加，
+    后一次刚发几个动作就被判成失控循环中止。owner / holds_lease 见 close_context。
+    """
 
     headless: bool = False
     persistent: bool = True
+    owner: str | None = None
+    step_count: int = 0
+    holds_lease: bool = False
+    manage_tabs: bool = True
 
 
 _DEFAULT_MAX_STEPS_PER_RUN = 500
+
+_UNNAMED_LEASE_OWNER = "未命名运行"
+
+
+class ExtensionBusyError(RuntimeError):
+    """扩展桥接通道已被另一次运行占用。holder 是占用方的可读描述，供调用方转成对用户的操作指引。"""
+
+    def __init__(self, holder: str, message: str) -> None:
+        super().__init__(message)
+        self.holder = holder
+
+
+def extension_busy_message(holder_label: str) -> str:
+    return (
+        f"浏览器扩展正被「{holder_label}」占用：它驱动的是用户自己那一个浏览器窗口，"
+        "两次运行同时操作会互相踩掉对方的页面跳转和输入，且失败现场看起来只是"
+        "「选择器找不到元素」。如果它在等待人工操作，请在浏览器顶部横幅点「完成，继续执行」；"
+        "否则先停止该运行，再重试。"
+    )
 
 
 class ExtensionExecutor:
@@ -85,24 +112,43 @@ class ExtensionExecutor:
     def __init__(self, bridge: ExtensionBridgeService, *, max_steps_per_run: int = _DEFAULT_MAX_STEPS_PER_RUN) -> None:
         self._bridge = bridge
         self._max_steps_per_run = max_steps_per_run
-        self._step_count = 0
+        # 留在实例上、不跟 step_count 一起搬进上下文：captureVisibleTab 的配额是整个 Chrome 共享的，
+        # 按运行分别节流等于两次运行交错时把间隔放宽一倍，照样触发限流。
         self._last_screenshot_at: float | None = None
+        self._lease_owner: str | None = None
 
     @property
     def is_connected(self) -> bool:
         return self._bridge.is_connected
 
-    # owner 只为满足 BrowserExecutor 协议：插件执行器借用用户自己的浏览器，不占用应用的 profile
-    async def create_context(self, *, headless: bool = True, owner: str | None = None) -> ExtensionExecutionContext:
+    @property
+    def lease_holder(self) -> str | None:
+        """当前占着扩展的运行标签，空闲时为 None。供起跑前的门控读取。"""
+        return self._lease_owner
+
+    # owner 是租约身份，不只是满足 BrowserExecutor 协议的占位参数：虽然不占应用的 profile，
+    # 但用户那一个浏览器窗口本身就是互斥资源。
+    async def create_context(self, *, headless: bool = True, owner: str | None = None, manage_tabs: bool = True) -> ExtensionExecutionContext:
         if not self._bridge.is_connected:
             raise ConnectionError("没有已连接的浏览器扩展，无法使用插件执行器——请确认扩展已加载并打开了一个标签页")
-        self._step_count = 0
-        await self._ensure_tab_group()
-        return ExtensionExecutionContext()
+        label = owner or _UNNAMED_LEASE_OWNER
+        if self._lease_owner is not None and self._lease_owner != label:
+            raise ExtensionBusyError(self._lease_owner, extension_busy_message(self._lease_owner))
+        # 判据是占用方是不是别人，而不是有没有人占：同一次运行里可能再建一次上下文（扩展采集
+        # 节点会自己建），写成后者运行会卡死在自己身上。只有拿到租约的那个上下文能释放它。
+        holds_lease = self._lease_owner is None
+        self._lease_owner = label
+        if manage_tabs:
+            await self._ensure_tab_group()
+        return ExtensionExecutionContext(owner=label, holds_lease=holds_lease, manage_tabs=manage_tabs)
 
     async def close_context(self, context: ExtensionExecutionContext | None) -> None:
-        await self._mark_tab_group_done()
-        return
+        if context is not None and context.manage_tabs:
+            await self._mark_tab_group_done()
+        # 只有登记者本人能释放（同 browser_profile_lock.release）：抢不到租约的一方也会走进自己的
+        # finally，无条件清空会抹掉正在跑的那次运行的登记，第三次运行就拿到空闲的假象。
+        if context is not None and context.holds_lease and self._lease_owner == context.owner:
+            self._lease_owner = None
 
     async def _ensure_tab_group(self) -> None:
         """标签页分组仅作可视化隔离，失败不应阻断真实流程执行。"""
@@ -130,6 +176,16 @@ class ExtensionExecutor:
         _, _, encoded = data_url.partition(",")
         return base64.b64decode(encoded) if encoded else b""
 
+    async def page_action(self, action: dict[str, object], *, timeout: float = 15.0) -> object:
+        """探索通道的原始动作出口：不走节点解析，直接把消息发给内容脚本。
+
+        故意与 run 共用 _bridge.execute 这一条链路和同一份审计：探索时点得动、运行时点不动
+        这类差异，只有共用链路才会在探索阶段就暴露出来。归属写成租约持有者——发这些动作的
+        就是它，审计行里才分得清哪些操作来自助手探索、哪些来自用户的运行。
+        """
+        with audit_scope(run_label=self._lease_owner, node_id=None):
+            return await self._bridge.execute(action, timeout=timeout)
+
     async def show_takeover_banner(self, task_id: str, message: str) -> None:
         """在真实浏览器标签页（而非 Easy RPA 应用窗口）顶部插入提示条，因为插件执行器运行时用户看的是前者。"""
         await self._bridge.execute({"type": "takeover.show", "message": message, "taskId": task_id}, timeout=5.0)
@@ -147,27 +203,29 @@ class ExtensionExecutor:
     async def run(
         self, node: FlowNode, variables: RuntimeVariableStore, context: ExtensionExecutionContext, *, timeout_ms: int
     ) -> BrowserActionResult:
-        self._step_count += 1
-        if self._step_count > self._max_steps_per_run:
+        context.step_count += 1
+        if context.step_count > self._max_steps_per_run:
             raise RuntimeError(
                 f"插件执行器单次运行动作数已达上限（{self._max_steps_per_run}），已停止执行——"
                 "这是为了防止失控循环对用户真实登录态的浏览器做出无限次操作。"
             )
-        try:
-            return await self._run_action(node, variables, context, timeout_ms=timeout_ms)
-        except Exception:
-            healed = await self._heal_selector(node, variables)
-            if healed is None:
-                raise
-            healed_node = dict(node)
-            healed_node["selector"] = healed
-            result = await self._run_action(healed_node, variables, context, timeout_ms=timeout_ms)
-            return BrowserActionResult(
-                action_type=result.action_type,
-                detail=f"{result.detail}（selector 自愈：原 selector 未命中，改用备选 {healed}）",
-                values=result.values,
-                structured=result.structured,
-            )
+        # 审计行要能落到哪次运行的哪个节点；自愈探测也包进来，它同样落在用户的真实页面上。
+        with audit_scope(run_label=context.owner, node_id=_read_optional_string(node, "id")):
+            try:
+                return await self._run_action(node, variables, context, timeout_ms=timeout_ms)
+            except Exception:
+                healed = await self._heal_selector(node, variables)
+                if healed is None:
+                    raise
+                healed_node = dict(node)
+                healed_node["selector"] = healed
+                result = await self._run_action(healed_node, variables, context, timeout_ms=timeout_ms)
+                return BrowserActionResult(
+                    action_type=result.action_type,
+                    detail=f"{result.detail}（selector 自愈：原 selector 未命中，改用备选 {healed}）",
+                    values=result.values,
+                    structured=result.structured,
+                )
 
     async def _heal_selector(self, node: FlowNode, variables: RuntimeVariableStore) -> str | None:
         """复用 BrowserActionRunner 的候选生成逻辑，探测改走 browser.elementState；
