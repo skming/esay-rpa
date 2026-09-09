@@ -119,10 +119,6 @@ def _lint_flow(
     """Programmatic flow quality checks; returns findings with severity/node_id/node_title/issue/message/fix."""
     findings: list[dict[str, Any]] = []
 
-    node_map: dict[str, dict] = {
-        n["id"]: n for n in nodes if isinstance(n, dict) and n.get("id")
-    }
-
     # Build per-node outgoing edges (with labels)
     out_edges: dict[str, list[dict]] = {}
     for e in edges:
@@ -139,225 +135,14 @@ def _lint_flow(
         if ntype in ("start", "end"):
             continue
 
-        # 1. foreach / repeat_until must have body + exit labeled edges
-        if ntype in _LOOP_LIKE_NODE_TYPES:
-            labels = {e.get("label", "") for e in out_edges.get(nid, [])}
-            if "body" not in labels:
-                findings.append({
-                    "severity": "error", "node_id": nid, "node_title": ntitle,
-                    "issue": "foreach_missing_body_edge",
-                    "message": f"循环节点 `{nid}`（{ntype}）缺少 label='body' 的循环体出边，循环体永远不会执行。",
-                    "fix": "用 update_flow add_edges 添加 source=该节点、target=循环体首节点、label='body' 的边。",
-                })
-            if "exit" not in labels:
-                findings.append({
-                    "severity": "error", "node_id": nid, "node_title": ntitle,
-                    "issue": "foreach_missing_exit_edge",
-                    "message": f"循环节点 `{nid}`（{ntype}）缺少 label='exit' 的循环后出边，迭代完成后流程无法继续。",
-                    "fix": "用 update_flow add_edges 添加 source=该节点、target=循环后首节点、label='exit' 的边。",
-                })
-
-        # 2. condition must have true + false labeled edges
-        if ntype == "control.condition":
-            labels = {e.get("label", "") for e in out_edges.get(nid, [])}
-            for branch in ("true", "false"):
-                if branch not in labels:
-                    findings.append({
-                        "severity": "error", "node_id": nid, "node_title": ntitle,
-                        "issue": f"condition_missing_{branch}_branch",
-                        "message": f"条件节点 `{nid}` 缺少 label='{branch}' 的分支出边，该分支永远不会执行。",
-                        "fix": f"添加一条 label='{branch}' 的出边，指向条件{'成立' if branch == 'true' else '不成立'}时的下一个节点。",
-                    })
-
-        # 2b. foreach / repeat_until ambiguous outgoing edges
-        if ntype in _LOOP_LIKE_NODE_TYPES:
-            outgoing = out_edges.get(nid, [])
-            labels = [str(e.get("label", "")).strip().lower() for e in outgoing]
-            unlabeled_count = sum(1 for label in labels if not label)
-            if len(outgoing) >= 2 and unlabeled_count:
-                findings.append({
-                    "severity": "error", "node_id": nid, "node_title": ntitle,
-                    "issue": "foreach_ambiguous_unlabeled_edges",
-                    "message": (
-                        f"循环节点 `{nid}`（{ntype}）有 {len(outgoing)} 条出边，但至少一条缺少 label。"
-                        "不同端（前端校验、后端执行、AI 修复）可能对未标注出边的循环体/退出分支理解不一致，"
-                        "会造成循环迭代了但写入节点未执行。"
-                    ),
-                    "fix": (
-                        "显式标注两条出边：循环体首节点 label='body'，循环完成后节点 label='exit'。"
-                        "循环体内部节点用普通边串联，不要把保存/结束节点误接成第二条未标注出边。"
-                    ),
-                })
-
-        # 3. browser.extract must have outputVariable or countVariable
-        if ntype == "browser.extract":
-            if not node.get("outputVariable") and not node.get("countVariable"):
-                findings.append({
-                    "severity": "error", "node_id": nid, "node_title": ntitle,
-                    "issue": "extract_no_output",
-                    "message": f"browser.extract 节点 `{nid}` 未设置 outputVariable，提取结果丢失。",
-                    "fix": "用 apply_node_fix 添加 outputVariable（如 'extracted_data'）。",
-                })
-            if not node.get("extractMode"):
-                findings.append({
-                    "severity": "warn", "node_id": nid, "node_title": ntitle,
-                    "issue": "extract_no_mode",
-                    "message": f"browser.extract 节点 `{nid}` 未设置 extractMode，行为依赖默认值，建议显式指定。",
-                    "fix": "设置 extractMode 为 text / html / attribute / count / table 之一。",
-                })
-
-        # 4. http.request without outputVariable
-        if ntype == "http.request" and not node.get("outputVariable"):
-            findings.append({
-                "severity": "warn", "node_id": nid, "node_title": ntitle,
-                "issue": "http_no_output",
-                "message": f"http.request 节点 `{nid}` 未设置 outputVariable，HTTP 响应无法被后续节点引用。",
-                "fix": "用 apply_node_fix 添加 outputVariable 字段（如 'api_response'）。",
-            })
-
-        # 5. variable.input misused for credentials
-        if ntype == "variable.input":
-            vname = (node.get("variableName") or "").lower()
-            if any(kw in vname for kw in _CREDENTIAL_KEYWORDS):
-                findings.append({
-                    "severity": "error", "node_id": nid, "node_title": ntitle,
-                    "issue": "credential_in_variable_input",
-                    "message": (
-                        f"节点 `{nid}` 用 variable.input 收集凭据字段 '{node.get('variableName')}'，"
-                        "每次运行都会暂停等待手动输入，破坏自动化。"
-                    ),
-                    "fix": (
-                        "删除此节点，改在流程 input_variables 中声明"
-                        "（category='credential'，密码加 sensitive=true），"
-                        "节点中用 ${var.xxx} 直接引用。"
-                    ),
-                })
-
-        # 6. output file path without timestamp
-        if ntype in ("file.write", "excel.save", "excel.addrow"):
-            path = node.get("path") or ""
-            if not path and any(node.get(key) for key in ("filePath", "targetPath", "targetUrl")):
-                findings.append({
-                    "severity": "warn", "node_id": nid, "node_title": ntitle,
-                    "issue": "noncanonical_path_field",
-                    "message": f"节点 `{nid}` 使用了 filePath/targetPath/targetUrl 作为文件路径兼容字段，前端校验与属性面板规范字段是 path。",
-                    "fix": "把路径写入 path 字段；兼容字段可保留但不要作为主字段。",
-                })
-                path = node.get("filePath") or node.get("targetPath") or node.get("targetUrl") or ""
-            if path and isinstance(path, str):
-                has_ts = any(kw in path for kw in (
-                    "${var.output_prefix}", "${var.run_timestamp}", "${var.output_dir}",
-                ))
-                if not has_ts:
-                    findings.append({
-                        "severity": "warn", "node_id": nid, "node_title": ntitle,
-                        "issue": "hardcoded_output_path",
-                        "message": f"节点 `{nid}` 输出路径 '{path}' 不含时间戳，每次运行会覆盖上次结果。",
-                        "fix": "将 path 改为 '${var.output_prefix}.json'（或 .xlsx）。",
-                    })
-
-        if ntype == "excel.addrow" and not any(node.get(key) is not None for key in ("rowData", "row", "content")):
-            findings.append({
-                "severity": "error", "node_id": nid, "node_title": ntitle,
-                "issue": "excel_addrow_missing_row_data",
-                "message": f"excel.addrow 节点 `{nid}` 缺少 rowData，运行时会追加空行或没有实际数据。",
-                "fix": "设置 rowData，例如 rowData='${var.current_row}' 或 rowData=[...]；循环内通常使用当前项变量。",
-            })
-
-        # 7. browser.* nodes missing selector
-        _NEED_SELECTOR = {
-            "browser.click", "browser.fill", "browser.wait",
-            "browser.extract", "browser.press", "browser.select",
-            "browser.check", "browser.drag", "browser.hover",
-        }
-        if ntype in _NEED_SELECTOR and not node.get("selector"):
-            findings.append({
-                "severity": "error", "node_id": nid, "node_title": ntitle,
-                "issue": "missing_selector",
-                "message": f"节点 `{nid}`（{ntype}）缺少 selector 字段，运行时会报错。",
-                "fix": "用 apply_node_fix 或 update_flow 添加 selector 字段。",
-            })
-
-        # 7a. browser.fill missing inputValue
-        if ntype == "browser.fill" and not node.get("inputValue") and not node.get("value"):
-            findings.append({
-                "severity": "error", "node_id": nid, "node_title": ntitle,
-                "issue": "missing_inputValue",
-                "message": (
-                    f"browser.fill 节点 `{nid}` 缺少 inputValue 字段，运行时会抛出"
-                    " '浏览器动作节点缺少 inputValue' 错误。"
-                ),
-                "fix": "添加 inputValue 字段，例如 inputValue: '${var.password}' 或具体的填写内容。",
-            })
-
-        # 7b. Playwright-only selector syntax in CSS selector fields
-        if ntype in _NEED_SELECTOR:
-            sel = str(node.get("selector", ""))
-            unsupported_selector = _detect_unsupported_css_selector_syntax(sel)
-            if unsupported_selector is not None:
-                findings.append({
-                    "severity": "error", "node_id": nid, "node_title": ntitle,
-                    "issue": "unsupported_selector_syntax",
-                    "message": (
-                        f"节点 `{nid}` 的 selector `{sel[:80]}` 使用了 `{unsupported_selector}` 这类 "
-                        "Playwright 专用定位语法。该字段会进入 CSS/querySelectorAll 兼容链路，"
-                        "运行时可能报“不是有效选择器”。"
-                    ),
-                    "fix": (
-                        "调用 inspect_page 获取真实 DOM selector，改成合法 CSS selector；"
-                        "文本匹配优先使用返回的稳定 id/name/placeholder/aria selector，"
-                        "不要把 text=、role=、xpath= 写入 selector 字段。"
-                    ),
-                })
-            if "text=" in sel and "," in sel:
-                findings.append({
-                    "severity": "error", "node_id": nid, "node_title": ntitle,
-                    "issue": "invalid_text_selector_in_css_list",
-                    "message": (
-                        f"节点 `{nid}` 的 selector `{sel[:80]}` 将 Playwright text= 语法与 CSS 选择器"
-                        " 用逗号混用，page.wait_for_selector 无法解析 '='，运行时会报"
-                        " 'Unexpected token \"=\" while parsing css selector' 错误。"
-                    ),
-                    "fix": (
-                        "把 text=XXX 改为 :has-text('XXX') 或 [aria-label='XXX']，"
-                        "与其他 CSS 选择器保持统一语法，不要在一个 selector 字段内用逗号混合两种语法。"
-                    ),
-                })
-
-        # 7c. interact_page 的临时元素引用被写进了流程
-        for field, raw in _locator_fields(node):
-            ref = next((v for v in raw if _TEMP_ELEMENT_REF.fullmatch(v)), None)
-            if ref is None:
-                continue
-            findings.append({
-                "severity": "error", "node_id": nid, "node_title": ntitle,
-                "issue": "temp_element_ref_in_flow",
-                "message": (
-                    f"节点 `{nid}` 的 {field} 写成了 `{ref}`，这是 inspect_page/interact_page 那一次观察"
-                    "内部的临时引用，只在当次观察的页面上成立。存进流程后每次运行都会找不到元素——"
-                    "而它长得像 selector，报错只会是普通的元素超时，排查会往 selector 写错的方向走。"
-                ),
-                "fix": (
-                    "换成观察结果里该元素的 selector 字段（稳定的 id/name/placeholder/aria 属性优先）；"
-                    "拿不到就用 interact_page 点开控件重新观察一次再取。"
-                ),
-            })
-
+        findings.extend(_lint_branch_edges_for_node(out_edges.get(nid, []), nid=nid, ntitle=ntitle, ntype=ntype))
+        findings.extend(_lint_output_contract_for_node(node, nid=nid, ntitle=ntitle, ntype=ntype))
+        findings.extend(_lint_credential_input_for_node(node, nid=nid, ntitle=ntitle, ntype=ntype))
+        findings.extend(_lint_output_target_for_node(node, nid=nid, ntitle=ntitle, ntype=ntype))
+        findings.extend(_lint_action_fields_for_node(node, nid=nid, ntitle=ntitle, ntype=ntype))
         findings.extend(_lint_variable_contract_for_node(node, nid=nid, ntitle=ntitle, ntype=ntype))
 
-    # 8. Unreachable (orphan) nodes
-    for nid in _unreachable_node_ids(nodes, edges):
-        node = node_map.get(nid, {})
-        ntype = node.get("type", "")
-        if ntype in ("start", "end"):
-            continue
-        findings.append({
-            "severity": "error", "node_id": nid, "node_title": node.get("title", nid),
-            "issue": "unreachable_node",
-            "message": f"节点 `{nid}` 无法从流程起点到达（孤儿节点），运行时会被跳过。",
-            "fix": "检查是否漏连了入边，用 update_flow add_edges 补连。",
-        })
-
+    findings.extend(_lint_unreachable_nodes(nodes, edges))
     findings.extend(_lint_visual_layout(nodes))
     findings.extend(_lint_flow_semantic_quality(nodes))
     findings.extend(_lint_extract_scalar_contract_for_scripts(nodes, edges))
@@ -368,8 +153,284 @@ def _lint_flow(
     findings.extend(_lint_critical_continue_on_error(nodes, edges))
     findings.extend(_lint_continue_on_error_output_defaults(nodes, edges))
 
-    # 只有一个 browser.open 却同时有登录+抽取节点，是空白页失败的常见根因
-    # （登录后未导航到数据页），AI 常误诊为下游 selector 问题。
+    findings.extend(_lint_single_navigation_node(nodes))
+    if input_variable_names is not None:
+        findings.extend(_lint_undefined_variable_refs(nodes, list(input_variable_names)))
+
+    return findings
+
+
+def _lint_branch_edges_for_node(
+    outgoing: list[dict],
+    *,
+    nid: str,
+    ntitle: str,
+    ntype: str,
+) -> list[dict[str, Any]]:
+    """循环/条件节点的分支出边契约。"""
+    findings: list[dict[str, Any]] = []
+    labels = {e.get("label", "") for e in outgoing}
+
+    if ntype in _LOOP_LIKE_NODE_TYPES:
+        if "body" not in labels:
+            findings.append({
+                "severity": "error", "node_id": nid, "node_title": ntitle,
+                "issue": "foreach_missing_body_edge",
+                "message": f"循环节点 `{nid}`（{ntype}）缺少 label='body' 的循环体出边，循环体永远不会执行。",
+                "fix": "用 update_flow add_edges 添加 source=该节点、target=循环体首节点、label='body' 的边。",
+            })
+        if "exit" not in labels:
+            findings.append({
+                "severity": "error", "node_id": nid, "node_title": ntitle,
+                "issue": "foreach_missing_exit_edge",
+                "message": f"循环节点 `{nid}`（{ntype}）缺少 label='exit' 的循环后出边，迭代完成后流程无法继续。",
+                "fix": "用 update_flow add_edges 添加 source=该节点、target=循环后首节点、label='exit' 的边。",
+            })
+
+    if ntype == "control.condition":
+        for branch in ("true", "false"):
+            if branch not in labels:
+                findings.append({
+                    "severity": "error", "node_id": nid, "node_title": ntitle,
+                    "issue": f"condition_missing_{branch}_branch",
+                    "message": f"条件节点 `{nid}` 缺少 label='{branch}' 的分支出边，该分支永远不会执行。",
+                    "fix": f"添加一条 label='{branch}' 的出边，指向条件{'成立' if branch == 'true' else '不成立'}时的下一个节点。",
+                })
+
+    if ntype in _LOOP_LIKE_NODE_TYPES:
+        unlabeled_count = sum(1 for e in outgoing if not str(e.get("label", "")).strip())
+        if len(outgoing) >= 2 and unlabeled_count:
+            findings.append({
+                "severity": "error", "node_id": nid, "node_title": ntitle,
+                "issue": "foreach_ambiguous_unlabeled_edges",
+                "message": (
+                    f"循环节点 `{nid}`（{ntype}）有 {len(outgoing)} 条出边，但至少一条缺少 label。"
+                    "不同端（前端校验、后端执行、AI 修复）可能对未标注出边的循环体/退出分支理解不一致，"
+                    "会造成循环迭代了但写入节点未执行。"
+                ),
+                "fix": (
+                    "显式标注两条出边：循环体首节点 label='body'，循环完成后节点 label='exit'。"
+                    "循环体内部节点用普通边串联，不要把保存/结束节点误接成第二条未标注出边。"
+                ),
+            })
+    return findings
+
+
+def _lint_output_contract_for_node(
+    node: dict[str, Any],
+    *,
+    nid: str,
+    ntitle: str,
+    ntype: str,
+) -> list[dict[str, Any]]:
+    """取数节点必须声明结果去处，否则抽到的数据静默丢弃。"""
+    findings: list[dict[str, Any]] = []
+
+    if ntype == "browser.extract":
+        if not node.get("outputVariable") and not node.get("countVariable"):
+            findings.append({
+                "severity": "error", "node_id": nid, "node_title": ntitle,
+                "issue": "extract_no_output",
+                "message": f"browser.extract 节点 `{nid}` 未设置 outputVariable，提取结果丢失。",
+                "fix": "用 apply_node_fix 添加 outputVariable（如 'extracted_data'）。",
+            })
+        if not node.get("extractMode"):
+            findings.append({
+                "severity": "warn", "node_id": nid, "node_title": ntitle,
+                "issue": "extract_no_mode",
+                "message": f"browser.extract 节点 `{nid}` 未设置 extractMode，行为依赖默认值，建议显式指定。",
+                "fix": "设置 extractMode 为 text / html / attribute / count / table 之一。",
+            })
+
+    if ntype == "http.request" and not node.get("outputVariable"):
+        findings.append({
+            "severity": "warn", "node_id": nid, "node_title": ntitle,
+            "issue": "http_no_output",
+            "message": f"http.request 节点 `{nid}` 未设置 outputVariable，HTTP 响应无法被后续节点引用。",
+            "fix": "用 apply_node_fix 添加 outputVariable 字段（如 'api_response'）。",
+        })
+    return findings
+
+
+def _lint_credential_input_for_node(
+    node: dict[str, Any],
+    *,
+    nid: str,
+    ntitle: str,
+    ntype: str,
+) -> list[dict[str, Any]]:
+    if ntype != "variable.input":
+        return []
+    vname = (node.get("variableName") or "").lower()
+    if not any(kw in vname for kw in _CREDENTIAL_KEYWORDS):
+        return []
+    return [{
+        "severity": "error", "node_id": nid, "node_title": ntitle,
+        "issue": "credential_in_variable_input",
+        "message": (
+            f"节点 `{nid}` 用 variable.input 收集凭据字段 '{node.get('variableName')}'，"
+            "每次运行都会暂停等待手动输入，破坏自动化。"
+        ),
+        "fix": (
+            "删除此节点，改在流程 input_variables 中声明"
+            "（category='credential'，密码加 sensitive=true），"
+            "节点中用 ${var.xxx} 直接引用。"
+        ),
+    }]
+
+
+def _lint_output_target_for_node(
+    node: dict[str, Any],
+    *,
+    nid: str,
+    ntitle: str,
+    ntype: str,
+) -> list[dict[str, Any]]:
+    """落盘节点的路径与待写内容。"""
+    findings: list[dict[str, Any]] = []
+
+    if ntype in ("file.write", "excel.save", "excel.addrow"):
+        path = node.get("path") or ""
+        if not path and any(node.get(key) for key in ("filePath", "targetPath", "targetUrl")):
+            findings.append({
+                "severity": "warn", "node_id": nid, "node_title": ntitle,
+                "issue": "noncanonical_path_field",
+                "message": f"节点 `{nid}` 使用了 filePath/targetPath/targetUrl 作为文件路径兼容字段，前端校验与属性面板规范字段是 path。",
+                "fix": "把路径写入 path 字段；兼容字段可保留但不要作为主字段。",
+            })
+            path = node.get("filePath") or node.get("targetPath") or node.get("targetUrl") or ""
+        if path and isinstance(path, str):
+            has_ts = any(kw in path for kw in (
+                "${var.output_prefix}", "${var.run_timestamp}", "${var.output_dir}",
+            ))
+            if not has_ts:
+                findings.append({
+                    "severity": "warn", "node_id": nid, "node_title": ntitle,
+                    "issue": "hardcoded_output_path",
+                    "message": f"节点 `{nid}` 输出路径 '{path}' 不含时间戳，每次运行会覆盖上次结果。",
+                    "fix": "将 path 改为 '${var.output_prefix}.json'（或 .xlsx）。",
+                })
+
+    if ntype == "excel.addrow" and not any(node.get(key) is not None for key in ("rowData", "row", "content")):
+        findings.append({
+            "severity": "error", "node_id": nid, "node_title": ntitle,
+            "issue": "excel_addrow_missing_row_data",
+            "message": f"excel.addrow 节点 `{nid}` 缺少 rowData，运行时会追加空行或没有实际数据。",
+            "fix": "设置 rowData，例如 rowData='${var.current_row}' 或 rowData=[...]；循环内通常使用当前项变量。",
+        })
+    return findings
+
+
+# 需要 selector 才能定位元素的动作节点
+_NEED_SELECTOR = frozenset({
+    "browser.click", "browser.fill", "browser.wait",
+    "browser.extract", "browser.press", "browser.select",
+    "browser.check", "browser.drag", "browser.hover",
+})
+
+
+def _lint_action_fields_for_node(
+    node: dict[str, Any],
+    *,
+    nid: str,
+    ntitle: str,
+    ntype: str,
+) -> list[dict[str, Any]]:
+    """动作节点的定位与取值字段：缺字段、写了运行不了的定位语法、写了只在观察当次成立的引用。"""
+    findings: list[dict[str, Any]] = []
+
+    if ntype in _NEED_SELECTOR and not node.get("selector"):
+        findings.append({
+            "severity": "error", "node_id": nid, "node_title": ntitle,
+            "issue": "missing_selector",
+            "message": f"节点 `{nid}`（{ntype}）缺少 selector 字段，运行时会报错。",
+            "fix": "用 apply_node_fix 或 update_flow 添加 selector 字段。",
+        })
+
+    if ntype == "browser.fill" and not node.get("inputValue") and not node.get("value"):
+        findings.append({
+            "severity": "error", "node_id": nid, "node_title": ntitle,
+            "issue": "missing_inputValue",
+            "message": (
+                f"browser.fill 节点 `{nid}` 缺少 inputValue 字段，运行时会抛出"
+                " '浏览器动作节点缺少 inputValue' 错误。"
+            ),
+            "fix": "添加 inputValue 字段，例如 inputValue: '${var.password}' 或具体的填写内容。",
+        })
+
+    if ntype in _NEED_SELECTOR:
+        sel = str(node.get("selector", ""))
+        unsupported_selector = _detect_unsupported_css_selector_syntax(sel)
+        if unsupported_selector is not None:
+            findings.append({
+                "severity": "error", "node_id": nid, "node_title": ntitle,
+                "issue": "unsupported_selector_syntax",
+                "message": (
+                    f"节点 `{nid}` 的 selector `{sel[:80]}` 使用了 `{unsupported_selector}` 这类 "
+                    "Playwright 专用定位语法。该字段会进入 CSS/querySelectorAll 兼容链路，"
+                    "运行时可能报“不是有效选择器”。"
+                ),
+                "fix": (
+                    "调用 inspect_page 获取真实 DOM selector，改成合法 CSS selector；"
+                    "文本匹配优先使用返回的稳定 id/name/placeholder/aria selector，"
+                    "不要把 text=、role=、xpath= 写入 selector 字段。"
+                ),
+            })
+        if "text=" in sel and "," in sel:
+            findings.append({
+                "severity": "error", "node_id": nid, "node_title": ntitle,
+                "issue": "invalid_text_selector_in_css_list",
+                "message": (
+                    f"节点 `{nid}` 的 selector `{sel[:80]}` 将 Playwright text= 语法与 CSS 选择器"
+                    " 用逗号混用，page.wait_for_selector 无法解析 '='，运行时会报"
+                    " 'Unexpected token \"=\" while parsing css selector' 错误。"
+                ),
+                "fix": (
+                    "把 text=XXX 改为 :has-text('XXX') 或 [aria-label='XXX']，"
+                    "与其他 CSS 选择器保持统一语法，不要在一个 selector 字段内用逗号混合两种语法。"
+                ),
+            })
+
+    for field, raw in _locator_fields(node):
+        ref = next((v for v in raw if _TEMP_ELEMENT_REF.fullmatch(v)), None)
+        if ref is None:
+            continue
+        findings.append({
+            "severity": "error", "node_id": nid, "node_title": ntitle,
+            "issue": "temp_element_ref_in_flow",
+            "message": (
+                f"节点 `{nid}` 的 {field} 写成了 `{ref}`，这是 inspect_page/interact_page 那一次观察"
+                "内部的临时引用，只在当次观察的页面上成立。存进流程后每次运行都会找不到元素——"
+                "而它长得像 selector，报错只会是普通的元素超时，排查会往 selector 写错的方向走。"
+            ),
+            "fix": (
+                "换成观察结果里该元素的 selector 字段（稳定的 id/name/placeholder/aria 属性优先）；"
+                "拿不到就用 interact_page 点开控件重新观察一次再取。"
+            ),
+        })
+    return findings
+
+
+def _lint_unreachable_nodes(nodes: list[Any], edges: list[Any]) -> list[dict[str, Any]]:
+    node_map: dict[str, dict] = {n["id"]: n for n in nodes if isinstance(n, dict) and n.get("id")}
+    findings: list[dict[str, Any]] = []
+    for nid in _unreachable_node_ids(nodes, edges):
+        node = node_map.get(nid, {})
+        if node.get("type", "") in ("start", "end"):
+            continue
+        findings.append({
+            "severity": "error", "node_id": nid, "node_title": node.get("title", nid),
+            "issue": "unreachable_node",
+            "message": f"节点 `{nid}` 无法从流程起点到达（孤儿节点），运行时会被跳过。",
+            "fix": "检查是否漏连了入边，用 update_flow add_edges 补连。",
+        })
+    return findings
+
+
+def _lint_single_navigation_node(nodes: list[Any]) -> list[dict[str, Any]]:
+    """只有一个 browser.open 却同时有登录+抽取节点，是空白页失败的常见根因
+    （登录后未导航到数据页），AI 常误诊为下游 selector 问题。
+    """
     _EXTRACTION_TYPES = {"browser.extract", "browser.wait"}
     _LOGIN_INDICATORS = {"input[type='password']", "password", "用户名", "账号", "登录"}
 
@@ -384,48 +445,49 @@ def _lint_flow(
         and any(kw in str(n.get("selector", "") + n.get("inputValue", "")).lower() for kw in _LOGIN_INDICATORS)
     ]
 
-    if len(open_nodes) == 1 and extraction_nodes and login_fill_nodes:
-        only_open = open_nodes[0]
+    if not (len(open_nodes) == 1 and extraction_nodes and login_fill_nodes):
+        return []
+
+    only_open = open_nodes[0]
+    return [{
+        "severity": "error",
+        "node_id": only_open.get("id", "?"),
+        "node_title": only_open.get("title", "browser.open"),
+        "issue": "single_navigation_node",
+        "message": (
+            f"流程只有一个 browser.open 节点（{only_open.get('targetUrl') or only_open.get('url','?')}），"
+            "但同时包含登录节点和数据提取节点。"
+            "登录后若目标数据在不同页面，必须添加第二个 browser.open（或菜单点击导航）跳转到数据页，"
+            "否则 browser.wait / browser.extract 节点会在登录成功页（仪表盘/首页）等待，永远等不到目标元素。"
+        ),
+        "fix": (
+            "在登录完成节点之后、数据提取节点之前，添加 browser.open 节点"
+            "（targetUrl 填目标页面地址，delayMs: 3000）并连线：登录完成 → 导航节点 → 等待/提取节点。"
+        ),
+    }]
+
+
+def _lint_undefined_variable_refs(nodes: list[Any], input_variable_names: list[str]) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for ref_issue in _validate_variable_refs(nodes, input_variable_names):
+        undefined = ref_issue.get("undefined_variables", [])
+        nid = ref_issue.get("node_id", "?")
         findings.append({
             "severity": "error",
-            "node_id": only_open.get("id", "?"),
-            "node_title": only_open.get("title", "browser.open"),
-            "issue": "single_navigation_node",
+            "node_id": nid,
+            "node_title": ref_issue.get("node_title", nid),
+            "issue": "undefined_variable_ref",
             "message": (
-                f"流程只有一个 browser.open 节点（{only_open.get('targetUrl') or only_open.get('url','?')}），"
-                "但同时包含登录节点和数据提取节点。"
-                "登录后若目标数据在不同页面，必须添加第二个 browser.open（或菜单点击导航）跳转到数据页，"
-                "否则 browser.wait / browser.extract 节点会在登录成功页（仪表盘/首页）等待，永远等不到目标元素。"
+                f"节点 `{nid}` 引用了未定义变量：{undefined}。"
+                "这些变量既不在 input_variables 中，也不由任何上游节点产出，运行时将报「变量未定义」。"
             ),
             "fix": (
-                "在登录完成节点之后、数据提取节点之前，添加 browser.open 节点"
-                "（targetUrl 填目标页面地址，delayMs: 3000）并连线：登录完成 → 导航节点 → 等待/提取节点。"
+                "在 input_variables 中声明该变量（category=flow/credential），"
+                "或在上游添加 variable.set 节点赋默认值，"
+                "或删除节点中的 ${var.xxx} 引用。"
             ),
+            "undefined_variables": undefined,
         })
-
-    # Undefined variable references
-    if input_variable_names is not None:
-        for ref_issue in _validate_variable_refs(nodes, list(input_variable_names)):
-            undefined = ref_issue.get("undefined_variables", [])
-            nid = ref_issue.get("node_id", "?")
-            ntitle = ref_issue.get("node_title", nid)
-            findings.append({
-                "severity": "error",
-                "node_id": nid,
-                "node_title": ntitle,
-                "issue": "undefined_variable_ref",
-                "message": (
-                    f"节点 `{nid}` 引用了未定义变量：{undefined}。"
-                    "这些变量既不在 input_variables 中，也不由任何上游节点产出，运行时将报「变量未定义」。"
-                ),
-                "fix": (
-                    "在 input_variables 中声明该变量（category=flow/credential），"
-                    "或在上游添加 variable.set 节点赋默认值，"
-                    "或删除节点中的 ${var.xxx} 引用。"
-                ),
-                "undefined_variables": undefined,
-            })
-
     return findings
 
 
