@@ -66,7 +66,11 @@ export function showTakeoverBanner(message: string, taskId: string): void {
   button.addEventListener('blur', () => {
     button.style.outline = 'none';
   });
-  button.addEventListener('click', () => {
+  button.addEventListener('click', (event) => {
+    // 内容脚本跑在隔离世界，但它建出来的 DOM 页面照样按 id 找得到、element.click() 也照样触发这里。
+    // isTrusted 是页面伪造不了的那一位：少了它，人工已确认就成了任意网页能替用户点下的动作，
+    // 而它放行的恰恰是流程特意留给人判断的那一步。
+    if (!event.isTrusted) return;
     void browser.runtime.sendMessage({ source: 'rpa-studio-bridge-event', type: 'takeoverResume', taskId: currentTakeoverTaskId });
     hideTakeoverBanner();
   });
