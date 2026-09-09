@@ -13,6 +13,7 @@ import logging
 import re
 import threading
 import time
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse
@@ -174,6 +175,235 @@ def _guess_framework(selectors: list[str]) -> str | None:
     return None
 
 
+@dataclass
+class _FlowEvidence:
+    """一次成功运行里可沉淀的事实，全部从流程定义读出，不含模型的判断。"""
+
+    domains: list[str] = field(default_factory=list)
+    urls: list[str] = field(default_factory=list)
+    # page_key -> 该页面首次出现的完整 URL，供档案回填 pages[*].url
+    url_by_page: dict[str, str] = field(default_factory=dict)
+    selectors_by_type: dict[str, list[str]] = field(default_factory=dict)
+    selectors_by_page: dict[str, dict[str, list[str]]] = field(default_factory=dict)
+    all_selectors: list[str] = field(default_factory=list)
+    requires_login: bool = False
+    logged_in_probe: str | None = None
+    framework: str | None = None
+
+
+def _add_selector(by_type: dict[str, list[str]], node_type: str, selector: str) -> None:
+    bucket = by_type.setdefault(node_type, [])
+    if selector not in bucket:
+        bucket.append(selector)
+
+
+def _scan_target_urls(nodes: list[Any], evidence: _FlowEvidence) -> None:
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        target = node.get("targetUrl")
+        if not isinstance(target, str) or not target.startswith("http"):
+            continue
+        domain = _domain_of(target)
+        if not domain:
+            continue
+        evidence.urls.append(target)
+        if domain not in evidence.domains:
+            evidence.domains.append(domain)
+        key = _page_key(target)
+        if key:
+            evidence.url_by_page.setdefault(key, target)
+
+
+def _scan_selectors(
+    nodes: list[Any], pages_by_node: dict[str, str | None], evidence: _FlowEvidence
+) -> None:
+    """收集本次跑通的 selector。这里不做 _MAX_SELECTORS_PER_TYPE 裁剪：裁剪针对档案里的
+    存量，本次真跑通的每一条都要参与去重与撤销禁令。"""
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        ntype = str(node.get("type") or "")
+        sel = node.get("selector")
+        if isinstance(sel, str) and sel.strip() and ntype.startswith(("browser.", "ui.")):
+            _add_selector(evidence.selectors_by_type, ntype, sel)
+            evidence.all_selectors.append(sel)
+            page = pages_by_node.get(str(node.get("id") or ""))
+            if page:
+                _add_selector(evidence.selectors_by_page.setdefault(page, {}), ntype, sel)
+        if ntype == "browser.fill":
+            value = str(node.get("inputValue") or "")
+            if "password" in str(sel or "") or "${var.password}" in value:
+                evidence.requires_login = True
+
+
+def _scan_login_probe(nodes: list[Any]) -> str | None:
+    """ensureLogin 的已登录探针是站点级事实，单独沉淀供后续流程复用。"""
+    for node in nodes:
+        if isinstance(node, dict) and str(node.get("type") or "") == "browser.ensureLogin":
+            sel = node.get("selector")
+            if isinstance(sel, str) and sel.strip():
+                return sel.strip()
+    return None
+
+
+def _collect_flow_evidence(flow_definition: dict[str, Any]) -> _FlowEvidence | None:
+    """没有任何 http 目标就没有可归属的站点，返回 None 表示这次运行没什么可沉淀。"""
+    nodes = flow_definition.get("nodes") or []
+    if not isinstance(nodes, list):
+        return None
+    evidence = _FlowEvidence()
+    _scan_target_urls(nodes, evidence)
+    if not evidence.domains:
+        return None
+    _scan_selectors(nodes, _pages_by_node(nodes, flow_definition.get("edges")), evidence)
+    evidence.logged_in_probe = _scan_login_probe(nodes)
+    evidence.framework = _guess_framework(evidence.all_selectors)
+    return evidence
+
+
+def _merge_selectors(target: dict[str, list[str]], incoming: dict[str, list[str]]) -> dict[str, list[str]]:
+    for node_type, selectors in incoming.items():
+        bucket = target.setdefault(node_type, [])
+        for selector in selectors:
+            if selector not in bucket:
+                bucket.append(selector)
+        target[node_type] = bucket[-_MAX_SELECTORS_PER_TYPE:]  # 保留最近验证过的
+    return target
+
+
+def _merge_pages(pages: dict[str, Any], evidence: _FlowEvidence, *, domain: str) -> dict[str, Any]:
+    for page_key, selectors in evidence.selectors_by_page.items():
+        if not page_key.startswith(domain + "/"):
+            continue  # 跨域流程：另一个域名的页面不能记到这个域名的档案里
+        entry = pages.get(page_key) or {"selectors": {}, "success_count": 0}
+        entry["success_count"] = int(entry.get("success_count", 0)) + 1
+        entry["updated_at"] = _now_iso()
+        if evidence.url_by_page.get(page_key):
+            entry["url"] = evidence.url_by_page[page_key]
+        entry["selectors"] = _merge_selectors(entry.get("selectors") or {}, selectors)
+        pages[page_key] = entry
+    if len(pages) > _MAX_PAGES_PER_DOMAIN:
+        ordered_pages = sorted(
+            pages.items(), key=lambda kv: str(kv[1].get("updated_at") or ""), reverse=True
+        )
+        pages = dict(ordered_pages[:_MAX_PAGES_PER_DOMAIN])
+    return pages
+
+
+def _merge_domain_profile(
+    profile: dict[str, Any], evidence: _FlowEvidence, *, domain: str, flow_name: str | None
+) -> None:
+    profile["success_count"] = int(profile.get("success_count", 0)) + 1
+    profile["updated_at"] = _now_iso()
+    if flow_name:
+        profile["last_flow_name"] = flow_name
+    if evidence.framework:
+        profile["framework"] = evidence.framework
+    if evidence.requires_login:
+        profile["requires_login"] = True
+    if evidence.logged_in_probe:
+        profile["logged_in_probe"] = evidence.logged_in_probe
+    profile["selectors"] = _merge_selectors(profile.get("selectors") or {}, evidence.selectors_by_type)
+    profile["pages"] = _merge_pages(profile.get("pages") or {}, evidence, domain=domain)
+    # 跑通即撤销禁令：能跑通说明当时挂的是别的原因（时序、登录态、页面在改版），
+    # 禁令留着会让模型绕开这个正确答案去猜别的写法。
+    profile["failed_selectors"] = [
+        f for f in _fresh_failures(profile.get("failed_selectors"))
+        if f.get("selector") not in evidence.all_selectors
+    ]
+    verified = profile.get("verified_urls") or []
+    for url in evidence.urls:
+        if _domain_of(url) == domain and url not in verified:
+            verified.append(url)
+    profile["verified_urls"] = verified[-10:]
+
+
+def _render_site_facts(profile: dict[str, Any]) -> list[str]:
+    lines = [f"### {profile.get('domain')}（成功运行 {profile.get('success_count', 0)} 次）"]
+    if profile.get("framework"):
+        lines.append(f"- UI 框架：{profile['framework']}")
+    if profile.get("requires_login"):
+        lines.append("- 该站点需要登录（历史流程包含账号密码填写）")
+    if profile.get("logged_in_probe"):
+        lines.append(
+            f"- 已验证的登录态探针：`{profile['logged_in_probe']}`"
+            "（browser.ensureLogin 的 selector 直接用它）"
+        )
+    verified = profile.get("verified_urls") or []
+    if verified:
+        lines.append("- 已验证可达的 URL：" + "、".join(f"`{u}`" for u in verified[-5:]))
+    return lines
+
+
+def _render_current_page_selectors(pages: dict[str, Any], current_keys: list[str]) -> list[str]:
+    lines: list[str] = []
+    for key in current_keys:
+        entry = pages.get(key) or {}
+        page_sels = entry.get("selectors") or {}
+        if not page_sels:
+            continue
+        lines.append(
+            f"- **当前页面** `{entry.get('url') or key}` 上已验证的 selector"
+            f"（在这个页面跑通 {int(entry.get('success_count') or 1)} 次，可直接复用）："
+        )
+        for ntype, sels in page_sels.items():
+            lines.append(f"  - {ntype}: " + "、".join(f"`{s}`" for s in sels[-4:]))
+    return lines
+
+
+def _render_other_page_selectors(pages: dict[str, Any], current_keys: list[str]) -> list[str]:
+    others = [k for k in pages if k not in set(current_keys)]
+    if not others:
+        return []
+    lines = [
+        "- 同域**其它页面**验证过的 selector（**未必适用当前页**：同一站点不同页面"
+        "常常 class 同名而结构不同，照抄前必须 inspect_page 确认它在当前页面存在）："
+    ]
+    for key in sorted(
+        others, key=lambda k: str((pages.get(k) or {}).get("updated_at") or ""), reverse=True
+    )[:4]:
+        flat = [s for sels in ((pages.get(key) or {}).get("selectors") or {}).values() for s in sels][-3:]
+        if flat:
+            lines.append(f"  - `{key}`：" + "、".join(f"`{s}`" for s in flat))
+    return lines
+
+
+def _render_unscoped_selectors(profile: dict[str, Any], pages: dict[str, Any]) -> list[str]:
+    """页面级已经展示过的不再重复；剩下的是归属不到具体页面的（分支汇合处、旧档案）。"""
+    shown_selectors = {
+        s
+        for entry in pages.values()
+        for sels in ((entry or {}).get("selectors") or {}).values()
+        for s in sels
+    }
+    residual = {
+        ntype: [s for s in sels if s not in shown_selectors]
+        for ntype, sels in (profile.get("selectors") or {}).items()
+    }
+    residual = {ntype: sels for ntype, sels in residual.items() if sels}
+    if not residual:
+        return []
+    # 判据是「这条 selector 的页面未知」，不是「这个档案有没有页面记录」：分支汇合处的
+    # selector 两个页面都可能，这份不确定不写进标签，模型就会当成当前页面已验证。
+    lines = ["- 同域已验证、但归属不到具体页面的 selector（用前先确认它在当前页面存在）："]
+    for ntype, sels in residual.items():
+        lines.append(f"  - {ntype}: " + "、".join(f"`{s}`" for s in sels[-4:]))
+    return lines
+
+
+def _render_falsified_selectors(profile: dict[str, Any]) -> list[str]:
+    failures = _fresh_failures(profile.get("failed_selectors"))
+    if not failures:
+        return []
+    lines = ["- 已证伪的 selector（真实运行时未命中，换个写法再试大概率还是这个结果）："]
+    for failure in sorted(failures, key=lambda x: -int(x.get("count") or 1))[:6]:
+        times = int(failure.get("count") or 1)
+        suffix = f"（已踩 {times} 次）" if times > 1 else ""
+        lines.append(f"  - `{failure['selector']}` — {failure.get('kind') or '运行失败'}{suffix}")
+    return lines
+
+
 class SiteKnowledgeStore:
     def __init__(self, path: str | None = None) -> None:
         self._path = path or str(storage.resolve_ai_dir() / "site_knowledge.json")
@@ -202,130 +432,22 @@ class SiteKnowledgeStore:
             logger.warning("site_knowledge save failed: %s", exc)
 
     def record_flow_success(self, flow_definition: dict[str, Any], flow_name: str | None = None) -> None:
-        nodes = flow_definition.get("nodes") or []
-        if not isinstance(nodes, list):
+        evidence = _collect_flow_evidence(flow_definition)
+        if evidence is None:
             return
-
-        domains: list[str] = []
-        urls: list[str] = []
-        url_by_page: dict[str, str] = {}
-        for node in nodes:
-            if not isinstance(node, dict):
-                continue
-            target = node.get("targetUrl")
-            if isinstance(target, str) and target.startswith("http"):
-                d = _domain_of(target)
-                if d:
-                    urls.append(target)
-                    if d not in domains:
-                        domains.append(d)
-                    key = _page_key(target)
-                    if key:
-                        url_by_page.setdefault(key, target)
-        if not domains:
-            return
-
-        pages_by_node = _pages_by_node(nodes, flow_definition.get("edges"))
-        selectors_by_type: dict[str, list[str]] = {}
-        selectors_by_page: dict[str, dict[str, list[str]]] = {}
-        all_selectors: list[str] = []
-        has_login_fill = False
-        for node in nodes:
-            if not isinstance(node, dict):
-                continue
-            ntype = str(node.get("type") or "")
-            sel = node.get("selector")
-            if isinstance(sel, str) and sel.strip() and ntype.startswith(("browser.", "ui.")):
-                bucket = selectors_by_type.setdefault(ntype, [])
-                if sel not in bucket:
-                    bucket.append(sel)
-                all_selectors.append(sel)
-                page = pages_by_node.get(str(node.get("id") or ""))
-                if page:
-                    page_bucket = selectors_by_page.setdefault(page, {}).setdefault(ntype, [])
-                    if sel not in page_bucket:
-                        page_bucket.append(sel)
-            if ntype == "browser.fill":
-                value = str(node.get("inputValue") or "")
-                if "password" in str(sel or "") or "${var.password}" in value:
-                    has_login_fill = True
-
-        # ensureLogin 的已登录探针是站点级事实，单独沉淀供后续流程复用。
-        logged_in_probe: str | None = None
-        for node in nodes:
-            if isinstance(node, dict) and str(node.get("type") or "") == "browser.ensureLogin":
-                sel = node.get("selector")
-                if isinstance(sel, str) and sel.strip():
-                    logged_in_probe = sel.strip()
-                    break
-
-        framework = _guess_framework(all_selectors)
-
         with self._lock:
             data = self._load()
-            for domain in domains:
+            for domain in evidence.domains:
                 profile = data.get(domain) or {
                     "domain": domain,
                     "success_count": 0,
                     "selectors": {},
                     "verified_urls": [],
                 }
-                profile["success_count"] = int(profile.get("success_count", 0)) + 1
-                profile["updated_at"] = _now_iso()
-                if flow_name:
-                    profile["last_flow_name"] = flow_name
-                if framework:
-                    profile["framework"] = framework
-                if has_login_fill:
-                    profile["requires_login"] = True
-                if logged_in_probe:
-                    profile["logged_in_probe"] = logged_in_probe
-                merged: dict[str, list[str]] = profile.get("selectors") or {}
-                for ntype, sels in selectors_by_type.items():
-                    bucket = merged.setdefault(ntype, [])
-                    for sel in sels:
-                        if sel not in bucket:
-                            bucket.append(sel)
-                    merged[ntype] = bucket[-_MAX_SELECTORS_PER_TYPE:]  # 保留最近的
-                profile["selectors"] = merged
-                pages: dict[str, Any] = profile.get("pages") or {}
-                for page_key, sels in selectors_by_page.items():
-                    if not page_key.startswith(domain + "/"):
-                        continue  # 跨域流程：另一个域名的页面不能记到这个域名的档案里
-                    entry = pages.get(page_key) or {"selectors": {}, "success_count": 0}
-                    entry["success_count"] = int(entry.get("success_count", 0)) + 1
-                    entry["updated_at"] = _now_iso()
-                    if url_by_page.get(page_key):
-                        entry["url"] = url_by_page[page_key]
-                    page_merged: dict[str, list[str]] = entry.get("selectors") or {}
-                    for ntype, page_sels in sels.items():
-                        bucket = page_merged.setdefault(ntype, [])
-                        for sel in page_sels:
-                            if sel not in bucket:
-                                bucket.append(sel)
-                        page_merged[ntype] = bucket[-_MAX_SELECTORS_PER_TYPE:]
-                    entry["selectors"] = page_merged
-                    pages[page_key] = entry
-                if len(pages) > _MAX_PAGES_PER_DOMAIN:
-                    ordered_pages = sorted(
-                        pages.items(), key=lambda kv: str(kv[1].get("updated_at") or ""), reverse=True
-                    )
-                    pages = dict(ordered_pages[:_MAX_PAGES_PER_DOMAIN])
-                profile["pages"] = pages
-                # 跑通即撤销禁令：能跑通说明当时挂的是别的原因（时序、登录态、页面在改版），
-                # 禁令留着会让模型绕开这个正确答案去猜别的写法。
-                profile["failed_selectors"] = [
-                    f for f in _fresh_failures(profile.get("failed_selectors"))
-                    if f.get("selector") not in all_selectors
-                ]
-                verified = profile.get("verified_urls") or []
-                for u in urls:
-                    if _domain_of(u) == domain and u not in verified:
-                        verified.append(u)
-                profile["verified_urls"] = verified[-10:]
+                _merge_domain_profile(profile, evidence, domain=domain, flow_name=flow_name)
                 data[domain] = profile
             self._save(data)
-        logger.info("site_knowledge updated for domains: %s", domains)
+        logger.info("site_knowledge updated for domains: %s", evidence.domains)
 
     def record_selector_failure(
         self,
@@ -398,73 +520,14 @@ class SiteKnowledgeStore:
             "## 站点经验档案（来自该站点历史成功运行，优先复用以下已验证信息）",
             "",
         ]
-        for p in profiles:
-            lines.append(f"### {p.get('domain')}（成功运行 {p.get('success_count', 0)} 次）")
-            if p.get("framework"):
-                lines.append(f"- UI 框架：{p['framework']}")
-            if p.get("requires_login"):
-                lines.append("- 该站点需要登录（历史流程包含账号密码填写）")
-            if p.get("logged_in_probe"):
-                lines.append(
-                    f"- 已验证的登录态探针：`{p['logged_in_probe']}`"
-                    "（browser.ensureLogin 的 selector 直接用它）"
-                )
-            verified = p.get("verified_urls") or []
-            if verified:
-                lines.append("- 已验证可达的 URL：" + "、".join(f"`{u}`" for u in verified[-5:]))
-            pages = p.get("pages") or {}
+        for profile in profiles:
+            pages = profile.get("pages") or {}
             current_keys = [k for k in wanted_pages if k in pages]
-            for key in current_keys:
-                entry = pages.get(key) or {}
-                page_sels = entry.get("selectors") or {}
-                if not page_sels:
-                    continue
-                lines.append(
-                    f"- **当前页面** `{entry.get('url') or key}` 上已验证的 selector"
-                    f"（在这个页面跑通 {int(entry.get('success_count') or 1)} 次，可直接复用）："
-                )
-                for ntype, sels in page_sels.items():
-                    lines.append(f"  - {ntype}: " + "、".join(f"`{s}`" for s in sels[-4:]))
-            others = [k for k in pages if k not in set(current_keys)]
-            if others:
-                lines.append(
-                    "- 同域**其它页面**验证过的 selector（**未必适用当前页**：同一站点不同页面"
-                    "常常 class 同名而结构不同，照抄前必须 inspect_page 确认它在当前页面存在）："
-                )
-                for key in sorted(
-                    others, key=lambda k: str((pages.get(k) or {}).get("updated_at") or ""), reverse=True
-                )[:4]:
-                    flat = [
-                        s for sels in ((pages.get(key) or {}).get("selectors") or {}).values() for s in sels
-                    ][-3:]
-                    if flat:
-                        lines.append(f"  - `{key}`：" + "、".join(f"`{s}`" for s in flat))
-            # 页面级已经展示过的不再重复；剩下的是归属不到具体页面的（分支汇合处、旧档案）。
-            shown_selectors = {
-                s
-                for entry in pages.values()
-                for sels in ((entry or {}).get("selectors") or {}).values()
-                for s in sels
-            }
-            residual = {
-                ntype: [s for s in sels if s not in shown_selectors]
-                for ntype, sels in (p.get("selectors") or {}).items()
-            }
-            residual = {ntype: sels for ntype, sels in residual.items() if sels}
-            if residual:
-                # 判据是「这条 selector 的页面未知」，不是「这个档案有没有页面记录」：分支汇合处的
-                # selector 两个页面都可能，这份不确定不写进标签，模型就会当成当前页面已验证。
-                lines.append("- 同域已验证、但归属不到具体页面的 selector（用前先确认它在当前页面存在）：")
-                for ntype, sels in residual.items():
-                    shown = "、".join(f"`{s}`" for s in sels[-4:])
-                    lines.append(f"  - {ntype}: {shown}")
-            failures = _fresh_failures(p.get("failed_selectors"))
-            if failures:
-                lines.append("- 已证伪的 selector（真实运行时未命中，换个写法再试大概率还是这个结果）：")
-                for f in sorted(failures, key=lambda x: -int(x.get("count") or 1))[:6]:
-                    times = int(f.get("count") or 1)
-                    suffix = f"（已踩 {times} 次）" if times > 1 else ""
-                    lines.append(f"  - `{f['selector']}` — {f.get('kind') or '运行失败'}{suffix}")
+            lines += _render_site_facts(profile)
+            lines += _render_current_page_selectors(pages, current_keys)
+            lines += _render_other_page_selectors(pages, current_keys)
+            lines += _render_unscoped_selectors(profile, pages)
+            lines += _render_falsified_selectors(profile)
             lines.append("")
         lines.append(
             "以上 selector 均来自真实运行结果。构建/修复同站点流程时**先用当前页面那一组**，"
