@@ -7,6 +7,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -78,32 +79,9 @@ class ScriptActionRunner:
             return await self._run_websocket(node, variables, timeout_ms=timeout_ms)
         script_path = self._resolve_script_path(node, variables)
         command = _build_command(action_type, script_path)
-        timeout_seconds = max(1, timeout_ms) / 1000
-        # python/js 走固定解释器，PATH 收窄到系统目录即可；script.shell 需要用户自定义命令，PATH 不收窄（见 _run_shell）
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            cwd=self._workspace_root,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=_build_script_env(variables, node=node, restrict_path=True),
-        )
-        try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
-        except TimeoutError as exc:
-            process.kill()
-            await process.wait()
-            raise TimeoutError(f"脚本执行超时: {script_path.name}") from exc
-
-        stdout = _decode_limited(stdout_bytes, "stdout")
-        stderr = _decode_limited(stderr_bytes, "stderr")
-        return ScriptActionResult(
-            action_type=action_type,
-            command=command,
-            cwd=str(self._workspace_root),
-            exit_code=process.returncode or 0,
-            stdout=stdout,
-            stderr=stderr,
+        return await self._run_process(
+            node, variables, command, timeout_ms=timeout_ms,
+            timeout_message=f"脚本执行超时: {script_path.name}",
         )
 
     async def _run_shell(self, node: FlowNode, variables: RuntimeVariableStore, *, timeout_ms: int) -> ScriptActionResult:
@@ -111,28 +89,42 @@ class ScriptActionRunner:
         if not command:
             raise ValueError("script.shell 节点缺少 command")
         command = _resolve_shell_safe(command, variables)
-        timeout_seconds = max(1, timeout_ms) / 1000
-        process = await asyncio.create_subprocess_shell(
-            command,
+        return await self._run_process(
+            node, variables, command, timeout_ms=timeout_ms, timeout_message="Shell 命令执行超时",
+        )
+
+    async def _run_process(
+        self,
+        node: FlowNode,
+        variables: RuntimeVariableStore,
+        command: list[str] | str,
+        *,
+        timeout_ms: int,
+        timeout_message: str,
+    ) -> ScriptActionResult:
+        shell = isinstance(command, str)
+        spawn = asyncio.create_subprocess_shell if shell else asyncio.create_subprocess_exec
+        process = await spawn(
+            *([command] if shell else command),
             cwd=self._workspace_root,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=_build_script_env(variables, node=node, restrict_path=False),
+            # 独立进程组让停止节点能同时清掉 shell 启动的命令。
+            start_new_session=os.name != "nt",
+            env=_build_script_env(variables, node=node, restrict_path=not shell),
         )
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+            stdout, stderr = await _read_process_output(process, timeout_ms=timeout_ms)
         except TimeoutError as exc:
-            process.kill()
-            await process.wait()
-            raise TimeoutError("Shell 命令执行超时") from exc
+            raise TimeoutError(timeout_message) from exc
         return ScriptActionResult(
-            action_type="script.shell",
-            command=[command],
+            action_type=_read_action_type(node),
+            command=[command] if shell else command,
             cwd=str(self._workspace_root),
             exit_code=process.returncode or 0,
-            stdout=_decode_limited(stdout_bytes, "stdout"),
-            stderr=_decode_limited(stderr_bytes, "stderr"),
+            stdout=stdout,
+            stderr=stderr,
         )
 
     async def _run_websocket(self, node: FlowNode, variables: RuntimeVariableStore, *, timeout_ms: int) -> ScriptActionResult:
@@ -333,10 +325,72 @@ def _json_dumps(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
-def _decode_limited(value: bytes, name: str) -> str:
-    if len(value) > _MAX_STDIO_BYTES:
-        raise ValueError(f"脚本 {name} 输出超过 512KB")
-    return value.decode("utf-8", errors="replace").strip()
+async def _read_limited(stream: asyncio.StreamReader, name: str) -> str:
+    output = bytearray()
+    while chunk := await stream.read(min(65_536, _MAX_STDIO_BYTES + 1 - len(output))):
+        output.extend(chunk)
+        if len(output) > _MAX_STDIO_BYTES:
+            raise ValueError(f"脚本 {name} 输出超过 512KB")
+    return output.decode("utf-8", errors="replace").strip()
+
+
+async def _read_process_output(process: asyncio.subprocess.Process, *, timeout_ms: int) -> tuple[str, str]:
+    assert process.stdout is not None and process.stderr is not None
+    readers = [
+        asyncio.create_task(_read_limited(process.stdout, "stdout")),
+        asyncio.create_task(_read_limited(process.stderr, "stderr")),
+    ]
+    try:
+        async with asyncio.timeout(max(1, timeout_ms) / 1000):
+            stdout, stderr = await asyncio.gather(*readers)
+            await process.wait()
+        return stdout, stderr
+    except BaseException:
+        async def cleanup() -> None:
+            for reader in readers:
+                reader.cancel()
+            await asyncio.gather(*readers, return_exceptions=True)
+            await _terminate_process(process)
+
+        # 用户停止与应用关停可能连续取消同一任务，清理必须先完成。
+        cleaning = asyncio.create_task(cleanup())
+        while not cleaning.done():
+            try:
+                await asyncio.shield(cleaning)
+            except asyncio.CancelledError:
+                continue
+        cleaning.result()
+        raise
+
+
+async def _terminate_process(process: asyncio.subprocess.Process) -> None:
+    if os.name == "nt":
+        if process.returncode is None:
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill", "/PID", str(process.pid), "/T", "/F",
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await killer.wait()
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    async def drain(stream: asyncio.StreamReader) -> None:
+        while await stream.read(65_536):
+            pass
+
+    # 超限或取消时 reader 可能已暂停底层管道；排空残留字节才能让 wait 完成。
+    assert process.stdout is not None and process.stderr is not None
+    await asyncio.gather(drain(process.stdout), drain(process.stderr), process.wait())
 
 
 def _read_action_type(node: FlowNode) -> str:
