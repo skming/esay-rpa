@@ -22,21 +22,31 @@ import asyncio
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from copy import deepcopy
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
+from urllib.parse import quote
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 # 允许 `python -m evals.run_e2e` 与直接执行两种方式
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from app.core.config import load_settings  # noqa: E402
+from app.models.schemas import FlowStatus  # noqa: E402
 from app.services.ai_config_service import AiConfigService  # noqa: E402
-from app.services.ai_orchestrator import AiOrchestrator  # noqa: E402
+from app.services.ai_orchestrator import (  # noqa: E402
+    AiOrchestrator, FlowState, GuardState, _detect_turn_intents, _tool_schemas_for_round,
+)
 from app.services.ai_tools.diagnostics import _parse_runtime_value  # noqa: E402
 from app.services.ai_tools.executor import RpaToolExecutor  # noqa: E402
 from app.services.ai_tools.schemas import TOOL_SCHEMAS  # noqa: E402
@@ -50,8 +60,28 @@ _PAGES = Path(__file__).resolve().parent.parent / "tests" / "pages"
 _MODEL_FACING_TOOLS = frozenset(item["function"]["name"] for item in TOOL_SCHEMAS)
 
 
-def page_url(name: str) -> str:
-    return (_PAGES / name).resolve().as_uri()
+class _FixtureHandler(SimpleHTTPRequestHandler):
+    def log_message(self, format: str, *args: Any) -> None:
+        pass
+
+
+@contextmanager
+def fixture_server() -> Iterator[str]:
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0), partial(_FixtureHandler, directory=str(_PAGES)),
+    )
+    worker = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+    worker.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join()
+
+
+def page_url(name: str, base_url: str) -> str:
+    return f"{base_url}/{quote(name)}"
 
 
 def isolation_env(root: Path) -> dict[str, str]:
@@ -441,6 +471,7 @@ class RecordingExecutor:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.platform_calls: list[tuple[str, dict[str, Any]]] = []
         self.created_flow_ids: list[str] = []
+        self.evidence: list[dict[str, Any]] = []
         self.recording = False
 
     async def execute(
@@ -450,12 +481,35 @@ class RecordingExecutor:
         progress_sink: dict[str, Any] | None = None,
         change_context: Any = None,
     ) -> dict[str, Any]:
-        result = await self._inner.execute(name, args, progress_sink, change_context)
+        record = None
         if self.recording:
             bucket = self.calls if name in _MODEL_FACING_TOOLS else self.platform_calls
-            bucket.append((name, args))
-            # create_flow 的 id 只在返回里：模型建完流程不再碰它时，args 里一个 flow_id 都没有
-            if name == "create_flow" and isinstance(result, dict) and result.get("flow_id"):
+            bucket.append((name, deepcopy(args)))
+            if name in _MODEL_FACING_TOOLS:
+                record = {"name": name, "flow_id": str(args.get("flow_id") or ""), "outcome": "pending"}
+                self.evidence.append(record)
+        try:
+            result = await self._inner.execute(name, args, progress_sink, change_context)
+        except BaseException as error:
+            if record is not None:
+                record.update(outcome="exception", exception={
+                    "type": type(error).__name__, "message": _redact(str(error)),
+                })
+            raise
+        if record is not None:
+            # 页面 DOM、截图和任意工具参数不进入报告；验收只保留运行身份与裁决。
+            summary = {
+                key: deepcopy(result[key]) for key in ("status", "flow_id", "task_id", "error", "issues", "expected_parameters")
+                if key in result
+            }
+            audit = result.get("acceptance_audit")
+            if isinstance(audit, dict):
+                summary["acceptance_audit"] = {"passed": audit.get("passed")}
+            record.update(outcome="returned", result={
+                key: _redact(value) if isinstance(value, str) else value
+                for key, value in summary.items()
+            })
+            if name == "create_flow" and result.get("flow_id") and _record_succeeded(record):
                 self.created_flow_ids.append(str(result["flow_id"]))
         return result
 
@@ -466,15 +520,34 @@ class RecordingExecutor:
         self.calls.clear()
         self.platform_calls.clear()
         self.created_flow_ids.clear()
+        self.evidence.clear()
 
     def saved_flow_id(self) -> str:
         """从模型调过的写入类工具里取：取库里「最后一条流程」会在有脏数据时判到别人的流程上。"""
-        for name, args in reversed(self.calls):
-            if name in ("run_flow", "publish_flow", "set_acceptance_contract", "update_flow"):
-                flow_id = str(args.get("flow_id") or "")
+        for record in reversed(self.evidence):
+            if not _record_succeeded(record):
+                continue
+            if record["name"] in ("run_flow", "publish_flow", "set_acceptance_contract", "update_flow"):
+                flow_id = record["flow_id"]
                 if flow_id:
                     return flow_id
         return self.created_flow_ids[-1] if self.created_flow_ids else ""
+
+
+def _record_succeeded(record: dict[str, Any]) -> bool:
+    result = record.get("result", {})
+    if record["outcome"] != "returned" or result.get("error"):
+        return False
+    status = result.get("status")
+    if record["name"] == "run_flow":
+        return status == "success"
+    return status in (*get_args(FlowStatus), "applied", "success") or (
+        status is None and bool(result.get("flow_id"))
+    )
+
+
+def _redact(text: str) -> str:
+    return re.sub(r"(?i)Bearer\s+\S+|\b(?:rc|sk)-[a-zA-Z0-9_-]+", "[REDACTED]", text)
 
 
 _SYSTEM_HINT = (
@@ -483,11 +556,25 @@ _SYSTEM_HINT = (
 )
 
 
+def _model_messages(case: E2ECase, url: str) -> list[dict[str, Any]]:
+    prompt = (
+        f"页面地址：{url}\n\n{case.requirement}\n\n{_SYSTEM_HINT}\n"
+        f"首次运行使用 variables：{json.dumps(case.variants[0], ensure_ascii=False)}"
+    )
+    messages = [{"role": "user", "content": prompt}]
+    intents = _detect_turn_intents(messages, None, FlowState(flow_id=None))
+    if intents.create_url != url:
+        raise ValueError(f"评测 URL 未被创建意图识别：{url}")
+    if not _tool_schemas_for_round(GuardState(), intents):
+        raise ValueError("评测首轮工具集合为空")
+    return messages
+
+
 async def _drive_model(
-    orchestrator: AiOrchestrator, recorder: RecordingExecutor, model: str, case: E2ECase
+    orchestrator: AiOrchestrator, recorder: RecordingExecutor, model: str, case: E2ECase, url: str
 ) -> dict[str, Any]:
     """让模型自己看页面、建流程、跑一次。只收事件，不替它做任何决定。"""
-    prompt = f"页面地址：{page_url(case.page)}\n\n{case.requirement}\n\n{_SYSTEM_HINT}"
+    messages = _model_messages(case, url)
     texts: list[str] = []
     usage: dict[str, Any] | None = None
     errors: list[str] = []
@@ -496,7 +583,7 @@ async def _drive_model(
     started = time.monotonic()
     try:
         async for event in orchestrator.stream(
-            messages=[{"role": "user", "content": prompt}], model=model, flow_id=None
+            messages=messages, model=model, flow_id=None
         ):
             kind = event.get("type")
             if kind == "text":
@@ -504,7 +591,9 @@ async def _drive_model(
             elif kind == "usage":
                 usage = event.get("usage") or event
             elif kind == "error":
-                errors.append(str(event.get("message") or event))
+                errors.append(_redact(str(event.get("message") or event)))
+    except Exception as error:
+        errors.append(_redact(f"{type(error).__name__}: {error}"))
     finally:
         recorder.recording = False
     return {
@@ -545,7 +634,7 @@ if not rows:
 """
 
 
-def _self_check_flow(case: E2ECase) -> dict[str, Any]:
+def _self_check_flow(case: E2ECase, base_url: str) -> dict[str, Any]:
     """手写流程的 create_flow 参数：选择器写死，因为自检只验接线，不验模型识别。
 
     走 executor.execute 而不是直接调 flow_service：要验的正是工具分派 → 执行器 → 存储
@@ -559,7 +648,7 @@ def _self_check_flow(case: E2ECase) -> dict[str, Any]:
             {"name": "end_date", "type": "String", "value": case.variants[0]["end_date"]},
         ],
         "nodes": [
-            {"id": "n1", "type": "browser.open", "targetUrl": page_url(case.page)},
+            {"id": "n1", "type": "browser.open", "targetUrl": page_url(case.page, base_url)},
             {"id": "n2", "type": "browser.fill", "selector": "#q-start",
              "inputValue": "${var.start_date}", "delayMs": 200},
             {"id": "n3", "type": "browser.fill", "selector": "#q-end",
@@ -616,7 +705,12 @@ def _verdict(case: E2ECase, stage: str, verdicts: list[dict[str, Any]], **extra:
 
 async def run_self_check(executor: RpaToolExecutor, case: E2ECase) -> dict[str, Any]:
     """手写流程走真实执行器：证明接线与判分今天就能跑，与模型能力无关。"""
-    created = await executor.execute("create_flow", _self_check_flow(case))
+    with fixture_server() as base_url:
+        return await _run_self_check(executor, case, base_url)
+
+
+async def _run_self_check(executor: RpaToolExecutor, case: E2ECase, base_url: str) -> dict[str, Any]:
+    created = await executor.execute("create_flow", _self_check_flow(case, base_url))
     flow_id = str(created.get("flow_id") or "")
     if not flow_id:
         return _verdict(case, "create_flow", [], error=created)
@@ -631,8 +725,15 @@ async def run_model_case(
     case: E2ECase,
 ) -> dict[str, Any]:
     """模型自己看页面、建流程、跑一次，然后换输入数据重放并判分。"""
+    with fixture_server() as base_url:
+        return await _run_model_case(orchestrator, recorder, model, case, base_url)
+
+
+async def _run_model_case(
+    orchestrator: AiOrchestrator, recorder: RecordingExecutor, model: str, case: E2ECase, base_url: str,
+) -> dict[str, Any]:
     with _observe_guards() as guard_hits:
-        turn = await _drive_model(orchestrator, recorder, model, case)
+        turn = await _drive_model(orchestrator, recorder, model, case, page_url(case.page, base_url))
     flow_id = recorder.saved_flow_id()
     metrics = collect_run_metrics(recorder.calls, turn["usage"], guard_hits)
     common = {
@@ -640,15 +741,45 @@ async def run_model_case(
         "model_errors": turn["errors"],
         "model_tool_calls": [name for name, _ in recorder.calls],
         "metrics": asdict(metrics),
+        "model_tool_evidence": deepcopy(recorder.evidence),
         "reply_tail": turn["reply"][-400:],
     }
     if not flow_id:
-        return _verdict(case, "no_flow_saved", [], **common)
+        return _verdict(case, "no_flow_saved", [], replay_passed=False,
+                        model_execution={"passed": False, "failures": ["模型未保存流程"]}, **common)
+    model_execution = await _judge_model_execution(recorder, case, flow_id)
     runs, verdicts = await _replay_variants(recorder._inner, case, flow_id)
+    replay_passed = bool(verdicts) and all(v["passed"] for v in verdicts)
     return _verdict(
         case, "done", verdicts, flow_id=flow_id,
-        statuses=[r.get("status") for r in runs], **common,
+        statuses=[r.get("status") for r in runs], replay_passed=replay_passed,
+        model_execution=model_execution,
+        passed=replay_passed and model_execution["passed"] and not turn["errors"], **common,
     )
+
+
+async def _judge_model_execution(
+    recorder: RecordingExecutor, case: E2ECase, flow_id: str,
+) -> dict[str, Any]:
+    mutations = {"create_flow", "update_flow", "apply_node_fix", "set_acceptance_contract"}
+    for record in reversed(recorder.evidence):
+        result = record.get("result", {})
+        target = record["flow_id"] or result.get("flow_id")
+        if target != flow_id:
+            continue
+        if record["name"] in mutations and _record_succeeded(record):
+            return {"passed": False, "failures": ["模型最后修改流程后未取得新的运行验收证据"]}
+        if record["name"] != "run_flow":
+            continue
+        task_id = str(result.get("task_id") or "")
+        if (record["outcome"] != "returned" or result.get("status") != "success"
+                or not task_id or result.get("acceptance_audit", {}).get("passed") is not True):
+            return {"passed": False, "task_id": task_id,
+                    "failures": ["模型最后一次运行缺少成功任务与通过的验收证据"]}
+        variables = await _task_variables(recorder._task_manager, task_id)
+        failures, detail = _judge_variant(case, 0, result, variables)
+        return {"passed": not failures, "task_id": task_id, "failures": failures, **detail}
+    return {"passed": False, "failures": ["模型未实际运行保存的流程"]}
 
 
 def _data_score(results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -676,6 +807,8 @@ def build_report(
         "model_e2e": {
             "cases_total": len(results),
             "cases_passed": sum(1 for r in results if r["passed"]),
+            "replay_cases_passed": sum(1 for r in results if r.get("replay_passed")),
+            "model_execution_cases_passed": sum(1 for r in results if r.get("model_execution", {}).get("passed")),
             **_data_score(results),
         },
         "self_check": {
@@ -700,6 +833,10 @@ def print_report(report: dict[str, Any]) -> None:
             print(f"  [{mark}] {row['case']}  变体 {row['variants_passed']}/{row['variants_total']}  阶段={row['stage']}")
             for verdict in row.get("verdicts") or []:
                 for failure in verdict.get("failures") or []:
+                    print(f"         - {failure}")
+            if "replay_passed" in row:
+                print(f"         外部重放={row['replay_passed']} 模型自行验收={row['model_execution']['passed']}")
+                for failure in row["model_execution"].get("failures", []):
                     print(f"         - {failure}")
             if row.get("error"):
                 print(f"         - {row['error']}")

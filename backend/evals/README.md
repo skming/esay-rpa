@@ -167,3 +167,18 @@ finding 只有 `severity: warn`，它据此判断可以先跑一次看看，完�
 `expect_guards_not_triggered` 断言的是「提示词能让模型自己避开」，而模型**根本没有可依据的字段**
 时，这条断言测的是猜谜。出路是把判断依据放进工具返回值（`annotate_lint_findings()` 给每条 finding
 标 `blocks_run`），不是加提示词——加完 3/3。fixture 也改成调真函数现算，手写的那份会把这个信号写死。
+
+
+### 真实页面 E2E 的评分边界
+
+`python -m evals.run_e2e` 使用临时 loopback HTTP server 提供 `tests/pages`；每个案例的模型生成与外部重放共用同一 server，退出或异常时关闭。模型调用前检查创建意图能识别页面 URL、首轮工具集合非空；接线错误直接报错，不记成模型能力失败。
+
+报告分别记录：
+
+- `replay_passed`：模型保存的流程在全部独立输入变体上通过真实重放。
+- `model_execution.passed`：模型对最终流程的最后一次 `run_flow` 返回成功任务和 `acceptance_audit.passed=true`，该任务的真实变量符合首组独立预期。运行后再次修改流程会使已有证据失效。
+- `passed`：以上两项都通过，且模型轮次没有错误事件。
+
+首次运行的输入变量会明确提供在评测 prompt 中；这与旧版本 prompt 不同，旧分数不能直接作为同条件基线。`--self-check` 只运行手写流程，不计入模型成功率。
+
+`model_tool_evidence` 在调用前登记，保留返回状态或异常类型/消息；异常仍从代理原样抛出。平台状态读取和外部重放不计入模型调用数。报告不保存完整工具参数、DOM 或截图；异常消息中的常见 API key/Bearer token 会脱敏。被取消的尝试也留在代理记录中，但进程取消不会产出一份完整案例报告。

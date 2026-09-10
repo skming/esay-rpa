@@ -5,7 +5,11 @@
 报错，只会安静地把结论弄反。
 """
 
+import asyncio
 import inspect
+import socket
+from urllib.request import urlopen
+from urllib.parse import urlsplit
 import json
 import os
 import sys
@@ -25,10 +29,14 @@ from evals.run_e2e import (  # noqa: E402
     E2ECase,
     RecordingExecutor,
     _judge_variant,
+    _judge_model_execution,
     _parse_date,
     _replay_variants,
     _row_values,
     isolation_env,
+    fixture_server,
+    page_url,
+    _model_messages,
     run_model_case,
 )
 
@@ -440,8 +448,174 @@ async def test_the_model_case_replays_the_saved_flow_and_reports_cost() -> None:
 
     result = await run_model_case(orchestrator, recorder, "m", _table_case())  # type: ignore[arg-type]
 
-    assert result["passed"] is True
+    assert result["passed"] is False
+    assert result["replay_passed"] is True
+    assert result["model_execution"]["passed"] is False
     assert result["variants_passed"] == 2 and result["flow_id"] == "f1"
     assert result["model_tool_calls"] == ["create_flow"]
     assert result["metrics"]["rounds"] == 3
     assert result["metrics"]["prompt_tokens"] == 11
+
+
+def test_fixture_server_serves_http_and_closes_after_error() -> None:
+    with pytest.raises(RuntimeError, match="stop"):
+        with fixture_server() as base_url:
+            url = page_url("filter_enter_commit.html", base_url)
+            with urlopen(url, timeout=2) as response:
+                assert response.status == 200
+                assert b"q-start" in response.read()
+            assert _model_messages(_table_case(), url)
+            port = urlsplit(url).port
+            raise RuntimeError("stop")
+    with socket.socket() as connection:
+        assert connection.connect_ex(("127.0.0.1", port)) != 0
+
+
+def test_preflight_rejects_an_unrecognized_url_before_model_call() -> None:
+    with pytest.raises(ValueError, match="URL"):
+        _model_messages(_table_case(), "file:///tmp/filter.html")
+
+
+async def test_recorder_keeps_failed_and_cancelled_attempts_and_original_exception() -> None:
+    error = TypeError("unexpected keyword argument 'arguments'")
+
+    class Failing:
+        async def execute(self, name: str, args: Any, *rest: Any) -> Any:
+            args.clear()
+            raise error
+
+    recorder = RecordingExecutor(Failing())
+    recorder.recording = True
+    with pytest.raises(TypeError) as caught:
+        await recorder.execute("run_flow", {"flow_id": "f1"})
+    assert caught.value is error
+    assert recorder.calls == [("run_flow", {"flow_id": "f1"})]
+    assert recorder.evidence[0]["outcome"] == "exception"
+    assert recorder.evidence[0]["exception"]["type"] == "TypeError"
+    assert recorder.saved_flow_id() == "", "failed calls cannot claim a saved flow"
+
+    error = asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await recorder.execute("run_flow", {"flow_id": "f1"})
+    assert len(recorder.calls) == 2
+    assert recorder.evidence[1]["exception"]["type"] == "CancelledError"
+
+
+async def test_recorder_retains_structured_failure_without_payloads() -> None:
+    class Failed:
+        async def execute(self, *args: Any) -> Any:
+            return {"status": "error", "error": "invalid_arguments", "screenshot": "base64-secret"}
+
+    recorder = RecordingExecutor(Failed())
+    recorder.recording = True
+    await recorder.execute("run_flow", {"arguments": {"password": "secret"}})
+    assert recorder.evidence[0]["outcome"] == "returned"
+    assert recorder.evidence[0]["result"]["status"] == "error"
+    assert recorder.evidence[0]["result"]["error"] == "invalid_arguments"
+    assert "base64-secret" not in json.dumps(recorder.evidence)
+    assert "password" not in json.dumps(recorder.evidence)
+
+
+async def test_model_e2e_requires_its_own_successful_audited_run() -> None:
+    rows = [{"rows": json.dumps(_V0_ROWS, ensure_ascii=False)},
+            {"rows": json.dumps(_V0_ROWS, ensure_ascii=False)},
+            {"rows": json.dumps([
+                {"单号": "B-01", "日期": "2026-05-28", "金额": "100"},
+                {"单号": "B-02", "日期": "2026-06-02", "金额": "200"},
+            ], ensure_ascii=False)}]
+    recorder = RecordingExecutor(_FakeExecutor(rows))
+    orchestrator = _FakeOrchestrator(recorder, [
+        ("create_flow", {"name": "x"}), ("run_flow", {"flow_id": "f1"}),
+    ])
+    result = await run_model_case(orchestrator, recorder, "m", _table_case())
+    assert result["passed"] is True
+    assert result["replay_passed"] is True
+    assert result["model_execution"]["passed"] is True
+    assert result["model_execution"]["task_id"] == "t1"
+    assert result["metrics"]["tool_calls"] == 2
+    assert len(result["model_tool_evidence"]) == 2
+
+
+@pytest.mark.parametrize("result", [
+    {"status": "success", "task_id": "t1"},
+    {"status": "success", "acceptance_audit": {"passed": True}},
+    {"status": "success", "task_id": "t1", "acceptance_audit": {"passed": False}},
+    {"status": "error", "task_id": "t1", "acceptance_audit": {"passed": True}},
+])
+async def test_model_execution_rejects_missing_or_failed_evidence(result: dict[str, Any]) -> None:
+    recorder = RecordingExecutor(_FakeExecutor([]))
+    recorder.evidence = [{"name": "run_flow", "flow_id": "f1", "outcome": "returned", "result": result}]
+    assert (await _judge_model_execution(recorder, _table_case(), "f1"))["passed"] is False
+
+
+async def test_model_execution_invalidates_a_run_when_flow_changes_afterwards() -> None:
+    recorder = RecordingExecutor(_FakeExecutor([]))
+    recorder.evidence = [
+        {"name": "run_flow", "flow_id": "f1", "outcome": "returned",
+         "result": {"task_id": "t1", **_OK_RUN}},
+        {"name": "apply_node_fix", "flow_id": "f1", "outcome": "returned", "result": {"status": "success"}},
+    ]
+    verdict = await _judge_model_execution(recorder, _table_case(), "f1")
+    assert verdict["passed"] is False
+    assert "修改流程后" in verdict["failures"][0]
+
+
+async def test_model_execution_checks_actual_task_data_even_with_a_passing_audit() -> None:
+    recorder = RecordingExecutor(_FakeExecutor([{"rows": "[]"}]))
+    recorder.evidence = [{"name": "run_flow", "flow_id": "f1", "outcome": "returned",
+                          "result": {"task_id": "t1", **_OK_RUN}}]
+    verdict = await _judge_model_execution(recorder, _table_case(), "f1")
+    assert verdict["passed"] is False
+    assert verdict["missing"] == ["B-02", "B-03"]
+
+
+def test_preflight_rejects_empty_tools(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("evals.run_e2e._tool_schemas_for_round", lambda *args: [])
+    with pytest.raises(ValueError, match="工具集合为空"):
+        _model_messages(_table_case(), "http://127.0.0.1:8123/filter.html")
+
+
+async def test_recorder_redacts_credentials_in_error_evidence() -> None:
+    class Failed:
+        async def execute(self, *args: Any) -> Any:
+            return {"status": "error", "error": "Bearer test-token sk-testsecret"}
+
+    recorder = RecordingExecutor(Failed())
+    recorder.recording = True
+    result = await recorder.execute("run_flow", {"flow_id": "f1"})
+    assert result["error"] == "Bearer test-token sk-testsecret"
+    assert recorder.evidence[0]["result"]["error"] == "[REDACTED] [REDACTED]"
+
+
+async def test_blocked_write_preserves_previous_run_evidence_and_saved_flow() -> None:
+    recorder = RecordingExecutor(_FakeExecutor([{"rows": json.dumps(_V0_ROWS)}]))
+    recorder.evidence = [
+        {"name": "run_flow", "flow_id": "f1", "outcome": "returned",
+         "result": {"task_id": "t1", **_OK_RUN}},
+        {"name": "update_flow", "flow_id": "f1", "outcome": "returned",
+         "result": {"status": "blocked_credential_values"}},
+        {"name": "update_flow", "flow_id": "other", "outcome": "returned",
+         "result": {"status": "blocked_credential_values"}},
+    ]
+    assert recorder.saved_flow_id() == "f1"
+    assert (await _judge_model_execution(recorder, _table_case(), "f1"))["passed"] is True
+
+
+async def test_recorder_copies_safe_argument_diagnostics() -> None:
+    result = {"status": "error", "error": "invalid_arguments",
+              "issues": [{"path": [], "rule": "required", "expected": ["flow_id"]}],
+              "expected_parameters": {"required": ["flow_id"]}}
+
+    class Failed:
+        async def execute(self, *args: Any) -> Any:
+            return result
+
+    recorder = RecordingExecutor(Failed())
+    recorder.recording = True
+    await recorder.execute("run_flow", {})
+    result["issues"].clear()
+    result["expected_parameters"].clear()
+    assert recorder.evidence[0]["result"]["issues"] == [
+        {"path": [], "rule": "required", "expected": ["flow_id"]},
+    ]
+    assert recorder.evidence[0]["result"]["expected_parameters"] == {"required": ["flow_id"]}
