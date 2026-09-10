@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from jsonschema import Draft202012Validator
+
 # Tool JSON Schemas (OpenAI tool format)
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
@@ -22,6 +24,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             ),
             "parameters": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "types": {
                         "type": "array",
@@ -47,6 +50,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             ),
             "parameters": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "name": {"type": "string", "description": "流程名称"},
                     "description": {"type": "string", "description": "流程描述"},
@@ -169,6 +173,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             ),
             "parameters": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "flow_id": {"type": "string"},
                     "name": {
@@ -226,6 +231,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             ),
             "parameters": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "flow_id": {"type": "string"},
                     "variables": {
@@ -256,7 +262,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "enabled=false 时提示用户去「设置 · 浏览器插件」开启，connected=false 时提示用户打开 Chrome 扩展、"
                 "确保有已登录的标签页——两种情形都应停止，而不是直接尝试运行。"
             ),
-            "parameters": {"type": "object", "properties": {}},
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
         },
     },
     {
@@ -273,6 +279,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             ),
             "parameters": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "task_id": {"type": "string", "description": "要停止的任务 ID（run_flow 返回的 task_id）"}
                 },
@@ -288,7 +295,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "列出全部定时任务（schedule_id、名称、cron 表达式、时区、启用状态、"
                 "关联 flow_id、下次/上次运行时间）。创建新定时任务前先调用，避免重复创建。"
             ),
-            "parameters": {"type": "object", "properties": {}},
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
         },
     },
     {
@@ -305,6 +312,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             ),
             "parameters": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "flow_id": {"type": "string", "description": "要定时运行的流程 ID"},
                     "name": {"type": "string", "description": "定时任务名称，默认为流程名"},
@@ -340,6 +348,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             ),
             "parameters": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "schedule_id": {"type": "string"},
                     "enabled": {"type": "boolean", "description": "true=启用，false=停用"},
@@ -363,6 +372,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             ),
             "parameters": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "task_id": {"type": "string"}
                 },
@@ -383,6 +393,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             ),
             "parameters": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "flow_id": {"type": "string"},
                     "node_id": {"type": "string"},
@@ -405,6 +416,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             ),
             "parameters": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "flow_id": {"type": "string"},
                     "acceptance_contract": {
@@ -427,6 +439,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "description": "将流程发布为 active 状态，使其可被调度执行。",
             "parameters": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "flow_id": {"type": "string"}
                 },
@@ -445,6 +458,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             ),
             "parameters": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "task_id": {"type": "string"}
                 },
@@ -468,6 +482,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             ),
             "parameters": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "browser_executor": {
                         "type": "string", "enum": ["playwright", "extension"],
@@ -527,6 +542,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             ),
             "parameters": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "action": {
                         "type": "string",
@@ -583,6 +599,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             ),
             "parameters": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "browser_executor": {
                         "type": "string", "enum": ["playwright", "extension"],
@@ -611,6 +628,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "description": "获取运行任务的日志，可按节点 ID 或日志级别过滤。",
             "parameters": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "task_id": {"type": "string"},
                     "node_id": {
@@ -628,3 +646,42 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
 ]
+
+
+_ARGUMENT_VALIDATORS = {
+    tool["function"]["name"]: Draft202012Validator(tool["function"]["parameters"])
+    for tool in TOOL_SCHEMAS
+}
+
+
+def validate_tool_arguments(name: str, args: Any) -> dict[str, Any] | None:
+    validator = _ARGUMENT_VALIDATORS.get(name)
+    if validator is None:
+        # get_flow 等平台内部读取不属于模型工具契约。
+        return None
+    issues = []
+    for error in validator.iter_errors(args):
+        issue = {
+            "path": list(error.absolute_path),
+            "rule": error.validator,
+            "expected": error.validator_value,
+        }
+        if error.validator == "additionalProperties" and isinstance(error.instance, dict):
+            issue["fields"] = sorted(set(error.instance) - set(error.schema.get("properties", {})))
+        issues.append(issue)
+    if not issues:
+        return None
+    # ValidationError.message 会插入参数原值；凭据或页面数据不能经诊断回传。
+    schema = validator.schema
+    return {
+        "status": "error",
+        "error": "invalid_arguments",
+        "tool": name,
+        "issues": issues,
+        "expected_parameters": {
+            "type": "object",
+            "required": schema.get("required", []),
+            "properties": {key: value.get("type") for key, value in schema.get("properties", {}).items()},
+            "additionalProperties": False,
+        },
+    }

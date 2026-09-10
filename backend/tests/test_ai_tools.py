@@ -73,7 +73,7 @@ def _valid_contract(variable: str) -> dict[str, Any]:
         "requirements": [{
             "id": "test-requirement",
             "description": "测试交付要求",
-            "sourceKind": "product_default",
+            "source_kind": "product_default",
             "confidence": 1,
             "confirmed": True,
         }],
@@ -81,7 +81,7 @@ def _valid_contract(variable: str) -> dict[str, Any]:
             "id": "test-deliverable",
             "variable": variable,
             "kind": "scalar",
-            "requirementIds": ["test-requirement"],
+            "requirement_ids": ["test-requirement"],
         }],
     }
 
@@ -188,12 +188,10 @@ async def test_create_flow_rejects_missing_or_unbound_acceptance_contract_before
     unbound = await executor.execute("create_flow", {
         "name": "订单",
         "nodes": nodes,
-        "acceptance_contract": {
-            "deliverables": [{"id": "orders", "variable": "unknown", "kind": "table"}],
-        },
+        "acceptance_contract": _valid_contract("unknown"),
     })
 
-    assert missing["error"] == "acceptance_contract_invalid"
+    assert missing["error"] == "invalid_arguments"
     assert unbound["error"] == "acceptance_contract_invalid"
     assert any("unknown" in issue for issue in unbound["contract_errors"])
 
@@ -217,6 +215,7 @@ async def test_create_flow_refuses_to_persist_credential_values() -> None:
     ):
         blocked = await executor.execute("create_flow", {
             "name": "订单", "nodes": nodes, "input_variables": [variable],
+            "acceptance_contract": _valid_contract("rows"),
         })
         assert blocked["status"] == "blocked_credential_values"
         assert blocked["exposed_variables"] == [variable["name"]]
@@ -3679,3 +3678,49 @@ def test_cleanup_wording_is_allowed_once_the_audit_has_passed():
     )
 
     assert _overstated_result_claim("已去除页面导航与样式表噪声，正文从 11.8 万字符降到 4200 字符。", state) is None
+
+
+async def test_execute_rejects_invalid_arguments_before_side_effects() -> None:
+    executor = RpaToolExecutor(SimpleNamespace(), SimpleNamespace())
+    cases = [
+        ("run_flow", {"arguments": {"flow_id": "f"}}, "additionalProperties"),
+        ("run_flow", {}, "required"),
+        ("run_flow", {"flow_id": 7}, "type"),
+        ("run_flow", {"flow_id": "f", "progress_sink": {}}, "additionalProperties"),
+        ("interact_page", {"action": "not-an-action"}, "enum"),
+        ("list_node_types", {"types": []}, "minItems"),
+        ("update_flow", {"flow_id": "f", "update_nodes": [{"id": "n", "patch": "secret-value"}]}, "type"),
+        ("inspect_page", [], "type"),
+    ]
+    for name, args, rule in cases:
+        result = await executor.execute(name, args)
+        assert result["status"] == "error"
+        assert result["error"] == "invalid_arguments"
+        assert result["tool"] == name
+        assert any(issue["rule"] == rule for issue in result["issues"])
+        assert "secret-value" not in json.dumps(result)
+
+
+async def test_execute_keeps_valid_parameters_and_internal_reads(monkeypatch) -> None:
+    from unittest.mock import AsyncMock
+
+    executor = RpaToolExecutor(SimpleNamespace(), SimpleNamespace())
+    run = AsyncMock(return_value={"status": "success"})
+    read = AsyncMock(return_value={"flow_id": "f"})
+    monkeypatch.setattr(executor, "_run_flow", run)
+    monkeypatch.setattr(executor, "_get_flow", read)
+    progress = {}
+    assert await executor.execute("run_flow", {"flow_id": "f", "variables": {"custom": 1}}, progress) == {
+        "status": "success",
+    }
+    run.assert_awaited_once_with(flow_id="f", variables={"custom": 1}, progress_sink=progress)
+    assert await executor.execute("get_flow", {"flow_id": "f"}) == {"flow_id": "f"}
+    read.assert_awaited_once_with(flow_id="f")
+
+
+def test_tool_arguments_never_turn_a_non_object_into_an_empty_call() -> None:
+    import pytest
+
+    for raw in ("[]", "null", "42", '\"text\"'):
+        with pytest.raises(json.JSONDecodeError, match="工具参数必须是 JSON 对象"):
+            _parse_tool_arguments(raw)

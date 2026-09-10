@@ -58,7 +58,8 @@ def test_tool_prompts_keep_the_contract_authoritative_and_bounded() -> None:
     catalog_params = functions["list_node_types"]["parameters"]
     assert catalog_params["required"] == ["types"]
     assert catalog_params["properties"]["types"]["maxItems"] == 8
-    assert len(json.dumps(TOOL_SCHEMAS, ensure_ascii=False)) < 15_000
+    assert all(item["parameters"]["additionalProperties"] is False for item in functions.values())
+    assert len(json.dumps(TOOL_SCHEMAS, ensure_ascii=False)) < 16_000
 
 
 def test_tool_schema_names_match_the_executor_dispatch_table() -> None:

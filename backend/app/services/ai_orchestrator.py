@@ -707,6 +707,23 @@ def _build_system_message(
     }
 
 
+def _serialize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """请求出口合并 system；内部历史保留状态块位置，供更新和压缩使用。"""
+    systems = [message for message in messages if message.get("role") == "system"]
+    history = [message for message in messages if message.get("role") != "system"]
+    if not systems:
+        return history
+    if all(isinstance(message["content"], str) for message in systems):
+        content: Any = "\n\n".join(message["content"] for message in systems)
+    else:
+        # 保留 Anthropic 文本块上的缓存断点，不把动态状态加入稳定前缀断点。
+        content = []
+        for message in systems:
+            value = message["content"]
+            content.extend([{"type": "text", "text": value}] if isinstance(value, str) else value)
+    return [{"role": "system", "content": content}, *history]
+
+
 def _build_few_shot_block(model: str, relayed: bool) -> list[dict[str, Any]]:
     """few-shot 序列，Anthropic 原生端点在末条上再打一个缓存断点。
 
@@ -1574,7 +1591,7 @@ class AiOrchestrator:
                 round_tools = _tool_schemas_for_round(guard_state, intents)
                 completion_args: dict[str, Any] = {
                     "model": effective_model,
-                    "messages": full_messages,
+                    "messages": _serialize_messages(full_messages),
                     "stream": True,
                     "stream_options": {"include_usage": True},
                     "drop_params": True,
@@ -1961,7 +1978,9 @@ def _parse_tool_arguments(raw_args: str) -> tuple[dict[str, Any], list[str]]:
         return dict(pairs)
 
     parsed = json.loads(raw_args, object_pairs_hook=_collect)
-    return (parsed if isinstance(parsed, dict) else {}), duplicates
+    if not isinstance(parsed, dict):
+        raise json.JSONDecodeError("工具参数必须是 JSON 对象", raw_args, 0)
+    return parsed, duplicates
 
 
 _FLOW_WRITE_TOOLS = ("create_flow", "update_flow", "apply_node_fix", "set_acceptance_contract")

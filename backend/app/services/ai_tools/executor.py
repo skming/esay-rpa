@@ -26,6 +26,7 @@ from app.services.browser_action_runner import detect_blocking_interstitial, per
 from app.services.extension_executor import ExtensionBusyError, extension_busy_message
 import app.services.ai_tools.extension_page_channel as _extension_page
 from app.services.ai_tools.catalog import select_node_types
+from app.services.ai_tools.schemas import validate_tool_arguments
 from app.services.ai_tools.diagnostics import (
     SELECTOR_MATCH_HIDDEN_OR_NOT_VISIBLE,
     SELECTOR_MATCH_NOT_VISIBLE,
@@ -294,6 +295,9 @@ class RpaToolExecutor:
 
         执行器是全进程单例，这两样都不能挂在 self 上——两个会话同时跑会互相覆盖。
         """
+        invalid = validate_tool_arguments(name, args)
+        if invalid is not None:
+            return invalid
         match name:
             case "lint_flow":
                 return await self._lint_flow_tool(**args)

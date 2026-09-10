@@ -1378,7 +1378,7 @@ async def test_running_needs_this_turn_authorization_not_a_default(monkeypatch) 
 
 
 async def test_every_round_carries_exactly_one_fresh_state_block(monkeypatch) -> None:
-    """状态块必须真的进到发给模型的那份 messages 里，且每轮只有一份、排在最后。
+    """状态块必须进入请求的 system 消息，且每轮只有一份最新状态。
 
     这是整套设计唯一的承重点：状态块到不了模型手上，「不必再去查证」就成了空话，而删掉的
     读取工具让它连查证的路都没有。单测只能证明 sync_state_message 自己对——发给上游的
@@ -1410,14 +1410,11 @@ async def test_every_round_carries_exactly_one_fresh_state_block(monkeypatch) ->
 
     assert len(captured) == 2
     for kwargs in captured:
-        blocks = [
-            m for m in kwargs["messages"]
-            if isinstance(m.get("content"), str) and m["content"].startswith("<flow-state")
-        ]
-        assert len(blocks) == 1
-        assert 'revision="7"' in blocks[0]["content"]
-        # 排在最后才压得住历史工具返回里那些已经过期的版本
-        assert kwargs["messages"][-1] is blocks[0]
+        system = kwargs["messages"][0]
+        assert system["role"] == "system"
+        assert system["content"].count("\n<flow-state ") == 1
+        assert 'revision="7"' in system["content"]
+        assert all(message["role"] != "system" for message in kwargs["messages"][1:])
         # 状态块答完的问题不该再有对应的工具可调，否则模型仍会花一轮去问
         offered = {item["function"]["name"] for item in kwargs.get("tools") or []}
         assert not offered & {"get_flow", "lint_flow", "validate_flow", "get_run_status"}
@@ -1924,3 +1921,89 @@ def test_compaction_retains_nested_failure_evidence_without_form_values():
     assert result["acceptance_audit"]["passed"] is False
     assert result["acceptance_audit"]["issues"] == [{"issue": "missing_rows"}]
     assert "secret-fixture" not in json.dumps(result)
+
+
+async def test_request_serializes_system_messages_before_tool_history(monkeypatch) -> None:
+    import copy
+    import litellm
+
+    captured = []
+
+    async def completion(**kwargs):
+        captured.append(copy.deepcopy(kwargs["messages"]))
+        if len(captured) == 1:
+            return _FakeStream([_chunk(tool_calls=[_tool_call_chunk(
+                0, call_id="inspect-system-order", name="inspect_page",
+                arguments='{ "url": "https://example.com" }',
+            )], finish="tool_calls")])
+        return _FakeStream([_chunk(content="已读取页面。", finish="stop")])
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    orchestrator = AiOrchestrator(tool_executor=_FakeExecutor())
+    _ = [event async for event in orchestrator.stream(
+        messages=[{"role": "user", "content": "创建流程，抓取 https://example.com 的正文"}],
+        model="test-model",
+    )]
+    assert len(captured) >= 2
+    for messages in captured:
+        assert messages[0]["role"] == "system"
+        assert all(message["role"] != "system" for message in messages[1:])
+    history = captured[1]
+    call = next(i for i, message in enumerate(history) if any(
+        item.get("id") == "inspect-system-order" for item in message.get("tool_calls", [])
+    ))
+    assert history[call + 1]["role"] == "tool"
+    assert history[call + 1]["tool_call_id"] == "inspect-system-order"
+
+
+def test_system_serialization_keeps_content_cache_and_original_history() -> None:
+    import copy
+    from app.services.ai_orchestrator import _serialize_messages
+
+    original = [
+        {"role": "system", "content": [{"type": "text", "text": "base", "cache_control": {"type": "ephemeral"}}]},
+        {"role": "user", "content": "task"},
+        {"role": "system", "content": "state"},
+        {"role": "assistant", "content": "history"},
+        {"role": "system", "content": [{"type": "text", "text": "guidance"}]},
+    ]
+    before = copy.deepcopy(original)
+    result = _serialize_messages(original)
+    assert [x["text"] for x in result[0]["content"]] == ["base", "state", "guidance"]
+    assert result[0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+    assert result[1:] == [original[1], original[3]]
+    assert original == before
+
+
+async def test_stream_returns_argument_evidence_and_accepts_corrected_call(monkeypatch) -> None:
+    import litellm
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    rounds = iter([
+        _FakeStream([_chunk(tool_calls=[_tool_call_chunk(
+            0, call_id="bad-args", name="inspect_page", arguments='{"arguments":{"url":"https://example.com"}}',
+        )], finish="tool_calls")]),
+        _FakeStream([_chunk(tool_calls=[_tool_call_chunk(
+            0, call_id="fixed-args", name="inspect_page", arguments='{"url":"https://example.com"}',
+        )], finish="tool_calls")]),
+        _FakeStream([_chunk(content="已读取页面。", finish="stop")]),
+    ])
+
+    async def completion(**kwargs):
+        return next(rounds)
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    executor = RpaToolExecutor(SimpleNamespace(), SimpleNamespace())
+    inspect = AsyncMock(return_value={"url": "https://example.com", "inputs": [], "buttons": [], "tables": []})
+    monkeypatch.setattr(executor, "_inspect_page", inspect)
+    events = [event async for event in AiOrchestrator(executor).stream(
+        messages=[{"role": "user", "content": "创建流程，抓取 https://example.com 的正文"}],
+        model="test-model",
+    )]
+    results = [event["result"] for event in events if event["type"] == "tool_result"]
+    assert results[0]["error"] == "invalid_arguments"
+    assert results[0]["issues"][0]["fields"] == ["arguments"]
+    assert "url" in results[0]["expected_parameters"]["properties"]
+    assert results[1]["url"] == "https://example.com"
+    inspect.assert_awaited_once_with(url="https://example.com")
