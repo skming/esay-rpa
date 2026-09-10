@@ -319,7 +319,13 @@ async def run_flow(flow_id: str, request: FlowRunRequest) -> TaskSnapshot:
     if snapshot is None:
         raise HTTPException(status_code=404, detail="Flow not found")
     try:
-        return await flow_run_service.run_flow(snapshot, mode=request.mode, run_request=request)
+        # 这条路由只服务面板上的手动运行，验收者就在屏幕前；契约门控留给定时与 AI 的无人值守路径。
+        return await flow_run_service.run_flow(
+            snapshot,
+            mode=request.mode,
+            run_request=request,
+            enforce_acceptance_contract=False,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

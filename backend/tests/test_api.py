@@ -188,6 +188,44 @@ async def test_flow_run_endpoint_starts_task_from_definition() -> None:
             await restart_global_workers()
 
 
+async def test_flow_run_endpoint_runs_flow_without_acceptance_contract() -> None:
+    """面板手动运行不受契约门控：平台没有编写契约的界面，硬拒会让手搭的流程一保存就跑不了。"""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        try:
+            create_response = await client.post(
+                "/api/flows",
+                json={
+                    "name": "无契约流程",
+                    "version": "v1.0.0",
+                    "status": "active",
+                    "definition": {
+                        "nodes": [
+                            {"id": "start", "type": "start"},
+                            {
+                                "id": "n1",
+                                "type": "browser.fetch",
+                                "targetUrl": "https://quotes.toscrape.com/",
+                                "selector": ".quote .text::text",
+                                "fetcher": "static",
+                                "extractMode": "text",
+                                "outputVariable": "api_rows",
+                                "timeoutMs": 1000,
+                            },
+                        ],
+                        "edges": [{"source": "start", "target": "n1"}],
+                    },
+                },
+            )
+            assert create_response.status_code == 200
+            flow_id = create_response.json()["flowId"]
+
+            run_response = await client.post(f"/api/flows/{flow_id}/run", json={"mode": "debug"})
+            assert run_response.status_code == 200
+            assert run_response.json()["flowId"] == flow_id
+        finally:
+            await restart_global_workers()
+
+
 async def test_task_endpoint_accepts_request_and_exposes_logs() -> None:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
         task_response = await client.post(

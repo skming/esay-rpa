@@ -18,29 +18,52 @@ class FlowRunService:
     def __init__(self, task_manager: "TaskManager") -> None:
         self._task_manager = task_manager
 
-    async def run_flow(self, flow: FlowSnapshot, *, mode: RunMode = "run", run_request: FlowRunRequest | None = None) -> TaskSnapshot:
-        request = self._build_task_request(flow, mode=mode, run_request=run_request)
+    async def run_flow(
+        self,
+        flow: FlowSnapshot,
+        *,
+        mode: RunMode = "run",
+        run_request: FlowRunRequest | None = None,
+        enforce_acceptance_contract: bool = True,
+    ) -> TaskSnapshot:
+        request = self._build_task_request(
+            flow,
+            mode=mode,
+            run_request=run_request,
+            enforce_acceptance_contract=enforce_acceptance_contract,
+        )
         return await self._task_manager.start_task(request)
 
-    def _build_task_request(self, flow: FlowSnapshot, *, mode: RunMode, run_request: FlowRunRequest | None = None) -> RunTaskRequest:
+    def _build_task_request(
+        self,
+        flow: FlowSnapshot,
+        *,
+        mode: RunMode,
+        run_request: FlowRunRequest | None = None,
+        enforce_acceptance_contract: bool = True,
+    ) -> RunTaskRequest:
         scope = run_request.scope if run_request is not None else "full"
         start_node_id = run_request.start_node_id if run_request is not None else None
         executable_nodes = FlowDefinitionSelector.select_executable_nodes(flow.definition, scope=scope, start_node_id=start_node_id)
         if not executable_nodes:
             raise ValueError("流程定义缺少可执行节点")
-        contract_errors = contract_validation_errors(
-            flow.acceptance_contract,
-            defined_variables=definition_variable_names(
-                flow.definition,
-                [
-                    variable.get("name") if isinstance(variable, dict) else variable.name
-                    for variable in flow.input_variables
-                    if (variable.get("name") if isinstance(variable, dict) else variable.name)
-                ],
-            ),
-        )
-        if contract_errors:
-            raise ValueError(f"流程缺少完整验收契约：{'；'.join(contract_errors)}")
+        # 默认拒绝：契约是无人值守运行唯一的验收依据，定时任务没人看结果，缺了它跑出垃圾也没人知道。
+        # 但人在面板上点运行时他自己就是验收者，而平台没有任何界面能编写契约，
+        # 一律硬拒等于让手搭的流程一出生就跑不了，且没有出路。
+        if enforce_acceptance_contract:
+            contract_errors = contract_validation_errors(
+                flow.acceptance_contract,
+                defined_variables=definition_variable_names(
+                    flow.definition,
+                    [
+                        variable.get("name") if isinstance(variable, dict) else variable.name
+                        for variable in flow.input_variables
+                        if (variable.get("name") if isinstance(variable, dict) else variable.name)
+                    ],
+                ),
+            )
+            if contract_errors:
+                raise ValueError(f"流程缺少完整验收契约：{'；'.join(contract_errors)}")
 
         overrides = run_request.variables if run_request is not None else {}
         base_request = RunTaskRequest(

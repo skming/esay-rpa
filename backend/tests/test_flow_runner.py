@@ -214,6 +214,21 @@ async def test_flow_run_service_rejects_missing_acceptance_contract_before_start
     assert task_manager.requests == []
 
 
+async def test_flow_run_service_allows_missing_contract_when_not_enforced() -> None:
+    """面板手动运行不走契约门控：平台没有编写契约的界面，硬拒会让手搭的流程没有出路。"""
+    task_manager = RecordingTaskManager()
+    service = FlowRunService(task_manager=task_manager)  # type: ignore[arg-type]
+    flow = build_flow()
+    flow.acceptance_contract = flow.acceptance_contract.model_copy(update={
+        "requirements": [],
+        "deliverables": [],
+    })
+
+    await service.run_flow(flow, enforce_acceptance_contract=False)
+
+    assert len(task_manager.requests) == 1
+
+
 async def test_flow_run_service_starts_non_fetch_flow_definition() -> None:
     task_manager = RecordingTaskManager()
     service = FlowRunService(task_manager=task_manager)  # type: ignore[arg-type]
