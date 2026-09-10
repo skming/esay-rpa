@@ -166,8 +166,12 @@ class ScheduleService:
             if not failures:
                 return last_ok, None
             summary = _describe_flow_failures(failures)
-            logger.warning("所有流程调度中部分流程启动失败：%s", summary)
-            return last_ok, f"{len(failures)}/{len(active_flows)} 个流程未启动：{summary}"
+            partial_error = f"{len(failures)}/{len(active_flows)} 个流程未启动：{summary}"
+            # 永远起不来的流程每个 tick 都会失败一次，秒级 cron 下几分钟就能把日志淹掉。
+            # last_error 已经承载了「现在是什么状态」，日志只需要记下「失败内容变了」这一刻。
+            if partial_error != (schedule.last_error or ""):
+                logger.warning("所有流程调度中部分流程启动失败：%s", summary)
+            return last_ok, partial_error
 
         if flow_id is None:
             snapshot = await self._task_manager.start_task(task_with_schedule_id)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -551,6 +552,50 @@ async def test_all_flows_mode_reports_partially_failed_flows() -> None:
         assert "1/2" in triggered.last_error
         assert "缺契约流程" in triggered.last_error
         assert "验收契约" in triggered.last_error
+    finally:
+        await task_manager.stop_workers()
+
+
+async def test_all_flows_mode_logs_repeated_partial_failure_once(caplog) -> None:
+    """同一批流程永远起不来，秒级 cron 下每个 tick 打一行会把日志淹掉；last_error 已经承载了当前状态。"""
+    task_manager = TaskManager(runner=FakeRunner(), broker=LogBroker())
+    flow_service = FlowService()
+    service = ScheduleService(
+        task_manager=task_manager,
+        flow_service=flow_service,
+        flow_run_service=FlowRunService(task_manager=task_manager),
+    )
+    try:
+        await flow_service.create_flow(
+            FlowCreateRequest(
+                name="可用流程",
+                version="v1.0.0",
+                status="active",
+                definition=all_flows_definition(),
+                acceptanceContract=acceptance_contract("scheduled_rows"),
+            )
+        )
+        await flow_service.create_flow(
+            FlowCreateRequest(name="缺契约流程", version="v1.0.0", status="active", definition=all_flows_definition())
+        )
+        schedule = await service.create_schedule(
+            ScheduleCreateRequest(
+                name="所有流程",
+                cronExpression="0 * * * *",
+                timezone="UTC",
+                task=build_task_request().model_copy(update={"flow_id": None}),
+            )
+        )
+
+        with caplog.at_level(logging.WARNING, logger="app.services.scheduler_service"):
+            first = await service.trigger_schedule(schedule.schedule_id)
+            second = await service.trigger_schedule(schedule.schedule_id)
+
+        assert first is not None and second is not None
+        assert second.last_error == first.last_error
+        assert "缺契约流程" in (second.last_error or "")
+        repeated = [r for r in caplog.records if "所有流程调度中部分流程启动失败" in r.getMessage()]
+        assert len(repeated) == 1
     finally:
         await task_manager.stop_workers()
 
