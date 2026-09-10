@@ -450,7 +450,11 @@ class BackendClient {
       }
       if (!response.ok) {
         const detail = data !== null && typeof data === 'object' ? data.detail : (typeof data === 'string' ? data : null);
-        throw new Error(typeof detail === 'string' ? detail : `后端请求失败：${response.status}`);
+        const rejected = new Error(typeof detail === 'string' ? detail : `后端请求失败：${response.status}`);
+        // 带上 status 才能区分「后端答复了但拒绝这次请求」和「后端不可用」：调用方对这两者的处置相反，
+        // 只看 message 分不出来，就只能把业务拒绝当成连不上处理。
+        rejected.status = response.status;
+        throw rejected;
       }
       return data;
     } catch (error) {

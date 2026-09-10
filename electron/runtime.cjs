@@ -91,6 +91,11 @@ function createRuntimeController({ backendClient = new BackendClient(), sendEven
       try {
         return await startBackendRun(win, payload);
       } catch (error) {
+        // 后端答复过（带 status）就说明请求是被业务规则拒绝的，这时改跑本地模拟等于把拒绝理由换成一次假的成功运行：
+        // 模拟用的是内置演示节点 id，真实流程的节点一个都对不上，面板既没有状态更新也没有产物，结束时却报 success。
+        if (typeof error?.status === 'number') {
+          throw error;
+        }
         return startMockRun(win, payload, `后端不可用，切换到本地模拟运行 · ${error.message}`);
       }
     }
