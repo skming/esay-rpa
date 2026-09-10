@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from app.models.schemas import FlowCreateRequest, FlowUpdateRequest
 from app.services.flow_service import FlowService
 from app.services.flow_store import SqlAlchemyFlowStore
@@ -134,5 +136,47 @@ async def test_sqlite_roundtrip_returns_timezone_aware_timestamps(tmp_path) -> N
     assert reloaded.created_at.tzinfo is not None
     assert reloaded.updated_at.tzinfo is not None
     assert reloaded.created_at == created.created_at
+
+    await store.close()
+
+
+async def test_update_flow_rejects_clearing_existing_acceptance_contract(tmp_path) -> None:
+    """空契约恰好能绕过契约校验，允许它覆盖已有契约就等于静默清空，直到运行时才被拒绝。"""
+    engine = create_schedule_engine(f"sqlite+aiosqlite:///{tmp_path / 'flows.db'}")
+    store = SqlAlchemyFlowStore(engine)
+    await store.create_schema()
+    service = FlowService(store=store)
+
+    created = await service.create_flow(
+        FlowCreateRequest(
+            name="契约流程",
+            version="v1.0.0",
+            definition=build_definition(),
+            acceptanceContract={
+                "requirements": [{
+                    "id": "orders-required",
+                    "description": "测试订单交付",
+                    "sourceKind": "product_default",
+                    "confidence": 1,
+                    "confirmed": True,
+                }],
+                "deliverables": [{
+                    "id": "orders",
+                    "variable": "orders",
+                    "kind": "table",
+                    "requirementIds": ["orders-required"],
+                }],
+            },
+            status="draft",
+        )
+    )
+
+    with pytest.raises(ValueError, match="空验收契约"):
+        await service.update_flow(created.flow_id, FlowUpdateRequest(acceptanceContract={}))
+
+    reloaded = await service.get_flow(created.flow_id)
+    assert reloaded is not None
+    assert reloaded.acceptance_contract.deliverables[0].variable == "orders"
+    assert reloaded.revision == created.revision
 
     await store.close()

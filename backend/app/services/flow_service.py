@@ -79,7 +79,16 @@ class FlowService:
         if revision_changed:
             next_definition = request.definition if request.definition is not None else current.definition
             next_variables = request.input_variables if request.input_variables is not None else current.input_variables
-            next_contract = request.acceptance_contract or current.acceptance_contract
+            # 空契约是真值（Pydantic 模型实例），用 `or` 取不到 current，显式传 {} 会把已有契约换成空的；
+            # 而空契约又刚好绕过下面的校验，于是契约被静默清掉，直到运行时才被拒绝。
+            next_contract = request.acceptance_contract if request.acceptance_contract is not None else current.acceptance_contract
+            cleared = (
+                not next_contract.requirements
+                and not next_contract.deliverables
+                and bool(current.acceptance_contract.requirements or current.acceptance_contract.deliverables)
+            )
+            if cleared:
+                raise ValueError("不能用空验收契约覆盖已有契约：清空后流程只会在运行时被拒绝，保存这一步看不出任何异常")
             if next_contract.deliverables or next_contract.requirements:
                 contract_errors = contract_validation_errors(
                     next_contract,
