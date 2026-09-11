@@ -38,7 +38,7 @@ _LAYOUT_ONLY_NODE_FIELDS = frozenset({"position", "status"})
 
 @dataclass(frozen=True)
 class ChangeContext:
-    """只有调用方（编排层）才知道的两件事，随调用传进来。
+    """只有调用方（编排层）才知道的写入上下文，随调用传进来。
 
     执行器是全进程单例，这些值不能挂在 self 上——两个会话同时写会互相覆盖。
 
@@ -49,6 +49,7 @@ class ChangeContext:
       不是模型再坚持一次。
     """
 
+    draft_flow_id: str | None = None
     protected_node_ids: frozenset[str] = frozenset()
     fresh_page_evidence: bool = False
 

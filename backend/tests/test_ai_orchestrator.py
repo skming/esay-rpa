@@ -465,14 +465,14 @@ def test_only_the_model_fixable_refusals_leave_the_run_unattempted() -> None:
         state = _ready(**verification_request)
         _orchestrator_guard_after_tool("run_flow", {"status": status, "message": "拒"}, state)
         assert not state.run_attempted, status
-        assert _unmet_verification_request("我已经检查了流程结构。", state) is not None, status
+        assert _unmet_verification_request(state) is not None, status
 
     # 只能等用户的那几条：模型确实跑不了，再催是空转
     for status in sorted(_RUN_NOT_STARTED_STATUSES - _RUN_REFUSED_MODEL_FIXABLE):
         state = _ready(**verification_request)
         _orchestrator_guard_after_tool("run_flow", {"status": status, "message": "拒"}, state)
         assert state.run_attempted is True, status
-        assert _unmet_verification_request("我已经检查了流程结构。", state) is None, status
+        assert _unmet_verification_request(state) is None, status
 
 
 def test_every_run_flow_status_is_classified_as_started_or_not() -> None:
@@ -1649,8 +1649,8 @@ async def test_blank_open_flow_still_requires_page_evidence(monkeypatch) -> None
         if m.get("role") == "system" and "强制执行顺序" in str(m.get("content") or "")
     ]
     assert guidance, "空白流程 + 含 URL 的构建需求必须注入 _GUIDANCE_BEFORE_CREATE"
-    # 流程已存在，引导与阻断都该指向 update_flow 而不是再建一个流程
-    assert "update_flow" in guidance[0]["content"]
+    # 空草稿由 create_flow 填充原 ID，页面证据门禁仍覆盖 update_flow。
+    assert "create_flow" in guidance[0]["content"]
 
     assert ("update_flow", {"flow_id": "flow-blank"}) not in executor.calls, "未 inspect_page 就落节点必须被阻断"
     blocked = [
@@ -2007,3 +2007,31 @@ async def test_stream_returns_argument_evidence_and_accepts_corrected_call(monke
     assert "url" in results[0]["expected_parameters"]["properties"]
     assert results[1]["url"] == "https://example.com"
     inspect.assert_awaited_once_with(url="https://example.com")
+
+
+def test_verification_nudge_uses_authorization_and_phase_not_reply_keywords() -> None:
+    for overrides in (
+        {"run_authorized": False}, {"read_only_tools": True}, {"flow_has_nodes": False},
+        {"blocking_diagnostics": [{"issue": "broken_edge"}]},
+        {"page_evidence_required": {"url": "https://example.com"}, "page_evidence_done": False},
+        {"challenge_page_lock": {"url": "https://example.com"}},
+        {"failure_budget_lock": {"flow_id": "f"}},
+        {"attempt_budget": {"spent": VERIFY_ATTEMPT_BUDGET}},
+    ):
+        state = _ready(latest_user_message="验收一下", **overrides)
+        before = dict(state.attempt_budget)
+        assert _unmet_verification_request(state) is None, overrides
+        assert not state.verification_nudged
+        assert state.attempt_budget == before
+    # 建流程已经授权验收；模型的一句凭据推测不是运行受阻的证据。
+    state = _ready(latest_user_message="创建这个流程")
+    assert _unmet_verification_request(state) is not None
+
+
+def test_invalid_run_arguments_are_not_execution_evidence() -> None:
+    state = _ready()
+    result = {"status": "error", "error": "invalid_arguments", "tool": "run_flow"}
+    _orchestrator_guard_after_tool("run_flow", result, state)
+    assert not state.run_attempted
+    assert state.attempt_budget["spent"] == 0
+    assert _unmet_verification_request(state) is not None

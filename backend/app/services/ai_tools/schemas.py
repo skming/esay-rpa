@@ -13,6 +13,85 @@ from jsonschema import Draft202012Validator
 
 # Tool JSON Schemas (OpenAI tool format)
 
+# 契约对象是审计引擎的固定读取面，所以三层都封死扩展字段：多写的字段没人读，模型却以为
+# 约束已经生效，运行完还会拿一份"通过"的审计结论。这里拦不住就会落到 executor 的
+# model_validate 抛 ValidationError，而 Pydantic 把 input_value 原样拼进异常文本，
+# 编排层对工具异常只做 {"error": str(exc)}——契约里的用户原话和页面数据会顺着回传给模型。
+# 与之相对，nodes / patch / input_variables 必须保持开放：那些字段由节点类型目录决定，
+# 封死等于新增一种节点就得先改这里，模型只会收到"参数非法"且无从绕开。
+_ACCEPTANCE_CONTRACT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "description": (
+        "运行前冻结的交付验收契约。requirements 必须逐条记录用户原文来源；"
+        "deliverables 每项必须明确 id、variable、kind、requirement_ids；"
+        "kind 可为 table/document/file/scalar，并按需求填写 required_fields、"
+        "date_ranges、allowed_values、unique_by、required_terms、forbidden_terms 等后置条件。"
+        "审计只验这里声明的交付变量，不再根据变量名猜测。"
+    ),
+    "properties": {
+        "requirements": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "id": {"type": "string"},
+                    "description": {"type": "string"},
+                    "source_kind": {"type": "string", "enum": ["user", "product_default"]},
+                    "source_quote": {"type": "string"},
+                    "source_turn_id": {"type": "string"},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "confirmed": {"type": "boolean"},
+                },
+                "required": ["id", "description", "source_kind", "confidence", "confirmed"],
+            },
+        },
+        "deliverables": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "id": {"type": "string"},
+                    "variable": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["table", "document", "file", "scalar"]},
+                    "required": {"type": "boolean"},
+                    "min_rows": {"type": "integer"},
+                    "max_rows": {"type": "integer"},
+                    "required_fields": {"type": "array", "items": {"type": "string"}},
+                    "date_ranges": {"type": "array", "items": {"type": "object"}},
+                    "allowed_values": {"type": "array", "items": {"type": "object"}},
+                    "unique_by": {"type": "array", "items": {"type": "string"}},
+                    "min_chars": {"type": "integer"},
+                    "required_terms": {"type": "array", "items": {"type": "string"}},
+                    "forbidden_terms": {"type": "array", "items": {"type": "string"}},
+                    "source_variables": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "文档正文取自哪些运行变量。kind=document 时必填："
+                            "审计用它验证正文里确实含有本次运行抓到的数据。"
+                        ),
+                    },
+                    "extensions": {"type": "array", "items": {"type": "string"}},
+                    "min_bytes": {"type": "integer"},
+                    "requirement_ids": {"type": "array", "items": {"type": "string"}},
+                    "numeric_ranges": {"type": "array", "items": {"type": "object"}},
+                    "field_formats": {"type": "array", "items": {"type": "object"}},
+                    "cross_field_assertions": {"type": "array", "items": {"type": "object"}},
+                    "sort_assertions": {"type": "array", "items": {"type": "object"}},
+                    "aggregate_assertions": {"type": "array", "items": {"type": "object"}},
+                    "expected_count_variable": {"type": "string"},
+                    "minimum_coverage_ratio": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+                },
+                "required": ["id", "variable", "kind", "requirement_ids"],
+            },
+        },
+    },
+    "required": ["requirements", "deliverables"],
+}
+
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
@@ -86,75 +165,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         ),
                         "items": {"type": "object"},
                     },
-                    "acceptance_contract": {
-                        "type": "object",
-                        "description": (
-                            "运行前冻结的交付验收契约。requirements 必须逐条记录用户原文来源；"
-                            "deliverables 每项必须明确 id、variable、kind、requirement_ids；"
-                            "kind 可为 table/document/file/scalar，并按需求填写 required_fields、"
-                            "date_ranges、allowed_values、unique_by、required_terms、forbidden_terms 等后置条件。"
-                            "审计只验这里声明的交付变量，不再根据变量名猜测。"
-                        ),
-                        "properties": {
-                            "requirements": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "id": {"type": "string"},
-                                        "description": {"type": "string"},
-                                        "source_kind": {"type": "string", "enum": ["user", "product_default"]},
-                                        "source_quote": {"type": "string"},
-                                        "source_turn_id": {"type": "string"},
-                                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                                        "confirmed": {"type": "boolean"},
-                                    },
-                                    "required": ["id", "description", "source_kind", "confidence", "confirmed"],
-                                },
-                            },
-                            "deliverables": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "id": {"type": "string"},
-                                        "variable": {"type": "string"},
-                                        "kind": {"type": "string", "enum": ["table", "document", "file", "scalar"]},
-                                        "required": {"type": "boolean"},
-                                        "min_rows": {"type": "integer"},
-                                        "max_rows": {"type": "integer"},
-                                        "required_fields": {"type": "array", "items": {"type": "string"}},
-                                        "date_ranges": {"type": "array", "items": {"type": "object"}},
-                                        "allowed_values": {"type": "array", "items": {"type": "object"}},
-                                        "unique_by": {"type": "array", "items": {"type": "string"}},
-                                        "min_chars": {"type": "integer"},
-                                        "required_terms": {"type": "array", "items": {"type": "string"}},
-                                        "forbidden_terms": {"type": "array", "items": {"type": "string"}},
-                                        "source_variables": {
-                                            "type": "array",
-                                            "items": {"type": "string"},
-                                            "description": (
-                                                "文档正文取自哪些运行变量。kind=document 时必填："
-                                                "审计用它验证正文里确实含有本次运行抓到的数据。"
-                                            ),
-                                        },
-                                        "extensions": {"type": "array", "items": {"type": "string"}},
-                                        "min_bytes": {"type": "integer"},
-                                        "requirement_ids": {"type": "array", "items": {"type": "string"}},
-                                        "numeric_ranges": {"type": "array", "items": {"type": "object"}},
-                                        "field_formats": {"type": "array", "items": {"type": "object"}},
-                                        "cross_field_assertions": {"type": "array", "items": {"type": "object"}},
-                                        "sort_assertions": {"type": "array", "items": {"type": "object"}},
-                                        "aggregate_assertions": {"type": "array", "items": {"type": "object"}},
-                                        "expected_count_variable": {"type": "string"},
-                                        "minimum_coverage_ratio": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
-                                    },
-                                    "required": ["id", "variable", "kind", "requirement_ids"],
-                                },
-                            },
-                        },
-                        "required": ["requirements", "deliverables"],
-                    },
+                    "acceptance_contract": _ACCEPTANCE_CONTRACT_SCHEMA,
                 },
                 "required": ["name", "nodes", "acceptance_contract"],
             },
@@ -419,9 +430,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "additionalProperties": False,
                 "properties": {
                     "flow_id": {"type": "string"},
+                    # 这里不复用 create_flow 的完整契约 schema：多这一份要占 2.6k 字符，
+                    # 而工具表每轮都在上下文里（见 test_ai_prompts 的 16k 硬预算）。
+                    # 扩展字段由 executor 的 _validated_contract 拦，只是晚一步、不早退。
                     "acceptance_contract": {
                         "type": "object",
-                        "description": "完整替换契约；requirements 的用户条款仍必须携带 source_quote 原文。",
+                        "description": "完整替换契约；字段与 create_flow 的 acceptance_contract 完全一致，不接受额外字段。",
                     },
                     "requirement_change_quote": {
                         "type": "string",

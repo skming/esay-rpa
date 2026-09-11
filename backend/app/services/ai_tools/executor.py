@@ -270,6 +270,30 @@ def _annotate_login_redirect(result: dict[str, Any], requested_url: str) -> None
     )
 
 
+def _validated_contract(raw: dict[str, Any] | None) -> tuple[Any, dict[str, Any] | None]:
+    """把契约的 Pydantic 校验失败转成结构化错误，而不是让异常放跑。
+
+    放跑的代价不只是文案难懂：编排层对工具异常只做 {"error": str(exc)}，而 Pydantic 会把
+    input_value 原样拼进异常文本，契约里装的用户原话和页面数据会顺着 tool 消息回传给模型，
+    再落进对话存档。参数闸门已封死扩展字段，这里剩下的是 schema 没有镜像的那些约束：
+    长度上限、minRows 大于 maxRows、requirement id 重复或悬空引用。
+    """
+    from pydantic import ValidationError
+
+    try:
+        return FlowAcceptanceContract.model_validate(raw or {}), None
+    except ValidationError as exc:
+        return None, {
+            "error": "acceptance_contract_invalid",
+            # 只留位置和规则文案：errors() 的 input 字段装的就是原值。
+            "contract_errors": [
+                f"{'.'.join(str(part) for part in item['loc'])}: {item['msg']}"
+                for item in exc.errors()[:10]
+            ],
+            "message": "验收契约结构非法，请按 schema 修正字段后重新提交。",
+        }
+
+
 class RpaToolExecutor:
     def __init__(
         self,
@@ -308,7 +332,7 @@ class RpaToolExecutor:
             case "validate_flow":
                 return await self._validate_flow(**args)
             case "create_flow":
-                return await self._create_flow(**args)
+                return await self._create_flow(**args, change_context=change_context)
             case "update_flow":
                 return await self._update_flow(**args, change_context=change_context)
             case "run_flow":
@@ -640,6 +664,7 @@ class RpaToolExecutor:
         description: str | None = None,
         input_variables: list[dict[str, Any]] | None = None,
         acceptance_contract: dict[str, Any] | None = None,
+        change_context: ChangeContext | None = None,
     ) -> dict[str, Any]:
         from app.models.schemas import FlowCreateRequest
 
@@ -733,7 +758,25 @@ class RpaToolExecutor:
                     ))),
                 })
 
-        contract = FlowAcceptanceContract.model_validate(acceptance_contract or {})
+        draft_flow_id = change_context.draft_flow_id if change_context else None
+        if draft_flow_id:
+            draft = await self._flow_service.get_flow(draft_flow_id)
+            if draft is None:
+                return {"error": "draft_flow_not_found", "flow_id": draft_flow_id}
+            if draft.status != "draft" or any(
+                node.get("type") not in {"start", "end"}
+                for node in draft.definition.get("nodes", [])
+            ):
+                return {
+                    "error": "draft_flow_not_empty",
+                    "flow_id": draft_flow_id,
+                    "message": "当前流程已有内容，必须用 update_flow 修改，不能覆盖生成。",
+                }
+            iv_names.extend(variable.name for variable in draft.input_variables if variable.name not in iv_names)
+
+        contract, contract_invalid = _validated_contract(acceptance_contract)
+        if contract_invalid is not None:
+            return contract_invalid
         defined_variables = _collect_defined_vars(nodes, iv_names)
         contract_errors = contract_validation_errors(contract, defined_variables=set(defined_variables))
         if contract_errors:
@@ -748,8 +791,27 @@ class RpaToolExecutor:
             definition=definition,
             input_variables=iv_snapshots,
             acceptance_contract=contract,
+            status="active" if any(node.get("type") not in {"start", "end"} for node in nodes) else "draft",
         )
-        flow = await self._flow_service.create_flow(req)
+        if draft_flow_id:
+            # 草稿中用户已配置的变量（尤其凭据）不能被模型生成的空默认值清掉。
+            generated_variables = {variable.name: variable for variable in req.input_variables}
+            generated_variables.update({variable.name: variable for variable in draft.input_variables})
+            flow = await self._flow_service.update_flow(
+                draft_flow_id,
+                FlowUpdateRequest(
+                    name=req.name,
+                    description=req.description,
+                    definition=req.definition,
+                    input_variables=list(generated_variables.values()),
+                    acceptance_contract=req.acceptance_contract,
+                    status=req.status,
+                ),
+            )
+            if flow is None:
+                return {"error": "draft_flow_not_found", "flow_id": draft_flow_id}
+        else:
+            flow = await self._flow_service.create_flow(req)
 
         issues = _validate_variable_refs(nodes, iv_names)
         lint_findings = _lint_flow(nodes, edges, input_variable_names=iv_names)
@@ -891,7 +953,12 @@ class RpaToolExecutor:
                 ),
             }
 
-        req = FlowUpdateRequest(definition=definition, name=new_name)
+        generated_business_nodes = any(node.get("type") not in {"start", "end"} for node in nodes)
+        req = FlowUpdateRequest(
+            definition=definition,
+            name=new_name,
+            status="active" if flow.status == "draft" and generated_business_nodes else None,
+        )
         updated = await self._flow_service.update_flow(flow_id, req)
         if updated is None:
             return {"error": "流程更新失败，未找到对应流程"}
@@ -1522,6 +1589,7 @@ class RpaToolExecutor:
         contract_errors = contract_validation_errors(
             flow.acceptance_contract,
             defined_variables=set(_collect_defined_vars(nodes, input_var_names)),
+            input_values=merged_variables,
         )
         if contract_errors:
             return {
@@ -2076,6 +2144,8 @@ class RpaToolExecutor:
             result["node_label"] = patched_node_ref["label"]
         if lint_findings:
             result["lint_findings"], result["lint_warning"] = annotate_lint_findings(lint_findings)
+        else:
+            result["lint_clean"] = True
         return result
 
     async def _publish_flow(self, flow_id: str) -> dict[str, Any]:
@@ -2094,7 +2164,9 @@ class RpaToolExecutor:
         flow = await self._flow_service.get_flow(flow_id)
         if flow is None:
             return {"error": f"流程 {flow_id} 不存在"}
-        contract = FlowAcceptanceContract.model_validate(acceptance_contract)
+        contract, contract_invalid = _validated_contract(acceptance_contract)
+        if contract_invalid is not None:
+            return contract_invalid
         defined = _collect_defined_vars(
             list(flow.definition.get("nodes", [])),
             [iv.name for iv in flow.input_variables],

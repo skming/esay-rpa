@@ -35,6 +35,7 @@ from app.services.ai_tools.diagnostics import (
     build_navigation_trace,
     build_navigation_verdict,
 )
+from app.services.ai_tools.schemas import validate_tool_arguments
 from app.services.ai_tools.lint import _lint_flow, is_blocking_finding
 from app.services.ai_tools.catalog import NODE_TYPE_CATALOG, select_node_types
 from app.services.ai_tools.lint_scenarios import (
@@ -2600,34 +2601,34 @@ def test_requirement_text_keeps_the_latest_correction_when_over_budget():
 
 
 def test_acceptance_request_without_a_single_run_is_pushed_back():
-    state = GuardState(latest_user_message="流程审查验收")
-    correction = _unmet_verification_request("静态检查通过；未做运行验证，实际输出未经确认。", state)
+    state = _ready_state(latest_user_message="流程审查验收")
+    correction = _unmet_verification_request(state)
     assert correction is not None
     assert "run_flow" in correction
     # 会话内只催一次，模型坚持不跑时不能空转
-    assert _unmet_verification_request("静态检查通过。", state) is None
+    assert _unmet_verification_request(state) is None
 
 
 def test_no_nudge_once_the_flow_was_actually_run():
     state = GuardState(latest_user_message="验收一下")
     _orchestrator_guard_after_tool("run_flow", {"status": "timeout"}, state)
-    assert _unmet_verification_request("流程已暂停等待您操作。", state) is None
+    assert _unmet_verification_request(state) is None
 
 
 def test_review_request_alone_does_not_demand_a_run():
     state = GuardState(latest_user_message="帮我审查一下这个流程的结构")
-    assert _unmet_verification_request("静态检查通过；未做运行验证。", state) is None
+    assert _unmet_verification_request(state) is None
 
 
 def test_user_saying_not_to_run_is_respected():
     state = GuardState(latest_user_message="验收一下，但不要运行流程")
-    assert _unmet_verification_request("静态检查通过；未做运行验证。", state) is None
+    assert _unmet_verification_request(state) is None
 
 
-def test_a_named_blocker_counts_as_an_answer():
-    state = GuardState(latest_user_message="验收")
-    text = "无法自动验收：流程含 control.human_takeover 节点，无法无人值守跑完，请手动运行一次。"
-    assert _unmet_verification_request(text, state) is None
+def test_a_runtime_blocker_prevents_another_nudge():
+    state = _ready_state(latest_user_message="验收")
+    _orchestrator_guard_after_tool("run_flow", {"status": "paused_for_human"}, state)
+    assert _unmet_verification_request(state) is None
 
 
 def _click_chain(count: int, selector: str) -> tuple[list[dict], list[dict]]:
@@ -3892,3 +3893,94 @@ def test_tool_arguments_never_turn_a_non_object_into_an_empty_call() -> None:
     for raw in ("[]", "null", "42", '\"text\"'):
         with pytest.raises(json.JSONDecodeError, match="工具参数必须是 JSON 对象"):
             _parse_tool_arguments(raw)
+
+
+async def test_execute_rejects_unknown_fields_inside_acceptance_contract() -> None:
+    """契约是审计引擎的固定读取面：多写的字段没人读，模型却以为约束已经生效。
+
+    值不能回传：契约里装的是用户原话和页面数据，而 Pydantic 的 ValidationError 会把
+    input_value 原样拼进 str(exc)，编排层对工具异常只做 {"error": str(exc)}。
+    所以这一档必须在参数闸门上拦掉，不能落到 model_validate 去抛。
+    """
+    executor = RpaToolExecutor(SimpleNamespace(), SimpleNamespace())
+    nodes = [{
+        "id": "extract",
+        "type": "browser.extract",
+        "selector": ".rows",
+        "outputVariable": "rows",
+    }]
+
+    contract_level = {**_valid_contract("rows"), "strict_mode": "leaked-value"}
+    requirement_level = _valid_contract("rows")
+    requirement_level["requirements"][0]["source_url"] = "leaked-value"
+    deliverable_level = _valid_contract("rows")
+    deliverable_level["deliverables"][0]["min_columns"] = "leaked-value"
+
+    for label, contract in (
+        ("contract", contract_level),
+        ("requirement", requirement_level),
+        ("deliverable", deliverable_level),
+    ):
+        result = await executor.execute(
+            "create_flow", {"name": "订单", "nodes": nodes, "acceptance_contract": contract}
+        )
+        assert result["error"] == "invalid_arguments", label
+        assert any(issue["rule"] == "additionalProperties" for issue in result["issues"]), label
+        assert "leaked-value" not in json.dumps(result, ensure_ascii=False), label
+
+    # 同一个契约对象换 set_acceptance_contract 进来必须一样拦。那条路上工具 schema 故意留松
+    # （复用完整契约要占 2.6k 字符预算），所以判据落在两条路共用的那一层。
+    from app.services.ai_tools.executor import _validated_contract
+
+    contract, invalid = _validated_contract(contract_level)
+    assert contract is None
+    assert invalid["error"] == "acceptance_contract_invalid"
+    assert "leaked-value" not in json.dumps(invalid, ensure_ascii=False)
+
+    # JSON schema 镜像不了的约束（这里是 minRows > maxRows）仍旧走 Pydantic，
+    # 但同样不许以异常收场：异常会被编排层拍成 {"error": str(exc)} 连原值一起回传。
+    bounds = _valid_contract("rows")
+    bounds["deliverables"][0].update(kind="table", min_rows=9, max_rows=1)
+    bounded = await executor.execute(
+        "create_flow", {"name": "订单", "nodes": nodes, "acceptance_contract": bounds}
+    )
+    assert bounded["error"] == "acceptance_contract_invalid"
+
+
+def test_argument_gate_keeps_nodes_patch_and_variable_dicts_open() -> None:
+    """节点字段由节点类型目录决定，不由工具 schema 枚举。
+
+    这三处一旦收紧，新增节点类型或新增配置项都要先改 schema 才调得动，
+    而模型看到的只是「参数非法」——它没有任何办法自己绕过去。
+    """
+    nodes = [{
+        "id": "extract",
+        "type": "browser.extract",
+        "selector": ".rows",
+        "outputVariable": "rows",
+        "extractMode": "table",
+        "columnAliases": {"金额": "amount"},
+    }]
+    open_cases = [
+        ("create_flow", {
+            "name": "订单",
+            "nodes": nodes,
+            "input_variables": [
+                {"name": "start_date", "type": "String", "value": "", "placeholder": "开始日期"}
+            ],
+            "acceptance_contract": _valid_contract("rows"),
+        }),
+        ("update_flow", {
+            "flow_id": "f",
+            "add_nodes": nodes,
+            "update_nodes": [{"id": "extract", "patch": {"columnAliases": {"金额": "amount"}}}],
+        }),
+        ("apply_node_fix", {
+            "flow_id": "f",
+            "node_id": "extract",
+            "config_patch": {"columnAliases": {"金额": "amount"}},
+        }),
+    ]
+    for name, args in open_cases:
+        assert validate_tool_arguments(name, args) is None, name
+

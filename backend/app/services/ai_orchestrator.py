@@ -48,7 +48,6 @@ from app.services.ai_prompts import PAGE_DISCOVERY_PROMPT, SYSTEM_PROMPT
 from app.services.ai_flow_state import (
     FlowState,
     build_flow_state,
-    is_local_draft_flow_id as _is_local_draft_flow_id,
     render_flow_state,
     sync_state_message,
 )
@@ -1540,8 +1539,7 @@ class AiOrchestrator:
             full_messages.append({"role": "system", "content": _GUIDANCE_PRESERVE_EXECUTION_CHANNEL})
 
         if intents.create_url:
-            # 空白流程已有 flow_id，该走 update_flow 落节点而不是再建一个
-            build_tool = "update_flow" if flow_id and not _is_local_draft_flow_id(flow_id) else "create_flow"
+            build_tool = "create_flow" if flow_state.is_blank else "update_flow"
             guard_state.page_evidence_required = {
                 "url": intents.create_url,
                 "reason": "build_from_page",
@@ -1675,12 +1673,13 @@ class AiOrchestrator:
                 for _checker, _reason in (
                     (_misapplied_refusal, "该请求在职责范围内，正在重写"),
                     (_overstated_result_claim, "结论超出已有证据，正在重写"),
-                    (_unmet_verification_request, "结论超出已有证据，正在重写"),
                 ):
                     claim_correction = _checker(final_text, guard_state)
                     if claim_correction is not None:
                         retract_reason = _reason
                         break
+                if claim_correction is None:
+                    claim_correction = _unmet_verification_request(guard_state)
                 if claim_correction is not None:
                     full_messages.append({"role": "assistant", "content": final_text})
                     full_messages.append({"role": "system", "content": claim_correction})
@@ -2110,45 +2109,23 @@ def _overstated_result_claim(text: str, state: GuardState) -> str | None:
     return None
 
 
-# 用户要一个判断（能用/不能用），静态检查给不出这个判断，只能靠跑一次
-_VERIFICATION_REQUEST_PHRASES = (
-    "验收", "验证", "测试一下", "测一下", "跑一下", "跑一次", "运行一下", "运行一次",
-    "确认结果", "确认一下", "能不能用", "是否可用", "对不对",
-)
 _NO_RUN_REQUEST_PHRASES = ("不要运行", "不用运行", "别运行", "不要跑", "不用跑", "别跑", "只看结构", "不要执行")
-# 模型已经点明了具体拦路条件，就不是"懒得跑"，不该再催
-_RUN_BLOCKER_PHRASES = (
-    "扩展未连接", "人工接管", "human_takeover", "variable.input", "等待您", "等待用户",
-    "请先填写", "未填写", "没有默认值", "凭据为空", "账号密码",
-)
 
 
-def _unmet_verification_request(text: str, state: GuardState) -> str | None:
-    """用户要的是验收结论，本轮却一次都没运行。
-
-    降级措辞只解决了「别说谎」，没解决「用户什么也没拿到」：静态检查判断不了
-    抓取内容对不对，而这正是用户问的。会话内只催一次，避免模型坚持不跑时空转。
-    """
-    if state.verification_nudged or state.run_attempted:
+def _unmet_verification_request(state: GuardState) -> str | None:
+    """只对已授权且可进入运行阶段的任务催跑；模型措辞不作为阻断证据。"""
+    if state.verification_nudged or state.run_attempted or not state.run_authorized:
         return None
-    request = str(state.latest_user_message or "")
-    if not any(phrase in request for phrase in _VERIFICATION_REQUEST_PHRASES):
+    if resolve_phase(state) is not Phase.VERIFY:
         return None
-    if any(phrase in request for phrase in _NO_RUN_REQUEST_PHRASES):
+    # 复用纯查询护栏，不调用会记账的 _orchestrator_guard_before_tool。
+    if apply_pre_tool_guards("run_flow", {"flow_id": state.flow_id}, state) is not None:
         return None
-    if any(phrase in text for phrase in _RUN_BLOCKER_PHRASES):
-        return None
-
     state.verification_nudged = True
     return (
-        "你上一条回复已被撤回，用户没有看到，请完整重写整段回复（不要只补一句更正）。\n"
-        "撤回原因：用户要的是「这个流程到底能不能用」这个判断，你本轮一次都没有运行流程，"
-        "只有静态诊断结果。静态检查读不到运行产物，"
-        "回答不了用户问的问题；把措辞降级成「未做运行验证」诚实，但用户依然什么都没拿到。\n"
-        "正确做法：现在就调用 run_flow，按返回里的 acceptance_audit 据实汇报。\n"
-        "只有确实跑不了才可以不跑，且必须写明是哪一条挡住的："
-        "用户说了不要运行 / 凭据变量没有值 / 流程含 variable.input 或 control.human_takeover 无法无人值守 / "
-        "指定了扩展执行器但扩展未连接。以上都不成立就去运行。"
+        "上一条回复已撤回。本轮已授权运行，当前流程已进入 VERIFY 阶段，"
+        "但尚未取得运行结果。请调用 run_flow，依据返回的 acceptance_audit 汇报。"
+        "若工具返回阻断或等待用户操作，说明该结果；不要用推测代替运行证据。"
     )
 
 
@@ -2319,6 +2296,7 @@ def _build_change_context(state: GuardState) -> _ChangeContext:
     if state.repair_intent == "preserve_execution_channel":
         protected = {str(nid) for nid in (state.browser_chain_node_ids or set())}
     return _ChangeContext(
+        draft_flow_id=state.flow_id if not state.flow_has_nodes else None,
         protected_node_ids=frozenset(protected),
         fresh_page_evidence=bool(state.fresh_page_evidence),
     )
@@ -2495,7 +2473,8 @@ def _after_run_flow(result: dict[str, Any], state: GuardState) -> None:
 
     # 超时/暂停也算尝试过：这些是真拦路条件，不该再催模型去跑。
     # 起跑前被拒且模型自己能改的那几条不算——见 _RUN_REFUSED_MODEL_FIXABLE。
-    if status not in _RUN_REFUSED_MODEL_FIXABLE:
+    invalid_arguments = status == "error" and result.get("error") == "invalid_arguments"
+    if status not in _RUN_REFUSED_MODEL_FIXABLE and not invalid_arguments:
         state.run_attempted = True
 
     if status == "success":
@@ -2505,7 +2484,7 @@ def _after_run_flow(result: dict[str, Any], state: GuardState) -> None:
     elif status not in _RUN_WAITING_STATUSES:
         # 停下来等人不是一次失败的修复：流程没跑完是因为轮到用户了，
         # 记进熔断计数会让「等一次人工接管」白白吃掉三分之一的修复预算
-        never_started = status in _RUN_NOT_STARTED_STATUSES
+        never_started = status in _RUN_NOT_STARTED_STATUSES or invalid_arguments
         _count_repair_cycle(
             state,
             result.get("error") or result.get("message"),
