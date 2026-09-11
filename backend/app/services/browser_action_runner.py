@@ -341,7 +341,7 @@ class BrowserActionRunner:
         timeout = max(1, timeout_ms)
         page = context.page
 
-        delay_ms = _read_int(node, "delayMs", default=0)
+        delay_ms = _read_int(node, "delayMs", default=0, variables=variables)
         compound_delay_actions = {"browser.clickLoadMore", "browser.paginateNext", "browser.dismiss"}
         if delay_ms > 0 and action_type not in compound_delay_actions:
             await page.wait_for_timeout(delay_ms)
@@ -383,7 +383,7 @@ class BrowserActionRunner:
             return BrowserActionResult(action_type=action_type, detail=new_page.url, values=[new_page.url])
 
         if action_type == "browser.tab.switch":
-            index = _read_non_negative_int(node, "index", default=0)
+            index = _read_non_negative_int(node, "index", default=0, variables=variables)
             pages = context.page.context.pages
             if index >= len(pages):
                 raise ValueError("标签页索引超出范围")
@@ -401,7 +401,7 @@ class BrowserActionRunner:
             return BrowserActionResult(action_type=action_type, detail=context.page.url, values=[context.page.url])
 
         if action_type == "browser.scroll":
-            distance = _read_int(node, "distance", default=800)
+            distance = _read_int(node, "distance", default=800, variables=variables)
             await page.mouse.wheel(0, distance)
             return BrowserActionResult(action_type=action_type, detail=str(distance), values=[str(distance)])
 
@@ -601,7 +601,7 @@ class BrowserActionRunner:
             except Exception as exc:
                 await _enrich_selector_error(exc, selector)
                 raise
-            delay_ms = max(0, _read_int(node, "delayMs", default=0))
+            delay_ms = max(0, _read_int(node, "delayMs", default=0, variables=variables))
             if delay_ms > 0:
                 import asyncio as _asyncio
                 await _asyncio.sleep(delay_ms / 1000)
@@ -628,8 +628,8 @@ class BrowserActionRunner:
         *,
         timeout: int,
     ) -> SweepOutcome:
-        max_iterations = max(1, _read_int(node, "maxIterations", default=5))
-        delay_ms = max(0, _read_int(node, "delayMs", default=500))
+        max_iterations = max(1, _read_int(node, "maxIterations", default=5, variables=variables))
+        delay_ms = max(0, _read_int(node, "delayMs", default=500, variables=variables))
         previous_count = await _count_locator(page, target_selector_config.selector)
         counts = [previous_count]
         clicks = 0
@@ -680,8 +680,8 @@ class BrowserActionRunner:
         *,
         timeout: int,
     ) -> SweepOutcome:
-        max_iterations = max(1, _read_int(node, "maxIterations", default=20))
-        delay_ms = max(0, _read_int(node, "delayMs", default=500))
+        max_iterations = max(1, _read_int(node, "maxIterations", default=20, variables=variables))
+        delay_ms = max(0, _read_int(node, "delayMs", default=500, variables=variables))
         pages_visited = 0
         all_values: list[object] = []
         per_page_counts: list[int] = []
@@ -766,11 +766,11 @@ class BrowserActionRunner:
         点击式翻页翻到第 2 页后，页码控件的位置和文字都变了，selector 往往当场失效；
         这条路径每页都从 URL 重新进入，与页面上有没有下一页按钮无关。
         """
-        max_iterations = max(1, _read_int(node, "maxIterations", default=20))
-        start_page = _read_int(node, "startPage", default=1)
+        max_iterations = max(1, _read_int(node, "maxIterations", default=20, variables=variables))
+        start_page = _read_int(node, "startPage", default=1, variables=variables)
         # offset 型分页（?start=0/20/40）靠步长表达，页号本身就是偏移量
-        page_step = max(1, _read_int(node, "pageStep", default=1))
-        delay_ms = max(0, _read_int(node, "delayMs", default=500))
+        page_step = max(1, _read_int(node, "pageStep", default=1, variables=variables))
+        delay_ms = max(0, _read_int(node, "delayMs", default=500, variables=variables))
 
         all_values: list[object] = []
         per_page_counts: list[int] = []
@@ -824,8 +824,8 @@ class BrowserActionRunner:
 
     async def _dismiss_overlays(self, page: object, selector: str, variables: RuntimeVariableStore, node: FlowNode, *, timeout: int) -> int:
         selectors = _split_selector_candidates(selector)
-        delay_ms = max(0, _read_int(node, "delayMs", default=200))
-        max_iterations = max(1, _read_int(node, "maxIterations", default=len(selectors) or 1))
+        delay_ms = max(0, _read_int(node, "delayMs", default=200, variables=variables))
+        max_iterations = max(1, _read_int(node, "maxIterations", default=len(selectors) or 1, variables=variables))
         dismissed = 0
 
         for candidate in selectors[:max_iterations]:
@@ -937,20 +937,28 @@ def _read_optional_string(node: FlowNode, key: str) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
-def _read_int(node: FlowNode, key: str, *, default: int) -> int:
+def _read_int(node: FlowNode, key: str, *, default: int, variables: "RuntimeVariableStore | None" = None) -> int:
     value = node.get(key)
     if isinstance(value, int) and not isinstance(value, bool):
         return value
     if isinstance(value, str) and value.strip():
+        text = value.strip()
+        if variables is not None:
+            # 翻页上限这类字段需求常写成「上限由输入变量决定」，不解析模板就只能把页数写死在节点里。
+            # 变量缺失/非数字时按 default 走：整数字段没有「报错停住」的调用方，抛异常会把整条流程带崩。
+            try:
+                text = variables.resolve_text(text).strip()
+            except ValueError:
+                return default
         try:
-            return int(value.strip())
+            return int(text)
         except ValueError:
             return default
     return default
 
 
-def _read_non_negative_int(node: FlowNode, key: str, *, default: int) -> int:
-    return max(0, _read_int(node, key, default=default))
+def _read_non_negative_int(node: FlowNode, key: str, *, default: int, variables: "RuntimeVariableStore | None" = None) -> int:
+    return max(0, _read_int(node, key, default=default, variables=variables))
 
 
 def _read_bool(node: FlowNode, key: str, *, default: bool) -> bool:

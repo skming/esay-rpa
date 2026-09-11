@@ -385,6 +385,54 @@ async def test_browser_paginate_next_collects_each_page_until_button_disabled() 
     assert variables.get("visited_pages") == 3
 
 
+async def test_browser_paginate_next_reads_max_iterations_from_a_runtime_variable() -> None:
+    """上限写成 ${var.x} 必须真的生效：不解析模板时会静默回落默认 20，把该停的翻页翻到底。"""
+    variables = RuntimeVariableStore.from_initial({"max_pages": "2"})
+    page = FakePaginatePage()
+    context = BrowserActionContext(playwright=object(), browser=object(), page=page)
+
+    result = await BrowserActionRunner().run(
+        {
+            "type": "browser.paginateNext",
+            "selector": "a.next",
+            "targetSelector": ".row::text",
+            "maxIterations": "${var.max_pages}",
+            "delayMs": 0,
+            "pageCountVariable": "visited_pages",
+        },
+        variables,
+        context,
+        timeout_ms=1000,
+    )
+
+    assert result.values == ["A1", "A2", "B1", "B2"]
+    assert variables.get("visited_pages") == 2
+    assert "stop=max_iterations_reached" in result.detail
+
+
+async def test_browser_paginate_next_falls_back_to_default_when_the_limit_variable_is_undefined() -> None:
+    """变量缺失只能回落默认值：整数字段没有「报错停住」的调用方，抛异常会把整条流程带崩。"""
+    variables = RuntimeVariableStore.from_initial({})
+    page = FakePaginatePage()
+    context = BrowserActionContext(playwright=object(), browser=object(), page=page)
+
+    result = await BrowserActionRunner().run(
+        {
+            "type": "browser.paginateNext",
+            "selector": "a.next",
+            "targetSelector": ".row::text",
+            "maxIterations": "${var.missing_limit}",
+            "delayMs": 0,
+        },
+        variables,
+        context,
+        timeout_ms=1000,
+    )
+
+    assert result.values == ["A1", "A2", "B1", "B2", "C1"]
+    assert "stop=next_button_disabled" in result.detail
+
+
 async def test_browser_paginate_next_fails_loudly_when_next_selector_matches_nothing() -> None:
     """配了 paginateNext 就是断言「这里有下一页」，断言不成立必须当场失败。
 
