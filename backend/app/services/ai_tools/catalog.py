@@ -106,9 +106,9 @@ NODE_TYPE_CATALOG: list[dict[str, str]] = [
     },
     {
         "type": "browser.scroll",
-        "key_fields": "direction, distance",
+        "key_fields": "distance（正数向下、负数向上，默认 800）",
         "output_var_field": "（无输出变量）",
-        "description": "滚动页面，direction: down|up|left|right",
+        "description": "垂直滚动页面；只有 distance 一个参数，横向滚动不支持",
     },
     {
         "type": "browser.select",
@@ -142,7 +142,7 @@ NODE_TYPE_CATALOG: list[dict[str, str]] = [
     },
     {
         "type": "browser.paginateNext",
-        "key_fields": "selector, targetSelector（点击式）／urlTemplate, targetSelector（URL 式）",
+        "key_fields": "selector, targetSelector（点击式）／urlTemplate, targetSelector（URL 式）, maxIterations",
         "output_var_field": "outputVariable（逐页累计提取到的内容列表，可选）",
         "description": (
             "逐页抓取，两种模式二选一。"
@@ -152,6 +152,7 @@ NODE_TYPE_CATALOG: list[dict[str, str]] = [
             "pageStep（默认 1；offset 型分页如 `?start=${page}` 配 startPage=0 + pageStep=20）。"
             "**数字页码站点（1 2 3 … 下一页）必须用 URL 式**：点到第 2 页后页码控件位置就变了，点击式会当场失效。"
             "两种模式都用 targetSelector 提取本页内容，结果累计存入 outputVariable，页数存入 pageCountVariable；"
+            "**限页数只有 maxIterations 这一个字段**（默认 20，最多翻多少页；需求说「最多 N 页」就填它，可写 `${var.x}`）；"
             "支持 outputSchema（同 browser.extract）"
         ),
     },
@@ -478,9 +479,9 @@ NODE_TYPE_CATALOG: list[dict[str, str]] = [
     },
     {
         "type": "excel.write",
-        "key_fields": "path, sheetName, cellAddress, value",
+        "key_fields": "path, sheetName, rows（二维数组，整表覆盖）",
         "output_var_field": "（无输出变量）",
-        "description": "写入 Excel 单元格",
+        "description": "整表覆盖写入 Excel/CSV；不是写单个单元格，原文件内容会被 rows 全量替换",
     },
     {
         "type": "excel.addrow",
@@ -502,9 +503,9 @@ NODE_TYPE_CATALOG: list[dict[str, str]] = [
     },
     {
         "type": "excel.filter",
-        "key_fields": "path, sheetName, filterExpression",
+        "key_fields": "path, sheetName, column, operation（filter|sort_asc|sort_desc，默认 filter）, pattern（filter 时的等值匹配文本）",
         "output_var_field": "outputVariable（过滤结果存入该变量，必填）",
-        "description": "按条件过滤 Excel 行",
+        "description": "按列过滤或排序 Excel 行；filter 是等值匹配，不支持表达式。column 缺失时原样返回全部行",
     },
 ]
 
