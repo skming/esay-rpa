@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from openpyxl import load_workbook
 
 from app.services.file_action_runner import FileActionRunner, apply_file_result_variables
@@ -137,3 +138,68 @@ async def test_file_copy_move_delete_and_list(tmp_path) -> None:
     delete_result = await runner.run({"type": "file.delete", "path": "source.txt"}, variables, timeout_ms=1000)
     assert delete_result.count == 1
     assert not (workspace / "source.txt").exists()
+
+
+async def test_deleterow_uses_row_index_the_catalog_advertises(tmp_path) -> None:
+    # 删掉的必须是 rowIndex 指的那行：删错行不会报错，用户只能靠比对数据才发现。
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "orders.csv").write_text("order_id\nA001\nA002\nA003\n", encoding="utf-8")
+    runner = FileActionRunner(workspace)
+    variables = RuntimeVariableStore.from_initial({})
+
+    await runner.run(
+        {"type": "excel.deleterow", "path": "orders.csv", "rowIndex": 2},
+        variables,
+        timeout_ms=1000,
+    )
+
+    assert (workspace / "orders.csv").read_text(encoding="utf-8-sig") == "order_id\nA001\nA003\n"
+
+
+async def test_deleterow_without_a_row_index_refuses_to_guess(tmp_path) -> None:
+    # 删行是破坏性的：键名写错时宁可报错停住，也不能默认删掉某一行。
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "orders.csv").write_text("order_id\nA001\nA002\n", encoding="utf-8")
+    runner = FileActionRunner(workspace)
+    variables = RuntimeVariableStore.from_initial({})
+
+    with pytest.raises(ValueError, match="rowIndex"):
+        await runner.run({"type": "excel.deleterow", "path": "orders.csv"}, variables, timeout_ms=1000)
+
+    assert (workspace / "orders.csv").read_text(encoding="utf-8") == "order_id\nA001\nA002\n"
+
+
+async def test_deleterow_resolves_a_templated_row_index(tmp_path) -> None:
+    # 循环里删行时行号来自变量，int("${var.i}") 会直接抛 ValueError。
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "orders.csv").write_text("order_id\nA001\nA002\nA003\n", encoding="utf-8")
+    runner = FileActionRunner(workspace)
+    variables = RuntimeVariableStore.from_initial({"target_row": "1"})
+
+    await runner.run(
+        {"type": "excel.deleterow", "path": "orders.csv", "rowIndex": "${var.target_row}"},
+        variables,
+        timeout_ms=1000,
+    )
+
+    assert (workspace / "orders.csv").read_text(encoding="utf-8-sig") == "order_id\nA002\nA003\n"
+
+
+async def test_deleterow_still_honours_the_legacy_index_key(tmp_path) -> None:
+    # 存量流程里行号存在 index 上，换键名不能让它们改删别的行。
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "orders.csv").write_text("order_id\nA001\nA002\nA003\n", encoding="utf-8")
+    runner = FileActionRunner(workspace)
+    variables = RuntimeVariableStore.from_initial({})
+
+    await runner.run(
+        {"type": "excel.deleterow", "path": "orders.csv", "index": 3},
+        variables,
+        timeout_ms=1000,
+    )
+
+    assert (workspace / "orders.csv").read_text(encoding="utf-8-sig") == "order_id\nA001\nA002\n"

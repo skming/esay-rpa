@@ -172,7 +172,7 @@ class FileActionRunner:
         if action_type == "excel.deleterow":
             if not path.exists():
                 return FileActionResult(action_type=action_type, path=str(path), values=[str(path)], count=0)
-            index = int(node.get("tabIndex", node.get("rowIndex", 1)))
+            index = _read_row_index(node, variables)
             if _is_xlsx_path(path):
                 count = _delete_xlsx_row(path, index, sheet_name=_read_optional_string(node, "sheetName"))
             else:
@@ -547,6 +547,27 @@ def _ensure_parent(path: Path) -> None:
 
 def _resolve_workspace_root() -> Path:
     return storage.resolve_workspace_root()
+
+
+def _read_row_index(node: FlowNode, variables: RuntimeVariableStore) -> int:
+    """行号 0-based。
+
+    不设默认值：删行不可逆，键名写错时默认值会静默删掉另一行，用户拿不到任何信号。
+    `rowIndex` 是 catalog 对模型声明的键，`tabIndex` 与 `index` 只为存量流程仍能跑。
+    """
+    for key in ("rowIndex", "tabIndex", "index"):
+        value = node.get(key)
+        if isinstance(value, bool):  # bool 是 int 子类，True 会被当成第 1 行
+            continue
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.strip():
+            text = variables.resolve_text(value.strip()).strip()
+            try:
+                return int(text)
+            except ValueError:
+                raise ValueError(f"excel.deleterow 的 {key} 不是整数行号：{text!r}") from None
+    raise ValueError("excel.deleterow 缺少 rowIndex（0-based 行号）")
 
 
 def _read_required_string(node: FlowNode, key: str, *, fallback_keys: tuple[str, ...] = ()) -> str:
