@@ -276,6 +276,11 @@ class TaskManager:
             return record.snapshot
         return await self._task_store.get_task(task_id)
 
+    async def flow_success_rates_30d(self) -> dict[str, int]:
+        from datetime import timedelta
+
+        return await self._task_store.success_rates_since(datetime.now(UTC) - timedelta(days=30))
+
     async def list_tasks(self, *, flow_id: str | None = None, schedule_id: str | None = None, limit: int = 50) -> list[TaskSnapshot]:
         # 合并持久化快照与内存中活跃任务，确保调用方看到实时状态
         snapshots = await self._task_store.list_tasks(flow_id=flow_id, schedule_id=schedule_id, limit=limit)

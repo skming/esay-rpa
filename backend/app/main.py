@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import logging.handlers
 import os
@@ -251,18 +250,12 @@ async def list_flows() -> list[FlowSnapshot]:
     if not flows:
         return flows
 
-    async def _enrich(flow: FlowSnapshot) -> FlowSnapshot:
-        try:
-            tasks = await task_manager.list_tasks(flow_id=flow.flow_id, limit=200)
-            rate = flow_service.compute_success_rate_30d(tasks)
-            return flow.model_copy(update={"success_rate_30d": rate})
-        except Exception:
-            logging.getLogger(__name__).warning(
-                "30天成功率计算失败，流程 %s 将返回空值", flow.flow_id, exc_info=True
-            )
-            return flow
-
-    return list(await asyncio.gather(*(_enrich(f) for f in flows)))
+    try:
+        rates = await task_manager.flow_success_rates_30d()
+    except Exception:
+        logging.getLogger(__name__).warning("30天成功率计算失败", exc_info=True)
+        rates = {}
+    return [flow.model_copy(update={"success_rate_30d": rates.get(flow.flow_id)}) for flow in flows]
 
 
 @app.get("/api/flows/{flow_id}", response_model=FlowSnapshot)

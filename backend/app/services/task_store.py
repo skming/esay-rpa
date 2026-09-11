@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Protocol
 
-from sqlalchemy import BigInteger, Integer, String, Text, delete, inspect, select, text
+from sqlalchemy import BigInteger, Index, Integer, String, Text, case, delete, func, inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -18,6 +18,8 @@ class TaskStore(Protocol):
     async def get_task(self, task_id: str) -> TaskSnapshot | None: ...
 
     async def list_tasks(self, *, flow_id: str | None = None, schedule_id: str | None = None, limit: int = 50) -> list[TaskSnapshot]: ...
+
+    async def success_rates_since(self, since: datetime) -> dict[str, int]: ...
 
     async def append_log(self, log: TaskLogEntry) -> TaskLogEntry: ...
 
@@ -55,6 +57,19 @@ class InMemoryTaskStore:
             snapshots = [s for s in snapshots if s.schedule_id == schedule_id]
         return sorted(snapshots, key=lambda snapshot: snapshot.updated_at, reverse=True)[: _normalize_limit(limit)]
 
+    async def success_rates_since(self, since: datetime) -> dict[str, int]:
+        counts: dict[str, list[int]] = {}
+        for record in self._tasks.values():
+            task = record.snapshot
+            updated = task.updated_at
+            if updated.tzinfo is None:
+                updated = updated.replace(tzinfo=UTC)
+            if task.flow_id and updated >= since and task.status in {"success", "error", "stopped"}:
+                totals = counts.setdefault(task.flow_id, [0, 0])
+                totals[0] += task.status == "success"
+                totals[1] += 1
+        return {flow_id: round(successes / total * 100) for flow_id, (successes, total) in counts.items()}
+
     async def append_log(self, log: TaskLogEntry) -> TaskLogEntry:
         record = self._tasks.get(log.task_id)
         if record is not None:
@@ -76,6 +91,7 @@ class InMemoryTaskStore:
 
 class TaskRow(Base):
     __tablename__ = "rpa_tasks"
+    __table_args__ = (Index("ix_rpa_tasks_rate", "status", "updated_at", "flow_id"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     flow_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
@@ -153,6 +169,8 @@ class SqlAlchemyTaskStore:
         async with self._engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all, tables=[TaskRow.__table__, TaskLogRow.__table__, TaskVariableRow.__table__, ArtifactRow.__table__])
             await connection.run_sync(_ensure_task_columns)
+            for index in TaskRow.__table__.indexes:
+                await connection.run_sync(lambda conn, index=index: index.create(conn, checkfirst=True))
 
     async def close(self) -> None:
         await self._engine.dispose()
@@ -189,6 +207,20 @@ class SqlAlchemyTaskStore:
         async with self._session_factory() as session:
             result = await session.scalars(statement)
             return [self._to_snapshot(row) for row in result]
+
+    async def success_rates_since(self, since: datetime) -> dict[str, int]:
+        statement = select(
+            TaskRow.flow_id,
+            func.sum(case((TaskRow.status == "success", 1), else_=0)),
+            func.count(),
+        ).where(
+            TaskRow.flow_id.is_not(None),
+            TaskRow.updated_at >= since,
+            TaskRow.status.in_(["success", "error", "stopped"]),
+        ).group_by(TaskRow.flow_id)
+        async with self._session_factory() as session:
+            rows = await session.execute(statement)
+            return {flow_id: round(successes / total * 100) for flow_id, successes, total in rows}
 
     async def append_log(self, log: TaskLogEntry) -> TaskLogEntry:
         async with self._session_factory() as session:

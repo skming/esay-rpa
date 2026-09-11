@@ -197,3 +197,33 @@ def test_compute_success_rate_30d_tolerates_naive_timestamps() -> None:
     ]
     assert FlowService.compute_success_rate_30d(tasks) == 67
     assert FlowService.compute_success_rate_30d([]) is None
+
+
+async def test_success_rates_use_all_recent_terminal_tasks_without_loading_payloads(tmp_path) -> None:
+    from datetime import timedelta
+    from app.services.task_store import InMemoryTaskStore
+
+    engine = create_schedule_engine(f"sqlite+aiosqlite:///{tmp_path / 'rates.db'}")
+    sql_store = SqlAlchemyTaskStore(engine)
+    await sql_store.create_schema()
+    now = datetime.now(UTC)
+    try:
+        for store in (InMemoryTaskStore(), sql_store):
+            for index in range(205):
+                task = build_task_snapshot(str(index)).model_copy(update={
+                    "status": "success" if index < 100 else "error", "updated_at": now,
+                })
+                await store.save_task(task, build_task_request())
+            for index, status, updated in ((206, "running", now), (207, "error", now - timedelta(days=31))):
+                await store.save_task(build_task_snapshot(str(index)).model_copy(update={
+                    "status": status, "updated_at": updated,
+                }), build_task_request())
+            if isinstance(store, SqlAlchemyTaskStore):
+                def no_payload_read(row):
+                    raise AssertionError("success rate must not deserialize task payloads")
+                store._to_snapshot = no_payload_read
+            assert await store.success_rates_since(now - timedelta(days=30)) == {
+                "00000000-0000-0000-0000-000000000101": 49,
+            }
+    finally:
+        await engine.dispose()
