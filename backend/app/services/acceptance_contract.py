@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+from typing import Any
+
 from app.models.schemas import FlowAcceptanceContract
 from app.services.execution_evidence import collect_node_output_names
+
+# 低于这个长度的输入值不做「被包含」判定：1-2 个字的值（"3"、"是"）几乎必然出现在
+# 某个无关词里，按包含算会把正常契约判成错。等值判定不受此限制。
+_MIN_CONTAINED_VALUE_CHARS = 4
 
 
 def contract_validation_errors(
     contract: FlowAcceptanceContract,
     *,
     defined_variables: set[str] | None = None,
+    input_values: dict[str, Any] | None = None,
 ) -> list[str]:
     errors: list[str] = []
     if not contract.requirements:
@@ -50,7 +57,43 @@ def contract_validation_errors(
             errors.append(f"交付物 {deliverable.id} 使用了仅适用于 table 的断言")
         if deliverable.kind == "document":
             errors.extend(_document_provenance_errors(deliverable, defined_variables))
+        if input_values:
+            errors.extend(_pinned_input_value_errors(deliverable, input_values))
     return errors
+
+
+def _pinned_input_value_errors(deliverable, input_values: dict[str, Any]) -> list[str]:
+    """契约冻结在流程上、换输入值重放（_replay_variants），而 required_terms 是纯字面子串
+    判定（acceptance_audit._audit_text_constraints）：把本次输入的 "2026-06-01" 写进
+    required_terms，下一次换日期重放时回读正确却仍报 required_terms_missing。
+
+    错误文本只给字段名、下标、deliverable id、命中的变量名。orchestrator 把 ValidationError
+    原样回灌给模型，输入变量还带 sensitive 标记，带上值等于把它漏回去。
+    """
+    errors: list[str] = []
+    for field_name, terms in (("requiredTerms", deliverable.required_terms), ("forbiddenTerms", deliverable.forbidden_terms)):
+        for index, term in enumerate(terms):
+            hit = _matched_input_variable(term, input_values)
+            if hit:
+                errors.append(
+                    f"交付物 {deliverable.id} 的 {field_name}[{index}] 等于或包含输入变量 {hit} 的本次取值；"
+                    "契约会以别的输入重放，把某次输入值冻进判据会让其它输入必然判失败"
+                )
+    return errors
+
+
+def _matched_input_variable(term: str, input_values: dict[str, Any]) -> str | None:
+    if not isinstance(term, str) or not term:
+        return None
+    for name, value in input_values.items():
+        text = value if isinstance(value, str) else ("" if value is None else str(value))
+        if not text:  # 空值：任何串都「包含」空串，跳过
+            continue
+        if term == text:
+            return name
+        if len(text) >= _MIN_CONTAINED_VALUE_CHARS and text in term:
+            return name
+    return None
 
 
 def _document_provenance_errors(deliverable, defined_variables: set[str] | None) -> list[str]:

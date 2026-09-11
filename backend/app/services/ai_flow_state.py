@@ -168,8 +168,9 @@ def _contract_findings(
     """验收契约不完整 —— run_flow 会在启动浏览器之前直接拒掉。
 
     这个拒绝一直都在，但模型只能靠真去跑一次才知道，然后花一轮读懂返回、再花一轮补契约。
-    判据用的是 run_flow 调的同一个 `contract_validation_errors`：两处结论不可能分岔，
-    状态块说能跑就真能跑。
+    判据用的是 run_flow 调的同一个 `contract_validation_errors`，两处结论不会分岔。唯一例外
+    是「输入值冻进 required_terms」：它要运行期 input_values 才判得出，状态块拿不到，故不传
+    ——对这条保持沉默，不谎报也不误拦。
 
     空画布不报：契约要引用节点产出的变量，还没有节点的时候它必然不完整，此时报出来只是噪声。
     """

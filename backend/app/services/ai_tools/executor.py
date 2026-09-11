@@ -1589,6 +1589,7 @@ class RpaToolExecutor:
         if task.status not in _TERMINAL:
             # 「跑得慢」和「停下来等人」都表现为非终态，但处理方式相反：前者继续等，
             # 后者重跑只会再起一个任务、把旧的留在后台继续等。这个判断由本工具给出，
+            input_values=merged_variables,
             # 不能丢给模型自己翻流程定义猜——它猜错的代价是一个孤儿任务。
             if task.status == "paused_for_human" or has_takeover_nodes:
                 result["status"] = "paused_for_human"
