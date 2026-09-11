@@ -59,6 +59,12 @@ export type RpaNodeAction = {
   column?: string;
   content?: string;
   rows?: unknown[];
+  /** excel 目标工作表名；缺省用活动表。 */
+  sheetName?: string;
+  /** excel.addrow 行数据：list 按列、str 按 Python/JSON 字面量解析成 dict 或 list。 */
+  rowData?: unknown[] | string;
+  /** excel.deleterow 的行号（0-based）；与 tabIndex 走同一入参。 */
+  rowIndex?: number;
   selector?: string;
   fetcher?: FetcherType;
   extractMode?: ExtractMode;
@@ -66,6 +72,12 @@ export type RpaNodeAction = {
   adaptive?: boolean;
   autoSave?: boolean;
   continueOnError?: boolean;
+  /** browser.open 打开前清空 localStorage/sessionStorage。 */
+  clearStorage?: boolean;
+  /** browser.open 打开前清空 cookie。 */
+  clearCookies?: boolean;
+  /** 绕过 Playwright 可见性检查直接点击，用于元素存在但被 CSS 隐藏。 */
+  force?: boolean;
   requireConfirmation?: boolean;
   fillMode?: 'js' | 'type';
   timeoutMs?: number;

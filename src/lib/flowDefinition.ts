@@ -177,6 +177,9 @@ function restoreAction(node: Record<string, unknown>, type: string): RpaNodeActi
     column: readOptionalString(node.column),
     content: readOptionalString(node.content),
     rows: readRows(node.rows),
+    sheetName: readOptionalString(node.sheetName),
+    rowData: readRowData(node.rowData),
+    rowIndex: readOptionalNumber(node.rowIndex),
     selector: readOptionalString(node.selector),
     fetcher: node.fetcher === 'dynamic' || node.fetcher === 'stealthy' ? node.fetcher : node.fetcher === 'static' ? 'static' : undefined,
     extractMode: readExtractMode(node.extractMode),
@@ -184,6 +187,9 @@ function restoreAction(node: Record<string, unknown>, type: string): RpaNodeActi
     adaptive: typeof node.adaptive === 'boolean' ? node.adaptive : undefined,
     autoSave: typeof node.autoSave === 'boolean' ? node.autoSave : undefined,
     continueOnError: typeof node.continueOnError === 'boolean' ? node.continueOnError : undefined,
+    clearStorage: typeof node.clearStorage === 'boolean' ? node.clearStorage : undefined,
+    clearCookies: typeof node.clearCookies === 'boolean' ? node.clearCookies : undefined,
+    force: typeof node.force === 'boolean' ? node.force : undefined,
     requireConfirmation: node.requireConfirmation === true ? true : undefined,
     fillMode: node.fillMode === 'js' ? 'js' : node.fillMode === 'type' || node.fillMode === 'keyboard' ? 'type' : undefined,
     timeoutMs: typeof node.timeoutMs === 'number' && Number.isFinite(node.timeoutMs) ? node.timeoutMs : undefined,
@@ -223,6 +229,9 @@ function restoreAction(node: Record<string, unknown>, type: string): RpaNodeActi
     itemVariable: readOptionalString(node.itemVariable),
     indexVariable: readOptionalString(node.indexVariable),
     maxIterations: readOptionalNumber(node.maxIterations),
+    condition: readOptionalString(node.condition),
+    continueOnMaxIterations: typeof node.continueOnMaxIterations === 'boolean' ? node.continueOnMaxIterations : undefined,
+    waitCondition: readWaitCondition(node.waitCondition),
     retryCount: readOptionalNumber(node.retryCount),
     errorVariable: readOptionalString(node.errorVariable),
     flowId: readOptionalString(node.flowId),
@@ -258,6 +267,21 @@ function readExtractMode(value: unknown): RpaNodeAction['extractMode'] {
     return value;
   }
   return undefined;
+}
+
+function readWaitCondition(value: unknown): RpaNodeAction['waitCondition'] {
+  if (value === 'visible' || value === 'hidden' || value === 'textContains') {
+    return value;
+  }
+  return undefined;
+}
+
+/** 行数据两种合法形态：list 按列写入，字符串交后端按 Python/JSON 字面量解析成 dict 或 list。 */
+function readRowData(value: unknown): RpaNodeAction['rowData'] {
+  if (Array.isArray(value)) {
+    return value;
+  }
+  return readOptionalString(value);
 }
 
 function readStatus(value: unknown): NodeStatus {

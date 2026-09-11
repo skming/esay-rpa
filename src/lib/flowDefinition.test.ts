@@ -61,6 +61,52 @@ describe('flowDefinition', () => {
     expect(restored?.nodes[0]?.data.action?.requireConfirmation).toBe(true);
   });
 
+  it('执行层会读的字段能穿过保存与重新载入', () => {
+    // buildFlowDefinition 用展开写出全部键，restoreAction 却是白名单：白名单漏收的键
+    // 在载入时被丢掉，再保存一次就从存储里永久消失。用户看不到任何报错，只看到
+    // 流程行为变了——写错 sheet、等待条件退回 visible、repeat_until 没了退出条件。
+    const waitNode = createFlowNode({ label: '等待元素', nodeType: 'browser' }, { x: 120, y: 180 }, 1);
+    waitNode.data.action = {
+      ...waitNode.data.action,
+      type: 'browser.waitFor',
+      selector: '#status',
+      waitCondition: 'textContains',
+      inputValue: '已完成',
+      force: true,
+      clearCookies: true,
+      clearStorage: true
+    };
+    const excelNode = createFlowNode({ label: '追加行', nodeType: 'excel' }, { x: 120, y: 280 }, 2);
+    excelNode.data.action = {
+      ...excelNode.data.action,
+      type: 'excel.addrow',
+      sheetName: '订单明细',
+      rowData: ['A', 'B'],
+      rowIndex: 3
+    };
+    const loopNode = createFlowNode({ label: '循环', nodeType: 'control' }, { x: 120, y: 380 }, 3);
+    loopNode.data.action = {
+      ...loopNode.data.action,
+      type: 'control.repeat_until',
+      condition: '${var.page} >= 5',
+      maxIterations: 20,
+      continueOnMaxIterations: true
+    };
+
+    const definition = buildFlowDefinition([waitNode, excelNode, loopNode], []);
+    const restored = restoreFlowCanvas(definition);
+
+    expect(restored?.nodes[0]?.data.action).toEqual(
+      expect.objectContaining({ waitCondition: 'textContains', force: true, clearCookies: true, clearStorage: true })
+    );
+    expect(restored?.nodes[1]?.data.action).toEqual(
+      expect.objectContaining({ sheetName: '订单明细', rowData: ['A', 'B'], rowIndex: 3 })
+    );
+    expect(restored?.nodes[2]?.data.action).toEqual(
+      expect.objectContaining({ condition: '${var.page} >= 5', continueOnMaxIterations: true })
+    );
+  });
+
   it('序列化并恢复累计输出配置', () => {
     const extractNode = createFlowNode({ label: '获取文本', nodeType: 'browser' }, { x: 120, y: 180 }, 1);
     expect(extractNode.data.action).toBeDefined();
