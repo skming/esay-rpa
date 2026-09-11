@@ -232,9 +232,11 @@ export function TaskCenterPage({
       </div>
 
       <FlowCreateDialog
-        onCreate={(name) => {
-          setCreateOpen(false);
-          void electron.createNewFlow(name).then(onOpenStudio);
+        onCreate={async (name) => {
+          if (await electron.createNewFlow(name)) {
+            setCreateOpen(false);
+            onOpenStudio();
+          }
         }}
         onOpenChange={setCreateOpen}
         open={createOpen}

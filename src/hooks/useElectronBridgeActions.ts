@@ -90,7 +90,7 @@ export type ElectronBridgeActions = {
   saveFlow: () => Promise<void>;
   exportFlow: () => Promise<void>;
   exportFlowById: (flowId: string) => Promise<void>;
-  createNewFlow: (name?: string) => Promise<void>;
+  createNewFlow: (name?: string) => Promise<boolean>;
   loadFlows: (options?: BridgeCallOptions) => Promise<void>;
   archiveCurrentFlow: () => Promise<void>;
   archiveFlowById: (flowId: string) => Promise<void>;
@@ -379,14 +379,22 @@ export function useElectronBridgeActions({
       },
       createNewFlow: async (name?: string) => {
         const flowName = typeof name === 'string' && name.trim() ? name.trim() : '新建 RPA 流程';
+        const created = await callBridge((api) => api.createFlow({
+          ...buildInitialFlowPayload(buildFlowDefinition(initialNodes, initialEdges, [], flowName), [], flowName),
+          status: 'draft',
+        }));
+        if (created === null) return false;
         clearDraftStorage();
         resetRunView();
-        setCurrentFlow(createLocalDraftFlow(flowName));
+        setCurrentFlow(created);
+        setFlows((current) => [created, ...current.filter((flow) => flow.flowId !== created.flowId)]);
+        useWorkspaceStore.getState().setLastOpenedFlowId(created.flowId);
         setFlowNodes(restoreInitialNodes());
         setFlowEdges(restoreInitialEdges());
         setInputVariables([]);
         clearLastRunOverrides();
         pushToast('info', `已创建草稿：${flowName}`);
+        return true;
       },
       saveFlow: async () => {
         const flow = await persistCurrentFlow({ callBridge, currentFlow, flows, flowCanvas, inputVariables });
@@ -1079,24 +1087,6 @@ function restoreInitialEdges(): Edge[] {
   return initialEdges.map((edge) => ({
     ...edge
   }));
-}
-
-// flowId 以 "local-" 开头即代表尚未持久化到后端的本地草稿；多处代码据此判断是
-// 该走 createFlow 还是 updateFlow（见 persistCurrentFlow / setDefaultBrowserExecutor）
-function createLocalDraftFlow(name: string): FlowSnapshot {
-  const now = new Date().toISOString();
-  return {
-    createdAt: now,
-    definition: buildFlowDefinition(initialNodes, initialEdges, [], name),
-    flowId: `local-${Date.now()}`,
-    folderPath: '默认目录',
-    inputVariables: [],
-    name,
-    snapshots: [],
-    status: 'draft',
-    updatedAt: now,
-    version: 'draft'
-  };
 }
 
 /** 把属性面板里未点保存的草稿落到画布，返回落盘后的快照。

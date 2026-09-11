@@ -27,13 +27,13 @@ const savedFlow: FlowSnapshot = {
   version: 'v1.0.0',
 };
 
-function renderActions() {
+function renderActions(callBridge: Parameters<typeof useElectronBridgeActions>[0]['callBridge'] = async () => null) {
   let variables = draftVariables;
   const params: Parameters<typeof useElectronBridgeActions>[0] = {
     activeFlowNameRef: { current: '' },
     activeRunId: null,
     activeRunFlowId: null,
-    callBridge: async () => null,
+    callBridge,
     clearLastRunOverrides: vi.fn(),
     currentFlow: null,
     flowCanvas: { nodes: initialNodes, edges: initialEdges },
@@ -106,13 +106,29 @@ describe('流程恢复的输入变量归属', () => {
   });
 
   it('新建流程清空上一个流程的变量', async () => {
-    const { actions, params, readVariables } = renderActions();
+    const createFlow = vi.fn(async (payload) => ({ ok: true as const, data: { ...savedFlow, ...payload, flowId: 'persisted-draft' } }));
+    const { actions, params, readVariables } = renderActions(async (action) => {
+      const result = await action({ createFlow } as unknown as import('../types/electron').RpaBridge);
+      return result.ok ? result.data ?? null : null;
+    });
 
-    await actions.createNewFlow('新流程');
+    expect(await actions.createNewFlow('新流程')).toBe(true);
+    expect(createFlow).toHaveBeenCalledWith(expect.objectContaining({ name: '新流程', status: 'draft' }));
+    expect(params.setFlows).toHaveBeenCalledOnce();
 
     expect(params.setCurrentFlow).toHaveBeenCalledWith(expect.objectContaining({ name: '新流程', inputVariables: [] }));
     const created = vi.mocked(params.setCurrentFlow).mock.calls[0][0] as FlowSnapshot;
     expect(restoreFlowCanvas(created.definition)?.nodes.map((node) => node.id)).toEqual(initialNodes.map((node) => node.id));
     expect(readVariables()).toEqual([]);
+    expect(created.flowId).toBe('persisted-draft');
+  });
+
+  it('后端创建失败时保留当前流程与画布', async () => {
+    const { actions, params, readVariables } = renderActions();
+    expect(await actions.createNewFlow('新流程')).toBe(false);
+    expect(params.setCurrentFlow).not.toHaveBeenCalled();
+    expect(params.setFlowNodes).not.toHaveBeenCalled();
+    expect(params.resetRunView).not.toHaveBeenCalled();
+    expect(readVariables()).toEqual(draftVariables);
   });
 });
