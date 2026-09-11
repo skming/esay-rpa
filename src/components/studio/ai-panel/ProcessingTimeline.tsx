@@ -1,3 +1,4 @@
+import { toolDisplayStatus } from './toolResult';
 import { CircleAlert, Clock3, Loader2, ShieldAlert } from 'lucide-react';
 import type { ReactElement } from 'react';
 import { useState } from 'react';
@@ -45,7 +46,7 @@ function buildProcessingSummary(toolCalls: ToolCallState[], processingMs?: numbe
   // 编排守卫拦截：既不是失败也不该走绿色"已处理"，否则用户扫一眼摘要会以为全部顺利完成
   if (blockedCount > 0) {
     return {
-      label: `需要确认${processingMs !== undefined ? ` ${formatProcessingTime(processingMs)}` : ''}`,
+      label: `需要处理${processingMs !== undefined ? ` ${formatProcessingTime(processingMs)}` : ''}`,
       badge: `${blockedCount} 步已阻断`,
       tone: 'blocked',
     };
@@ -104,7 +105,8 @@ export function ProcessingTimeline({
   usage?: AiUsage;
   onFocusNode?: (nodeId: string) => void;
 }): ReactElement {
-  const summary = buildProcessingSummary(toolCalls, processingMs, streamingPending);
+  const calls = toolCalls.map((call) => ({ ...call, status: toolDisplayStatus(call, Boolean(streamingPending)) }));
+  const summary = buildProcessingSummary(calls, processingMs, streamingPending);
   // 手风琴：同时只展开一条。展开体是 JSON 代码块，两三条一起展开就把后面的步骤和最终回答推出几屏，
   // 要逐条收回来才能继续读——换成开新的自动关旧的，展开/收起都只需要一次点击。
   const [openId, setOpenId] = useState<string | null>(null);
@@ -154,7 +156,7 @@ export function ProcessingTimeline({
       )}
     >
       <div className="space-y-1">
-        {toolCalls.map((tc) => (
+        {calls.map((tc) => (
           <ToolCallCard
             key={tc.id}
             expanded={openId === tc.id}

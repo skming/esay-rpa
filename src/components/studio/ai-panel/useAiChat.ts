@@ -1,3 +1,4 @@
+import { toolResultStatus } from './toolResult';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { DEFAULT_MODEL, useAiChatStore } from '../../../stores/useAiChatStore';
 import type { AiAttachment, AiMessage, AiUsage, FlowDiff, ToolCallState, VerificationStatus } from './aiPanelTypes';
@@ -5,13 +6,6 @@ import { backend } from '../../../lib/backendClient';
 
 function nanoid(): string {
   return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
-}
-
-// guard 拦截返回的是 status 以 `blocked_` 开头的正常结果，渲染成绿色 done 会让拦截完全不可见
-function isBlockedResult(result: unknown): boolean {
-  if (result === null || typeof result !== 'object') return false;
-  const status = (result as Record<string, unknown>).status;
-  return typeof status === 'string' && status.startsWith('blocked_');
 }
 
 // 同一轮并行调用同一个工具时，按工具名匹配会把两次结果都盖到第一张卡片上，
@@ -84,7 +78,7 @@ export function cleanForStore(messages: AiMessage[]): AiMessage[] {
   return messages
     .filter(isPersistableMessage)
     // 剥离流式临时字段；running 降级为 stopped，否则重载后工具卡片永远转圈
-    .map(({ diffPreview: _dp, reasoning: _r, statusText: _s, statusDetail: _sd, error: _e, ...rest }) => ({
+    .map(({ diffPreview: _dp, reasoning: _r, statusText: _s, statusDetail: _sd, ...rest }) => ({
       ...rest,
       toolCalls: rest.toolCalls?.map((tc) =>
         tc.status === 'running' ? { ...tc, status: 'stopped' as const } : tc
@@ -106,7 +100,7 @@ export function useAiChat(flowId: string | null, onFlowChanged?: (flowId: string
   const [model, setModelLocal] = useState<string>(storeModel);
 
   const abortRef = useRef<AbortController | null>(null);
-  const saveInFlightRef = useRef(false);
+  const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
   // 供长生命周期异步闭包读取最新值，避免 stale capture
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
@@ -145,7 +139,7 @@ export function useAiChat(flowId: string | null, onFlowChanged?: (flowId: string
       const cleaned = cleanForStore(msgs);
       // cleanup 里不能调 hook，直接取 Zustand store
       useAiChatStore.getState().setMessages(k, cleaned);
-      void backendSave(k, cleaned);
+      saveQueueRef.current = saveQueueRef.current.then(() => backendSave(k, cleaned));
     };
   }, []); // 依赖故意留空：只在最终卸载时执行
 
@@ -190,10 +184,8 @@ export function useAiChat(flowId: string | null, onFlowChanged?: (flowId: string
     const k = keyRef.current;
     const cleaned = cleanForStore(msgs);
     storeSetMessages(k, cleaned);
-    if (!saveInFlightRef.current) {
-      saveInFlightRef.current = true;
-      void backendSave(k, cleaned).finally(() => { saveInFlightRef.current = false; });
-    }
+    // 按产生顺序保存，不能因为上一份仍在写入就丢掉工具结果或最后一份回复。
+    saveQueueRef.current = saveQueueRef.current.then(() => backendSave(k, cleaned));
   }, [storeSetMessages]);
 
   // 落库统一放到提交之后：done/abort/流式检查点触发时 messagesRef 还停在上一次渲染，
@@ -224,11 +216,13 @@ export function useAiChat(flowId: string | null, onFlowChanged?: (flowId: string
 
       // 经 ref 取最新历史，避免把 `messages` 加进依赖导致 send 每个 chunk 重建
       const historySnapshot = messagesRef.current;
-      setMessages([
+      const initialMessages: AiMessage[] = [
         ...historySnapshot,
         userMsg,
         { id: assistantId, role: 'assistant', content: '', createdAt: assistantStartedAt },
-      ]);
+      ];
+      setMessages(initialMessages);
+      persistMessages(initialMessages);
 
       const finishAssistantMessage = (message: AiMessage, patch: Partial<AiMessage> = {}): AiMessage => ({
         ...message,
@@ -360,6 +354,7 @@ export function useAiChat(flowId: string | null, onFlowChanged?: (flowId: string
                 )
               );
             } else if (chunk.type === 'tool_result' && chunk.tool) {
+              persistAfterCommitRef.current = true;
               if (chunk.tool === 'update_flow' && chunk.result && typeof chunk.result === 'object') {
                 const res = chunk.result as Record<string, unknown>;
                 if (res.status === 'applied' && typeof res.flow_id === 'string' && res.flow_id) {
@@ -368,7 +363,7 @@ export function useAiChat(flowId: string | null, onFlowChanged?: (flowId: string
               } else if (chunk.tool === 'create_flow' && chunk.result && typeof chunk.result === 'object') {
                 const res = chunk.result as Record<string, unknown>;
                 if (typeof res.flow_id === 'string' && res.flow_id) {
-                  aiCreatedFlowRef.current = true;
+                  aiCreatedFlowRef.current = res.flow_id !== flowId;
                   onFlowChangedRef.current?.(res.flow_id);
                 }
               }
@@ -379,7 +374,7 @@ export function useAiChat(flowId: string | null, onFlowChanged?: (flowId: string
                       ...m,
                       toolCalls: patchToolCall(m.toolCalls, chunk.call_id, {
                         result: chunk.result,
-                        status: isBlockedResult(chunk.result) ? 'blocked' : 'done',
+                        status: toolResultStatus(chunk.result),
                       }),
                     }
                     : m

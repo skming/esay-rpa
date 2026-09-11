@@ -1,4 +1,5 @@
-import { CheckCircle2, ChevronRight, ChevronUp, CircleAlert, CircleSlash, Loader2, ShieldAlert } from 'lucide-react';
+import { toolDisplayStatus } from './toolResult';
+import { CheckCircle2, ChevronRight, CircleAlert, CircleSlash, Loader2, ShieldAlert } from 'lucide-react';
 import type { ReactElement } from 'react';
 import { useState } from 'react';
 import { cn } from '../../../lib/utils';
@@ -9,8 +10,8 @@ const TOOL_LABELS: Record<string, string> = {
   get_flow: '读取流程结构',
   lint_flow: '静态质量检查',
   validate_flow: '验证变量引用',
-  create_flow: '创建新流程',
-  update_flow: '生成变更方案',
+  create_flow: '生成流程',
+  update_flow: '更新流程',
   run_flow: '运行流程',
   get_run_status: '查询运行状态',
   get_run_error: '分析运行错误',
@@ -20,6 +21,7 @@ const TOOL_LABELS: Record<string, string> = {
   get_run_logs: '读取运行日志',
   list_node_types: '查询节点类型',
   inspect_page: '检查页面结构',
+  interact_page: '操作页面',
   inspect_screenshot: '截图查看页面',
   assert_run_output: '审计运行输出',
   set_acceptance_contract: '更新验收标准',
@@ -82,37 +84,12 @@ function blockedMessage(toolCall: ToolCallState): string | null {
   return typeof result?.message === 'string' ? result.message : null;
 }
 
-function summarize(toolCall: ToolCallState): string | null {
-  const args = parseArgs(toolCall.args);
-  const result = toolCall.result as Record<string, unknown> | undefined;
-
-  const flowName = typeof args.name === 'string' ? args.name : undefined;
-  const nodeId = typeof args.node_id === 'string' ? args.node_id : undefined;
-
-  switch (toolCall.tool) {
-    case 'create_flow':
-    case 'update_flow':
-      return flowName ?? null;
-    case 'run_flow':
-      return typeof result?.task_id === 'string' ? `任务 ${(result.task_id).slice(0, 8)}` : null;
-    case 'get_run_output': {
-      const vars = Array.isArray(result?.artifacts) ? (result!.artifacts as unknown[]).length : null;
-      return vars !== null ? `${vars} 个产物` : null;
-    }
-    case 'apply_node_fix':
-      return getPrimaryNodeRef(toolCall)?.title ?? nodeId ?? null;
-    case 'list_node_types':
-      return Array.isArray(result?.types) ? `${(result!.types as unknown[]).length} 种节点` : null;
-    default:
-      return null;
-  }
-}
-
 export function ToolCallCard({
   toolCall,
   live = true,
   expanded: controlledExpanded,
   onToggle,
+  onFocusNode,
 }: {
   toolCall: ToolCallState;
   live?: boolean;
@@ -125,31 +102,36 @@ export function ToolCallCard({
   const expanded = controlledExpanded ?? selfExpanded;
   const toggle = onToggle ?? ((): void => setSelfExpanded((value) => !value));
   const label = TOOL_LABELS[toolCall.tool] ?? toolCall.tool;
-  const detail = summarize(toolCall);
   // A "running" card in a non-live (historical) conversation means the session ended mid-stream.
-  const status = (!live && toolCall.status === 'running') ? 'stopped' : toolCall.status;
+  const status = toolDisplayStatus(toolCall, live);
+  const result = readObject(toolCall.result);
+  const findings = (Array.isArray(result?.lint_findings) ? result.lint_findings : Array.isArray(result?.findings) ? result.findings : [])
+    .map(readObject).filter((item): item is Record<string, unknown> => Boolean(item));
+  const node = getPrimaryNodeRef(toolCall);
+  const statusLabel = { running: '执行中', done: '已返回', error: '异常', blocked: '已阻断', stopped: '已中断' }[status];
   const parsedArgs = parseArgs(toolCall.args);
   const hasArgs = Object.keys(parsedArgs).length > 0;
   // guard 拦截（如失败预算耗尽）不是成功也不是报错，需单独展示，否则会被误读为已完成
-  const blockMsg = status === 'blocked' ? blockedMessage(toolCall) : null;
+  const blockMsg = status === 'blocked' || status === 'error'
+    ? blockedMessage(toolCall) ?? (typeof result?.error === 'string' ? result.error : null) : null;
 
   return (
     <div
       className={cn(
-        'my-1 w-full overflow-hidden rounded-lg border text-[11px] transition-colors',
-        status === 'error' ? 'border-red-200 bg-red-50/50'
-          : status === 'blocked' ? 'border-amber-200 bg-amber-50/50'
-            : 'border-slate-200 bg-slate-50/80'
+        'w-full min-w-0 overflow-hidden rounded-md text-xs',
+        status === 'error' ? 'bg-red-50/50'
+          : status === 'blocked' ? 'bg-amber-50/50'
+            : 'bg-transparent'
       )}
     >
       <button
         aria-expanded={expanded}
-        className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left hover:bg-black/2"
+        className="flex w-full items-center gap-2 px-2 py-1.5 text-left hover:bg-black/2"
         onClick={toggle}
         type="button"
       >
         {status === 'running' ? (
-          <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-accent" strokeWidth={2} />
+          <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin motion-reduce:animate-none text-accent" strokeWidth={2} />
         ) : status === 'error' ? (
           <CircleAlert className="h-3.5 w-3.5 shrink-0 text-red-500" strokeWidth={2} />
         ) : status === 'blocked' ? (
@@ -157,21 +139,17 @@ export function ToolCallCard({
         ) : status === 'stopped' ? (
           <CircleSlash className="h-3.5 w-3.5 shrink-0 text-slate-500" strokeWidth={2} />
         ) : (
-          <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-500" strokeWidth={2} />
+          <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-700" strokeWidth={2} />
         )}
 
         <span className={cn(
-          'font-medium',
+          'min-w-0 flex-1 font-medium',
           status === 'error' ? 'text-red-700' : status === 'blocked' ? 'text-amber-700' : 'text-slate-700'
         )}>
-          {label}{status === 'blocked' && ' · 已阻断'}
+          {label}
         </span>
 
-        {detail && (
-          <span className="min-w-0 truncate rounded-md border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] font-medium text-slate-500">
-            {detail}
-          </span>
-        )}
+        <span className="sr-only">{statusLabel}</span>
 
         <ChevronRight
           className={cn('ml-auto h-3 w-3 shrink-0 text-slate-300 transition-transform', expanded && 'rotate-90')}
@@ -179,13 +157,29 @@ export function ToolCallCard({
       </button>
 
       {blockMsg && (
-        <p className="border-t border-amber-200/70 px-2.5 py-1.5 text-[10.5px] leading-relaxed text-amber-700">
+        <p className="px-2.5 pb-2 text-xs leading-relaxed text-slate-700 break-words">
           {blockMsg}
         </p>
       )}
 
       {expanded && (
-        <div className="border-t border-slate-200/80 bg-white">
+        <div className="ml-5 border-l border-slate-200 pl-2">
+          {node && onFocusNode && (
+            <button type="button" className="m-2 text-xs text-accent underline underline-offset-4" onClick={() => onFocusNode(node.id)}>
+              定位节点：{node.title ?? node.id}
+            </button>
+          )}
+          {findings.length > 0 && (
+            <ul className="space-y-2 px-3 py-2 text-xs leading-relaxed text-slate-700">
+              {findings.map((finding, index) => (
+                <li key={index} className="break-words">
+                  <span className="font-medium">{finding.severity === 'error' || finding.blocks_run === true ? '阻断' : '提示'} · {String(finding.node_id ?? '流程')}</span>
+                  <p>{String(finding.message ?? finding.issue ?? '')}</p>
+                  {typeof finding.fix === 'string' && <p className="mt-1 text-slate-600">{finding.fix}</p>}
+                </li>
+              ))}
+            </ul>
+          )}
           {hasArgs && (
             <div className="px-2.5 pt-2">
               <p className="mb-1 text-[9.5px] font-semibold uppercase tracking-wide text-slate-500">参数</p>
@@ -198,15 +192,7 @@ export function ToolCallCard({
               <CodeBlock code={JSON.stringify(toolCall.result, null, 2)} language="json" maxHeight={192} variant="light" />
             </div>
           )}
-          {/* 展开体高到读完就看不见标题行了，底部再给一个收起入口，省掉反向滚动去找折叠箭头 */}
-          <button
-            className="flex w-full items-center justify-center gap-1 border-t border-slate-100 py-1.5 text-[10px] font-medium text-slate-500 transition-colors hover:bg-slate-50 hover:text-slate-600"
-            onClick={toggle}
-            type="button"
-          >
-            <ChevronUp className="h-3 w-3" strokeWidth={2} />
-            收起
-          </button>
+
         </div>
       )}
     </div>

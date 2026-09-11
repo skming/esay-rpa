@@ -1,7 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { backend } from '../../../lib/backendClient';
+import { useAiChatStore } from '../../../stores/useAiChatStore';
 
 import type { AiMessage, ToolCallState } from './aiPanelTypes';
-import { cleanForStore, isPersistableMessage, patchToolCall } from './useAiChat';
+import { cleanForStore, isPersistableMessage, patchToolCall, useAiChat } from './useAiChat';
 
 function msg(overrides: Partial<AiMessage>): AiMessage {
   return { id: 'm1', role: 'assistant', content: '', createdAt: 1, ...overrides };
@@ -86,4 +90,39 @@ describe('cleanForStore', () => {
     expect(cleaned.verificationStatus).toBe('run_verified');
     expect(cleaned.verificationRevision).toBe(7);
   });
+});
+
+
+it('等待模型响应期间需求已按草稿ID保存', async () => {
+  let resolveResponse!: (response: Response) => void;
+  const stream = vi.spyOn(backend, 'streamAiChat').mockImplementation(() => new Promise((resolve) => { resolveResponse = resolve; }));
+  const save = vi.spyOn(backend, 'saveAiChat').mockResolvedValue(undefined);
+  let chat!: ReturnType<typeof useAiChat>;
+  function Probe() {
+    chat = useAiChat('persisted-draft');
+    return null;
+  }
+  try {
+    renderToStaticMarkup(createElement(Probe));
+    const sending = chat.send('抓取帖子内容');
+    expect(useAiChatStore.getState().getMessages('flow_persisted-draft')).toEqual([
+      expect.objectContaining({ role: 'user', content: '抓取帖子内容' }),
+    ]);
+    await Promise.resolve();
+    expect(save).toHaveBeenCalledWith('flow_persisted-draft', expect.any(Array));
+    resolveResponse(new Response(null));
+    await sending;
+  } finally {
+    stream.mockRestore();
+    save.mockRestore();
+    useAiChatStore.getState().clearMessages('flow_persisted-draft');
+  }
+});
+
+
+it('中断错误经过保存和恢复后仍保留，不变成空回复', () => {
+  const interrupted = msg({ error: '连接中断，请继续', content: '' });
+  const saved = cleanForStore([interrupted]);
+  expect(saved[0].error).toBe('连接中断，请继续');
+  expect(cleanForStore(saved)).toEqual(saved);
 });
