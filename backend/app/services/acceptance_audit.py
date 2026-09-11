@@ -155,19 +155,24 @@ def _audit_table(deliverable, value: Any, variables: dict[str, Any]) -> list[dic
 
 
 def _audit_document(deliverable, value: Any, variables: dict[str, Any], workspace_root: Path) -> list[dict[str, Any]]:
+    source_issues: list[dict[str, Any]] = []
+    for source_name in deliverable.source_variables:
+        if source_name not in variables:
+            source_issues.append(_issue(deliverable, "source_variable_missing", f"来源变量 `{source_name}` 不存在。"))
+        elif not _has_source_content(variables[source_name]):
+            source_issues.append(_issue(deliverable, "source_variable_empty", f"来源变量 `{source_name}` 没有非空内容，无法证明正文来自本次抓取。"))
     binary = _binary_document_path(value, workspace_root)
     if binary is not None:
-        return _audit_binary_document(deliverable, binary)
+        return source_issues + _audit_binary_document(deliverable, binary)
     text = _read_text_value(value, workspace_root)
     if text is None:
-        return [_issue(deliverable, "document_unreadable", "文档变量既不是正文，也不指向可读取文件。")]
-    issues = _audit_text_constraints(deliverable, text)
+        return source_issues + [_issue(deliverable, "document_unreadable", "文档变量既不是正文，也不指向可读取文件。")]
+    issues = source_issues + _audit_text_constraints(deliverable, text)
     if deliverable.min_chars is not None and len(text.strip()) < deliverable.min_chars:
         issues.append(_issue(deliverable, "document_too_short", f"文档只有 {len(text.strip())} 字符，小于要求的 {deliverable.min_chars}。"))
     haystack = _collapse(text)
     for source_name in deliverable.source_variables:
-        if source_name not in variables:
-            issues.append(_issue(deliverable, "source_variable_missing", f"来源变量 `{source_name}` 不存在。"))
+        if source_name not in variables or not _has_source_content(variables[source_name]):
             continue
         probes = _source_probes(variables[source_name])
         if probes and not any(probe in haystack for probe in probes):
@@ -177,6 +182,18 @@ def _audit_document(deliverable, value: Any, variables: dict[str, Any], workspac
                 f"文档未包含来源变量 `{source_name}` 的运行数据（比对片段 {probes[:3]}）。",
             ))
     return issues
+
+
+def _has_source_content(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, dict):
+        return any(_has_source_content(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_has_source_content(item) for item in value)
+    return True
 
 
 _WHITESPACE_RUN = re.compile(r"\s+")

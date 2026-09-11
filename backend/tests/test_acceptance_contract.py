@@ -168,3 +168,24 @@ def test_document_with_a_real_source_variable_is_accepted() -> None:
         _document_contract(sourceVariables=["topic_text"]),
         defined_variables={"summary_md", "topic_text"},
     ) == []
+
+
+def test_file_cannot_silently_accept_document_source_constraints() -> None:
+    contract = _document_contract(
+        kind="file", variable="post_content", sourceVariables=["post_content"],
+    )
+    errors = contract_validation_errors(contract, defined_variables={"post_content"})
+    assert any("sourceVariables" in error and "document" in error for error in errors)
+
+
+def test_file_cannot_silently_accept_min_chars() -> None:
+    errors = contract_validation_errors(
+        _document_contract(kind="file", minChars=1), defined_variables={"summary_md"},
+    )
+    assert any("minChars" in error and "document" in error for error in errors)
+
+
+def test_file_without_document_constraints_remains_valid() -> None:
+    assert contract_validation_errors(
+        _document_contract(kind="file", minBytes=0), defined_variables={"summary_md"},
+    ) == []

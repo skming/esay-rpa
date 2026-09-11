@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from app.models.schemas import FlowAcceptanceContract, NodeExecutionEvidence
 from app.services.acceptance_audit import audit_acceptance_contract
 
@@ -261,3 +263,67 @@ def test_document_written_entirely_from_boilerplate_is_rejected(tmp_path: Path) 
 
     assert result["passed"] is False
     assert [issue["issue"] for issue in result["issues"]] == ["document_missing_source_data"]
+
+
+def test_split_content_and_file_contract_rejects_empty_source(tmp_path: Path) -> None:
+    contract = FlowAcceptanceContract.model_validate({
+        "deliverables": [
+            {"id": "body", "variable": "body_text", "kind": "document",
+             "minChars": 1, "sourceVariables": ["post_content"]},
+            {"id": "file", "variable": "output_path", "kind": "file"},
+        ],
+    })
+    (tmp_path / "output.json").write_text('[""]', encoding="utf-8")
+    result = audit_acceptance_contract(
+        contract, {"body_text": "帖子内容", "post_content": [""], "output_path": "output.json"},
+        [], workspace_root=tmp_path,
+    )
+    assert result["passed"] is False
+    assert [issue["issue"] for issue in result["issues"]] == ["source_variable_empty"]
+
+    content = "帖子标题以及实际抓取的正文内容"
+    (tmp_path / "output.json").write_text(content, encoding="utf-8")
+    result = audit_acceptance_contract(
+        contract, {"body_text": content, "post_content": [content], "output_path": "output.json"},
+        [], workspace_root=tmp_path,
+    )
+    assert result["passed"] is True, result["issues"]
+
+
+def test_file_only_contract_allows_empty_json_results(tmp_path: Path) -> None:
+    (tmp_path / "output.json").write_text("[]", encoding="utf-8")
+    contract = FlowAcceptanceContract.model_validate({
+        "deliverables": [{"id": "file", "variable": "output_path", "kind": "file"}],
+    })
+    result = audit_acceptance_contract(
+        contract, {"output_path": "output.json"}, [], workspace_root=tmp_path,
+    )
+    assert result["passed"] is True
+
+
+@pytest.mark.parametrize("source", [None, [], ["", " \n"], {"body": [""]}])
+def test_document_rejects_empty_declared_sources(tmp_path: Path, source) -> None:
+    result = audit_acceptance_contract(
+        _markdown_contract(), {"md_path": "已有标题不能替代来源正文", "post_texts": source},
+        [], workspace_root=tmp_path,
+    )
+    assert [issue["issue"] for issue in result["issues"]] == ["source_variable_empty"]
+
+
+@pytest.mark.parametrize("source", ["短文", 0, False, ["", "短文"]])
+def test_document_does_not_confuse_short_or_falsy_values_with_empty_sources(tmp_path: Path, source) -> None:
+    result = audit_acceptance_contract(
+        _markdown_contract(), {"md_path": "短文 0 False", "post_texts": source},
+        [], workspace_root=tmp_path,
+    )
+    assert result["passed"] is True, result["issues"]
+
+
+def test_binary_document_still_checks_whether_declared_source_is_empty(tmp_path: Path) -> None:
+    (tmp_path / "report.pdf").write_bytes(b"%PDF-1.7\n" + b"x" * 512)
+    result = audit_acceptance_contract(
+        _pdf_contract(), {"report_path": "report.pdf", "topic_text": [""]},
+        [], workspace_root=tmp_path,
+    )
+    assert [issue["issue"] for issue in result["issues"]] == ["source_variable_empty"]
+    assert [warning["issue"] for warning in result["warnings"]] == ["document_content_not_text_verifiable"]

@@ -55,6 +55,14 @@ def contract_validation_errors(
         ))
         if deliverable.kind != "table" and table_only:
             errors.append(f"交付物 {deliverable.id} 使用了仅适用于 table 的断言")
+        if deliverable.kind != "document":
+            if deliverable.source_variables:
+                errors.append(
+                    f"交付物 {deliverable.id} 的 sourceVariables 仅适用于 document；"
+                    "请将正文声明为 document 交付物，并将文件路径另列为 file 交付物"
+                )
+            if deliverable.min_chars is not None:
+                errors.append(f"交付物 {deliverable.id} 的 minChars 仅适用于 document")
         if deliverable.kind == "document":
             errors.extend(_document_provenance_errors(deliverable, defined_variables))
         if input_values:
