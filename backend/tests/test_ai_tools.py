@@ -2013,6 +2013,39 @@ def test_lint_does_not_flag_row_level_table_selector() -> None:
     assert not any(f["issue"] == "table_extract_selector_not_table_like" for f in findings)
 
 
+def test_lint_reports_id_named_table_as_container_not_as_unknown_structure() -> None:
+    """`#bill-table` 指的就是 <table id="bill-table">，两条 error 的分流必须落在容器那条。
+
+    两条都是 error、都拦运行，差别在 fix 文案：容器那条直说「改成行选择器」，
+    而 not_table_like 那条会让模型怀疑目标压根不是表格、改用 extractMode='text'。
+    判据只认 class 不认 id 时，最常见的 id 命名会被指去这条错的岔路。
+    真实后果见 evals：模型为此连开 4 次 apply_node_fix、3 次 inspect_page 仍没修好。
+    """
+    nodes = [
+        {"id": "n_extract", "type": "browser.extract", "title": "提取筛选后表格",
+         "selector": "#bill-table", "extractMode": "table",
+         "outputVariable": "rows", "countVariable": "rows_count", "position": {"x": 0, "y": 0}},
+    ]
+
+    issues = {f["issue"] for f in _lint_flow(nodes, [])}
+
+    assert "table_extract_selector_targets_container" in issues
+    assert "table_extract_selector_not_table_like" not in issues
+
+
+def test_lint_keeps_id_named_row_selector_out_of_the_container_branch() -> None:
+    """id 里含 table 但收窄到了行，就不该再报容器：`#bill-table tbody tr` 抓的是行。"""
+    nodes = [
+        {"id": "n_extract", "type": "browser.extract", "title": "提取筛选后表格",
+         "selector": "#bill-table tbody tr", "extractMode": "table",
+         "outputVariable": "rows", "countVariable": "rows_count", "position": {"x": 0, "y": 0}},
+    ]
+
+    issues = {f["issue"] for f in _lint_flow(nodes, [])}
+
+    assert "table_extract_selector_targets_container" not in issues
+    assert "table_extract_selector_not_table_like" not in issues
+
 
 def test_lint_flags_forked_path_whose_downstream_is_swallowed() -> None:
     """复现 grok-4.5 生成的拓扑：校验腿在分叉另一侧，又汇合回抽取节点。

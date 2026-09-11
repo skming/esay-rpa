@@ -57,6 +57,11 @@ def _extract_classes_from_token(token: str) -> list[str]:
     return re.findall(r'\.([a-zA-Z][a-zA-Z0-9_-]*)', token)
 
 
+def _extract_ids_from_token(token: str) -> list[str]:
+    """Return all id names from a compound selector token (e.g. 'table#bill-table' → ['bill-table'])."""
+    return re.findall(r'#([a-zA-Z][a-zA-Z0-9_-]*)', token)
+
+
 def _is_framework_class(cls: str) -> bool:
     return any(cls.lower().startswith(p) for p in _FRAMEWORK_CLASS_PREFIXES)
 
@@ -68,8 +73,11 @@ def _is_table_container_token(token: str) -> bool:
         return True
     if re.match(r'^\[role=[\'"]?(grid|table)[\'"]?\]$', t):
         return True
-    for cls in _extract_classes_from_token(t):
-        if "table" in cls and not re.search(r'[-_](row|tr)$|__row$|__tr$', cls):
+    # id 与 class 同判：#bill-table 就是 <table id="bill-table">，而 id 才是最常见的写法。
+    # 漏掉 id 不会放过这个选择器，只会把它甩去 not_table_like 那条 error——那条的 fix 文案
+    # 让模型怀疑目标不是表格、改用 extractMode='text'，等于把人指去修一个不存在的问题。
+    for name in _extract_classes_from_token(t) + _extract_ids_from_token(t):
+        if "table" in name and not re.search(r'[-_](row|tr)$|__row$|__tr$', name):
             return True
     return False
 
