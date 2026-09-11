@@ -65,3 +65,42 @@ def _collect_downstream_nodes(
             collected.append(node)
         queue.extend(downstream_by_source.get(current, []))
     return collected
+
+
+def _find_swallowed_fork_targets(
+    source_id: str,
+    targets: list[str],
+    downstream_by_source: dict[str, list[str]],
+) -> list[tuple[str, str]]:
+    """找出「下游被另一条分叉路径吞掉」的目标，返回 (被吞掉的目标, 吞掉它的兄弟)。
+
+    task_manager 的遍历是单条 DFS：节点出栈才记 visited（task_manager.py:579-582），
+    两条分叉谁先把下游走完由 `_push_edge_targets` 的倒序压栈决定。走在后面的那条分叉，
+    其目标若已在这条链路上被走过，就命中 `node_id in visited` 被静默跳过——那条路径一次都不跑，
+    流程照样报成功。这就是「回读校验挂在分叉另一侧、又汇合回抽取节点」丢校验步骤的原因。
+
+    `_unreachable_node_ids` 看得见孤儿节点，看不见这件事：两条分叉从起点都可达。
+    """
+    found: list[tuple[str, str]] = []
+    for index, target in enumerate(targets):
+        for other_index, sibling in enumerate(targets):
+            if index == other_index or target == sibling:
+                continue
+            if _reaches_from(sibling, target, downstream_by_source):
+                found.append((target, sibling))
+    return found
+
+
+def _reaches_from(start: str, target: str, downstream_by_source: dict[str, list[str]]) -> bool:
+    """target 是否落在 start 的下游。不含 start 自身，否则自环会被当成吞并。"""
+    seen: set[str] = set()
+    stack = list(downstream_by_source.get(start, []))
+    while stack:
+        current = stack.pop()
+        if current == target:
+            return True
+        if current in seen:
+            continue
+        seen.add(current)
+        stack.extend(downstream_by_source.get(current, []))
+    return False

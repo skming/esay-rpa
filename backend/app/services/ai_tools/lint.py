@@ -7,7 +7,12 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from app.services.ai_tools.graph import _collect_ancestor_node_ids, _collect_downstream_nodes, _unreachable_node_ids
+from app.services.ai_tools.graph import (
+    _collect_ancestor_node_ids,
+    _collect_downstream_nodes,
+    _find_swallowed_fork_targets,
+    _unreachable_node_ids,
+)
 from app.services.ai_tools.lint_scenarios import (
     _lint_extract_scalar_contract_for_scripts,
     _lint_blind_delay_instead_of_wait,
@@ -145,6 +150,7 @@ def _lint_flow(
         findings.extend(_lint_variable_contract_for_node(node, nid=nid, ntitle=ntitle, ntype=ntype))
 
     findings.extend(_lint_unreachable_nodes(nodes, edges))
+    findings.extend(_lint_swallowed_fork_paths(nodes, edges))
     findings.extend(_lint_visual_layout(nodes))
     findings.extend(_lint_flow_semantic_quality(nodes))
     findings.extend(_lint_extract_scalar_contract_for_scripts(nodes, edges))
@@ -470,6 +476,54 @@ def _lint_unreachable_nodes(nodes: list[Any], edges: list[Any]) -> list[dict[str
             "issue": "unreachable_node",
             "message": f"节点 `{nid}` 无法从流程起点到达（孤儿节点），运行时会被跳过。",
             "fix": "检查是否漏连了入边，用 update_flow add_edges 补连。",
+        })
+    return findings
+
+
+def _lint_swallowed_fork_paths(nodes: list[Any], edges: list[Any]) -> list[dict[str, Any]]:
+    """分叉出边里有一条路径的下游会被兄弟分叉吞掉，运行时静默不执行。
+
+    条件节点和循环节点的分叉由 label 显式表达、执行器也按 label 走，不在判据范围内；
+    普通动作节点出现两条出边只可能是想表达顺序或分支，两种意图在单条 DFS 下都不成立。
+    """
+    node_map: dict[str, dict] = {n["id"]: n for n in nodes if isinstance(n, dict) and n.get("id")}
+    downstream: dict[str, list[str]] = {}
+    out_edges: dict[str, list[dict]] = {}
+    for edge in edges:
+        if isinstance(edge, dict) and edge.get("source") and edge.get("target"):
+            out_edges.setdefault(str(edge["source"]), []).append(edge)
+            downstream.setdefault(str(edge["source"]), []).append(str(edge["target"]))
+
+    findings: list[dict[str, Any]] = []
+    for source_id, outgoing in out_edges.items():
+        node = node_map.get(source_id, {})
+        ntype = str(node.get("type", ""))
+        if ntype in _LOOP_LIKE_NODE_TYPES or ntype == "control.condition":
+            continue
+        targets = [str(e["target"]) for e in outgoing]
+        if len(targets) < 2:
+            continue
+        swallowed = _find_swallowed_fork_targets(source_id, targets, downstream)
+        if not swallowed:
+            continue
+        dropped, winner = swallowed[0]
+        winner_title = node_map.get(winner, {}).get("title", winner)
+        dropped_title = node_map.get(dropped, {}).get("title", dropped)
+        findings.append({
+            "severity": "warn",
+            "node_id": source_id,
+            "node_title": str(node.get("title") or source_id),
+            "issue": "forked_path_downstream_swallowed",
+            "message": (
+                f"节点 `{source_id}` 有 {len(targets)} 条出边，但流程是单条 DFS 遍历："
+                f"`{winner}`（{winner_title}）这条链路会先把下游整条走完，"
+                f"`{dropped}`（{dropped_title}）再到达时它已被走过、不会重跑，"
+                "它下游独有的节点于是一次都不执行，流程却报成功。"
+            ),
+            "fix": (
+                "把分叉改成串联的普通边；确实要按条件走不同分支就用 control.condition 并显式标注 "
+                "label='true'/'false' 两条出边。"
+            ),
         })
     return findings
 

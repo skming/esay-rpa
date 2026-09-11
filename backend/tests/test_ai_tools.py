@@ -2013,6 +2013,80 @@ def test_lint_does_not_flag_row_level_table_selector() -> None:
     assert not any(f["issue"] == "table_extract_selector_not_table_like" for f in findings)
 
 
+
+def test_lint_flags_forked_path_whose_downstream_is_swallowed() -> None:
+    """复现 grok-4.5 生成的拓扑：校验腿在分叉另一侧，又汇合回抽取节点。
+
+    n4 有两条出边 n5/n6，n6→n7→n8 后连回 n5。单条 DFS 下 n5 先出栈先执行，
+    n8 执行时 n5 已在 visited 里，`e9` 被丢——日期校验这条腿一次都不跑。
+    两个节点从起点都可达，所以 unreachable_node 看不见它。
+    """
+
+    def node(nid: str, ntype: str, title: str) -> dict:
+        return {"id": nid, "type": ntype, "title": title,
+                "selector": "#x", "position": {"x": 0, "y": 0}}
+
+    nodes = [
+        node("n4", "browser.press", "按Enter提交"),
+        node("n5", "browser.extract", "提取筛选后表格"),
+        node("n6", "browser.extract", "回读开始日期值"),
+        node("n7", "browser.extract", "回读结束日期值"),
+        node("n8", "script.python", "校验日期范围"),
+    ]
+    nodes[4]["outputVariable"] = "rows"
+    edges = [
+        {"id": "e5", "source": "n4", "target": "n5"},
+        {"id": "e6", "source": "n4", "target": "n6"},
+        {"id": "e7", "source": "n6", "target": "n7"},
+        {"id": "e8", "source": "n7", "target": "n8"},
+        {"id": "e9", "source": "n8", "target": "n5"},
+    ]
+
+    findings = _lint_flow(nodes, edges)
+
+    hit = next(f for f in findings if f["issue"] == "forked_path_downstream_swallowed")
+    assert hit["severity"] == "warn"
+    assert hit["node_id"] == "n4"
+    # 报告里必须点名是哪条腿被吞，否则模型只知道"有分叉"、不知道该改哪条边
+    assert "n5" in hit["message"] and "n6" in hit["message"]
+
+
+def test_lint_keeps_condition_and_loop_fanout_out_of_the_swallowed_fork_rule() -> None:
+    """条件/循环的分叉由 label 决定走哪条，两条腿本来就不都执行，不能按吞并报。"""
+    cond = {"id": "c1", "type": "control.condition", "title": "有数据吗",
+            "expression": "${var.n} > 0", "position": {"x": 0, "y": 0}}
+    loop = {"id": "l1", "type": "control.foreach", "title": "逐行",
+            "listVariable": "rows", "itemVariable": "row", "position": {"x": 0, "y": 0}}
+    leaf_a = {"id": "a1", "type": "browser.click", "title": "A", "selector": "#a", "position": {"x": 0, "y": 0}}
+    leaf_b = {"id": "a2", "type": "browser.click", "title": "B", "selector": "#b", "position": {"x": 0, "y": 0}}
+    leaf_c = {"id": "a3", "type": "browser.click", "title": "C", "selector": "#c", "position": {"x": 0, "y": 0}}
+
+    edges = [
+        {"source": "c1", "target": "a1", "label": "true"},
+        {"source": "c1", "target": "a2", "label": "false"},
+        {"source": "l1", "target": "a3", "label": "body"},
+        {"source": "l1", "target": "a1", "label": "exit"},
+        {"source": "a3", "target": "a1"},
+    ]
+
+    issues = {f["issue"] for f in _lint_flow([cond, loop, leaf_a, leaf_b, leaf_c], edges)}
+
+    assert "forked_path_downstream_swallowed" not in issues
+
+
+def test_lint_does_not_flag_plain_linear_chain() -> None:
+    """串联的正常流程不能因为规则新增就报分叉。"""
+    nodes = [
+        {"id": f"n{i}", "type": "browser.click", "title": f"N{i}",
+         "selector": "#x", "position": {"x": 0, "y": 0}} for i in range(1, 4)
+    ]
+    edges = [{"source": "n1", "target": "n2"}, {"source": "n2", "target": "n3"}]
+
+    assert not any(
+        f["issue"] == "forked_path_downstream_swallowed" for f in _lint_flow(nodes, edges)
+    )
+
+
 async def test_update_flow_drops_leftover_start_to_end_skeleton_edge() -> None:
     """空流程自带的 start→end 边在接上真实链路后必须消失。"""
     flow_service = FakeRenamableFlowService(initial_name="新建 RPA 流程")
