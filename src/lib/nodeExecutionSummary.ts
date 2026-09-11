@@ -225,7 +225,7 @@ export function buildNodeExecutionSummary(node: Node<RpaNodeData>): NodeExecutio
 
   if (actionType === 'excel.deleterow') {
     addRow('path', '文件路径', action.path);
-    addRow('index', '行索引', typeof action.index === 'number' ? String(action.index) : undefined);
+    addRow('rowIndex', '行索引', typeof action.rowIndex === 'number' ? String(action.rowIndex) : undefined);
   }
 
   if (actionType === 'excel.save') {

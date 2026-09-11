@@ -4,6 +4,39 @@ import type { RpaNodeData } from '../types/rpa';
 import { applyNodeConfigDraft, createNodeConfigDraft } from './nodeConfigDraft';
 
 describe('nodeConfigDraft', () => {
+  it('删行节点的行号要写进后端真正读的键', () => {
+    // 面板行号必须落到 file_action_runner 读的 rowIndex：落错键会静默删掉另一行。
+    const data: RpaNodeData = {
+      title: '删除数据行',
+      description: 'data/orders.csv',
+      kind: 'excel',
+      status: 'pending',
+      action: { type: 'excel.deleterow', path: 'data/orders.csv', rowIndex: 0, timeoutMs: 30_000 }
+    };
+
+    const draft = createNodeConfigDraft(data);
+    const next = applyNodeConfigDraft(data, { ...draft, tabIndex: 2 });
+
+    expect(next.action?.rowIndex).toBe(2);
+  });
+
+  it('切换标签页节点仍然写 index', () => {
+    // rowIndex 与 index 共用同一个面板字段，改删行不能把标签页索引也改掉。
+    const data: RpaNodeData = {
+      title: '切换标签页',
+      description: '',
+      kind: 'browser',
+      status: 'pending',
+      action: { type: 'browser.tab.switch', index: 0, timeoutMs: 30_000 }
+    };
+
+    const draft = createNodeConfigDraft(data);
+    const next = applyNodeConfigDraft(data, { ...draft, tabIndex: 3 });
+
+    expect(next.action?.index).toBe(3);
+    expect(next.action?.rowIndex).toBeUndefined();
+  });
+
   it('应保存浏览器属性提取配置', () => {
     const data: RpaNodeData = {
       title: '提取链接',

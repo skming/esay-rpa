@@ -394,7 +394,7 @@ function getDefaultAction(payload: ComponentDragPayload): RpaNodeData['action'] 
     return {
       type: 'excel.deleterow',
       path: 'data/orders.csv',
-      index: 0,
+      rowIndex: 0,
       outputVariable: 'excel_row_count',
       countVariable: 'excel_row_count',
       timeoutMs: 30_000
