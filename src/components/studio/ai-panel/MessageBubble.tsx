@@ -67,22 +67,26 @@ function AttachmentStrip({ attachments, isUser }: { attachments: AiAttachment[];
 const VERIFICATION_META: Record<VerificationStatus, {
   icon: typeof BadgeCheck;
   label: string;
+  description: string;
   className: string;
 }> = {
   modified_unverified: {
     icon: CircleDashed,
-    label: '定义已更新 · 尚未运行',
-    className: 'border-amber-200 bg-amber-50 text-amber-700',
+    label: '未运行',
+    description: '定义已更新，尚未运行验证',
+    className: 'text-slate-500',
   },
   run_verified: {
     icon: PlayCircle,
-    label: '运行已通过 · 结果待验收',
-    className: 'border-blue-200 bg-blue-50 text-blue-700',
+    label: '待验收',
+    description: '运行已通过，输出结果尚未验收',
+    className: 'text-slate-500',
   },
   accepted: {
     icon: BadgeCheck,
-    label: '实际输出已验收',
-    className: 'border-emerald-200 bg-emerald-50 text-emerald-700',
+    label: '已验收',
+    description: '实际输出已通过验收',
+    className: 'text-emerald-500',
   },
 };
 
@@ -92,15 +96,15 @@ function VerificationBadge({ status, revision }: {
 }): ReactElement {
   const meta = VERIFICATION_META[status];
   const Icon = meta.icon;
+  const description = `${meta.description}${revision !== undefined ? `（版本 r${revision}）` : ''}`;
   return (
     <div
-      aria-label={`验证状态：${meta.label}`}
-      className={cn('mt-1 inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[10.5px] font-medium', meta.className)}
-      role="status"
+      aria-label={description}
+      title={description}
+      className={cn('my-1 inline-flex items-center gap-1 text-[11px] leading-5', meta.className)}
     >
-      <Icon className="h-3 w-3 shrink-0" strokeWidth={1.8} />
+      <Icon aria-hidden="true" className="h-3 w-3 shrink-0" strokeWidth={1.8} />
       <span>{meta.label}</span>
-      {revision !== undefined && <span className="font-mono text-[9.5px] opacity-70">r{revision}</span>}
     </div>
   );
 }

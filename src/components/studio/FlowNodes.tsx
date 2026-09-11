@@ -81,8 +81,6 @@ export function RpaStepNode({ data, selected }: NodeProps<Node<RpaNodeData>>): R
           boxShadow: `0 0 0 3px ${style.accent}38, 0 4px 20px rgba(15,23,42,0.12)`,
         } : undefined}
       >
-        <div aria-hidden="true" className={cn('h-1 w-full', NODE_STATUS[data.status].bar)} />
-
         {data.breakpoint && (
           <span
             className="absolute left-2.5 top-2.5 z-(--z-sticky) grid h-2.5 w-2.5 place-items-center rounded-full bg-red-500 ring-2 ring-white"
