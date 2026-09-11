@@ -163,3 +163,28 @@ def test_configure_storage_warns_instead_of_failing_silently(
         ScraplingRunner(storage_dir=str(tmp_path))
 
     assert "自动重定位" in caplog.text
+
+
+def test_plain_text_extracts_descendants_and_excludes_script_style(tmp_path: Path) -> None:
+    page = _page('<html><body><main><h1>帖子标题</h1><p>正文<b>内容</b></p></main>'
+                 '<script>secret_script()</script><style>.hidden{}</style></body></html>', str(tmp_path))
+    result = ScraplingRunner()._extract_values(page, _request("body"))
+    assert result == ["帖子标题\n正文\n内容"]
+
+
+async def test_empty_values_remain_observable_without_claiming_data(monkeypatch) -> None:
+    from scrapling.parser import Selector
+
+    runner = ScraplingRunner()
+    async def fetch(url):
+        return Selector("<html><body><div></div></body></html>")
+    monkeypatch.setattr(runner, "_fetch_static_async", fetch)
+    logs = []
+    async def log(level, message, detail):
+        logs.append((level, message, detail))
+    result = await runner.run("empty", _request("body", adaptive=False, autoSave=False), log)
+    assert result.values == [""]
+    assert result.count == 1
+    assert logs[-1][0] == "warn"
+    assert "非空 0 项" in logs[-1][1]
+    assert "命中 1 条数据" not in logs[-1][1]

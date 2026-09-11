@@ -442,7 +442,7 @@ class TaskManager:
                 progress=RuntimeProgress(current_step=total_steps, total_steps=total_steps, percent=100, elapsed_ms=elapsed_ms),
             )
             await self._append_log(record, "success", "结果已保存", artifact.storage_url, node_id=record.active_node_id or "end")
-            await self._append_log(record, "success", "任务完成", f"命中 {result.count} 条", node_id="end")
+            await self._append_log(record, "success", "任务完成", f"提取结果 {result.count} 项", node_id="end")
             await self._notify_flow_run_complete(record, "success")
         except asyncio.CancelledError:
             await self._update_snapshot(record, status="stopped")

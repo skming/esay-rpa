@@ -74,7 +74,12 @@ class ScraplingRunner:
         except Exception as exc:
             raise RuntimeError(self._format_runtime_error(exc, request)) from exc
 
-        await on_log("success", f"采集完成 · 命中 {len(raw_result.values)} 条数据", None)
+        non_empty = sum(bool(value.strip()) for value in raw_result.values)
+        await on_log(
+            "success" if non_empty else "warn",
+            f"提取完成 · 返回 {len(raw_result.values)} 项，非空 {non_empty} 项",
+            None if non_empty else "未提取到非空内容；是否允许空结果由交付验收契约判断。",
+        )
         return ScrapeResult(
             url=str(request.target_url),
             selector=request.selector,
@@ -145,7 +150,7 @@ class ScraplingRunner:
             # 页面级 "sel::text" 取的是直接文本子节点、不含后代，./text() 与之逐字等价；
             # 元素级 el.css("::text") 会把后代文本也捞进来，换掉会改变既有流程的输出。
             return [str(t) for el in elements for t in el.xpath("./text()").getall()]
-        return [str(getattr(el, "text", el)) for el in elements]
+        return [str(el.get_all_text(strip=True)) for el in elements]
 
     @staticmethod
     def _select(page: Any, selector: str, request: RunTaskRequest) -> Any:
@@ -170,7 +175,7 @@ class ScraplingRunner:
             return []
         if not isinstance(results, (list, tuple)):
             results = [results]
-        return [str(getattr(el, "text", el)) for el in results if el is not None]
+        return [str(el.get_all_text(strip=True)) for el in results if el is not None]
 
     @staticmethod
     def _extract_similar(page: Any, selector: str) -> list[str]:
@@ -186,7 +191,7 @@ class ScraplingRunner:
         seen: set[str] = set()
         results: list[str] = []
         for el in all_els:
-            text = str(getattr(el, "text", el) or "").strip()
+            text = str(el.get_all_text(strip=True))
             if text and text not in seen:
                 seen.add(text)
                 results.append(text)
