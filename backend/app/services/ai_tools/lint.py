@@ -17,6 +17,7 @@ from app.services.ai_tools.lint_scenarios import (
     _lint_unrolled_repeat_chain,
     _lint_visual_layout,
 )
+from app.services.ai_tools.node_fields import FIELD_ALIAS_HINTS, KNOWN_NODE_FIELDS
 from app.services.ai_tools.selectors import _detect_unsupported_css_selector_syntax
 from app.services.ai_tools.variables import (
     _CONDITION_EXPRESSION_FIELDS,
@@ -62,6 +63,7 @@ BLOCKING_LINT_ISSUES = frozenset({
     "unrolled_repeat_click_chain",
     "login_without_navigation_to_data_page",
     "probe_extract_without_continue_on_error",
+    "unread_node_field",
 })
 
 
@@ -407,6 +409,51 @@ def _lint_action_fields_for_node(
                 "换成观察结果里该元素的 selector 字段（稳定的 id/name/placeholder/aria 属性优先）；"
                 "拿不到就用 interact_page 点开控件重新观察一次再取。"
             ),
+        })
+    findings.extend(_lint_unread_node_fields(node, nid=nid, ntitle=ntitle, ntype=ntype))
+    return findings
+
+
+def _lint_unread_node_fields(
+    node: dict[str, Any],
+    *,
+    nid: str,
+    ntitle: str,
+    ntype: str,
+) -> list[dict[str, Any]]:
+    """写了平台没人读的键。
+
+    节点字段是扁平 dict，normalize 原样透传、schema 故意不约束（字段随类型变），所以键名
+    写错不会报错也不会被拦：执行层读不到就按默认值走，流程照常 success、验收照常通过，
+    只有数据是错的。pagination_sweep 就是这么过的——模型写 maxPages，执行层只读
+    maxIterations，翻页上限静默变成默认 20。
+
+    判据挂「平台任一层是否会读这个键」，不挂类型白名单：换节点、换语言，猜错键名照样拦得住。
+    """
+    unread = sorted(
+        key for key in node
+        if isinstance(key, str) and key not in KNOWN_NODE_FIELDS
+    )
+    if not unread:
+        return []
+
+    findings: list[dict[str, Any]] = []
+    for key in unread:
+        alias = FIELD_ALIAS_HINTS.get(key)
+        suggestion = (
+            f"改成 `{alias}`。"
+            if alias
+            else "查 list_node_types 里该节点类型的 key_fields，改成其中的字段名；确实不需要就删掉这个键。"
+        )
+        findings.append({
+            "severity": "warn", "node_id": nid, "node_title": ntitle,
+            "issue": "unread_node_field",
+            "message": (
+                f"节点 `{nid}`（{ntype}）写了字段 `{key}`，平台没有任何一层会读它。"
+                "这个键会被原样存下来然后忽略，运行不报错、验收也照样通过，"
+                "但它想表达的约束不会生效——错只体现在数据上。"
+            ),
+            "fix": suggestion,
         })
     return findings
 

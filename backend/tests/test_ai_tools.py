@@ -35,7 +35,7 @@ from app.services.ai_tools.diagnostics import (
     build_navigation_trace,
     build_navigation_verdict,
 )
-from app.services.ai_tools.lint import _lint_flow
+from app.services.ai_tools.lint import _lint_flow, is_blocking_finding
 from app.services.ai_tools.catalog import NODE_TYPE_CATALOG, select_node_types
 from app.services.ai_tools.lint_scenarios import (
     _lint_claimed_semantic_capability,
@@ -359,6 +359,67 @@ def test_lint_flow_reports_long_wait_and_login_detection_risk() -> None:
 
     assert any(finding["issue"] == "long_fixed_wait" for finding in findings)
     assert any(finding["issue"] == "login_detection_timeout_may_skip_login" for finding in findings)
+
+
+def test_lint_flow_rejects_node_fields_nobody_reads() -> None:
+    """写了没人读的键必须拦住：这是 pagination_sweep 真实的失败形态。
+
+    模型把翻页上限写成 maxPages，执行层只读 maxIterations，上限静默变成默认 20，
+    流程 success、验收通过、数据多了一页。只有第二组变体的外部重放才暴露出来。
+    """
+    nodes = [
+        {"id": "start", "type": "start", "position": {"x": 560, "y": 20}},
+        {
+            "id": "n_paginate",
+            "type": "browser.paginateNext",
+            "title": "累计分页行",
+            "selector": "button.next-page",
+            "targetSelector": "#grid tbody tr",
+            "outputVariable": "rows",
+            "maxPages": "${var.max_pages}",
+            "position": {"x": 560, "y": 140},
+        },
+        {"id": "end", "type": "end", "position": {"x": 560, "y": 260}},
+    ]
+    edges = [
+        {"source": "start", "target": "n_paginate"},
+        {"source": "n_paginate", "target": "end"},
+    ]
+
+    findings = _lint_flow(nodes, edges)
+    unread = [f for f in findings if f["issue"] == "unread_node_field"]
+
+    assert [f["node_id"] for f in unread] == ["n_paginate"]
+    assert "maxPages" in unread[0]["message"]
+    # 只提示「有个键没人读」不够，模型得知道改成哪个字段
+    assert "maxIterations" in unread[0]["fix"]
+    # warn 级但必须挡住 run_flow：跑完才发现等于白跑一趟真实站点
+    assert unread[0]["severity"] == "warn"
+    assert is_blocking_finding(unread[0])
+
+
+def test_lint_flow_accepts_the_page_limit_field_the_executor_actually_reads() -> None:
+    """同一个流程改用 maxIterations 就不该再报——判据挂「谁会读这个键」，不是挂字段数量。"""
+    nodes = [
+        {"id": "start", "type": "start", "position": {"x": 560, "y": 20}},
+        {
+            "id": "n_paginate",
+            "type": "browser.paginateNext",
+            "title": "累计分页行",
+            "selector": "button.next-page",
+            "targetSelector": "#grid tbody tr",
+            "outputVariable": "rows",
+            "maxIterations": "${var.max_pages}",
+            "position": {"x": 560, "y": 140},
+        },
+        {"id": "end", "type": "end", "position": {"x": 560, "y": 260}},
+    ]
+    edges = [
+        {"source": "start", "target": "n_paginate"},
+        {"source": "n_paginate", "target": "end"},
+    ]
+
+    assert not [f for f in _lint_flow(nodes, edges) if f["issue"] == "unread_node_field"]
 
 
 def test_lint_flow_rejects_temporary_element_refs_written_into_the_flow() -> None:
