@@ -505,6 +505,15 @@ class RecordingExecutor:
             audit = result.get("acceptance_audit")
             if isinstance(audit, dict):
                 summary["acceptance_audit"] = {"passed": audit.get("passed")}
+            # blocking_lint_findings 是「流程存在但跑不起来」的唯一说明，只留 status 等于
+            # 报告说了「被拦」却不说拦在哪，判节点配置/连线只能回头翻隔离库重算。
+            # issue/severity/node_id 都是判据自己产出的枚举，不含页面数据。
+            findings = result.get("lint_findings")
+            if isinstance(findings, list):
+                summary["lint_findings"] = [
+                    {k: f.get(k) for k in ("severity", "issue", "node_id")}
+                    for f in findings if isinstance(f, dict)
+                ]
             record.update(outcome="returned", result={
                 key: _redact(value) if isinstance(value, str) else value
                 for key, value in summary.items()
@@ -744,6 +753,14 @@ async def _run_model_case(
         "model_tool_evidence": deepcopy(recorder.evidence),
         "reply_tail": turn["reply"][-400:],
     }
+    # 上游一个回合都没给（配额用尽、真限流、中转根本没有这个模型）时这个案例没跑过：
+    # 没有流程、没有运行、没有可判的数据。计成 FAIL 会让「上游挂了」冒充「模型没通过」，
+    # 分母里还多一个从未执行的案例，通过率跟着失真。
+    # 判据只看有没有回合，不解析错误文本：中转把「没有这个模型」也写成 rate-limited,
+    # 按关键词分流会把两种处置（等配额 / 永远等不到）判反。
+    if metrics.rounds == 0 and turn["errors"]:
+        return _verdict(case, "model_unreachable", [], not_run=True, replay_passed=False,
+                        model_execution={"passed": False, "failures": ["上游未返回任何回合"]}, **common)
     if not flow_id:
         return _verdict(case, "no_flow_saved", [], replay_passed=False,
                         model_execution={"passed": False, "failures": ["模型未保存流程"]}, **common)
@@ -798,18 +815,27 @@ def _data_score(results: list[dict[str, Any]]) -> dict[str, Any]:
 def build_report(
     *, model: str, ran_online: bool, results: list[dict[str, Any]],
     self_check: list[dict[str, Any]], env: dict[str, str], not_run_reason: str = "",
+    served_by: str = "",
 ) -> dict[str, Any]:
+    # 上游没给回合的案例不进分母：它没跑过，既不算通过也不算失败。留在分母里
+    # 会把「4 个案例过了 2 个」这种读数变成对模型的指控，而其中一个从未执行。
+    ran = [r for r in results if not r.get("not_run")]
     return {
         "model": model,
+        # 中转没有目标模型时 _resolve_relay_model 会按 family/名称模糊匹配到另一个，
+        # 报告只写请求的 model 等于把结果挂到评测时根本没跑的模型头上。
+        "served_by": served_by,
+        "model_substituted": bool(served_by) and served_by != model.split("/", 1)[-1],
         "online_ran": ran_online,
         "not_run_reason": not_run_reason,
         # 成功率只统计模型自己生成的流程；--self-check 是手写流程，单独一栏
         "model_e2e": {
-            "cases_total": len(results),
-            "cases_passed": sum(1 for r in results if r["passed"]),
-            "replay_cases_passed": sum(1 for r in results if r.get("replay_passed")),
-            "model_execution_cases_passed": sum(1 for r in results if r.get("model_execution", {}).get("passed")),
-            **_data_score(results),
+            "cases_total": len(ran),
+            "cases_passed": sum(1 for r in ran if r["passed"]),
+            "cases_not_run": len(results) - len(ran),
+            "replay_cases_passed": sum(1 for r in ran if r.get("replay_passed")),
+            "model_execution_cases_passed": sum(1 for r in ran if r.get("model_execution", {}).get("passed")),
+            **_data_score(ran),
         },
         "self_check": {
             "cases_total": len(self_check),
@@ -823,18 +849,25 @@ def build_report(
 
 
 def print_report(report: dict[str, Any]) -> None:
+    if report.get("model_substituted"):
+        print(f"\n模型被中转替换：请求 {report['model']}，实际服务 {report['served_by']}")
     for title, key in (("模型端到端", "results"), ("自检（手写流程，不计入模型成功率）", "self_check_results")):
         rows = report.get(key) or []
         if not rows:
             continue
         print(f"\n{title}")
         for row in rows:
-            mark = "PASS" if row["passed"] else "FAIL"
+            mark = "NOT-RUN" if row.get("not_run") else "PASS" if row["passed"] else "FAIL"
             print(f"  [{mark}] {row['case']}  变体 {row['variants_passed']}/{row['variants_total']}  阶段={row['stage']}")
+            # 上游错误原样打出来：litellm 只在 stderr 留「Give Feedback / Get Help」，
+            # 真正的原因（配额用尽 / 中转没有这个模型）此前只存在 report.json 里，
+            # 看命令输出的人拿到的是一排 FAIL，方向会判到模型能力上。
+            for message in row.get("model_errors") or []:
+                print(f"         ! 上游：{message}")
             for verdict in row.get("verdicts") or []:
                 for failure in verdict.get("failures") or []:
                     print(f"         - {failure}")
-            if "replay_passed" in row:
+            if "replay_passed" in row and not row.get("not_run"):
                 print(f"         外部重放={row['replay_passed']} 模型自行验收={row['model_execution']['passed']}")
                 for failure in row["model_execution"].get("failures", []):
                     print(f"         - {failure}")
@@ -852,6 +885,8 @@ def print_report(report: dict[str, Any]) -> None:
     print(f"\n模型端到端：案例 {summary['cases_passed']}/{summary['cases_total']}，"
           f"变体 {summary['variants_passed']}/{summary['variants_total']}，"
           f"缺行 {summary['variants_missing_rows']}，多行 {summary['variants_extra_rows']}")
+    if summary.get("cases_not_run"):
+        print(f"其中 {summary['cases_not_run']} 个案例未运行（上游未返回任何回合），已排除在分母外")
     if not report["online_ran"]:
         print(f"⚠️  真实模型端到端【未运行】：{report['not_run_reason']}（exit 0，不代表通过）")
 
@@ -906,6 +941,24 @@ async def _amain(args: argparse.Namespace) -> int:
     env = apply_isolation(root)
     print(f"隔离根目录：{root}")
 
+    # 只读地算一遍中转实际会派给哪个模型：报告里必须带上，否则「qwen3.7-max 评测结果」
+    # 可能是 Qwen3.8-Flash-Next 答的。取不到（无 base_url / 中转不通）就留空，不猜。
+    served_by = ""
+    if has_key:
+        base_url = config.get_base_url_for_model(model)
+        api_key = config.get_api_key_for_model(model)
+        if base_url:
+            from app.services.ai_orchestrator import _normalize_base_url, _resolve_relay_model
+            try:
+                resolved = await _resolve_relay_model(
+                    model, _normalize_base_url(base_url), api_key or "sk-relay",
+                )
+                served_by = resolved.split("/", 1)[-1]
+            except Exception:
+                served_by = ""
+    if served_by and served_by != model.split("/", 1)[-1]:
+        print(f"注意：中转实际服务的模型是 {served_by}（请求的是 {model}）")
+
     async def _body(executor: RpaToolExecutor) -> dict[str, Any]:
         self_check: list[dict[str, Any]] = []
         results: list[dict[str, Any]] = []
@@ -920,9 +973,16 @@ async def _amain(args: argparse.Namespace) -> int:
             f"模型 {model or '(未配置 default_model)'} 无可用 API Key 或 base_url："
             "请在应用内配置模型或设置对应环境变量后重跑同一条命令"
         )
+        # 一个案例都没跑起来时整轮就是「未运行」，退出码不能是失败：否则上游限流
+        # 会在 CI 上表现成模型退化，而重跑同一条命令是唯一的处置。
+        ran = [r for r in results if not r.get("not_run")]
+        if results and not ran:
+            upstream = next((m for r in results for m in r.get("model_errors") or []), "")
+            reason = f"上游未返回任何回合：{upstream}" if upstream else "上游未返回任何回合"
         return build_report(
-            model=model, ran_online=bool(results), results=results,
+            model=model, ran_online=bool(ran), results=results,
             self_check=self_check, env=env, not_run_reason=reason,
+            served_by=served_by,
         )
 
     report = await _with_runtime(root, _body)
@@ -931,7 +991,8 @@ async def _amain(args: argparse.Namespace) -> int:
     print_report(report)
     print(f"\n报告：{path}")
     # 未运行不是失败，退出码保持 0；模型跑了但没过才算失败
-    failed = [r for r in report["results"] + report["self_check_results"] if not r["passed"]]
+    failed = [r for r in report["results"] + report["self_check_results"]
+              if not r["passed"] and not r.get("not_run")]
     return 1 if failed else 0
 
 

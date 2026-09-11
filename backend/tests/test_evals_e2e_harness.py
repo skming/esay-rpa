@@ -434,6 +434,55 @@ async def test_a_model_that_never_saved_a_flow_is_scored_as_such_not_as_wrong_da
     assert inner.runs == [], "没有流程可跑，不能糊里糊涂跑一次空的"
 
 
+class _ErroringOrchestrator:
+    """只吐 error 事件的假编排层：复现上游限流/配额用尽时一个回合都没给的情形。"""
+
+    def __init__(self, errors: list[str], usage: dict[str, Any] | None = None) -> None:
+        self._errors = errors
+        self._usage = usage
+
+    async def stream(self, messages: list[dict[str, Any]], model: str, flow_id: Any = None) -> Any:
+        assert messages and model
+        if self._usage is not None:
+            yield {"type": "usage", "usage": self._usage}
+        for message in self._errors:
+            yield {"type": "error", "message": message}
+
+
+async def test_an_upstream_that_never_answered_is_marked_not_run_not_no_flow_saved() -> None:
+    """上游一个回合都没给时阶段必须是 model_unreachable：报成 no_flow_saved 会把
+    「中转挂了」说成「模型不会建流程」，人会去翻提示词和工具 schema。"""
+    inner = _FakeExecutor([])
+    recorder = RecordingExecutor(inner)  # type: ignore[arg-type]
+    orchestrator = _ErroringOrchestrator(['code=429 reason="MONTHLY_LIMIT_EXCEEDED"'])
+
+    result = await run_model_case(orchestrator, recorder, "m", _table_case())  # type: ignore[arg-type]
+
+    assert result["stage"] == "model_unreachable"
+    assert result["not_run"] is True
+    assert result["metrics"]["rounds"] == 0
+    assert result["model_errors"] == ['code=429 reason="MONTHLY_LIMIT_EXCEEDED"']
+    assert inner.runs == []
+
+
+async def test_an_error_after_real_rounds_is_still_a_real_failure() -> None:
+    """模型答过、只是收尾时才撞上配额：案例跑过、有数据可判，不能算「未运行」。
+
+    判据只看有没有回合，不解析错误文本——中转把「没有这个模型」也写成 rate-limited，
+    按关键词分流会把两种处置（等配额 / 永远等不到）判反。
+    """
+    inner = _FakeExecutor([])
+    recorder = RecordingExecutor(inner)  # type: ignore[arg-type]
+    orchestrator = _ErroringOrchestrator(
+        ["monthly usage limit exceeded"], usage={"rounds": 13, "prompt_tokens": 290182},
+    )
+
+    result = await run_model_case(orchestrator, recorder, "m", _table_case())  # type: ignore[arg-type]
+
+    assert result.get("not_run") is None
+    assert result["stage"] == "no_flow_saved"
+
+
 async def test_the_model_case_replays_the_saved_flow_and_reports_cost() -> None:
     """模型存下流程后：按变体重放、判分，并带回本轮的轮次与 token 成本。"""
     inner = _FakeExecutor([
@@ -619,3 +668,122 @@ async def test_recorder_copies_safe_argument_diagnostics() -> None:
         {"path": [], "rule": "required", "expected": ["flow_id"]},
     ]
     assert recorder.evidence[0]["result"]["expected_parameters"] == {"required": ["flow_id"]}
+
+
+async def test_blocked_run_evidence_names_the_findings_that_blocked_it() -> None:
+    """报告只写 status='blocked_lint' 等于说「被拦了」不说「拦在哪」：
+    判节点配置和连线得回头翻隔离库重算 lint，评测结论就不再来自报告本身。"""
+    finding = {
+        "severity": "error", "issue": "forked_path_downstream_swallowed", "node_id": "n4",
+        "node_title": "读取校验结果", "message": "含页面数据的说明", "fix": "含修正建议的说明",
+    }
+
+    class Blocked:
+        async def execute(self, *args: Any) -> Any:
+            return {"status": "blocked_lint", "task_id": "", "lint_findings": [finding]}
+
+    recorder = RecordingExecutor(Blocked())
+    recorder.recording = True
+    await recorder.execute("run_flow", {"flow_id": "f1"})
+    kept = recorder.evidence[0]["result"]["lint_findings"]
+    assert kept == [{"severity": "error", "issue": "forked_path_downstream_swallowed", "node_id": "n4"}]
+    assert "message" not in kept[0] and "fix" not in kept[0]
+
+
+def test_report_says_which_model_actually_served_the_run() -> None:
+    """中转没有目标模型时会按名称模糊匹配到另一个：报告只写请求的 model，
+    等于把这次的通过率挂到评测时根本没跑的模型头上。"""
+    from evals.run_e2e import build_report
+
+    substituted = build_report(
+        model="agentrouter/claude-opus-5", ran_online=True, results=[], self_check=[],
+        env={}, served_by="claude-opus-5-20260101",
+    )
+    assert substituted["model_substituted"] is True
+    assert substituted["served_by"] == "claude-opus-5-20260101"
+
+    same = build_report(
+        model="agentrouter/claude-opus-5", ran_online=True, results=[], self_check=[],
+        env={}, served_by="claude-opus-5",
+    )
+    assert same["model_substituted"] is False
+
+    # 没连上中转（served_by 为空）时不能报成「被替换」，那会把没跑起来读成换了模型
+    unknown = build_report(
+        model="claude-opus-5", ran_online=False, results=[], self_check=[], env={},
+    )
+    assert unknown["model_substituted"] is False
+
+
+def _not_run_case(name: str, error: str) -> dict[str, Any]:
+    """上游一个回合都没给的案例，形状与 _run_model_case 的 model_unreachable 分支一致。"""
+    return {
+        "case": name, "page": "p.html", "stage": "model_unreachable", "passed": False,
+        "not_run": True, "variants_passed": 0, "variants_total": 2, "verdicts": [],
+        "replay_passed": False, "model_errors": [error],
+        "model_execution": {"passed": False, "failures": ["上游未返回任何回合"]},
+    }
+
+
+def _passed_case(name: str) -> dict[str, Any]:
+    verdicts = [{"passed": True, "failures": []}, {"passed": True, "failures": []}]
+    return {
+        "case": name, "page": "p.html", "stage": "done", "passed": True,
+        "variants_passed": 2, "variants_total": 2, "verdicts": verdicts,
+        "replay_passed": True, "model_errors": [],
+        "model_execution": {"passed": True, "failures": []},
+    }
+
+
+def test_a_case_the_upstream_never_answered_is_not_counted_as_a_failure() -> None:
+    """上游限流/配额用尽时案例根本没跑过：计进分母等于让「上游挂了」冒充「模型没通过」。
+
+    实测 gpt-5.5 那轮 4 个案例里有 1 个是 429 MONTHLY_LIMIT_EXCEEDED、rounds=0、
+    tokens=0，报告却算成 2/4——真实分母是 3，差的那一个从未执行。
+    """
+    from evals.run_e2e import build_report
+
+    report = build_report(
+        model="gpt-5.5", ran_online=True, self_check=[], env={},
+        results=[_passed_case("a"), _passed_case("b"),
+                 _not_run_case("c", 'code=429 reason="MONTHLY_LIMIT_EXCEEDED"')],
+    )
+    summary = report["model_e2e"]
+    assert summary["cases_total"] == 2
+    assert summary["cases_passed"] == 2
+    assert summary["cases_not_run"] == 1
+    # 变体分母同样不能含没跑过的案例
+    assert summary["variants_total"] == 4
+
+
+def test_every_case_unreachable_reports_not_run_rather_than_a_zero_score() -> None:
+    """一个案例都没跑起来时整轮是「未运行」，不是「0 分」。"""
+    from evals.run_e2e import build_report
+
+    report = build_report(
+        model="gpt-5.5", ran_online=False, self_check=[], env={},
+        not_run_reason="上游未返回任何回合：All available accounts are currently rate-limited.",
+        results=[_not_run_case("a", "rate-limited"), _not_run_case("b", "rate-limited")],
+    )
+    assert report["model_e2e"]["cases_total"] == 0
+    assert report["model_e2e"]["cases_not_run"] == 2
+    assert report["online_ran"] is False
+    assert "rate-limited" in report["not_run_reason"]
+
+
+def test_a_case_that_ran_and_failed_still_counts_even_with_a_late_upstream_error() -> None:
+    """配额在收尾时才打断的案例跑过、有数据可判，必须留在分母里。
+
+    gpt-5.5 的 pagination_sweep 就是这种：rounds=13、流程建好跑成功，最后一轮才撞配额。
+    误判成「未运行」会把真实的多抓一行洗掉。
+    """
+    from evals.run_e2e import build_report
+
+    late = _passed_case("pagination_sweep")
+    late.update(passed=False, variants_passed=1, model_errors=["monthly usage limit exceeded"],
+                verdicts=[{"passed": True, "failures": []},
+                          {"passed": False, "failures": ["多了这些记录：['P3-A']"], "extra": ["P3-A"]}])
+    report = build_report(model="gpt-5.5", ran_online=True, self_check=[], env={}, results=[late])
+    assert report["model_e2e"]["cases_total"] == 1
+    assert report["model_e2e"]["cases_not_run"] == 0
+    assert report["model_e2e"]["variants_extra_rows"] == 1
