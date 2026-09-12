@@ -585,6 +585,7 @@ async def _drive_model(
     """让模型自己看页面、建流程、跑一次。只收事件，不替它做任何决定。"""
     messages = _model_messages(case, url)
     texts: list[str] = []
+    response_started = False
     usage: dict[str, Any] | None = None
     errors: list[str] = []
     recorder.reset()
@@ -595,6 +596,10 @@ async def _drive_model(
             messages=messages, model=model, flow_id=None
         ):
             kind = event.get("type")
+            if kind in {"text", "thinking"} and (event.get("delta") or event.get("text")):
+                response_started = True
+            elif kind in {"tool_start", "tool_args", "tool_result"}:
+                response_started = True
             if kind == "text":
                 texts.append(str(event.get("delta") or event.get("text") or ""))
             elif kind == "usage":
@@ -607,6 +612,7 @@ async def _drive_model(
         recorder.recording = False
     return {
         "seconds": round(time.monotonic() - started, 1),
+        "response_started": response_started,
         "reply": "".join(texts)[-2000:],
         "usage": usage,
         "errors": errors,
@@ -756,11 +762,14 @@ async def _run_model_case(
     # 上游一个回合都没给（配额用尽、真限流、中转根本没有这个模型）时这个案例没跑过：
     # 没有流程、没有运行、没有可判的数据。计成 FAIL 会让「上游挂了」冒充「模型没通过」，
     # 分母里还多一个从未执行的案例，通过率跟着失真。
-    # 判据只看有没有回合，不解析错误文本：中转把「没有这个模型」也写成 rate-limited,
-    # 按关键词分流会把两种处置（等配额 / 永远等不到）判反。
-    if metrics.rounds == 0 and turn["errors"]:
+    # 完整轮次数在流结束后才增加；还需检查首轮的正文、思考和工具事件，
+    # 避免把已开始响应但中途断流的案例当成未运行。
+    if metrics.rounds == 0 and turn["errors"] and not turn["response_started"] and not recorder.calls:
         return _verdict(case, "model_unreachable", [], not_run=True, replay_passed=False,
                         model_execution={"passed": False, "failures": ["上游未返回任何回合"]}, **common)
+    if metrics.rounds == 0 and turn["errors"] and turn["response_started"]:
+        return _verdict(case, "model_response_interrupted", [], replay_passed=False,
+                        model_execution={"passed": False, "failures": ["模型首轮响应中断"]}, **common)
     if not flow_id:
         return _verdict(case, "no_flow_saved", [], replay_passed=False,
                         model_execution={"passed": False, "failures": ["模型未保存流程"]}, **common)

@@ -787,3 +787,20 @@ def test_a_case_that_ran_and_failed_still_counts_even_with_a_late_upstream_error
     assert report["model_e2e"]["cases_total"] == 1
     assert report["model_e2e"]["cases_not_run"] == 0
     assert report["model_e2e"]["variants_extra_rows"] == 1
+
+
+@pytest.mark.parametrize("event", [
+    {"type": "text", "delta": "已开始分析"},
+    {"type": "thinking", "delta": "检查页面"},
+    {"type": "tool_start", "tool": "inspect_page", "call_id": "c1"},
+])
+async def test_partial_first_response_is_interrupted_not_unreachable(event):
+    class Interrupted:
+        async def stream(self, **kwargs):
+            yield event
+            yield {"type": "error", "message": "connection reset"}
+    recorder = RecordingExecutor(_FakeExecutor([]))
+    result = await run_model_case(Interrupted(), recorder, "m", _table_case())
+    assert result["stage"] == "model_response_interrupted"
+    assert not result.get("not_run")
+    assert result["passed"] is False
