@@ -3984,3 +3984,67 @@ def test_argument_gate_keeps_nodes_patch_and_variable_dicts_open() -> None:
     for name, args in open_cases:
         assert validate_tool_arguments(name, args) is None, name
 
+
+
+async def test_inspect_page_continues_static_snapshot_without_refetch(monkeypatch):
+    from scrapling.engines.toolbelt.custom import Response
+    import app.services.ai_tools.static_page_probe as probe
+    import app.services.ai_tools.static_page_content as content
+
+    executor = RpaToolExecutor(flow_service=FakeFlowService(), task_manager=FakeTaskManager())
+    calls = []
+
+    async def blocked_browser(*args):
+        calls.append("browser")
+        return {"_browser_blocked": {"kind": "http", "status": "blocked", "http_status": 403}}
+
+    async def fetch(url):
+        calls.append("http")
+        return Response(url=url, content='<article id="article">' + ''.join(
+            f'<p>段落{i:02d}' + '正文' * 25 + '</p>' for i in range(8)
+        ) + '</article><aside id="aside"><p>旁栏内容</p></aside>',
+            status=200, reason="OK", cookies={}, headers={}, request_headers={})
+
+    monkeypatch.setattr(content, "CONTENT_BUDGET", 100)
+    monkeypatch.setattr(executor, "_inspect_page_via_browser", blocked_browser)
+    monkeypatch.setattr(probe, "_fetch_static_page", fetch)
+    first = await executor.execute("inspect_page", {"url": "https://example.com/", "scope_selector": "#article"})
+    assert first["truncated"] is True
+    second = await executor.execute("inspect_page", {"snapshot_id": first["snapshot_id"], "cursor": first["next_cursor"]})
+    assert second["status"] == "success"
+    assert "段落01" in second["page_text_sample"]
+    scoped = await executor.execute("inspect_page", {"snapshot_id": first["snapshot_id"], "scope_selector": "#aside"})
+    assert scoped["page_text_sample"] == "旁栏内容"
+    assert calls == ["browser", "http"]
+    invalid = await executor.execute("inspect_page", {"cursor": first["next_cursor"]})
+    assert invalid["status"] == "error"
+    invalid = await executor.execute("inspect_page", {"snapshot_id": first["snapshot_id"], "url": "https://example.com/"})
+    assert invalid["status"] == "error"
+    assert calls == ["browser", "http"]
+    await executor.execute("inspect_page", {"url": "https://example.com/"})
+    stale = await executor.execute("inspect_page", {"snapshot_id": first["snapshot_id"]})
+    assert stale["status"] == "error"
+    assert calls == ["browser", "http", "browser", "http"]
+
+
+async def test_static_scope_error_is_not_reported_as_page_access_denied(monkeypatch):
+    from scrapling.engines.toolbelt.custom import Response
+    import app.services.ai_tools.static_page_probe as probe
+
+    executor = RpaToolExecutor(flow_service=FakeFlowService(), task_manager=FakeTaskManager())
+
+    async def blocked_browser(*args):
+        return {"_browser_blocked": {"kind": "http", "http_status": 403}}
+
+    async def fetch(url):
+        return Response(url=url, content='<article><p>业务正文</p></article>',
+            status=200, reason="OK", cookies={}, headers={}, request_headers={})
+
+    monkeypatch.setattr(executor, "_inspect_page_via_browser", blocked_browser)
+    monkeypatch.setattr(probe, "_fetch_static_page", fetch)
+    result = await executor.execute("inspect_page", {"url": "https://example.com/", "scope_selector": "#missing"})
+    assert result["status"] == "error"
+    assert "scope_selector" in result["error"]
+    assert result["snapshot_id"]
+    recovered = await executor.execute("inspect_page", {"snapshot_id": result["snapshot_id"], "scope_selector": "article"})
+    assert recovered["status"] == "success"

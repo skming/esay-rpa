@@ -67,6 +67,7 @@ from app.services.ai_tools.page_probe_js import PAGE_PROBE_JS
 # 而 __init__ 又导入本模块，test_ai_module_layering 会判定成循环 import。
 import app.services.ai_tools.page_session as _page_session
 from app.services.ai_tools.static_page_probe import inspect_static_page
+from app.services.ai_tools.static_page_content import clear_static_snapshot, read_static_snapshot
 from app.services.ai_tools.variables import _RUNTIME_BUILTINS, _collect_defined_vars, _validate_variable_refs
 
 if TYPE_CHECKING:
@@ -1657,7 +1658,6 @@ class RpaToolExecutor:
         if task.status not in _TERMINAL:
             # 「跑得慢」和「停下来等人」都表现为非终态，但处理方式相反：前者继续等，
             # 后者重跑只会再起一个任务、把旧的留在后台继续等。这个判断由本工具给出，
-            input_values=merged_variables,
             # 不能丢给模型自己翻流程定义猜——它猜错的代价是一个孤儿任务。
             if task.status == "paused_for_human" or has_takeover_nodes:
                 result["status"] = "paused_for_human"
@@ -2394,12 +2394,19 @@ class RpaToolExecutor:
         frame_selector: str | None = None,
         tab_index: int | None = None,
         browser_executor: str | None = None,
+        snapshot_id: str | None = None,
+        cursor: str | None = None,
     ) -> dict[str, Any]:
         """浏览器通道拿不到真实页面时降级为静态抓取；两条通道都失败才终止。
 
         不传 url 时观察探索会话当前所在的页面，不重新导航——点开的下拉/日历/弹窗只存在于
         那一刻的页面上，重新 goto 会把它们全部关掉。
         """
+        if snapshot_id is not None or cursor is not None:
+            if not snapshot_id or any(value is not None for value in (url, wait_selector, frame_selector, tab_index, browser_executor)):
+                return {"status": "error", "error": "补读必须提供 snapshot_id，且只能搭配 scope_selector 和 cursor"}
+            return read_static_snapshot(snapshot_id, scope_selector, cursor)
+        clear_static_snapshot()
         if browser_executor not in (None, "playwright", "extension"):
             return {"error": "browser_executor 必须为 playwright 或 extension"}
         if browser_executor == "extension" or (browser_executor is None and _extension_page.get_channel() is not None):
@@ -2423,9 +2430,9 @@ class RpaToolExecutor:
         # 静态降级刻意放在浏览器 profile 锁和 browser context 之外：这是一次纯 HTTP 请求，
         # 既不需要浏览器进程，也不该占着跨进程的 profile 锁——最长占 20s，
         # 用户这期间点运行只会拿到「浏览器被占用」，而真正占着它的活儿跟浏览器无关。
-        static_result = await inspect_static_page(url)
+        static_result = await inspect_static_page(url, scope_selector=scope_selector) if scope_selector else await inspect_static_page(url)
         browser_attempt = {key: value for key, value in blocked.items() if key != "kind"}
-        if static_result.get("status") == "success":
+        if static_result.get("status") == "success" or static_result.get("snapshot_id"):
             static_result["requested_url"] = url
             static_result["browser_attempt"] = browser_attempt
             return static_result
@@ -2674,6 +2681,7 @@ class RpaToolExecutor:
         一次调用同时给出「做了什么」和「页面因此变成什么样」：分成两个工具时，模型经常
         操作完就去写节点，从没确认过下拉面板到底打开了没有。
         """
+        clear_static_snapshot()
         if _extension_page.get_channel() is not None or _extension_page.foreign_channel() is not None:
             return await self._interact_page_via_extension(action, element_ref, selector, value,
                                                          observation_version, scope_selector, wait_selector, wait_ms)
@@ -2830,6 +2838,8 @@ class RpaToolExecutor:
         截图必须落在 inspect_page 用的同一个页面会话上：另开一个上下文重新 goto，
         点开的下拉、日历、弹窗全部消失，模型看到的图和它刚读到的 DOM 不是同一刻的页面。
         """
+        if url is not None or browser_executor is not None:
+            clear_static_snapshot()
         if browser_executor not in (None, "playwright", "extension"):
             return {"error": "browser_executor 必须为 playwright 或 extension"}
         if browser_executor == "extension" or (browser_executor is None and _extension_page.get_channel() is not None):

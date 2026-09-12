@@ -493,11 +493,21 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "selector 时优先使用返回值；tables[].row_selector 可直接用于表格抽取。元素为空时"
                 "结合 warning 以 wait_selector 重试，登录重定向时不得把登录页 DOM 当成目标页。"
                 "降级成功时 inspection_source=scrapling_static，此时证据只覆盖纯 HTTP 通道。"
+                "静态摘要 truncated=true 时，带 snapshot_id、cursor=next_cursor 补读；partial_block=true 表示长段落片段。"
+                "也可用 snapshot_id、scope_selector 读取唯一容器。补读不请求网页，仅允许这三个参数；摘要不代表全量采集。"
             ),
             "parameters": {
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
+                    "snapshot_id": {
+                        "type": "string", "minLength": 1,
+                        "description": "静态观察返回的快照 ID；仅当前对话有效，重新观察或交互后失效",
+                    },
+                    "cursor": {
+                        "type": "string", "minLength": 1,
+                        "description": "上一段静态摘要的 next_cursor，必须搭配同一个 snapshot_id；省略从范围开头读取",
+                    },
                     "browser_executor": {
                         "type": "string", "enum": ["playwright", "extension"],
                         "description": "指定观察通道；省略沿用当前会话，初次默认 playwright。extension 读取 Chrome 当前活动网页和登录态，须省略 url；不支持 frame_selector/tab_index/full_page。",

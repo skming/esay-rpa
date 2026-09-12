@@ -9,6 +9,7 @@ from lxml.etree import ParserError
 
 from app.models.schemas import AnalyzeSiteRequest
 from app.services.site_analyzer import SiteAnalyzer
+from app.services.ai_tools.static_page_content import StaticSnapshot, clear_static_snapshot, save_static_snapshot
 
 
 _BLOCK_TEXT_MARKERS = (
@@ -29,7 +30,6 @@ _BLOCK_HTML_MARKERS = (
     "id=\"challenge-form\"",
     "turnstile",
 )
-_MAX_TEXT_SAMPLE_CHARS = 6_000
 
 
 async def _fetch_static_page(url: str) -> Any:
@@ -80,8 +80,9 @@ def _looks_like_block_page(document: Any, page_text: str, title: str, html_text:
     return False
 
 
-async def inspect_static_page(url: str, *, timeout_ms: int = 20_000) -> dict[str, Any]:
+async def inspect_static_page(url: str, *, timeout_ms: int = 20_000, scope_selector: str | None = None) -> dict[str, Any]:
     """用独立 HTTP 通道获取静态 HTML，避免把浏览器单通道失败误判成站点不可达。"""
+    clear_static_snapshot()
     try:
         page = await asyncio.wait_for(_fetch_static_page(url), timeout=timeout_ms / 1000)
     except asyncio.TimeoutError:
@@ -118,23 +119,14 @@ async def inspect_static_page(url: str, *, timeout_ms: int = 20_000) -> dict[str
             "title": title or None,
             "error": "静态抓取得到的是访问验证或拒绝页面，而不是真实业务内容",
         }
-    if not page_text:
-        return {
-            "status": "error",
-            "http_status": status,
-            "url": final_url,
-            "error": "静态抓取未取得可用正文",
-        }
-
     request = AnalyzeSiteRequest(targetUrl=url, fetcher="static", timeoutMs=timeout_ms)
     analysis = SiteAnalyzer().analyze_html(html_text=html_text, request=request)
-    return {
+    evidence = {
         "status": "success",
         "inspection_source": "scrapling_static",
         "http_status": status,
         "url": final_url,
         "title": title or analysis.title,
-        "page_text_sample": page_text[:_MAX_TEXT_SAMPLE_CHARS],
         "selector_candidates": [item.model_dump() for item in analysis.candidates],
         "has_css_in_js": analysis.has_css_in_js,
         "warnings": analysis.warnings,
@@ -145,3 +137,11 @@ async def inspect_static_page(url: str, *, timeout_ms: int = 20_000) -> dict[str
             "只能据此创建 browser.fetch；不得声称已验证点击、登录或 JavaScript 渲染交互。"
         ),
     }
+
+    snapshot = StaticSnapshot(document=document, evidence=evidence)
+    save_static_snapshot(snapshot)
+    try:
+        return snapshot.read(scope_selector)
+    except Exception as exc:
+        return {"status": "error", "snapshot_id": snapshot.id, "url": final_url,
+                "error": f"静态摘要读取失败：{exc}"}

@@ -334,6 +334,9 @@ async def close_current(reason: str = "explicit", token: str | None = None) -> s
     可重入：会话已关或已被空闲超时收走时返回 no_session / already_closed，不抛异常——
     正常结束、取消、异常三条退出路径会重叠走到这里。
     """
+    from app.services.ai_tools.static_page_content import clear_static_snapshot
+
+    clear_static_snapshot(token)
     global _current
     session = _live()
     if session is None:
