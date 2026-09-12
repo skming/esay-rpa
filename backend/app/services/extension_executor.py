@@ -19,6 +19,8 @@ from app.services.browser_action_runner import (
     SelectorConfig,
     SweepOutcome,
     _build_extract_result,
+    _apply_output_schema,
+    _with_schema_note,
     _healing_candidates,
     _normalize_action_type,
     _normalize_table_rows,
@@ -288,7 +290,7 @@ class ExtensionExecutor:
             return BrowserActionResult(action_type=action_type, detail=url, values=[url])
 
         if action_type == "browser.tab.switch":
-            index = _read_int(node, "index", default=0)
+            index = _read_int(node, "index", default=0, variables=variables)
             result = await self._bridge.execute({"type": "browser.tab.switch", "index": index}, timeout=timeout_seconds)
             url = str(result.get("url", ""))
             return BrowserActionResult(action_type=action_type, detail=url, values=[url])
@@ -334,12 +336,14 @@ class ExtensionExecutor:
             raw_values = result.get("values")
             if selector_config.extract_mode == "table":
                 rows = _normalize_table_rows(raw_values)
-                return _build_extract_result(action_type, selector_config.selector, rows)
+                rows, schema_note = _apply_output_schema(rows, node)
+                return _build_extract_result(action_type, _with_schema_note(selector_config.selector, schema_note), rows)
             if isinstance(raw_values, list):
                 values = [str(v) for v in raw_values]
             else:
                 values = [str(result.get("text", ""))]
-            return BrowserActionResult(action_type=action_type, detail=selector_config.selector, values=values)
+            rows, schema_note = _apply_output_schema(values, node)
+            return _build_extract_result(action_type, _with_schema_note(selector_config.selector, schema_note), rows)
 
         if action_type == "browser.hover":
             selector = variables.resolve_text(_read_required_string(node, "selector"))
@@ -368,7 +372,7 @@ class ExtensionExecutor:
             return BrowserActionResult(action_type=action_type, detail=selector or "(page)", values=[key])
 
         if action_type == "browser.scroll":
-            distance = _read_int(node, "distance", default=800)
+            distance = _read_int(node, "distance", default=800, variables=variables)
             await self._bridge.execute({"type": "browser.scroll", "distance": distance}, timeout=timeout_seconds)
             return BrowserActionResult(action_type=action_type, detail=str(distance), values=[str(distance)])
 
@@ -518,8 +522,8 @@ class ExtensionExecutor:
         self, selector: str, variables: RuntimeVariableStore, node: FlowNode, *, timeout_seconds: float
     ) -> int:
         selectors = _split_selector_candidates(selector)
-        delay_ms = max(0, _read_int(node, "delayMs", default=200))
-        max_iterations = max(1, _read_int(node, "maxIterations", default=len(selectors) or 1))
+        delay_ms = max(0, _read_int(node, "delayMs", default=200, variables=variables))
+        max_iterations = max(1, _read_int(node, "maxIterations", default=len(selectors) or 1, variables=variables))
         dismissed = 0
 
         for candidate in selectors[:max_iterations]:
@@ -550,8 +554,8 @@ class ExtensionExecutor:
         *,
         timeout_seconds: float,
     ) -> SweepOutcome:
-        max_iterations = max(1, _read_int(node, "maxIterations", default=5))
-        delay_ms = max(0, _read_int(node, "delayMs", default=500))
+        max_iterations = max(1, _read_int(node, "maxIterations", default=5, variables=variables))
+        delay_ms = max(0, _read_int(node, "delayMs", default=500, variables=variables))
         current_values = await self._extract_selector_values(target_selector_config, timeout_seconds=timeout_seconds)
         previous_count = len(current_values)
         counts = [previous_count]
@@ -601,8 +605,8 @@ class ExtensionExecutor:
         *,
         timeout_seconds: float,
     ) -> SweepOutcome:
-        max_iterations = max(1, _read_int(node, "maxIterations", default=20))
-        delay_ms = max(0, _read_int(node, "delayMs", default=500))
+        max_iterations = max(1, _read_int(node, "maxIterations", default=20, variables=variables))
+        delay_ms = max(0, _read_int(node, "delayMs", default=500, variables=variables))
         pages_visited = 0
         all_values: list[object] = []
         per_page_counts: list[int] = []
@@ -695,10 +699,10 @@ class ExtensionExecutor:
         timeout_seconds: float,
     ) -> SweepOutcome:
         """按 URL 逐页抓取，判据与 browser_action_runner._paginate_by_url_and_extract 一致。"""
-        max_iterations = max(1, _read_int(node, "maxIterations", default=20))
-        start_page = _read_int(node, "startPage", default=1)
-        page_step = max(1, _read_int(node, "pageStep", default=1))
-        delay_ms = max(0, _read_int(node, "delayMs", default=500))
+        max_iterations = max(1, _read_int(node, "maxIterations", default=20, variables=variables))
+        start_page = _read_int(node, "startPage", default=1, variables=variables)
+        page_step = max(1, _read_int(node, "pageStep", default=1, variables=variables))
+        delay_ms = max(0, _read_int(node, "delayMs", default=500, variables=variables))
 
         all_values: list[object] = []
         per_page_counts: list[int] = []

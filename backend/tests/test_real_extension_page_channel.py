@@ -81,6 +81,10 @@ async def test_extension_observe_act_and_document_boundaries(tmp_path, monkeypat
                 <div id="layer" role="dialog" hidden style="position:fixed;top:100px;background:white">选择日期<button id="day" onclick="document.querySelector('#start').value='2026-01-02'">2</button></div>
                 <section>Login credentials<input id="password" type="password" value="fixture-secret"></section><input id="readonly" readonly>
                 <div id="scroll" style="overflow:auto;height:40px"><div style="height:800px">滚动</div></div>
+                <section class="outer"><section class="inner"><div class="custom-table">
+                <table id="pricing"><thead><tr><th></th><th>Model Name</th><th>Ratio</th><th>Price</th></tr></thead>
+                <tbody><tr><td></td><td>model-a</td><td>1.5</td><td>$3</td></tr>
+                <tr><td></td><td>model-b</td><td>3</td><td>$6</td></tr></tbody></table></div></section></section>
                 <div id="shadow"></div><script>document.querySelector('#shadow').attachShadow({mode:'open'}).innerHTML='<button id="shadow-button">shadow</button>';</script>
                 </body></html>"""
                 await context.route("https://fixture.test/**", lambda route: route.fulfill(body=html, content_type="text/html; charset=utf-8"))
@@ -96,6 +100,13 @@ async def test_extension_observe_act_and_document_boundaries(tmp_path, monkeypat
                 assert "error" not in first, first
                 assert first["url"] == page.url
                 assert "fixture-secret" not in json.dumps(first)
+                assert len(first["tables"]) == 1, first["tables"]
+                assert await page.locator(first["tables"][0]["row_selector"]).count() == 2
+                table_result = await bridge.execute({"type": "browser.extract", "selector": "#pricing tr", "extractMode": "table"})
+                assert table_result["values"] == [
+                    {"列1": "", "Model Name": "model-a", "Ratio": "1.5", "Price": "$3"},
+                    {"列1": "", "Model Name": "model-b", "Ratio": "3", "Price": "$6"},
+                ]
                 assert first.get("date_controls"), first
                 recipe = first["date_controls"][0]["interaction_recipe"]
                 assert recipe["trigger"] == "#start" and recipe["end_input"] == "#end"

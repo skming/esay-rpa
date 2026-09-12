@@ -730,3 +730,16 @@ async def test_same_run_can_reacquire_without_deadlocking_itself() -> None:
     assert executor.lease_holder == "运行 A"
     await executor.close_context(first)
     assert executor.lease_holder is None
+
+
+async def test_table_extract_applies_output_schema_and_rejects_missing_fields():
+    bridge = FakeBridge({"browser.extract": [{"values": [{"列1": "", "Model Name": "model-a", "Ratio": "1.5", "Model priceM": "$3"}]}]})
+    executor, context = await make_context(bridge)
+    node = {"type": "browser.extract", "selector": "table tr", "extractMode": "table",
+            "outputSchema": [{"name": "Model Name", "required": True}, {"name": "Ratio", "required": True},
+                             {"name": "Price", "aliases": ["Model priceM"], "required": True}]}
+    result = await executor.run(node, RuntimeVariableStore.from_initial({}), context, timeout_ms=1000)
+    assert result.structured == [{"Model Name": "model-a", "Ratio": "1.5", "Price": "$3"}]
+    bridge._responses["browser.extract"] = [{"values": [{"Model Name": "model-a"}]}]
+    with pytest.raises(ValueError, match="必需字段未命中"):
+        await executor.run(node, RuntimeVariableStore.from_initial({}), context, timeout_ms=1000)
