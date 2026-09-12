@@ -95,11 +95,11 @@ class ScraplingRunner:
         return f"Scrapling 采集失败：{message} · {request.fetcher} · {request.target_url}"
 
     async def _run_async(self, request: RunTaskRequest) -> _RawScrapeResult:
-        # static 走原生异步 AsyncFetcher；dynamic/stealthy 内部封装 Playwright，必须放线程池。
+        # 原生异步调用让外层超时和任务取消传入抓取协程，退出其浏览器会话。
         if request.fetcher == "static":
             page = await self._fetch_static_async(str(request.target_url))
         else:
-            page = await asyncio.to_thread(self._fetch_page_sync, request)
+            page = await self._fetch_browser_async(request)
 
         values = self._extract_values(page, request)
         return _RawScrapeResult(values=values)
@@ -111,15 +111,19 @@ class ScraplingRunner:
         return await AsyncFetcher.get(url)
 
     @staticmethod
-    def _fetch_page_sync(request: RunTaskRequest) -> Any:
+    async def _fetch_browser_async(request: RunTaskRequest) -> Any:
         if request.fetcher == "dynamic":
             from scrapling.fetchers import DynamicFetcher
 
-            return DynamicFetcher.fetch(str(request.target_url), headless=True, network_idle=True)
+            return await DynamicFetcher.async_fetch(
+                str(request.target_url), headless=True, network_idle=True, timeout=request.timeout_ms,
+            )
 
         from scrapling.fetchers import StealthyFetcher
 
-        return StealthyFetcher.fetch(str(request.target_url), headless=True, network_idle=True)
+        return await StealthyFetcher.async_fetch(
+            str(request.target_url), headless=True, network_idle=True, timeout=request.timeout_ms,
+        )
 
     def _extract_values(self, page: Any, request: RunTaskRequest) -> list[str]:
         selector = request.selector or ""

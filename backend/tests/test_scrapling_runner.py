@@ -188,3 +188,49 @@ async def test_empty_values_remain_observable_without_claiming_data(monkeypatch)
     assert logs[-1][0] == "warn"
     assert "非空 0 项" in logs[-1][1]
     assert "命中 1 条数据" not in logs[-1][1]
+
+
+@pytest.mark.parametrize("fetcher_name", ["dynamic", "stealthy"])
+@pytest.mark.parametrize("finish", ["success", "cancel", "timeout"])
+async def test_browser_fetch_uses_async_api_and_propagates_cancellation(monkeypatch, fetcher_name, finish):
+    from scrapling.fetchers import DynamicFetcher, StealthyFetcher
+    from scrapling.parser import Selector
+
+    fetcher = DynamicFetcher if fetcher_name == "dynamic" else StealthyFetcher
+    started = asyncio.Event()
+    closed = asyncio.Event()
+    options = {}
+
+    async def fetch(url, **kwargs):
+        options.update(kwargs)
+        started.set()
+        try:
+            if finish != "success":
+                await asyncio.Event().wait()
+            return Selector('<article><span>结果</span></article>')
+        finally:
+            closed.set()
+
+    def sync_fetch(*args, **kwargs):
+        raise AssertionError("同步抓取不能接收任务取消")
+
+    monkeypatch.setattr(fetcher, "async_fetch", fetch)
+    monkeypatch.setattr(fetcher, "fetch", sync_fetch)
+    request = RunTaskRequest(
+        flowName="异步抓取", targetUrl="https://example.com/", selector="article",
+        fetcher=fetcher_name, timeoutMs=1000,
+    )
+    task = asyncio.create_task(ScraplingRunner().run("async-fetch", request, _noop_log))
+    if finish == "cancel":
+        await asyncio.wait_for(started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    elif finish == "timeout":
+        with pytest.raises(RuntimeError, match="采集超时"):
+            await task
+    else:
+        result = await task
+        assert result.values == ["结果"]
+    assert closed.is_set()
+    assert options == {"headless": True, "network_idle": True, "timeout": 1000}
