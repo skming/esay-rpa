@@ -753,22 +753,35 @@ function formatLogTime(date) {
 }
 
 async function generateScraplingScript(payload = {}, backendClient = new BackendClient()) {
+  let degradedReason = '';
   if (payload.backend !== 'mock') {
     try {
       return await backendClient.generateScript(payload);
-    } catch {
-      // 后端不可用时继续使用本地模板，保证桌面端离线仍可生成可编辑脚本。
+    } catch (error) {
+      // 离线模板只带流程定义、一个页面都不抓。静默换掉真脚本，UI 会照常报「已生成」，
+      // 于是失败原因必须跟着结果回到调用方，由它换成告警提示。
+      degradedReason = error instanceof Error ? error.message : String(error);
     }
   }
 
   const flowName = sanitizeComment(payload.flowName ?? '未命名流程');
   const flowDefinition = JSON.stringify(payload.flowDefinition && typeof payload.flowDefinition === 'object' ? payload.flowDefinition : {}, null, 2);
+  const degradedHeader = degradedReason === ''
+    ? []
+    : [
+      '# 后端不可用，这是离线模板：只保留流程定义，不含任何抓取逻辑。',
+      `# 失败原因：${sanitizeComment(degradedReason)}`,
+      '# 连上 Easy RPA 后端重新生成，才能得到可运行的脚本。',
+      ''
+    ];
 
   return {
     filename: `${slugify(flowName)}.py`,
     language: 'python',
     dependencies: ['scrapling[all]>=0.3.0'],
+    ...(degradedReason === '' ? {} : { degraded: true, degradedReason }),
     content: [
+      ...degradedHeader,
       'from __future__ import annotations',
       '',
       'import json',
@@ -778,10 +791,9 @@ async function generateScraplingScript(payload = {}, backendClient = new Backend
       '',
       '',
       'def run() -> dict:',
-      `    """运行从 Easy RPA 生成的 ${flowName} 全流程 Scrapling 脚本。"""`,
-      '    # 后端不可用时生成的离线模板：保留完整流程定义，便于手动补全。',
-      '    # 重新连接后端可生成包含节点映射逻辑的完整脚本。',
-      '    return {"flow": FLOW_DEFINITION}',
+      `    """离线模板：${flowName} 的流程定义，抓取逻辑需手动补全。"""`,
+      '    # 直接抛错而不是返回流程定义：打印一份 JSON 再退出 0，等于把「一条数据都没抓到」报成成功。',
+      '    raise RuntimeError("离线模板没有抓取逻辑：请连上 Easy RPA 后端重新生成脚本")',
       '',
       '',
       'if __name__ == "__main__":',
@@ -800,13 +812,15 @@ function sanitizeComment(value) {
 }
 
 function slugify(value) {
-  const ascii = String(value)
+  // 与后端 code_generator._slugify 一致按 Unicode 词字符切：只留 [a-z0-9] 会把中文流程名
+  // 整段吃掉，两个中文流程导出后都叫 rpa-flow.py，第二个直接覆盖第一个。
+  const slug = String(value)
     .trim()
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/[^\p{L}\p{N}_]+/gu, '-')
     .replace(/^-+|-+$/g, '');
 
-  return ascii.length > 0 ? ascii : 'rpa-flow';
+  return slug.length > 0 ? slug : 'rpa-flow';
 }
 
 module.exports = {
