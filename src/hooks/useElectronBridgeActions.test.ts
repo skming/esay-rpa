@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { initialEdges, initialNodes } from '../data/studioData';
 import { fetchFlowSnapshot } from '../lib/backendClient';
 import { buildFlowDefinition, restoreFlowCanvas } from '../lib/flowDefinition';
-import type { FlowSnapshot } from '../types/electron';
+import type { BridgeResult, FlowSnapshot } from '../types/electron';
 import type { RuntimeVariable } from '../types/rpa';
 import { useElectronBridgeActions, type ElectronBridgeActions } from './useElectronBridgeActions';
 
@@ -139,13 +139,15 @@ describe('脚本生成与导出', () => {
     vi.mocked(fetchFlowSnapshot).mockResolvedValue({ kind: 'ok', flow: savedFlow });
   });
 
+  // 必须自身是泛型函数：callBridge 按 <T> 分配类型，签名固定成某个具体结果的
+  // 函数赋不进去（内联 lambda 能过是因为它按上下文推断成泛型）。
   function bridgeReturning(result: unknown) {
-    return async (action: (api: import('../types/electron').RpaBridge) => Promise<{ ok: boolean; data?: unknown }>) => {
+    return async <T,>(action: (api: import('../types/electron').RpaBridge) => Promise<BridgeResult<T>>): Promise<T | null> => {
       const response = await action({
-        exportScraplingScript: async () => ({ ok: true, data: result }),
-        generateScraplingScript: async () => ({ ok: true, data: result }),
+        exportScraplingScript: async () => ({ ok: true as const, data: result as T }),
+        generateScraplingScript: async () => ({ ok: true as const, data: result as T }),
       } as unknown as import('../types/electron').RpaBridge);
-      return response.ok ? (response.data ?? null) : null;
+      return response.ok ? response.data ?? null : null;
     };
   }
 
