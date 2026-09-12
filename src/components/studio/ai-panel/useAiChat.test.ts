@@ -126,3 +126,30 @@ it('中断错误经过保存和恢复后仍保留，不变成空回复', () => {
   expect(saved[0].error).toBe('连接中断，请继续');
   expect(cleanForStore(saved)).toEqual(saved);
 });
+
+
+it('清空等待已开始的保存完成，并丢弃尚未开始的旧保存', async () => {
+  let release!: () => void;
+  const order: string[] = [];
+  const save = vi.spyOn(backend, 'saveAiChat').mockImplementation(async () => {
+    order.push('save');
+    await new Promise<void>((resolve) => { release = resolve; });
+  });
+  const remove = vi.spyOn(backend, 'deleteAiChat').mockImplementation(async () => { order.push('delete'); });
+  const stream = vi.spyOn(backend, 'streamAiChat').mockResolvedValue(new Response(null));
+  let chat!: ReturnType<typeof useAiChat>;
+  function Probe() { chat = useAiChat('clear-test'); return null; }
+  try {
+    renderToStaticMarkup(createElement(Probe));
+    await chat.send('第一条');
+    await chat.send('第二条');
+    chat.clearMessages();
+    expect(order).toEqual(['save']);
+    expect(useAiChatStore.getState().getMessages('flow_clear-test')).toEqual([]);
+    release();
+    await vi.waitFor(() => expect(order).toEqual(['save', 'delete']));
+  } finally {
+    save.mockRestore(); remove.mockRestore(); stream.mockRestore();
+    useAiChatStore.getState().clearMessages('flow_clear-test');
+  }
+});

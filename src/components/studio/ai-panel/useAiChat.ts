@@ -101,6 +101,7 @@ export function useAiChat(flowId: string | null, onFlowChanged?: (flowId: string
 
   const abortRef = useRef<AbortController | null>(null);
   const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const saveGenerationRef = useRef<Record<string, number>>({});
   // 供长生命周期异步闭包读取最新值，避免 stale capture
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
@@ -132,6 +133,7 @@ export function useAiChat(flowId: string | null, onFlowChanged?: (flowId: string
 
   // 卸载时快照 messagesRef，正在流式的回复保存到最后一个已渲染 chunk 而非静默丢弃
   useEffect(() => {
+    const generations = saveGenerationRef.current;
     return () => {
       const msgs = messagesRef.current;
       const k = keyRef.current;
@@ -139,7 +141,10 @@ export function useAiChat(flowId: string | null, onFlowChanged?: (flowId: string
       const cleaned = cleanForStore(msgs);
       // cleanup 里不能调 hook，直接取 Zustand store
       useAiChatStore.getState().setMessages(k, cleaned);
-      saveQueueRef.current = saveQueueRef.current.then(() => backendSave(k, cleaned));
+      const generation = generations[k] ?? 0;
+      saveQueueRef.current = saveQueueRef.current.then(() => {
+        if (generation === (generations[k] ?? 0)) return backendSave(k, cleaned);
+      });
     };
   }, []); // 依赖故意留空：只在最终卸载时执行
 
@@ -150,7 +155,10 @@ export function useAiChat(flowId: string | null, onFlowChanged?: (flowId: string
       const currentMsgs = messagesRef.current;
       if (currentMsgs.length > 0) {
         const cleaned = cleanForStore(currentMsgs);
-        void backendSave(key, cleaned);
+        const generation = saveGenerationRef.current[key] ?? 0;
+        saveQueueRef.current = saveQueueRef.current.then(() => {
+          if (generation === (saveGenerationRef.current[key] ?? 0)) return backendSave(key, cleaned);
+        });
         storeSetMessages(key, cleaned);
         return;
       }
@@ -185,7 +193,10 @@ export function useAiChat(flowId: string | null, onFlowChanged?: (flowId: string
     const cleaned = cleanForStore(msgs);
     storeSetMessages(k, cleaned);
     // 按产生顺序保存，不能因为上一份仍在写入就丢掉工具结果或最后一份回复。
-    saveQueueRef.current = saveQueueRef.current.then(() => backendSave(k, cleaned));
+    const generation = saveGenerationRef.current[k] ?? 0;
+    saveQueueRef.current = saveQueueRef.current.then(() => {
+      if (generation === (saveGenerationRef.current[k] ?? 0)) return backendSave(k, cleaned);
+    });
   }, [storeSetMessages]);
 
   // 落库统一放到提交之后：done/abort/流式检查点触发时 messagesRef 还停在上一次渲染，
@@ -501,17 +512,24 @@ export function useAiChat(flowId: string | null, onFlowChanged?: (flowId: string
   const clearDiff = useCallback((messageId: string) => {
     setMessages((prev) => {
       const next = prev.map((m) => (m.id === messageId ? { ...m, diffPreview: undefined } : m));
-      void backendSave(key, next);
+      const generation = saveGenerationRef.current[key] ?? 0;
+      saveQueueRef.current = saveQueueRef.current.then(() => {
+        if (generation === (saveGenerationRef.current[key] ?? 0)) return backendSave(key, next);
+      });
       storeSetMessages(key, cleanForStore(next));
       return next;
     });
   }, [key, storeSetMessages]);
 
   const clearMessages = useCallback(() => {
+    if (pending) return;
+    saveGenerationRef.current[key] = (saveGenerationRef.current[key] ?? 0) + 1;
+    messagesRef.current = [];
+    persistAfterCommitRef.current = false;
     setMessages([]);
     storeClearMessages(key);
-    void backendDelete(key);
-  }, [key, storeClearMessages]);
+    saveQueueRef.current = saveQueueRef.current.then(() => backendDelete(key));
+  }, [key, pending, storeClearMessages]);
 
   return { messages, pending, sentHistory, model, setModel, send, stop, retry, applyDiff, clearDiff, clearMessages };
 }
