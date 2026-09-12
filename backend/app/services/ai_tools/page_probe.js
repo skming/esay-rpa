@@ -403,10 +403,16 @@ export const PAGE_PROBE = (args) => {
 
     // ── 表格：标准 HTML + ARIA grid/table，外加渲染出表头行的自研组件 ──
     function bizRowSelector(tbl) {
+        const tableScope = bestSelector(tbl).selector;
+        if (tbl.tagName === 'TABLE' && tbl.querySelector('tbody > tr')) {
+            return tableScope + ' > tbody > tr';
+        }
+        if (tbl.matches('[role=grid], [role=table]') && tbl.querySelector('[role=row]')) {
+            return tableScope + ' [role=row]:has([role=cell], [role=gridcell])';
+        }
         const anc = nearestBizAncestor(tbl);
         if (!anc) return null;
         const scope = '.' + CSS.escape(anc.cls);
-        if (tbl.querySelector('tbody tr')) return scope + ' tr';
         const rowEl = tbl.querySelector('[class*="row"], [class*="__row"], [class*="-row"]');
         if (rowEl) {
             const rowCls = [...rowEl.classList].find(c =>
@@ -418,6 +424,8 @@ export const PAGE_PROBE = (args) => {
     }
     const tableElSet = new Set(queryAll(ROOTS, 'table, [role=grid], [role=table]'));
     queryAll(ROOTS, '[class]:not(table)').forEach(el => {
+        // 标准表格的祖先只是布局容器，不是另一张表。
+        if (el.querySelector('table, [role=grid], [role=table]') || el.closest('table, [role=grid], [role=table]')) return;
         if (el.querySelector('th, [role=columnheader]')) tableElSet.add(el);
     });
     const tables = [...tableElSet].slice(0, 5).map(tbl => ({
