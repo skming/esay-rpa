@@ -6,6 +6,7 @@
  *
  * 用法：
  *   node tools/dist-mac.cjs              # 交互选择架构，生成 DMG + ZIP
+ *   node tools/dist-mac.cjs --arm64      # 仅构建 Apple Silicon；--x64 构建 Intel
  *   node tools/dist-mac.cjs --dir        # 仅打包 .app，不生成 DMG/ZIP（快速预览）
  *   node tools/dist-mac.cjs --clean      # 打包前先清理 release/ + dist/
  *   node tools/dist-mac.cjs --skip-build   # 跳过前端构建（dist/ 已是最新）
@@ -45,8 +46,9 @@ function runElectronBuilder(arch, dirOnly) {
     ? { RPA_RELEASE_SIGN: '1' }
     : { CSC_IDENTITY_AUTO_DISCOVERY: 'false' };
 
-  const ebArgs = ['--config', 'electron-builder.config.cjs', `--${arch}`];
-  if (dirOnly) ebArgs.push('--dir');
+  // Explicit targets prevent target.arch in the config from adding other architectures.
+  const ebArgs = ['--config', 'electron-builder.config.cjs', '--mac',
+    ...(dirOnly ? ['dir'] : ['dmg', 'zip']), `--${arch}`, '--publish', 'never'];
 
   return new Promise((resolve, reject) => {
     w(`\n  ${pc.bold(pc.blue('▶'))}  打包 ${pc.bold(label)}\n`);
@@ -88,20 +90,25 @@ function runElectronBuilder(arch, dirOnly) {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
-    let buf = '';
-    const onData = (chunk) => {
-      buf += chunk.toString();
-      const lines = buf.split('\n');
-      buf = lines.pop();
-      lines.forEach(parseLine);
-    };
-    child.stdout.on('data', onData);
-    child.stderr.on('data', onData);
+    let output = '';
+    let spawnError;
+    for (const stream of [child.stdout, child.stderr]) {
+      let buf = '';
+      stream.setEncoding('utf8');
+      stream.on('data', chunk => {
+        output += chunk;
+        buf += chunk;
+        const lines = buf.split('\n');
+        buf = lines.pop();
+        lines.forEach(parseLine);
+      });
+      stream.on('end', () => { if (buf) parseLine(buf); });
+    }
+    child.on('error', error => { spawnError = error; });
 
-    // 仅在进程真正退出后才标记完成，避免并发构建提前结束动画
-    child.on('close', (code) => {
-      if (buf) parseLine(buf);
-      if (sub.active()) sub.finish();
+    child.on('close', (code, signal) => {
+      if (code === 0) sub.finish();
+      else sub.fail();
 
       const total = fmtMs(Date.now() - t0);
       if (code === 0) {
@@ -109,7 +116,8 @@ function runElectronBuilder(arch, dirOnly) {
         resolve();
       } else {
         w(`  ${pc.red('✗')}  打包 ${label} 失败\n`);
-        reject(new Error(`electron-builder (${arch}) 退出码 ${code}`));
+        reject(new Error([`electron-builder (${arch}) ${signal ? `被信号 ${signal} 终止` : `退出码 ${code}`}`,
+          spawnError?.message, output.trim()].filter(Boolean).join('\n')));
       }
     });
   });
@@ -132,7 +140,10 @@ async function main() {
 
   // 选择打包架构（--dir 模式默认当前架构，不弹菜单）
   let archList;
-  if (flags.dir) {
+  const requestedArchs = ['arm64', 'x64'].filter(arch => process.argv.includes(`--${arch}`));
+  if (requestedArchs.length) {
+    archList = requestedArchs;
+  } else if (flags.dir) {
     archList = [process.arch === 'x64' ? 'x64' : 'arm64'];
   } else if (IS_TTY) {
     const { arch } = await prompts({
@@ -229,4 +240,6 @@ async function main() {
   w('\n');
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { runElectronBuilder };

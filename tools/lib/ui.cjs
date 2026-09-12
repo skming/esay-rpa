@@ -84,6 +84,12 @@ function makeSubSpinner() {
       if (IS_TTY) w('\x1b[2K\x1b[G');
       w(`     ${pc.green('✓')}  ${nameOverride ?? label}  ${pc.dim(t)}\n`);
     },
+    fail() {
+      if (!active) return;
+      clearInterval(timer); timer = null; active = false;
+      if (IS_TTY) w('\x1b[2K\x1b[G');
+      w(`     ${pc.red('✗')}  ${label}\n`);
+    },
     updateLabel(newLabel) { label = newLabel; },
     active() { return active; },
   };
