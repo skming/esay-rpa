@@ -231,6 +231,26 @@ function registerIpcHandlers({
     }
   });
 
+  handle(IPC_CHANNELS.script.export, async (event, payload = {}) => {
+    try {
+      const win = getSenderWindow(event);
+      const content = typeof payload.content === 'string' ? payload.content : '';
+      const defaultName = typeof payload.filename === 'string' && payload.filename.trim() ? payload.filename : 'rpa-flow.py';
+      const result = await dialog.showSaveDialog(win ?? undefined, {
+        title: '导出 Python 脚本',
+        defaultPath: defaultName,
+        filters: [{ name: 'Python Script', extensions: ['py'] }]
+      });
+      if (result.canceled || result.filePath === undefined) {
+        return success({ canceled: true });
+      }
+      await fs.writeFile(result.filePath, content, 'utf8');
+      return success({ canceled: false, path: result.filePath, name: path.basename(result.filePath) });
+    } catch (error) {
+      return failure(error);
+    }
+  });
+
   handle(IPC_CHANNELS.picker.open, async (event, payload = {}) => {
     try {
       setMainWindow(getSenderWindow(event));

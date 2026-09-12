@@ -55,7 +55,8 @@ const IPC_CHANNELS = Object.freeze({
     list: 'runs:list'
   }),
   script: Object.freeze({
-    generate: 'script:generate'
+    generate: 'script:generate',
+    export: 'script:export'
   }),
   site: Object.freeze({
     analyze: 'site:analyze'
@@ -128,6 +129,7 @@ function createRpaBridge(ipcRenderer) {
     listRuns: (options) => invoke(IPC_CHANNELS.runs.list, options),
     listFlowRuns: (flowId, options) => invoke(IPC_CHANNELS.flows.runs, flowId, options),
     generateScraplingScript: (payload) => invoke(IPC_CHANNELS.script.generate, payload),
+    exportScraplingScript: (payload) => invoke(IPC_CHANNELS.script.export, payload),
     analyzeSite: (payload) => invoke(IPC_CHANNELS.site.analyze, payload),
     listFlows: () => invoke(IPC_CHANNELS.flows.list),
     createFlow: (payload) => invoke(IPC_CHANNELS.flows.create, payload),

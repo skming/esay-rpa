@@ -52,7 +52,8 @@ const IPC_CHANNELS = Object.freeze({
     list: 'runs:list'
   }),
   script: Object.freeze({
-    generate: 'script:generate'
+    generate: 'script:generate',
+    export: 'script:export'
   }),
   site: Object.freeze({
     analyze: 'site:analyze'
