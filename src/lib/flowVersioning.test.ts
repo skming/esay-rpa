@@ -77,3 +77,11 @@ describe('flowVersioning', () => {
     expect(updatePayload.inputVariables?.[0]?.sensitive).toBe(false);
   });
 });
+
+
+it('保存只有起止节点的草稿不提前激活，避免阻断agent继续生成', () => {
+  const current = buildFlow({ status: 'draft' });
+  const empty = { nodes: [{ id: 'start', type: 'start' }, { id: 'end', type: 'end' }], edges: [] };
+  expect(buildUpdatePayload(current, [current], empty, []).status).toBe('draft');
+  expect(buildUpdatePayload(current, [current], { ...empty, nodes: [...empty.nodes, { id: 'n1', type: 'variable.set' }] }, []).status).toBe('active');
+});

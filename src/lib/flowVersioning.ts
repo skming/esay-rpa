@@ -37,7 +37,12 @@ export function buildUpdatePayload(
     inputVariables,
     name: currentFlow.name,
     version: buildNextFlowVersion(currentFlow, flows),
-    status: 'active',
+    status: currentFlow.status === 'draft' && !(
+      Array.isArray(definition.nodes) && definition.nodes.some((node) =>
+        node !== null && typeof node === 'object'
+        && !['start', 'end'].includes(node.type ?? node.id)
+      )
+    ) ? 'draft' : 'active',
   };
 }
 
