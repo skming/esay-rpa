@@ -155,6 +155,11 @@ export type ExportLogsPayload = {
   filename?: string;
 };
 
+export type ExportScriptPayload = {
+  content: string;
+  filename?: string;
+};
+
 export type PickerResult = {
   selector: string;
   strategy: 'css' | 'xpath' | 'text';
@@ -258,6 +263,9 @@ export type GeneratedScriptResult = {
   language: 'python';
   dependencies: string[];
   content: string;
+  /** 后端不可用时为 true：内容是离线模板，不含抓取逻辑。 */
+  degraded?: boolean;
+  degradedReason?: string;
 };
 
 export type FlowStatus = 'draft' | 'active' | 'paused' | 'disabled' | 'archived';
@@ -518,6 +526,7 @@ export type RpaBridge = {
   listRuns: (options?: { flowId?: string; limit?: number }) => Promise<BridgeResult<TaskSnapshot[]>>;
   listFlowRuns: (flowId: string, options?: { limit?: number }) => Promise<BridgeResult<TaskSnapshot[]>>;
   generateScraplingScript: (payload: GenerateScriptPayload) => Promise<BridgeResult<GeneratedScriptResult>>;
+  exportScraplingScript: (payload: ExportScriptPayload) => Promise<BridgeResult<FlowFileResult>>;
   analyzeSite: (payload: AnalyzeSitePayload) => Promise<BridgeResult<SiteAnalysisResult>>;
   listFlows: () => Promise<BridgeResult<FlowSnapshot[]>>;
   createFlow: (payload: FlowSavePayload) => Promise<BridgeResult<FlowSnapshot>>;

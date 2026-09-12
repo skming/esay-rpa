@@ -109,6 +109,7 @@ export type ElectronBridgeActions = {
   provideInput: (value: string) => Promise<void>;
   resumeHumanTakeover: (resumeMode: string) => Promise<void>;
   generateScraplingScript: () => Promise<void>;
+  exportScraplingScript: (content: string, filename: string) => Promise<void>;
   analyzeCurrentSite: () => Promise<void>;
   loadRuns: (options?: { flowId?: string; limit?: number } & BridgeCallOptions) => Promise<void>;
   loadFlowRuns: (flowId: string, options?: { limit?: number } & BridgeCallOptions) => Promise<void>;
@@ -699,10 +700,21 @@ export function useElectronBridgeActions({
       },
       generateScraplingScript: async () => {
         const flowDefinition = buildFlowDefinition(flowCanvas.nodes, flowCanvas.edges, inputVariables, currentFlow?.name ?? '未命名流程');
-        const result = await callBridge((api) => api.generateScraplingScript({ adaptive: true, autoSave: true, flowDefinition, flowName: currentFlow?.name ?? '未命名流程' }));
+        const result = await callBridge((api) => api.generateScraplingScript({ flowDefinition, flowName: currentFlow?.name ?? '未命名流程' }));
         if (result !== null) {
           setGeneratedScript(result);
-          pushToast('success', `已生成 ${result.filename}`);
+          // 后端不可用时拿到的是离线模板，它一个页面都不抓：报「已生成」会让人拿着空脚本去跑。
+          if (result.degraded === true) {
+            pushToast('error', `后端不可用，已生成离线模板 ${result.filename}（不含抓取逻辑）`);
+          } else {
+            pushToast('success', `已生成 ${result.filename}`);
+          }
+        }
+      },
+      exportScraplingScript: async (content: string, filename: string) => {
+        const result = await callBridge((api) => api.exportScraplingScript({ content, filename }));
+        if (result !== null && !result.canceled && result.name !== undefined) {
+          pushToast('success', `已导出 ${result.name}`);
         }
       },
       analyzeCurrentSite: async () => {

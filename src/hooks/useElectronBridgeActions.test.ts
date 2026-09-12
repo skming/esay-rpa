@@ -132,3 +132,62 @@ describe('流程恢复的输入变量归属', () => {
     expect(readVariables()).toEqual(draftVariables);
   });
 });
+
+describe('脚本生成与导出', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(fetchFlowSnapshot).mockResolvedValue({ kind: 'ok', flow: savedFlow });
+  });
+
+  function bridgeReturning(result: unknown) {
+    return async (action: (api: import('../types/electron').RpaBridge) => Promise<{ ok: boolean; data?: unknown }>) => {
+      const response = await action({
+        exportScraplingScript: async () => ({ ok: true, data: result }),
+        generateScraplingScript: async () => ({ ok: true, data: result }),
+      } as unknown as import('../types/electron').RpaBridge);
+      return response.ok ? (response.data ?? null) : null;
+    };
+  }
+
+  it('离线模板不报「已生成」', async () => {
+    // 离线模板一个页面都不抓，成功提示会让人拿着空脚本去跑。
+    const { actions, params } = renderActions(bridgeReturning({
+      content: '# offline', degraded: true, degradedReason: 'fetch failed', dependencies: [], filename: '门店合约抓取.py', language: 'python',
+    }));
+
+    await actions.generateScraplingScript();
+
+    expect(params.setGeneratedScript).toHaveBeenCalledOnce();
+    expect(params.pushToast).toHaveBeenCalledWith('error', expect.stringContaining('离线模板'));
+  });
+
+  it('正常生成的脚本报成功', async () => {
+    const { actions, params } = renderActions(bridgeReturning({
+      content: '# real', dependencies: [], filename: '门店合约抓取.py', language: 'python',
+    }));
+
+    await actions.generateScraplingScript();
+
+    expect(params.pushToast).toHaveBeenCalledWith('success', '已生成 门店合约抓取.py');
+  });
+
+  it('导出脚本带上当前内容与文件名', async () => {
+    const exportScript = vi.fn(async () => ({ ok: true, data: { canceled: false, name: '门店合约抓取.py' } }));
+    const { actions, params } = renderActions(async (action) => {
+      const result = await action({ exportScraplingScript: exportScript } as unknown as import('../types/electron').RpaBridge);
+      return result.ok ? result.data ?? null : null;
+    });
+
+    await actions.exportScraplingScript('# content', '门店合约抓取.py');
+
+    expect(exportScript).toHaveBeenCalledWith({ content: '# content', filename: '门店合约抓取.py' });
+    expect(params.pushToast).toHaveBeenCalledWith('success', '已导出 门店合约抓取.py');
+  });
+  it('用户取消保存时不报导出成功', async () => {
+    const { actions, params } = renderActions(bridgeReturning({ canceled: true }));
+
+    await actions.exportScraplingScript('# content', '门店合约抓取.py');
+
+    expect(params.pushToast).not.toHaveBeenCalled();
+  });
+});

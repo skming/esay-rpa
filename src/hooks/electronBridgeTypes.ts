@@ -90,6 +90,7 @@ export type ElectronBridgeState = {
   resumeHumanTakeover: (resumeMode: string) => Promise<void>;
   debugControl: (command: DebugControlCommand) => void;
   generateScraplingScript: () => Promise<void>;
+  exportScraplingScript: (content: string, filename: string) => Promise<void>;
   analyzeCurrentSite: () => Promise<void>;
   loadRuns: (options?: { flowId?: string; limit?: number } & BridgeCallOptions) => Promise<void>;
   loadFlowRuns: (flowId: string, options?: { limit?: number } & BridgeCallOptions) => Promise<void>;

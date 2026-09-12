@@ -378,6 +378,16 @@ export function createBrowserBridge({ backendClient = new BackendClient() }: Bro
         return failure(error);
       }
     },
+    exportScraplingScript: async (payload): Promise<BridgeResult<FlowFileResult>> => {
+      const blob = new Blob([payload.content], { type: 'text/x-python;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.download = payload.filename ?? 'rpa-flow.py';
+      anchor.href = url;
+      anchor.click();
+      URL.revokeObjectURL(url);
+      return success({ canceled: false, name: anchor.download });
+    },
     getAppVersion: async () =>
       success({
         arch: navigator.userAgent.includes('arm64') ? 'arm64' : 'browser',
