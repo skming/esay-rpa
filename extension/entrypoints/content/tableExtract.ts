@@ -42,12 +42,11 @@ function hasHeaderCells(row: Element): boolean {
 
 function readTableHeaders(root: Element, options: HeaderReadOptions = {}): string[] {
   const allowFirstRowFallback = options.allowFirstRowFallback ?? true;
-  const tableRoot = root.closest('[role="grid"],table') ?? root;
+  const tableRoot = root.closest('[role="grid"],[role="table"],table') ?? root;
   const theadHeaders = Array.from(
     tableRoot.querySelectorAll('thead th,[role="columnheader"]'),
   )
-    .map(normalizeCellText)
-    .filter((value) => value !== '');
+    .map(normalizeCellText);
   if (theadHeaders.length > 0) return uniqueHeaders(theadHeaders);
   if (!allowFirstRowFallback) return [];
 
@@ -58,16 +57,15 @@ function readTableHeaders(root: Element, options: HeaderReadOptions = {}): strin
   return uniqueHeaders(cells);
 }
 
-function isHeaderRow(cells: string[], headers: string[]): boolean {
-  if (cells.length === 0 || headers.length === 0) return false;
-  const normalizedCells = cells.map((value) => value.trim().toLowerCase());
-  const normalizedHeaders = headers.slice(0, cells.length).map((value) => value.trim().toLowerCase());
-  return normalizedCells.every((value, index) => value === normalizedHeaders[index]);
+function isHeaderRow(row: Element): boolean {
+  if (row.closest('thead') !== null) return true;
+  const cells = Array.from(row.children).filter((child) => child.matches(TABLE_CELL_SELECTOR));
+  return cells.length > 0 && cells.every((cell) => cell.matches(HEADER_CELL_SELECTOR));
 }
 
 function buildTableRow(cells: string[], headers: string[]): ExtractedTableRow | null {
   if (cells.length === 0) return null;
-  if (headers.length >= cells.length && !isHeaderRow(cells, headers)) {
+  if (headers.length >= cells.length) {
     const row: Record<string, string> = {};
     cells.forEach((value, index) => {
       row[headers[index] ?? `列${index + 1}`] = value;
@@ -82,6 +80,7 @@ function extractRowsFromTable(table: Element): ExtractedTableRow[] {
   const rows = Array.from(table.querySelectorAll(':scope > tbody tr, :scope > tr, [role="row"]'));
   const sourceRows = rows.length > 0 ? rows : Array.from(table.querySelectorAll(TABLE_ROW_SELECTOR));
   return sourceRows
+    .filter((row) => !isHeaderRow(row))
     .map((row) => buildTableRow(readRowCells(row), headers))
     .filter((row): row is ExtractedTableRow => row !== null);
 }
@@ -101,7 +100,8 @@ export function extractTableRows(elements: Element[]): ExtractedTableRow[] {
     }
 
     if (element.matches(TABLE_ROW_SELECTOR)) {
-      const root = element.closest('[role="grid"],table');
+      if (isHeaderRow(element)) continue;
+      const root = element.closest('[role="grid"],[role="table"],table');
       const headers = root === null ? [] : readTableHeaders(root, { allowFirstRowFallback: false });
       const row = buildTableRow(readRowCells(element), headers);
       if (row !== null) rows.push(row);
@@ -120,7 +120,8 @@ export function extractTableRows(elements: Element[]): ExtractedTableRow[] {
 
     const nestedRows = Array.from(element.querySelectorAll(TABLE_ROW_SELECTOR));
     for (const rowElement of nestedRows) {
-      const root = rowElement.closest('[role="grid"],table');
+      if (isHeaderRow(rowElement)) continue;
+      const root = rowElement.closest('[role="grid"],[role="table"],table');
       const headers = root === null ? [] : readTableHeaders(root, { allowFirstRowFallback: false });
       const row = buildTableRow(readRowCells(rowElement), headers);
       if (row !== null) rows.push(row);
