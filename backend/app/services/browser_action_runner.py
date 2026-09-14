@@ -1647,7 +1647,10 @@ async def _detect_login_state(page: object, node: FlowNode, variables: RuntimeVa
 
 async def _extract_locator_values(page: object, selector_config: SelectorConfig, *, timeout: int) -> list[object]:
     locator = _target_locator(page, selector_config.selector)
-    await _first_locator(locator).wait_for(state="visible", timeout=timeout)
+    if selector_config.extract_mode == "table":
+        await _await_table_ready(page, locator, selector_config.selector, timeout=timeout)
+    else:
+        await _first_locator(locator).wait_for(state="visible", timeout=timeout)
     if "," in selector_config.selector:
         await _raise_if_union_selector_collapses(locator, selector_config.selector)
     if selector_config.extract_mode == "count":
@@ -1671,6 +1674,55 @@ async def _extract_locator_values(page: object, selector_config: SelectorConfig,
     return _clean_text_values(raw_values)
 
 
+_TABLE_READY_POLL_MS = 250
+
+
+async def _await_table_ready(page: object, locator: object, selector: str, *, timeout: int) -> None:
+    """table 模式等的是「目标区域就绪或明确空状态」，不是「首行出现」。
+
+    行选择器打在合法空表上（thead 还在、tbody 清空）永远等不到首行，旧的
+    wait_for(state="visible") 必然超时，抽取脚本里「有列标题、零数据行 = 合法空表」
+    那条判据根本走不到。反过来，探到空状态就立刻收也不行：异步表格首屏就是
+    「表壳已在、数据未到」，那样会把没加载完的数据当成空结果——所以 framed_empty
+    必须等满 timeout 仍是同一状态才认。
+    探针跑不了（非纯 CSS 的 Playwright 引擎写法、宿主没有 evaluate）时回落到首行等待。
+    """
+    evaluate = getattr(page, "evaluate", None)
+    sleep = getattr(page, "wait_for_timeout", None)
+    if not callable(evaluate) or not callable(sleep):
+        await _first_locator(locator).wait_for(state="visible", timeout=timeout)
+        return
+
+    deadline = time.monotonic() + max(0, timeout) / 1000
+    state = "nothing"
+    while True:
+        try:
+            probed = str(await evaluate(_TABLE_READY_PROBE, selector))
+        except Exception:
+            await _first_locator(locator).wait_for(state="visible", timeout=timeout)
+            return
+        if probed == "unsupported":
+            await _first_locator(locator).wait_for(state="visible", timeout=timeout)
+            return
+        # 命中了元素但里面没有表格行：等下去也不会变成表格，交给抽取脚本报 no_rows_in_scope，
+        # 错误文案只留一处。
+        if probed in ("rows_present", "matched_no_table"):
+            return
+        state = probed
+        if time.monotonic() >= deadline:
+            break
+        await sleep(_TABLE_READY_POLL_MS)
+
+    if state == "framed_empty":
+        return
+    raise RuntimeError(
+        f"extractMode=table 等了 {timeout}ms，selector {selector!r} 一个元素都没命中，"
+        "连空表的列标题行也找不到，无法区分「表格还没加载出来」和「selector 写错了」。"
+        "请核对 selector 是否指向当前页面真实存在的表格或行容器；"
+        "若目标本来就不是表格（如指标卡片、列表项），应改用 text/attribute 模式。"
+    )
+
+
 # textContent 会把内联样式和隐藏 DOM 一起交给下游；文本抽取的契约是用户可见内容，
 # 因此隐藏匹配项直接跳过，避免用 textContent 回落后把不可见模板重新带回来
 _TEXT_EXTRACT_SCRIPT = (
@@ -1683,18 +1735,57 @@ _TEXT_EXTRACT_SCRIPT = (
 )
 
 
+# 表格判据的共享前缀：抽取脚本与就绪探针必须用同一条 isHeaderRow / framed 判定。
+# 两边分岔的后果是死等——探针说「还没就绪」、脚本说「这是合法空表」，等待永远收不了。
+_TABLE_JUDGEMENT_PRELUDE = (
+    " const rowSelector = 'tr,[role=\"row\"]';"
+    # 行标题（role=rowheader / <th scope="row">）长在数据行上，必须算作数据单元格：
+    # 漏掉它那张表就少一列，后面每个值整体左移一位顶到别的字段名下——实测 ARIA 表交出
+    # {"工单号": "进行中", "状态": "8"}，四行齐全、每个字段都是错的。
+    " const cellSelector = 'td,th,[role=\"cell\"],[role=\"gridcell\"],[role=\"columnheader\"],[role=\"rowheader\"]';"
+    " const tableSelector = '[role=\"grid\"],[role=\"table\"],table';"
+    " const directCells = (row) => Array.from(row.children || []).filter((child) => child.matches && child.matches(cellSelector));"
+    # 行标题（<th scope="row"> / role=rowheader）长在数据行上，不算列标题：认了它，
+    # 首列是行标题的那条数据整行会被当表头摘掉。与 page_probe.js / tableExtract.ts 同一判据。
+    " const isColHeaderCell = (c) => {"
+    "   if (c.getAttribute && c.getAttribute('role') === 'rowheader') return false;"
+    "   if (c.tagName === 'TH' && c.getAttribute && c.getAttribute('scope') === 'row') return false;"
+    "   return c.tagName === 'TH' || (c.getAttribute && c.getAttribute('role') === 'columnheader');"
+    " };"
+    " const isHeaderRow = (row) => {"
+    "   if (row.closest && row.closest('thead')) return true;"
+    "   const cells = directCells(row);"
+    "   return cells.length > 0 && cells.every(isColHeaderCell);"
+    " };"
+    " const sourceRowsOf = (els) => els.flatMap((el) => {"
+    "   if (el.matches && el.matches(rowSelector)) return [el];"
+    "   return Array.from(el.querySelectorAll(rowSelector));"
+    " });"
+    # 「圈到了一片有列标题行的表格」是合法空表的唯一凭据：单看行数判不出来——零行既可能是
+    # 空表，也可能是 selector 没命中，而两者的出路相反。
+    " const hasFramedHeader = (els, rows) => {"
+    "   const tables = [];"
+    "   const add = (el) => { if (el && tables.indexOf(el) === -1) tables.push(el); };"
+    "   els.forEach((el) => {"
+    "     if (el.matches && el.matches(tableSelector)) add(el);"
+    "     else Array.from(el.querySelectorAll(tableSelector)).forEach(add);"
+    "   });"
+    "   rows.forEach((r) => { if (r.closest) add(r.closest(tableSelector)); });"
+    "   return tables.some((t) => Array.from(t.querySelectorAll(rowSelector)).some(isHeaderRow));"
+    " };"
+)
+
+
 _TABLE_EXTRACT_SCRIPT = (
     "(elements) => {"
     " if (!elements.length) return [];"
-    " const txt = (c) => (c && c.innerText ? c.innerText : '').replace(/\\s+/g, ' ').trim();"
+    + _TABLE_JUDGEMENT_PRELUDE
+    + " const txt = (c) => (c && c.innerText ? c.innerText : '').replace(/\\s+/g, ' ').trim();"
     " const colNo = (el) => {"
     "   const raw = el.getAttribute && (el.getAttribute('aria-colindex') || el.getAttribute('data-colindex') || el.getAttribute('data-column-index'));"
     "   const n = raw ? Number(raw) : NaN;"
     "   return Number.isFinite(n) && n > 0 ? n : null;"
     " };"
-    " const rowSelector = 'tr,[role=\"row\"]';"
-    " const cellSelector = 'td,th,[role=\"cell\"],[role=\"gridcell\"],[role=\"columnheader\"]';"
-    " const directCells = (row) => Array.from(row.children || []).filter((child) => child.matches && child.matches(cellSelector));"
     " const allCells = (row) => {"
     "   const direct = directCells(row);"
     "   if (direct.length) return direct;"
@@ -1702,7 +1793,19 @@ _TABLE_EXTRACT_SCRIPT = (
     "   return nested.filter((cell) => cell.closest(rowSelector) === row || cell.parentElement === row);"
     " };"
     " const table = elements[0].closest('table');"
-    " const root = elements[0].closest('[role=grid],table') || (table ? table.parentElement : elements[0].parentElement);"
+    " const root = elements[0].closest(tableSelector) || (table ? table.parentElement : elements[0].parentElement);"
+    # 空表头单元格必须占住列位、命名成 列N：丢掉它，后面按下标取名的每个值都整体左移一位
+    # （实测 4 列的价目表交出 {"Model Name": "", "Ratio": "model-a", ...}）。重名加 _2 后缀，
+    # 与 tableExtract.ts::uniqueHeaders 同一套规则，两条通道的字段名才对得上。
+    " const uniqueHeaders = (raw) => {"
+    "   const seen = new Map();"
+    "   return raw.map((text, i) => {"
+    "     const base = text.trim() || ('列' + (i + 1));"
+    "     const n = seen.get(base) || 0;"
+    "     seen.set(base, n + 1);"
+    "     return n === 0 ? base : (base + '_' + (n + 1));"
+    "   });"
+    " };"
     " let headerPairs = [];"
     " if (root) {"
     "   const ths = root.querySelectorAll('thead th,[role=\"columnheader\"]');"
@@ -1710,14 +1813,15 @@ _TABLE_EXTRACT_SCRIPT = (
     "     index: i + 1,"
     "     col: colNo(th),"
     "     text: txt(th.querySelector('.cell') || th)"
-    "   })).filter((h) => h.text !== '');"
+    "   }));"
     " }"
     " if (!headerPairs.length && table) {"
     "   const ths = table.querySelectorAll('thead th');"
-    "   headerPairs = Array.from(ths).map((th, i) => ({ index: i + 1, col: colNo(th), text: txt(th.querySelector('.cell') || th) })).filter((h) => h.text !== '');"
+    "   headerPairs = Array.from(ths).map((th, i) => ({ index: i + 1, col: colNo(th), text: txt(th.querySelector('.cell') || th) }));"
     " }"
-    " const headers = headerPairs.map((h) => h.text);"
-    " const headerByCol = new Map(headerPairs.filter((h) => h.col).map((h) => [h.col, h.text]));"
+    " const headers = uniqueHeaders(headerPairs.map((h) => h.text));"
+    " const headerByCol = new Map();"
+    " headerPairs.forEach((h, i) => { if (h.col) headerByCol.set(h.col, headers[i]); });"
     " const cellsOf = (row) => {"
     "   const allC = allCells(row);"
     "   if (!allC.length) return [txt(row)].filter(Boolean);"
@@ -1730,24 +1834,31 @@ _TABLE_EXTRACT_SCRIPT = (
     "   if (!hasColumnClasses) return cells.map((c) => c.text);"
     "   const obj = {};"
     "   cells.forEach((c) => {"
-    "     const key = headerByCol.get(c.col) || headers[c.index - 1] || ('col_' + c.index);"
+    "     const key = headerByCol.get(c.col) || headers[c.index - 1] || ('列' + c.index);"
     "     obj[key] = c.text;"
     "   });"
     "   return obj;"
     " };"
-    " const sourceRows = elements.flatMap((el) => {"
-    "   if (el.matches && el.matches(rowSelector)) return [el];"
-    "   return Array.from(el.querySelectorAll(rowSelector));"
-    " });"
-    " if (!sourceRows.length) return {__table_scope_error: 'no_rows_in_scope'};"
-    # 只统计含 td/gridcell 的数据表：Element UI 会把表头拆成独立的纯 th 表格，那不算另一张表
+    " const sourceRows = sourceRowsOf(elements);"
+    # 表头行必须按结构剔掉，否则空表会把表头当成唯一一条数据交出去（实测 #order-table
+    # 返回 {"编号": "编号", ...}），而「有表头、零数据行」这条判据在这里根本算不出来。
+    " const dataRows = sourceRows.filter((r) => !isHeaderRow(r));"
     " const dataOwners = [];"
     " sourceRows.forEach((r) => {"
-    "   const o = r.closest && r.closest('[role=\"grid\"],table');"
-    "   if (o && dataOwners.indexOf(o) === -1 && o.querySelector('td,[role=\"gridcell\"]')) dataOwners.push(o);"
+    "   const o = r.closest && r.closest(tableSelector);"
+    # 「这张表里有数据」的判据。漏掉 role=cell，用它的 ARIA 表永远不算数据表，
+    # 多张表圈在一起时不报错而是静默合并。
+    "   if (o && dataOwners.indexOf(o) === -1 && o.querySelector('td,[role=\"cell\"],[role=\"gridcell\"]')) dataOwners.push(o);"
     " });"
     " if (dataOwners.length > 1) return {__table_scope_error: 'multiple_tables_in_scope', tableCount: dataOwners.length};"
-    " const rows = sourceRows.map(cellsOf);"
+    # 零行有两种，出路相反：圈到了一片有表头的数据区域、此刻没有数据 = 合法空表，照常交零行
+    # （与观察侧 empty_state 同一条判据）；什么表格都没圈到才是选择器没命中。报错报反了，
+    # 模型会去改一个本来就对的选择器，或者把一份空结果当成功交出去。
+    " if (!dataRows.length) {"
+    "   if (hasFramedHeader(elements, sourceRows)) return [];"
+    "   return {__table_scope_error: 'no_rows_in_scope'};"
+    " }"
+    " const rows = dataRows.map(cellsOf);"
     " const widths = rows.map((r) => Array.isArray(r) ? r.length : Object.keys(r).length).filter((n) => n > 0);"
     " const maxW = widths.length ? Math.max.apply(null, widths) : 0;"
     " const threshold = maxW >= 3 ? Math.ceil(maxW / 2) : 1;"
@@ -1757,9 +1868,46 @@ _TABLE_EXTRACT_SCRIPT = (
     "   if (!Array.isArray(r)) return r;"
     "   if (!useHeaders) return r;"
     "   const obj = {};"
-    "   r.forEach((v, i) => { obj[useHeaders[i] || ('col_' + (i + 1))] = v; });"
+    "   r.forEach((v, i) => { obj[useHeaders[i] || ('列' + (i + 1))] = v; });"
     "   return obj;"
     " });"
+    "}"
+)
+
+
+# table 模式的就绪探针，在页面上下文按 selector 字符串跑，返回四态之一：
+# rows_present（已有数据行）/ framed_empty（圈到有列标题行的表格、此刻零数据行）/
+# matched_no_table（命中了元素但里面没有表格行）/ nothing（一个元素都没命中）。
+# 只认纯 CSS：Playwright 的 text=/xpath=/:has-text 与本仓库的 >>> 跨 frame 写法，
+# document.querySelectorAll 解析不了会抛 SyntaxError，一律报 unsupported 由调用方回落。
+_TABLE_READY_PROBE = (
+    "(selector) => {"
+    + _TABLE_JUDGEMENT_PRELUDE
+    + " const hit = (sel) => { try { return Array.from(document.querySelectorAll(sel)); } catch (e) { return null; } };"
+    " const els = hit(selector);"
+    " if (els === null) return 'unsupported';"
+    " const rows = sourceRowsOf(els);"
+    " if (rows.some((r) => !isHeaderRow(r))) return 'rows_present';"
+    " if (hasFramedHeader(els, rows)) return 'framed_empty';"
+    " if (els.length) return 'matched_no_table';"
+    # 行选择器打在空表上一个元素都命中不到（tbody 已清空），此时能证明「表在、只是没数据」的
+    # 只剩容器：按后代前缀逐级收缩，取最贴近的那一级。并集写法拆开每段都定位不到，交回落。
+    " if (selector.indexOf(',') !== -1) return 'nothing';"
+    " const parts = selector.trim().split(/\\s+/);"
+    " for (let n = parts.length - 1; n > 0; n -= 1) {"
+    "   const prefix = parts.slice(0, n).join(' ').replace(/[>+~]$/, '').trim();"
+    "   if (!prefix) continue;"
+    "   const hits = hit(prefix);"
+    "   if (hits === null || !hits.length) continue;"
+    "   const framed = hits.some((el) => {"
+    "     const t = (el.matches && el.matches(tableSelector) ? el : null)"
+    "       || (el.closest && el.closest(tableSelector))"
+    "       || (el.querySelector && el.querySelector(tableSelector));"
+    "     return !!t && Array.from(t.querySelectorAll(rowSelector)).some(isHeaderRow);"
+    "   });"
+    "   return framed ? 'framed_empty' : 'nothing';"
+    " }"
+    " return 'nothing';"
     "}"
 )
 

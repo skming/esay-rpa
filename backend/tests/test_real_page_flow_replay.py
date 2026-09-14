@@ -229,3 +229,174 @@ async def test_pagination_sweep_accumulates_every_page_and_stops_by_page_state(
     assert full.get("pages") == 3
     # 末页的判据是按钮置灰，不是「翻了 3 次」——次数写死的话页数一变就错
     assert "stop=next_button_disabled" in str(full.get("__last_detail"))
+
+
+async def test_a_sidebar_sharing_the_row_class_only_stays_out_when_the_selector_is_scoped(
+    replay: Any,
+) -> None:
+    """侧栏用同一个类名：不收在结果区里的选择器会多交两条，流程照样绿灯。
+
+    这里刻意两条都断言。只断言收窄那条，诱饵哪天失效了测试还是绿的，评测里这一案例
+    就变成白送分——而它要量的正是模型会不会圈错范围。
+    """
+    def nodes(selector: str, owner: str) -> list[dict[str, Any]]:
+        return [
+            {"id": "r1", "type": "browser.open", "targetUrl": _url("eval_repeat_list.html")},
+            {"id": "r2", "type": "browser.fill", "selector": "#q-owner", "inputValue": owner},
+            {"id": "r3", "type": "browser.click", "selector": "#q-submit"},
+            {"id": "r4", "type": "browser.extract", "selector": selector,
+             "extractMode": "text", "outputVariable": "rows"},
+        ]
+
+    scoped = await replay(nodes("#result-list .record .code", "张三"))
+    assert scoped.get("rows") == ["R-01", "R-03"], scoped.get("rows")
+
+    leaked = await replay(nodes(".record .code", "张三"))
+    assert leaked.get("rows") == ["R-01", "R-03", "R-97", "R-98"], leaked.get("rows")
+
+
+async def test_the_login_path_has_to_be_walked_before_the_target_table_exists(
+    replay: Any,
+) -> None:
+    """目标页未登录时整页换成登录表单：直接抓表拿不到任何行，得先走完登录。
+
+    会话状态在 URL 上，所以这条路径每次回放都重走一遍，不会因为浏览器里留了登录态
+    而在第二次变成「直接就有表」。
+    """
+    direct = [
+        {"id": "l1", "type": "browser.open", "targetUrl": _url("eval_login_redirect.html")},
+        {"id": "l2", "type": "browser.extract", "selector": "#username",
+         "extractMode": "count", "firstValueVariable": "login_inputs"},
+    ]
+    assert (await replay(direct)).get("login_inputs") == "1"
+
+    full = [
+        *direct[:1],
+        {"id": "l3", "type": "browser.fill", "selector": "#username", "inputValue": "${var.username}"},
+        {"id": "l4", "type": "browser.fill", "selector": "#password", "inputValue": "${var.password}"},
+        {"id": "l5", "type": "browser.click", "selector": "#login-submit"},
+        {"id": "l6", "type": "browser.waitFor", "selector": "#bill-table"},
+        {"id": "l7", "type": "browser.fill", "selector": "#q-kind", "inputValue": "${var.kind}"},
+        {"id": "l8", "type": "browser.click", "selector": "#q-submit"},
+        {"id": "l9", "type": "browser.extract", "selector": "#bill-table",
+         "extractMode": "table", "outputVariable": "rows"},
+    ]
+    store = await replay(full, {"username": "replay-user", "password": "replay-pass", "kind": "采购"})
+    assert store.get("rows") == [{"单号": "T-04", "类型": "采购", "金额": "910"}], store.get("rows")
+
+
+async def test_waiting_on_the_target_region_survives_both_the_first_paint_and_the_refill(
+    replay: Any,
+) -> None:
+    """首屏只有加载态、筛选本身也异步：等的是目标区域和回填后的行，不是固定时长。
+
+    提交后 tbody 先被清空再回填，所以第二次等的是行而不是表——表一直在，等它等不到
+    任何东西，抓回的会是上一次的结果。
+    """
+    nodes = [
+        {"id": "a1", "type": "browser.open", "targetUrl": _url("eval_async_table.html")},
+        {"id": "a2", "type": "browser.waitFor", "selector": "#bill-table"},
+        {"id": "a3", "type": "browser.fill", "selector": "#q-kind", "inputValue": "报销"},
+        {"id": "a4", "type": "browser.click", "selector": "#q-submit"},
+        {"id": "a5", "type": "browser.waitFor", "selector": "#bill-body tr"},
+        {"id": "a6", "type": "browser.extract", "selector": "#bill-table",
+         "extractMode": "table", "outputVariable": "rows"},
+    ]
+    store = await replay(nodes)
+    assert store.get("rows") == [
+        {"单号": "A-01", "类型": "报销", "金额": "1200"},
+        {"单号": "A-03", "类型": "报销", "金额": "430"},
+    ], store.get("rows")
+
+
+async def test_a_row_selector_on_a_legit_empty_table_yields_no_rows_instead_of_timing_out(
+    replay: Any,
+) -> None:
+    """合法空表（thead 在、tbody 清空）交 []：行选择器一个元素都命中不到，等的是区域不是行。
+
+    这一条走的是最慢的路径——探到「有列标题、零数据行」还要等满 NODE_TIMEOUT_MS 才认，
+    否则异步表格的首屏会被当成空结果。慢是判据的一部分，不是可以省掉的等待。
+    """
+    nodes = [
+        {"id": "e1", "type": "browser.open", "targetUrl": _url("eval_native_table.html")},
+        {"id": "e2", "type": "browser.fill", "selector": "#q-region", "inputValue": "西北"},
+        {"id": "e3", "type": "browser.click", "selector": "#q-submit"},
+        {"id": "e4", "type": "browser.extract", "selector": "#sales-body tr",
+         "extractMode": "table", "outputVariable": "rows"},
+    ]
+    store = await replay(nodes)
+    assert store.get("rows") == [], store.get("rows")
+
+
+async def test_a_selector_that_frames_no_table_still_fails_instead_of_passing_as_empty(
+    replay: Any,
+) -> None:
+    """圈到的元素里没有表格行：立刻报 no_rows_in_scope，不等、也不交空结果。
+
+    与上一条的区别全在「圈到的是不是表格」：零行两种成因的出路相反，一个要收一个要改
+    selector，混成同一个空结果就是让模型去改一个本来对的选择器。
+    """
+    nodes = [
+        {"id": "b1", "type": "browser.open", "targetUrl": _url("eval_native_table.html")},
+        {"id": "b2", "type": "browser.extract", "selector": ".query-bar",
+         "extractMode": "table", "outputVariable": "rows"},
+    ]
+    with pytest.raises(Exception) as excinfo:
+        await replay(nodes)
+    assert "没有任何表格行" in str(excinfo.value), str(excinfo.value)
+
+
+async def test_a_selector_pointing_at_no_such_table_reports_the_selector_not_the_empty_state(
+    replay: Any,
+) -> None:
+    """连空表的列标题行都找不到：等满超时后报「分不清没加载还是选择器写错」，不能交 []。"""
+    nodes = [
+        {"id": "m1", "type": "browser.open", "targetUrl": _url("eval_native_table.html")},
+        {"id": "m2", "type": "browser.extract", "selector": "#no-such-body tr",
+         "extractMode": "table", "outputVariable": "rows"},
+    ]
+    with pytest.raises(Exception) as excinfo:
+        await replay(nodes)
+    message = str(excinfo.value)
+    assert "一个元素都没命中" in message, message
+    assert "#no-such-body tr" in message, message
+
+
+async def test_the_async_first_paint_is_not_reported_as_an_empty_table(
+    replay: Any,
+) -> None:
+    """首屏连表壳都还没有就发起提取：等出来的是 4 行，不是空表。
+
+    这是「探到空状态就立刻收」的反例：本页 2.5s 后才渲染表格，提交后还要清空再回填
+    600ms。两次都不等就抓，第一次交空结果、第二次交上一轮的数据，页面全程不报错。
+    """
+    nodes = [
+        {"id": "f1", "type": "browser.open", "targetUrl": _url("eval_async_table.html")},
+        {"id": "f2", "type": "browser.extract", "selector": "#bill-body tr",
+         "extractMode": "table", "outputVariable": "first_paint"},
+        {"id": "f3", "type": "browser.fill", "selector": "#q-kind", "inputValue": "报销"},
+        {"id": "f4", "type": "browser.click", "selector": "#q-submit"},
+        {"id": "f5", "type": "browser.extract", "selector": "#bill-body tr",
+         "extractMode": "table", "outputVariable": "filtered"},
+    ]
+    store = await replay(nodes)
+    assert [row["单号"] for row in store.get("first_paint")] == ["A-01", "A-02", "A-03", "A-04"], store.get("first_paint")
+    assert [row["单号"] for row in store.get("filtered")] == ["A-01", "A-03"], store.get("filtered")
+
+
+async def test_a_blank_header_column_keeps_its_slot_on_both_channels(replay: Any) -> None:
+    """空表头列命名成 列1、列位不左移，预期值与扩展通道逐字相同。
+
+    页面是 test_real_extension_page_channel 嵌进它那张页面的同一份片段，两条通道跑的
+    是同一份 DOM、比的是同一份预期；期望值改在一边，另一边的断言会立刻红。
+    """
+    nodes = [
+        {"id": "h1", "type": "browser.open", "targetUrl": _url("table_blank_header_col.html")},
+        {"id": "h2", "type": "browser.extract", "selector": "#pricing tr",
+         "extractMode": "table", "outputVariable": "rows"},
+    ]
+    store = await replay(nodes)
+    assert store.get("rows") == [
+        {"列1": "", "Model Name": "model-a", "Ratio": "1.5", "Price": "$3"},
+        {"列1": "", "Model Name": "model-b", "Ratio": "3", "Price": "$6"},
+    ], store.get("rows")

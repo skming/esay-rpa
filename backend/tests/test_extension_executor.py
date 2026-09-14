@@ -167,6 +167,41 @@ async def test_browser_extract_table_preserves_structured_rows() -> None:
     assert result.values == ['{"姓名": "张三", "金额": "100"}', '{"姓名": "李四", "金额": "200"}']
 
 
+async def test_table_extract_raises_when_the_selector_framed_no_rows() -> None:
+    """坏选择器必须报错，不能当成「这张表此刻没有数据」。
+
+    返回空列表时流程照常成功，交出来的是一份空结果——这种失败没有任何出错迹象，
+    而两条执行通道的报错文案都来自 browser_action_runner 的同一个 guard。
+    """
+    bridge = FakeBridge(responses={"browser.extract": [{"values": {"__table_scope_error": "no_rows_in_scope"}, "count": 0}]})
+    executor, context = await make_context(bridge)
+
+    with pytest.raises(RuntimeError, match="没有任何表格行"):
+        await executor.run(
+            {"type": "browser.extract", "selector": ".stats-card", "extractMode": "table"},
+            RuntimeVariableStore.from_initial({}),
+            context,
+            timeout_ms=0,
+        )
+
+
+async def test_table_extract_raises_when_the_selector_framed_several_tables() -> None:
+    bridge = FakeBridge(responses={"browser.extract": [
+        {"values": {"__table_scope_error": "multiple_tables_in_scope", "tableCount": 3}, "count": 0},
+    ]})
+    executor, context = await make_context(bridge)
+
+    with pytest.raises(RuntimeError, match="3 张不同的表格"):
+        await executor.run(
+            {"type": "browser.extract", "selector": ".workbench-page", "extractMode": "table"},
+            RuntimeVariableStore.from_initial({}),
+            context,
+            timeout_ms=1000,
+        )
+
+    assert len(action_calls(bridge)) == 1
+
+
 async def test_browser_dismiss_skips_hidden_or_disabled_candidates() -> None:
     bridge = FakeBridge(
         responses={
@@ -743,3 +778,18 @@ async def test_table_extract_applies_output_schema_and_rejects_missing_fields():
     bridge._responses["browser.extract"] = [{"values": [{"Model Name": "model-a"}]}]
     with pytest.raises(ValueError, match="必需字段未命中"):
         await executor.run(node, RuntimeVariableStore.from_initial({}), context, timeout_ms=1000)
+
+
+async def test_table_extract_retries_missing_scope_until_rows_arrive() -> None:
+    rows = [{"A": "1"}]
+    bridge = FakeBridge(responses={"browser.extract": [
+        {"values": {"__table_scope_error": "no_rows_in_scope"}},
+        {"values": rows},
+    ]})
+    executor, context = await make_context(bridge)
+    result = await executor.run(
+        {"type": "browser.extract", "selector": "#t tr", "extractMode": "table"},
+        RuntimeVariableStore.from_initial({}), context, timeout_ms=1000,
+    )
+    assert result.structured == rows
+    assert len(action_calls(bridge)) == 2

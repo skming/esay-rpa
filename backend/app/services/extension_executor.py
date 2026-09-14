@@ -24,6 +24,7 @@ from app.services.browser_action_runner import (
     _healing_candidates,
     _normalize_action_type,
     _normalize_table_rows,
+    _raise_if_table_scope_error,
     _read_action_type,
     _read_bool,
     _read_int,
@@ -332,12 +333,14 @@ class ExtensionExecutor:
             }
             if selector_config.attribute is not None:
                 payload["attribute"] = selector_config.attribute
-            result = await self._bridge.execute(payload, timeout=timeout_seconds)
-            raw_values = result.get("values")
             if selector_config.extract_mode == "table":
+                raw_values = await self._await_table_values(payload, timeout_ms=timeout_ms)
+                _raise_if_table_scope_error(raw_values, selector_config.selector)
                 rows = _normalize_table_rows(raw_values)
                 rows, schema_note = _apply_output_schema(rows, node)
                 return _build_extract_result(action_type, _with_schema_note(selector_config.selector, schema_note), rows)
+            result = await self._bridge.execute(payload, timeout=timeout_seconds)
+            raw_values = result.get("values")
             if isinstance(raw_values, list):
                 values = [str(v) for v in raw_values]
             else:
@@ -451,6 +454,28 @@ class ExtensionExecutor:
         await self._wait_for_selector(selector, timeout_ms=timeout_ms)
         return BrowserActionResult(action_type=action_type, detail=selector, values=[selector])
 
+    async def _await_table_values(self, payload: dict[str, object], *, timeout_ms: int) -> object:
+        """table 模式等的是「目标区域就绪或明确空状态」，不是「有元素命中」。
+
+        内容脚本已按容器把零行裁成两态：空列表＝圈到了有列标题行的表、此刻没有数据行；
+        范围错标记＝什么表都没圈到。空列表不能一探到就收——异步表格的首屏和筛选回填过程
+        都是「表壳已在、数据未到」，那样会把没加载完的数据当成空结果，所以要等满超时仍是
+        空才认。选择器此刻定位不到（页面还在渲染）同理，等满超时才把内容脚本的错原样交出。
+        """
+        deadline = time.monotonic() + timeout_ms / 1000
+        while True:
+            try:
+                result = await self._bridge.execute(payload, timeout=max(1.0, timeout_ms / 1000))
+            except RuntimeError:
+                if time.monotonic() >= deadline:
+                    raise
+                await asyncio.sleep(_WAIT_POLL_INTERVAL_SECONDS)
+                continue
+            raw_values = result.get("values")
+            if not isinstance(raw_values, list) or raw_values or time.monotonic() >= deadline:
+                return raw_values
+            await asyncio.sleep(_WAIT_POLL_INTERVAL_SECONDS)
+
     async def _wait_for_selector(self, selector: str, *, timeout_ms: int) -> None:
         deadline = time.monotonic() + timeout_ms / 1000
         last_error: Exception | None = None
@@ -509,10 +534,14 @@ class ExtensionExecutor:
         }
         if selector_config.attribute is not None:
             payload["attribute"] = selector_config.attribute
+        if selector_config.extract_mode == "table":
+            # 翻页/加载更多的每一页都走这里，所以就绪等待与范围错判定必须和单次 extract 同一份：
+            # 少了 guard，圈错范围的标记会被 _normalize_table_rows 当成数据静默吞掉。
+            raw_values = await self._await_table_values(payload, timeout_ms=int(timeout_seconds * 1000))
+            _raise_if_table_scope_error(raw_values, selector_config.selector)
+            return _normalize_table_rows(raw_values)
         result = await self._bridge.execute(payload, timeout=timeout_seconds)
         values = result.get("values")
-        if selector_config.extract_mode == "table":
-            return _normalize_table_rows(values)
         if isinstance(values, list):
             return [str(v) for v in values]
         text = str(result.get("text", ""))
