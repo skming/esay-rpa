@@ -60,10 +60,6 @@ export function ModelSelector({
 
   return (
     <DropdownMenu onOpenChange={setOpen} open={open}>
-      {/* 换到 Radix 之前这里是一个 div 套 button 的手搓菜单：没有 aria-expanded /
-          aria-haspopup，选项是一排普通 button（读屏听不出「这是一组单选」，也听不出
-          哪个正在生效），Esc 关不掉、方向键不走、关闭后焦点不回来。这些都由 Radix
-          的 menu + menuitemradio 语义与焦点管理提供，不需要在这里重写一遍。 */}
       <DropdownMenuTrigger asChild disabled={disabled}>
         <button
           aria-label={`AI 模型：${currentLabel}`}

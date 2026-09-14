@@ -1101,12 +1101,7 @@ function restoreInitialEdges(): Edge[] {
   }));
 }
 
-/** 把属性面板里未点保存的草稿落到画布，返回落盘后的快照。
- *
- * 运行读的是画布节点，草稿只活在面板本地 state：改完直接点运行，跑的是改之前的值，
- * 结果还是 success，唯一提示是面板标题旁 1.5px 的小圆点。
- * 就地返回新快照而不是等 setFlowNodes 生效：状态更新要下一帧才可见，本次运行仍会拿到旧节点。
- */
+/** 提交未保存的节点草稿并返回新快照，避免本次运行读取 React 状态更新前的旧节点。 */
 function commitPendingNodeDraft(
   flowCanvas: FlowCanvasSnapshot,
   setFlowNodes: Dispatch<SetStateAction<Node<RpaNodeData>[]>>
