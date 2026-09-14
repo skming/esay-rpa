@@ -14,7 +14,7 @@ interface BridgeInstruction {
     limit?: number;
     distance?: number;
     trusted?: boolean; // true 时改走 chrome.debugger(CDP) 可信输入，规避 dispatchEvent 的 isTrusted:false
-    targetUrl?: string; // browser.open / tab.open
+    targetUrl?: string; // browser.open / tab.open / page.begin（探索会话要打开或复用的目标页）
     clearStorage?: boolean; // 插件模式暂不支持，见 navigateActiveTab
     clearCookies?: boolean;
     index?: number; // browser.tab.switch：按自动化自己持有的标签页顺序的下标（见 switchTab / ownedTabIds）
@@ -124,16 +124,80 @@ async function findActiveTab(): Promise<Browser.tabs.Tab | null> {
   return lastFocused ?? null;
 }
 
-async function beginPageExploration(): Promise<{ ok: boolean; result?: unknown; error?: string }> {
-  const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
-  if (tab?.id === undefined || !isInjectableTabUrl(tab.url)) {
-    return { ok: false, error: '当前活动标签页不是可操作的普通网页，请先切到目标网站页面再重试' };
+// hash 路由参与比对，页内锚点不参与：`#/pricing` 和 `#/dashboard` 在 HashRouter 下是两个页面，
+// 忽略 hash 会复用后者且不导航，后续动作全打在错误页面上；而 `#section` 只是同一页的位置。
+function routeHash(url: URL): string {
+  return /^#!?\//.test(url.hash) ? url.hash : '';
+}
+
+function sameTargetUrl(candidate: string | undefined, target: URL): boolean {
+  if (candidate === undefined) return false;
+  try {
+    const url = new URL(candidate);
+    return url.origin === target.origin
+      && url.pathname === target.pathname
+      && url.search === target.search
+      && routeHash(url) === routeHash(target);
+  } catch {
+    return false;
+  }
+}
+
+// 探索标签页是借用用户的，不进 ownedTabIds/controlledTabId：releasePageExploration 只清 explorationTabId，
+// 混进运行专用标签集合会留下一个指向已关闭标签的 controlledTabId。
+async function openExplorationTab(targetUrl: string): Promise<Browser.tabs.Tab | null> {
+  const created = await browser.tabs.create({ url: targetUrl, active: true });
+  if (created.id === undefined) return null;
+  await waitForTabLoad(created.id, NAVIGATION_TIMEOUT_MS);
+  return browser.tabs.get(created.id);
+}
+
+async function bindExplorationTab(
+  tab: Browser.tabs.Tab,
+  meta: { requestedUrl: string | null; reused: boolean },
+): Promise<{ ok: boolean; result?: unknown; error?: string }> {
+  if (tab.id === undefined) {
+    return { ok: false, error: '目标标签页没有身份，无法建立探索会话' };
   }
   if (explorationTabId !== null && explorationTabId !== tab.id) {
     await releasePageExploration(explorationTabId);
   }
   explorationTabId = tab.id;
-  return { ok: true, result: { tab_id: tab.id } };
+  // 落地 url 与 requested_url 分开返回：跳转到登录页时两者不同，后端据此判定访问结论。
+  return {
+    ok: true,
+    result: { tab_id: tab.id, url: tab.url ?? null, requested_url: meta.requestedUrl, reused: meta.reused },
+  };
+}
+
+async function beginPageExploration(targetUrl?: string): Promise<{ ok: boolean; result?: unknown; error?: string }> {
+  if (targetUrl === undefined) {
+    const [active] = await browser.tabs.query({ active: true, currentWindow: true });
+    if (active?.id === undefined || !isInjectableTabUrl(active.url)) {
+      return { ok: false, error: '当前活动标签页不是可操作的普通网页，请先切到目标网站页面再重试' };
+    }
+    return bindExplorationTab(active, { requestedUrl: null, reused: true });
+  }
+  if (!isInjectableTabUrl(targetUrl)) {
+    return { ok: false, error: `只能打开 http/https/file 页面：${targetUrl}` };
+  }
+  const target = new URL(targetUrl);
+  const open = await browser.tabs.query({});
+  const match = open.find((candidate) => candidate.id !== undefined && sameTargetUrl(candidate.url, target));
+  let tab: Browser.tabs.Tab | null;
+  if (match?.id !== undefined) {
+    // 目标页已经开着就复用：重开一个会丢掉用户已点开的筛选、弹窗和滚动位置。
+    if (match.windowId !== undefined) await browser.windows.update(match.windowId, { focused: true });
+    await browser.tabs.update(match.id, { active: true });
+    tab = await browser.tabs.get(match.id);
+  } else {
+    // 找不到就新开。绝不把用户正在看的标签页导航走——同 navigateActiveTab 的规则。
+    tab = await openExplorationTab(targetUrl);
+  }
+  if (tab === null) {
+    return { ok: false, error: `无法打开目标页：${targetUrl}` };
+  }
+  return bindExplorationTab(tab, { requestedUrl: targetUrl, reused: match?.id !== undefined });
 }
 
 async function resolveExplorationTab(action: BridgeInstruction['action']): Promise<Browser.tabs.Tab> {
@@ -527,7 +591,7 @@ async function handleInstruction(instruction: BridgeInstruction): Promise<void> 
   let result: { ok: boolean; result?: unknown; error?: string };
   try {
     if (action.type === 'page.begin') {
-      result = await beginPageExploration();
+      result = await beginPageExploration(action.targetUrl);
     } else if (action.type === 'page.end') {
       result = await releasePageExploration(action.explorationTabId as number);
     } else if (action.explorationTabId !== undefined) {

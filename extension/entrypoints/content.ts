@@ -310,7 +310,7 @@ async function handleAction(action: ContentAction): Promise<unknown> {
       return { ok: true };
     }
     case 'page.observe': {
-      return { ...observePage({ scope: action.scope, version: action.observationVersion }), document_id: documentId };
+      return { ...observePage({ scope: action.scope, version: action.observationVersion, includeHtml: action.includeHtml }), document_id: documentId };
     }
     case 'page.end': {
       setPageBlocked(false);

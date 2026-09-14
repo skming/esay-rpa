@@ -18,6 +18,10 @@ from app.services.ai_tools.executor import RpaToolExecutor
 from app.services.extension_bridge_service import ExtensionBridgeService
 from app.services.extension_executor import ExtensionExecutor
 
+# 与 test_real_page_flow_replay 的 Playwright 回放共用同一份片段：空表头列的命名与列位
+# 是两条通道漂移过的地方，页面各写一份就会各自漂各自的，比不出不一致。
+PRICING_TABLE = (Path(__file__).parent / "pages/table_blank_header_col.html").read_text(encoding="utf-8")
+
 
 class SocketAdapter:
     def __init__(self, socket):
@@ -81,10 +85,7 @@ async def test_extension_observe_act_and_document_boundaries(tmp_path, monkeypat
                 <div id="layer" role="dialog" hidden style="position:fixed;top:100px;background:white">选择日期<button id="day" onclick="document.querySelector('#start').value='2026-01-02'">2</button></div>
                 <section>Login credentials<input id="password" type="password" value="fixture-secret"></section><input id="readonly" readonly>
                 <div id="scroll" style="overflow:auto;height:40px"><div style="height:800px">滚动</div></div>
-                <section class="outer"><section class="inner"><div class="custom-table">
-                <table id="pricing"><thead><tr><th></th><th>Model Name</th><th>Ratio</th><th>Price</th></tr></thead>
-                <tbody><tr><td></td><td>model-a</td><td>1.5</td><td>$3</td></tr>
-                <tr><td></td><td>model-b</td><td>3</td><td>$6</td></tr></tbody></table></div></section></section>
+                """ + PRICING_TABLE + """
                 <div id="shadow"></div><script>document.querySelector('#shadow').attachShadow({mode:'open'}).innerHTML='<button id="shadow-button">shadow</button>';</script>
                 </body></html>"""
                 await context.route("https://fixture.test/**", lambda route: route.fulfill(body=html, content_type="text/html; charset=utf-8"))

@@ -266,6 +266,23 @@ export function querySelectorAllDeep(selector: string): Element[] {
   return results;
 }
 
+// 目标选择器一个元素都命中不到时，用来找「最贴近的还能定位到的那一级容器」：
+// 逐级砍掉末尾的后代段，长的在前。与 Playwright 侧 _TABLE_READY_PROBE 的收缩算法同形。
+// 并集选择器不收缩——拆开的每一段都可能各自定位不到，凑出来的容器不代表任何一段的范围。
+export function containerSelectorPrefixes(selector: string): string[] {
+  if (splitSelectorList(selector).length !== 1) return [];
+  const segments = splitCompoundSelector(selector);
+  const prefixes: string[] = [];
+  for (let count = segments.length - 1; count > 0; count -= 1) {
+    const text = segments
+      .slice(0, count)
+      .map((segment, index) => (index === 0 ? segment.text : `${segment.combinator === ' ' ? ' ' : ` ${segment.combinator} `}${segment.text}`))
+      .join('');
+    if (text !== '') prefixes.push(text);
+  }
+  return prefixes;
+}
+
 export function resolveElement(action: Pick<ContentAction, 'ref' | 'selector' | 'observationVersion'>): Element {
   if (action.ref !== undefined) return resolveRef(action.ref, action.observationVersion);
   if (action.selector !== undefined) {
@@ -404,10 +421,10 @@ export function captureSnapshot(): DomElementSummary[] {
  *   evaluate 不进去（跨源时连 contentDocument 都读不到），所以 frame 定向观察不支持。
  * - 闭合 shadow root 与「没有 shadow root」在页面脚本里无法区分，两条通道同样受限。
  */
-export function observePage(args: { scope?: string | null; version?: number }): Record<string, unknown> {
+export function observePage(args: { scope?: string | null; version?: number; includeHtml?: boolean }): Record<string, unknown> {
   resetSnapshot();
   const version = args.version ?? 0;
-  const result = PAGE_PROBE({ scope: args.scope ?? null, version });
+  const result = PAGE_PROBE({ scope: args.scope ?? null, version, includeHtml: args.includeHtml ?? false });
   const registry = (window as unknown as { __rpaProbe?: { version: number; els: Element[] } }).__rpaProbe;
   if (registry !== undefined && Array.isArray(registry.els)) {
     // 编号规则必须和探测脚本里的 'e' + index 完全一致：这里错一位，模型点的就是相邻那个元素。

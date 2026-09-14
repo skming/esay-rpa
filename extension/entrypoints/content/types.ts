@@ -85,6 +85,8 @@ export interface ContentAction {
    * 少了这个校验，上一次观察的 ref 会指向重渲染后同一位置的另一行数据。
    */
   observationVersion?: number;
+  /** page.observe 使用：额外带回整页 HTML，供后端建精简正文快照。 */
+  includeHtml?: boolean;
   documentId?: string;
   explorationTabId?: number;
 }
