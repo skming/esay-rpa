@@ -49,6 +49,7 @@ from app.services.ai_orchestrator import (  # noqa: E402
 )
 from app.services.ai_tools.diagnostics import _parse_runtime_value  # noqa: E402
 from app.services.ai_tools.executor import RpaToolExecutor  # noqa: E402
+from app.services.ai_tools.page_observation import TARGET_CONTENT_READY  # noqa: E402
 from app.services.ai_tools.schemas import TOOL_SCHEMAS  # noqa: E402
 from app.services.log_broker import LogBroker  # noqa: E402
 from app.services.runtime_factory import create_runtime_services  # noqa: E402
@@ -239,6 +240,140 @@ CASES: list[E2ECase] = [
         # 最前的写法：一旦允许 %d/%m/%Y，03/02 与 02/03 就没法区分，日月填反会判成通过。
         date_formats=("%Y-%m-%d", "%Y/%m/%d", "%Y年%m月%d日", "%Y.%m.%d"),
         note="留出页：没有数据表，只能用回读值当交付物；第二组输入的日月都小于 13，日月填反会被这一组抓到。",
+    ),
+    E2ECase(
+        name="native_table_filter",
+        page="eval_native_table.html",
+        kind="table",
+        requirement=(
+            "把页面上的地区筛成 region 并提交查询，"
+            "再把筛选后的表格抓成变量 rows（每行含 订单号、地区、金额）。"
+            "region 必须是 input_variable，运行时由 variables 传入，不要写死在节点里。"
+        ),
+        output_variable="rows",
+        id_key="订单号",
+        row_fields=("订单号", "地区", "金额"),
+        numeric_fields=("金额",),
+        date_formats=(),
+        variants=[{"region": "华东"}, {"region": "华北"}],
+        expected_records=[
+            [["N-01", "华东", "1200"], ["N-03", "华东", "430"]],
+            [["N-04", "华北", "910"]],
+        ],
+        note="原生 <table>：表头在 thead、数据在 tbody，按钮提交不监听 Enter。",
+    ),
+    E2ECase(
+        name="native_table_empty_state",
+        page="eval_native_table.html",
+        kind="table",
+        requirement=(
+            "把页面上的地区筛成 region 并提交查询，"
+            "再把筛选后的表格抓成变量 rows（每行含 订单号、地区、金额）。"
+            "查不到数据时 rows 就是空列表，这是正常结果，不要当成失败，也不要因此改选择器或重试。"
+            "region 必须是 input_variable，运行时由 variables 传入。"
+        ),
+        output_variable="rows",
+        id_key="订单号",
+        row_fields=("订单号", "地区", "金额"),
+        numeric_fields=("金额",),
+        date_formats=(),
+        # 空的那组放第一位：模型自己那次运行就得面对零行，把合法空表当成执行错误的流程
+        # 在这里就交不出验收证据，而不是等到重放才暴露。
+        variants=[{"region": "西北"}, {"region": "华南"}],
+        expected_records=[
+            [],
+            [["N-02", "华南", "860"]],
+        ],
+        note="合法空表：thead 还在、tbody 清空。报成选择器没命中会让模型去改一个本来就对的选择器。",
+    ),
+    E2ECase(
+        name="aria_table_filter",
+        page="eval_aria_table.html",
+        kind="table",
+        requirement=(
+            "把页面上的状态筛成 status 并提交筛选，"
+            "再把筛选后的表格抓成变量 rows（每行含 工单号、状态、工时）。"
+            "status 必须是 input_variable，运行时由 variables 传入。"
+        ),
+        output_variable="rows",
+        id_key="工单号",
+        row_fields=("工单号", "状态", "工时"),
+        numeric_fields=("工时",),
+        date_formats=(),
+        variants=[{"status": "进行中"}, {"status": "待开始"}],
+        expected_records=[
+            [["G-01", "进行中", "8"], ["G-03", "进行中", "13"]],
+            [["G-04", "待开始", "2"]],
+        ],
+        note="全靠 role 的表格，首列是 role=rowheader：漏掉它四行齐全但每个值左移一位顶到别的字段名下。",
+    ),
+    E2ECase(
+        name="repeat_list_scope",
+        page="eval_repeat_list.html",
+        kind="table",
+        requirement=(
+            "把页面上的负责人筛成 owner 并提交筛选，"
+            "再把结果区里每条记录的编号抓成变量 rows。"
+            "右侧「最近查看」里的记录不是结果，不能抓进来。"
+            "owner 必须是 input_variable，运行时由 variables 传入。"
+        ),
+        output_variable="rows",
+        id_key="编号",
+        row_fields=("编号",),
+        date_formats=(),
+        variants=[{"owner": "张三"}, {"owner": "王五"}],
+        expected_records=[
+            [["R-01"], ["R-03"]],
+            [["R-04"]],
+        ],
+        note="没有 table：结果是一串同构 div，侧栏用同一个类名。选择器不收在结果区里会多抓 R-97/R-98。",
+    ),
+    E2ECase(
+        name="async_table_filter",
+        page="eval_async_table.html",
+        kind="table",
+        requirement=(
+            "页面要等一会儿才渲染出来。等它出来后把类型筛成 kind 并提交查询，"
+            "再把筛选后的表格抓成变量 rows（每行含 单号、类型、金额）。"
+            "kind 必须是 input_variable，运行时由 variables 传入。"
+        ),
+        output_variable="rows",
+        id_key="单号",
+        row_fields=("单号", "类型", "金额"),
+        numeric_fields=("金额",),
+        date_formats=(),
+        variants=[{"kind": "报销"}, {"kind": "采购"}],
+        expected_records=[
+            [["A-01", "报销", "1200"], ["A-03", "报销", "430"]],
+            [["A-04", "采购", "910"]],
+        ],
+        note="首屏只有加载态，筛选本身也异步：提交后先清空再回填，不等就抓会拿到上一次的结果。",
+    ),
+    E2ECase(
+        name="login_redirect_filter",
+        page="eval_login_redirect.html",
+        kind="table",
+        requirement=(
+            "这个页面未登录时会跳到登录页。请先用 username 和 password 登录，"
+            "再把类型筛成 kind 并提交查询，"
+            "最后把筛选后的表格抓成变量 rows（每行含 单号、类型、金额）。"
+            "username、password、kind 都必须是 input_variables，运行时由 variables 传入。"
+        ),
+        output_variable="rows",
+        id_key="单号",
+        row_fields=("单号", "类型", "金额"),
+        numeric_fields=("金额",),
+        date_formats=(),
+        # 测试页不校验口令，任意非空即放行：这里的值只是占位，页面背后没有任何真实系统。
+        variants=[
+            {"username": "eval-user", "password": "eval-pass", "kind": "报销"},
+            {"username": "eval-user-2", "password": "eval-pass-2", "kind": "采购"},
+        ],
+        expected_records=[
+            [["T-01", "报销", "1200"], ["T-03", "报销", "430"]],
+            [["T-04", "采购", "910"]],
+        ],
+        note="登录跳转：直接抓目标页只会抓到登录表单，观察必须报 redirected_to_login 而不是「没有表格」。",
     ),
 ]
 
@@ -498,8 +633,10 @@ class RecordingExecutor:
             raise
         if record is not None:
             # 页面 DOM、截图和任意工具参数不进入报告；验收只保留运行身份与裁决。
+            # page_outcome 是枚举、不含页面内容，所以可以留：没有它，跳登录页、还在加载、
+            # 根本没读到 DOM 三种失败会被算成同一件事。
             summary = {
-                key: deepcopy(result[key]) for key in ("status", "flow_id", "task_id", "error", "issues", "expected_parameters")
+                key: deepcopy(result[key]) for key in ("status", "flow_id", "task_id", "error", "issues", "expected_parameters", "page_outcome")
                 if key in result
             }
             audit = result.get("acceptance_audit")
@@ -756,6 +893,7 @@ async def _run_model_case(
         "model_errors": turn["errors"],
         "model_tool_calls": [name for name, _ in recorder.calls],
         "metrics": asdict(metrics),
+        "page_observation": _observation_stats(recorder.evidence),
         "model_tool_evidence": deepcopy(recorder.evidence),
         "reply_tail": turn["reply"][-400:],
     }
@@ -808,6 +946,56 @@ async def _judge_model_execution(
     return {"passed": False, "failures": ["模型未实际运行保存的流程"]}
 
 
+def _observation_stats(evidence: list[dict[str, Any]]) -> dict[str, Any]:
+    """目标页观察成功率：观察调用里有几次真的看到了目标内容。
+
+    按 page_outcome 分桶而不是只留一个成功率：跳登录页、还在渲染、根本没读到 DOM，
+    出路分别是补登录步骤、加等待、换通道——合成一个数字就分不出该做哪一件。
+    """
+    outcomes: dict[str, int] = {}
+    for record in evidence:
+        outcome = str(record.get("result", {}).get("page_outcome") or "")
+        if outcome:
+            outcomes[outcome] = outcomes.get(outcome, 0) + 1
+    return {
+        "observations": sum(outcomes.values()),
+        "target_ready": outcomes.get(TARGET_CONTENT_READY, 0),
+        "outcomes": outcomes,
+    }
+
+
+def _cost_score(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """把各案例的观察结论与代价读数汇总成报告顶层的那几项。
+
+    重复调用与被拦调用分开记：前者是模型手上已有答案又问一遍，后者是护栏挡下的动作，
+    合起来只能说明「有浪费」，说不出该收紧护栏还是该给模型更好的证据。
+    """
+    observations = 0
+    target_ready = 0
+    outcomes: dict[str, int] = {}
+    totals = {"tool_calls": 0, "duplicate_calls": 0, "blocked_calls": 0,
+              "prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0}
+    for row in results:
+        stats = row.get("page_observation") or {}
+        observations += int(stats.get("observations") or 0)
+        target_ready += int(stats.get("target_ready") or 0)
+        for name, count in (stats.get("outcomes") or {}).items():
+            outcomes[name] = outcomes.get(name, 0) + count
+        metrics = row.get("metrics") or {}
+        for key in totals:
+            totals[key] += int(metrics.get(key) or 0)
+    return {
+        "observations": observations,
+        "observations_target_ready": target_ready,
+        "observation_outcomes": outcomes,
+        # 「有没有至少看到一次目标内容」按案例算：同一页观察三次都成功不代表多覆盖了一个页面
+        "cases_target_ready": sum(
+            1 for r in results if (r.get("page_observation") or {}).get("target_ready")
+        ),
+        **totals,
+    }
+
+
 def _data_score(results: list[dict[str, Any]]) -> dict[str, Any]:
     """数据正确性与完整性分开报：全对、少行、多行是三种不同的失败，处置也不同。"""
     variants = [v for r in results for v in r.get("verdicts") or []]
@@ -845,6 +1033,7 @@ def build_report(
             "replay_cases_passed": sum(1 for r in ran if r.get("replay_passed")),
             "model_execution_cases_passed": sum(1 for r in ran if r.get("model_execution", {}).get("passed")),
             **_data_score(ran),
+            **_cost_score(ran),
         },
         "self_check": {
             "cases_total": len(self_check),
@@ -894,6 +1083,16 @@ def print_report(report: dict[str, Any]) -> None:
     print(f"\n模型端到端：案例 {summary['cases_passed']}/{summary['cases_total']}，"
           f"变体 {summary['variants_passed']}/{summary['variants_total']}，"
           f"缺行 {summary['variants_missing_rows']}，多行 {summary['variants_extra_rows']}")
+    # 这四行是逐阶段对比的固定读数，顺序与口径不要改：换算法就对不上上一阶段的数
+    print(f"目标页观察：案例 {summary.get('cases_target_ready', 0)}/{summary['cases_total']}，"
+          f"观察 {summary.get('observations_target_ready', 0)}/{summary.get('observations', 0)}"
+          f" {summary.get('observation_outcomes') or {}}")
+    print(f"流程实际交付：{summary.get('replay_cases_passed', 0)}/{summary['cases_total']}"
+          f"（模型自行验收 {summary.get('model_execution_cases_passed', 0)}）")
+    print(f"无效工具调用：重复 {summary.get('duplicate_calls', 0)}、被拦 {summary.get('blocked_calls', 0)}"
+          f"，共调用 {summary.get('tool_calls', 0)}")
+    print(f"token：prompt {summary.get('prompt_tokens', 0)} + completion "
+          f"{summary.get('completion_tokens', 0)}（cached {summary.get('cached_tokens', 0)}）")
     if summary.get("cases_not_run"):
         print(f"其中 {summary['cases_not_run']} 个案例未运行（上游未返回任何回合），已排除在分母外")
     if not report["online_ran"]:

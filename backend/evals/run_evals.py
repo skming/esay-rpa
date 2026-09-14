@@ -667,7 +667,7 @@ SCENARIOS: list[Scenario] = [
         ),
         expect_flow_lint_error_free=True,
         # 不断言 browser.ensureLogin：无条件登录也是提示词允许的写法。
-        # 「登录后有没有再导航一次」交给 single_navigation_node 这类 error 级 lint 判
+        # 登录提交可能直接到达数据页，是否需要额外导航由页面与运行证据判定。
         expect_flow_node_types_include=["browser.open", "browser.extract"],
     ),
     Scenario(

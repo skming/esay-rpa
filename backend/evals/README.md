@@ -1,7 +1,7 @@
 # RPA 助手行为评测集
 
 改 system prompt、换模型、调整编排护栏之前后各跑一遍，对比行为是否回归。
-工具层全部 mock（不启动浏览器、不真正运行流程），只消耗 LLM tokens。
+`run_evals` 使用 mock 工具，只验证模型行为；`run_e2e` 使用真实本地页面与执行器，验证流程交付。两者在线运行都会消耗 LLM tokens。
 
 ## 运行
 
@@ -13,7 +13,7 @@ python -m evals.run_evals --only off_topic_refusal,review_request_does_not_run
 python -m evals.run_evals --reps 3            # 每场景重复 3 次，按通过率判定
 ```
 
-未配置 API Key 时自动跳过（exit 0），可安全挂进 CI。
+未配置 API Key 时跳过（exit 0）；报告必须记为未运行，不能当作通过。
 
 ### 录像与重放
 
@@ -27,17 +27,11 @@ python -m evals.run_evals --reps 3 --replay   # 只重放录像判分，不调�
 
 指纹是 `SYSTEM_PROMPT` 与 `PAGE_DISCOVERY_PROMPT` 拼起来的 SHA-256 前 12 位（两段都算，
 因为首轮探测阶段用的是后者，只算前者会让探测规则的改动共用旧录像）。指纹变了就是新目录，
-旧目录随即再也读不到——它不是历史存档，是判分对不上的样本，该删。
+重放只读取匹配指纹的目录；历史录像不能充当新提示词的评测结果。
 
-### 每次重跑都从「第一次见到这个流程」开始
+### 状态隔离
 
-修复台账、会话检查点、验证证据按 `flow_id` 落在真实 `~/.easy-rpa/ai/` 下，而所有场景共用
-`eval-flow-0001`。不清的话第 2 次重跑读到的是第 1 次的失败记录：台账摘要会作为 system 消息
-注入，selector 修复计数还会触发 `lint_diff` 的预算护栏——每个场景的输入都被上一轮污染，
-通过率既不可比也不可复现。`run_scenario` 开头的 `_reset_session_state()` 负责清这三份。
-
-不整体隔离 `RPA_APP_DATA_DIR`（测试套件那样做）：API Key 与中转地址就在那个目录里，
-隔离掉评测就没法调模型了。
+`run_scenario` 开始前通过 `_reset_session_state()` 清理评测 flow_id 的修复台账、检查点和验证证据，避免上轮结果污染输入。评测仍读取应用配置中的模型凭据，不要使用业务流程 ID。
 
 ### 提示词变更对比
 
@@ -114,60 +108,12 @@ Git revision 与候选 revision 运行同一命令，再比较逐场景通过率
 约定：**每条场景断言一个明确的行为约束**，来源应当是 system prompt 中的硬规则、
 护栏的触发条件，或历史上出过的真实事故（回归测试）。
 
-### 全套不变量：不挂在任何场景上
+### 评分与排错
 
-`_check_fabricated_write` 对每一局都判一次：回复宣称流程已落盘，但一次写入工具都没成功调过，
-即为假交付。它不挂场景，因为跟场景想测什么无关——而现有判据一条都拦不住：`expect_tool_order`
-对没发生的调用恒真，`expect_reply_contains_any` 还会因为「已创建流程」这类措辞判过。
-实测在 `guard_blocking_lint_fixed_before_run` 的录像里出现过整局零调用的假绿灯。
-
-短语表与编排层的撤回判据同一份（`ai_orchestrator._FLOW_SAVED_CLAIM_PHRASES`）：各写一份的话，
-编排层补了新说法而评测测不到，等于放掉一条已经修好的缺陷的回归。
-
-### 行为指标：断言之外的那半
-
-断言只回答「这一次对不对」，答不了「大量重复审查创建修复」——那是一个分布。一个场景可以
-每条断言都通过，却用了 18 轮、把同一个工具调了 5 次。`evals/metrics.py` 按轮数、工具调用数、
-重复调用数（与护栏共用 `call_fingerprint`，两边算法不同就会调到错的地方去）、token 与护栏
-触发分布记账，跑完打一张表。这里只记账不判定；阈值等实测基线出来再定。
-
-### 断言 run_flow 之前，先确认 fixture 推得到 VERIFY
-
-`run_flow` 只在 VERIFY 阶段才拿得到，而阶段由 fixture 决定的事实（有没有节点、有没有阻断诊断）
-推出来。fixture 推不到 VERIFY 时断言 `run_flow` 等于断言一件不可能的事，而失败信息指向模型，
-人会去改提示词。`tests/test_evals_harness.py::test_scenarios_expecting_run_flow_can_reach_verify`
-把这条钉住：fixture 要么现在放行，要么落一次 `apply_node_fix` 后放行。实际踩过——fixture 流程
-没带 `acceptance_contract`，状态块判出 error 级 `acceptance_contract_incomplete`，四个场景整局
-钉在 FIX 阶段。它同时守住 fixture 的动态性：写死返回值的 fixture 在第二次判定里仍然停在 FIX。
-
-### 场景红了，先怀疑判据
-
-`repair_inspects_before_touching_selectors` 的前身长期 0/3，两处都是判据自己写错的：
-
-- `expect_first_tool` 钉死第一个工具，把「先读一眼再动手」判成违规——那恰恰是对的行为，
-  这条判据实际在要求模型盲改。真正的不变量是**任何写工具之前必须已经拿到证据**，
-  所以有了 `expect_before_writes`（写工具集合复用 `ai_guards.FLOW_WRITE_TOOLS`，新增写工具自动纳入）。
-- fixture 用的是默认返回的**空流程**，修复场景里无处可修，模型只能反问，被断言的那条路径
-  根本走不到。样本流程要真带缺陷，`findings` 用真 `_lint_flow` 现算而不是手写快照——
-  手写的那份会和 lint 规则各自演化，最后测的是一份过期快照。
-
-判据写错和模型做错在结果上同形（都是红的），区别只在**失败原因读起来是否荒谬**。
-调用序列里模型的动作明明合理却被判失败时，先改判据。
-
-「读一眼」这件事后来连工具都不需要了：`get_flow` / `lint_flow` / `validate_flow` 已从 schema
-撤下，状态块每轮重算一份塞在消息尾部（见 `ai_flow_state.py`）。所以现在的判据换成了
-`repair_spends_no_round_on_reading_state`——不是禁止复检，是复检已经无处可调。
-
-### 模型踩护栏，先看它手上有没有躲开的字段
-
-`guard_blocking_lint_fixed_before_run` 长期 0/3，模型每次都在修复前先 `run_flow` 撞一次
-`blocking_diagnostics_must_be_fixed`。这不是提示词说得不够重：阻断名单只存在于编排层，`create_flow` 交回给模型的
-finding 只有 `severity: warn`，它据此判断可以先跑一次看看，完全合理。
-
-`expect_guards_not_triggered` 断言的是「提示词能让模型自己避开」，而模型**根本没有可依据的字段**
-时，这条断言测的是猜谜。出路是把判断依据放进工具返回值（`annotate_lint_findings()` 给每条 finding
-标 `blocks_run`），不是加提示词——加完 3/3。fixture 也改成调真函数现算，手写的那份会把这个信号写死。
-
+- `_check_fabricated_write` 对所有场景检查虚假落盘声明；措辞判据与编排层共用。
+- `evals/metrics.py` 记录轮数、工具调用、重复调用、token 和护栏触发分布。行为通过不代表调用成本合理。
+- 断言运行前，fixture 必须能进入 VERIFY；修复场景必须包含真实缺陷，静态检查结果由实际 lint 生成。
+- 区分模型错误、fixture 错误与断言错误。要求模型避开护栏时，工具返回必须提供足够的判断证据，例如 `blocks_run`。
 
 ### 真实页面 E2E 的评分边界
 

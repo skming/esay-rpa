@@ -98,6 +98,26 @@ def test_declared_date_formats_never_put_the_day_before_the_month() -> None:
             assert fmt.index("%Y") == 0, (case.name, fmt)
 
 
+def test_every_case_points_at_a_fixture_that_exists() -> None:
+    """页面名写错时在线那一档会跑出一串 404 页面，报告上看起来像模型不会做。
+
+    只判文件在不在，不读内容：holdout/ 下的页面不能打开。
+    """
+    pages = Path(__file__).parent / "pages"
+    for case in CASES:
+        assert (pages / case.page).is_file(), case.name
+
+
+def test_every_requirement_is_recognised_as_a_create_intent() -> None:
+    """需求文本必须能被创建意图认出来，否则首轮拿不到建流程的工具。
+
+    这一条只有真实跑一次模型才会暴露，而那一次的钱已经花掉了；案例是在本文件里
+    改的，判据也该在本文件里钉住。
+    """
+    for case in CASES:
+        _model_messages(case, f"http://127.0.0.1:8123/{case.page}")
+
+
 def _table_case() -> E2ECase:
     return E2ECase(
         name="t", page="filter_enter_commit.html", kind="table", requirement="需求原文",
