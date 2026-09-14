@@ -1,0 +1,38 @@
+<!doctype html>
+<meta charset="utf-8"><title>工单明细</title>
+<!-- 未登录时整页跳到 eval_login.html：URL 变了、DOM 是登录表单，观察必须报
+     redirected_to_login，而不是「页面上没有表格」。会话状态放在 URL 上而不是
+     cookie/sessionStorage：留在浏览器里的话，第二次运行会跳过登录，同一条流程
+     在重放时走的就不是同一条路径了。 -->
+<body>
+  <script>
+    const user = new URLSearchParams(location.search).get('user') || '';
+    if (!user) location.replace('eval_login.html');
+  </script>
+  <div id="app"></div>
+  <script>
+    const ROWS = [
+      ['T-01', '报销', '1200'],
+      ['T-02', '差旅', '860'],
+      ['T-03', '报销', '430'],
+      ['T-04', '采购', '910'],
+    ];
+    function render(kind) {
+      const rows = ROWS.filter(r => !kind || r[1] === kind);
+      document.getElementById('bill-body').innerHTML = rows
+        .map(r => '<tr><td>' + r[0] + '</td><td>' + r[1] + '</td><td>' + r[2] + '</td></tr>')
+        .join('');
+    }
+    if (new URLSearchParams(location.search).get('user')) {
+      document.getElementById('app').innerHTML =
+        '<div class="query-bar"><input id="q-kind" placeholder="类型" autocomplete="off">'
+        + '<button id="q-submit" type="button">查询</button></div>'
+        + '<table id="bill-table"><thead><tr><th>单号</th><th>类型</th><th>金额</th></tr></thead>'
+        + '<tbody id="bill-body"></tbody></table>';
+      render('');
+      document.getElementById('q-submit').addEventListener('click', () => {
+        render(document.getElementById('q-kind').value.trim());
+      });
+    }
+  </script>
+</body>

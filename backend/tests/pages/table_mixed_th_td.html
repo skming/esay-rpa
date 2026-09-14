@@ -1,0 +1,16 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>混合 th/td 的表格</title>
+<!-- 数据行的首列是 <th scope="row">：行标题也是 th，「整行都是 th」才算表头行，
+     按「这行里有 th」判会把每一条数据都摘掉，表格看起来一行数据都没有。 -->
+<h1>季度汇总</h1>
+<table id="summary-table">
+  <thead>
+    <tr><th>地区</th><th>Q1</th><th>Q2</th></tr>
+  </thead>
+  <tbody>
+    <tr><th scope="row">华东</th><td>1200</td><td>1350</td></tr>
+    <tr><th scope="row">华南</th><td></td><td>880</td></tr>
+    <tr><th scope="row">华北</th><td>760</td><td>810</td></tr>
+  </tbody>
+</table>

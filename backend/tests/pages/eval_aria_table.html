@@ -1,0 +1,45 @@
+<!doctype html>
+<meta charset="utf-8"><title>ARIA 表格 · 按状态筛选</title>
+<!-- 一个 <table> 都没有：行与单元格全靠 role。按标签名找行的判据在这页上零命中。
+     首列用 role=rowheader——它长在数据行上，认成列标题会把第一条数据当表头摘掉。 -->
+<style>
+  .grid-row { display: flex; gap: 12px; }
+  .grid-cell { width: 140px; }
+</style>
+<body>
+  <div class="query-bar">
+    <input id="q-status" placeholder="状态" autocomplete="off">
+    <button id="q-submit" type="button">筛选</button>
+  </div>
+  <div id="task-grid" role="table" aria-label="工单">
+    <div role="rowgroup">
+      <div role="row" class="grid-row">
+        <div role="columnheader" class="grid-cell">工单号</div>
+        <div role="columnheader" class="grid-cell">状态</div>
+        <div role="columnheader" class="grid-cell">工时</div>
+      </div>
+    </div>
+    <div role="rowgroup" id="task-body"></div>
+  </div>
+  <script>
+    const ROWS = [
+      ['G-01', '进行中', '8'],
+      ['G-02', '已完成', '5'],
+      ['G-03', '进行中', '13'],
+      ['G-04', '待开始', '2'],
+    ];
+    function render(status) {
+      const rows = ROWS.filter(r => !status || r[1] === status);
+      document.getElementById('task-body').innerHTML = rows.map(r =>
+        '<div role="row" class="grid-row">'
+        + '<div role="rowheader" class="grid-cell">' + r[0] + '</div>'
+        + '<div role="cell" class="grid-cell">' + r[1] + '</div>'
+        + '<div role="cell" class="grid-cell">' + r[2] + '</div>'
+        + '</div>').join('');
+    }
+    document.getElementById('q-submit').addEventListener('click', () => {
+      render(document.getElementById('q-status').value.trim());
+    });
+    render('');
+  </script>
+</body>

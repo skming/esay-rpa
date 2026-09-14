@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>缺 tbody 的表格</title>
+<!-- 整张表由脚本建：DOM API 往 <table> 上 append <tr> 不补 tbody（只有 HTML 解析器补），
+     所以这页上根本没有 tbody，`table > tbody > tr` 零命中。
+     源码里写一个 <tr> 都不行——那一个会被解析器裹进 tbody，就不是「缺 tbody」了。 -->
+<h1>订单</h1>
+<table id="order-table"></table>
+<script>
+  const table = document.getElementById('order-table');
+  const header = document.createElement('tr');
+  for (const name of ['编号', '客户', '金额']) {
+    const th = document.createElement('th');
+    th.textContent = name;
+    header.appendChild(th);
+  }
+  table.appendChild(header);
+  const rows = [
+    ['A-1', '甲公司', '1200'],
+    ['A-2', '乙公司', ''],
+    ['A-3', '丙公司', '980'],
+  ];
+  for (const cells of rows) {
+    const tr = document.createElement('tr');
+    for (const value of cells) {
+      const td = document.createElement('td');
+      td.textContent = value;
+      tr.appendChild(td);
+    }
+    table.appendChild(tr);
+  }
+</script>

@@ -1,0 +1,25 @@
+<!doctype html>
+<meta charset="utf-8"><title>登录 · 工单系统</title>
+<!-- 测试页，不校验口令：任意非空账号密码都放行，页面里因此没有任何可当凭据的字符串。
+     登录成功回到 eval_login_redirect.html 并把账号带在 URL 上。 -->
+<body>
+  <h1>登录</h1>
+  <form id="login-form" autocomplete="off">
+    <input id="username" name="username" placeholder="账号" autocomplete="off">
+    <input id="password" name="password" type="password" placeholder="密码" autocomplete="off">
+    <button id="login-submit" type="submit">登录</button>
+  </form>
+  <div id="login-error" hidden>账号或密码不能为空</div>
+  <script>
+    document.getElementById('login-form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const user = document.getElementById('username').value.trim();
+      const pass = document.getElementById('password').value.trim();
+      if (!user || !pass) {
+        document.getElementById('login-error').hidden = false;
+        return;
+      }
+      location.replace('eval_login_redirect.html?user=' + encodeURIComponent(user));
+    });
+  </script>
+</body>

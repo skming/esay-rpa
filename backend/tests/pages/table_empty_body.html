@@ -1,0 +1,12 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>没有数据行的表格</title>
+<!-- 表头齐全、tbody 空着：这是「合法的空表」，与「选择器没命中」形状相同但出路相反——
+     前者该照常交零行，后者该报错重选。row_count=0 单独一个数分不开这两件事。 -->
+<h1>本月订单</h1>
+<table id="order-table">
+  <thead>
+    <tr><th>编号</th><th></th><th>金额</th></tr>
+  </thead>
+  <tbody></tbody>
+</table>

@@ -1,0 +1,12 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>只有行标题的表格</title>
+<!-- 没有列标题行，首列是 <th scope="row"> 行标题。退回「第一个 th 的父元素」会把
+     第一行数据（East / 12）当成列标题交出去，字段名成了数据、第一行数据又还在样例里。 -->
+<h1>区域销量</h1>
+<table id="sales-table">
+  <tbody>
+    <tr><th scope="row">East</th><td>12</td></tr>
+    <tr><th scope="row">West</th><td>9</td></tr>
+  </tbody>
+</table>

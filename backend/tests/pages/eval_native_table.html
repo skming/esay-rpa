@@ -1,0 +1,33 @@
+<!doctype html>
+<meta charset="utf-8"><title>原生表格 · 按地区筛选</title>
+<!-- 原生 <table>，表头在 thead，数据行在 tbody。按钮提交，不监听 Enter。
+     「查无此地区」时 tbody 清空但 thead 还在：这正是合法空表——有表头、零数据行，
+     与选择器没命中是两回事。两者的出路相反，混为一谈时模型会去改一个本来就对的选择器。 -->
+<body>
+  <div class="query-bar">
+    <input id="q-region" placeholder="地区" autocomplete="off">
+    <button id="q-submit" type="button">查询</button>
+  </div>
+  <table id="sales-table">
+    <thead><tr><th>订单号</th><th>地区</th><th>金额</th></tr></thead>
+    <tbody id="sales-body"></tbody>
+  </table>
+  <script>
+    const ROWS = [
+      ['N-01', '华东', '1200'],
+      ['N-02', '华南', '860'],
+      ['N-03', '华东', '430'],
+      ['N-04', '华北', '910'],
+    ];
+    function render(region) {
+      const rows = ROWS.filter(r => !region || r[1] === region);
+      document.getElementById('sales-body').innerHTML = rows
+        .map(r => '<tr><td>' + r[0] + '</td><td>' + r[1] + '</td><td>' + r[2] + '</td></tr>')
+        .join('');
+    }
+    document.getElementById('q-submit').addEventListener('click', () => {
+      render(document.getElementById('q-region').value.trim());
+    });
+    render('');
+  </script>
+</body>

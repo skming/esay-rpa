@@ -1,0 +1,36 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>ARIA 表格</title>
+<!-- 没有一个 <table>：结构全靠 role。按标签名找行的判据在这页上零命中，
+     必须按 role=row + role=cell 认。 -->
+<style>
+  .grid-row { display: flex; gap: 12px; }
+  .grid-cell { width: 120px; }
+</style>
+<h1>任务列表</h1>
+<div id="task-grid" role="table" aria-label="任务">
+  <div role="rowgroup">
+    <div role="row" class="grid-row">
+      <div role="columnheader" class="grid-cell">任务</div>
+      <div role="columnheader" class="grid-cell">负责人</div>
+      <div role="columnheader" class="grid-cell">状态</div>
+    </div>
+  </div>
+  <div role="rowgroup">
+    <div role="row" class="grid-row">
+      <div role="cell" class="grid-cell">导出报表</div>
+      <div role="cell" class="grid-cell">张三</div>
+      <div role="cell" class="grid-cell">进行中</div>
+    </div>
+    <div role="row" class="grid-row">
+      <div role="cell" class="grid-cell">对账</div>
+      <div role="cell" class="grid-cell"></div>
+      <div role="cell" class="grid-cell">待开始</div>
+    </div>
+    <div role="row" class="grid-row">
+      <div role="cell" class="grid-cell">归档</div>
+      <div role="cell" class="grid-cell">李四</div>
+      <div role="cell" class="grid-cell">已完成</div>
+    </div>
+  </div>
+</div>

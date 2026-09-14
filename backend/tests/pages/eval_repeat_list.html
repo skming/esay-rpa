@@ -1,0 +1,46 @@
+<!doctype html>
+<meta charset="utf-8"><title>重复列表 · 按负责人筛选</title>
+<!-- 一个 <table> 都没有：结果是一串同构的 div.record。同一个类名在右侧「最近查看」里
+     也有几条——全局用 .record .code 会把侧栏那几条一起抓走，页面不报错，多出来的记录
+     混在结果里跟真数据长得一模一样。选择器必须收在 #result-list 内。 -->
+<style>
+  body { display: flex; gap: 32px; }
+  .record { display: flex; gap: 10px; padding: 4px 0; }
+  .code { width: 70px; }
+  aside { border-left: 1px solid #ccc; padding-left: 16px; }
+</style>
+<body>
+  <main>
+    <div class="query-bar">
+      <input id="q-owner" placeholder="负责人" autocomplete="off">
+      <button id="q-submit" type="button">筛选</button>
+    </div>
+    <div id="result-list"></div>
+  </main>
+  <aside>
+    <h3>最近查看</h3>
+    <div id="recent">
+      <div class="record"><span class="code">R-97</span><span class="owner">历史</span><span class="amount">0</span></div>
+      <div class="record"><span class="code">R-98</span><span class="owner">历史</span><span class="amount">0</span></div>
+    </div>
+  </aside>
+  <script>
+    const ROWS = [
+      ['R-01', '张三', '1200'],
+      ['R-02', '李四', '860'],
+      ['R-03', '张三', '430'],
+      ['R-04', '王五', '910'],
+    ];
+    function render(owner) {
+      const rows = ROWS.filter(r => !owner || r[1] === owner);
+      document.getElementById('result-list').innerHTML = rows.map(r =>
+        '<div class="record"><span class="code">' + r[0] + '</span>'
+        + '<span class="owner">' + r[1] + '</span>'
+        + '<span class="amount">' + r[2] + '</span></div>').join('');
+    }
+    document.getElementById('q-submit').addEventListener('click', () => {
+      render(document.getElementById('q-owner').value.trim());
+    });
+    render('');
+  </script>
+</body>

@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8"><title>异步加载 · 按类型筛选</title>
+<!-- 首屏只有加载态，2.5s 后才有筛选框和表格；筛选本身也是异步的（600ms）。
+     等待要等目标区域出现，不能等行——加载中零行与筛完零行长得一样。
+     提交后先清空 tbody 再回填：不等就抓，拿到的是上一次的结果，页面不会报错。 -->
+<body>
+  <div id="app"><div class="ant-spin ant-spin-spinning"><span class="ant-spin-dot"></span>加载中</div></div>
+  <script>
+    const ROWS = [
+      ['A-01', '报销', '1200'],
+      ['A-02', '差旅', '860'],
+      ['A-03', '报销', '430'],
+      ['A-04', '采购', '910'],
+    ];
+    function render(kind) {
+      const rows = ROWS.filter(r => !kind || r[1] === kind);
+      document.getElementById('bill-body').innerHTML = rows
+        .map(r => '<tr><td>' + r[0] + '</td><td>' + r[1] + '</td><td>' + r[2] + '</td></tr>')
+        .join('');
+    }
+    setTimeout(() => {
+      document.getElementById('app').innerHTML =
+        '<div class="query-bar"><input id="q-kind" placeholder="类型" autocomplete="off">'
+        + '<button id="q-submit" type="button">查询</button></div>'
+        + '<table id="bill-table"><thead><tr><th>单号</th><th>类型</th><th>金额</th></tr></thead>'
+        + '<tbody id="bill-body"></tbody></table>';
+      render('');
+      document.getElementById('q-submit').addEventListener('click', () => {
+        const kind = document.getElementById('q-kind').value.trim();
+        document.getElementById('bill-body').innerHTML = '';
+        setTimeout(() => render(kind), 600);
+      });
+    }, 2500);
+  </script>
+</body>
