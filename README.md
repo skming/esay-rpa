@@ -23,10 +23,14 @@ Easy RPA 是一个本地桌面端 RPA（机器人流程自动化）工具，用�
 
 ## 快速启动
 
-安装前端依赖：
+需要 Node.js、pnpm、uv 和 Python 3.12。先安装前后端依赖及浏览器：
 
 ```bash
 pnpm install
+cd backend
+uv sync --locked
+uv run playwright install chromium
+cd ..
 ```
 
 启动完整开发栈：
@@ -47,18 +51,20 @@ pnpm dev
 pnpm backend:dev
 ```
 
-端口占用：
+若启动失败，先检查后端日志及端口占用：
 
 ```bash
-lsof -ti :8765 | xargs kill
+lsof -nP -iTCP:8765 -sTCP:LISTEN
 ```
+
+确认进程归属后再停止对应开发进程，不要直接终止所有占用端口的进程。
 
 ## 执行模式
 
 | 模式 | 适用场景 | 说明 |
 | --- | --- | --- |
 | Playwright | 默认后台自动化、定时任务、无人值守流程 | 使用 Easy RPA 管理的浏览器 Profile，稳定可复现 |
-| Chrome 扩展 | 复用用户真实 Chrome 登录态、企业 SSO、人机协同 | 需要扩展在线并控制当前标签页，不建议作为无人值守主路径 |
+| Chrome 扩展 | 复用用户真实 Chrome 登录态、企业 SSO、人机协同 | 需要扩展在线，复用真实浏览器会话，不建议作为无人值守主路径 |
 
 扩展开发与调试见 [extension/README.md](extension/README.md)。
 
@@ -109,3 +115,9 @@ lsof -ti :8765 | xargs kill
 - 图形验证码、滑块验证、点选验证不做自动破解：运行时检测到验证组件会自动暂停转人工完成后重试（有头模式），或在错误信息中提示（无头模式）。
 - iframe（`>>>` 穿透语法）与 open Shadow DOM（CSS 自动穿透）已支持；closed Shadow DOM 不可及。
 - 复杂前端组件如日期范围、多选下拉、级联选择仍是后续重点增强方向。
+
+## 文档维护
+
+README 维护安装和导航；OVERVIEW 维护能力与行为边界；PRODUCT 和 DESIGN 分别维护产品原则与设计约束；打包、扩展和评测步骤放在各自文档。
+
+修改功能时同步其所属文档。命令和参数以源码为依据，避免重复抄录版本、阈值和性能数字；评测结果必须注明条件，未运行不能写成通过。

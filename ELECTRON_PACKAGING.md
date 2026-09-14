@@ -33,11 +33,11 @@ pnpm backend:bundle:verify
 pnpm electron:dist
 ```
 
-`electron:dist` 只构建**当前操作系统**对应产物：
+打包入口按平台区分：
 
-- macOS：`.dmg`、`.zip`
-- Windows：NSIS `.exe`
-- Linux：`.AppImage`
+- macOS：`pnpm electron:dist`，生成 `.dmg`、`.zip`
+- Windows：`pnpm electron:dist:win`，生成 NSIS `.exe`
+- Linux：`pnpm electron:dist:linux`，生成 `.AppImage`
 
 Windows 安装包需要在 Windows 环境执行：
 
@@ -122,11 +122,10 @@ http://127.0.0.1:8765
 
 AI 模型目录（`backend/config/model_catalog.json`）在打包时自动随包携带，无需额外配置。若需新增或修改模型，直接编辑该 JSON 文件，重新打包即可生效。
 
-运行期可写目录不再落到应用包内，而是由 Electron 注入到用户数据目录：
+运行期数据默认写入以下目录，布局见 [README](README.md#数据目录)，不写入应用包：
 
 ```text
-<userData>/backend-runtime/workspace
-<userData>/backend-runtime/artifacts
+~/.easy-rpa/
 ```
 
 开发态如需改连外部后端，仍可在启动桌面端前设置：
@@ -137,7 +136,7 @@ export RPA_BACKEND_URL=http://127.0.0.1:8765
 
 ## 冷启动测量
 
-执行方案要求 Electron 冷启动时间不超过 3 秒。先生成目录包，再用测量脚本连续启动 5 次并计算均值：
+以下示例以平均 3 秒作为测量阈值，不代表已达到该性能。先生成目录包，再连续测量 5 次：
 
 ```bash
 pnpm electron:pack
@@ -155,29 +154,28 @@ node tools/measure_electron_startup.cjs \
 output/bench/electron-startup.json
 ```
 
-Pitfalls：
+测量边界：
 
 - 该测量只能证明当前操作系统和当前硬件上的目录包冷启动，不代表 Windows/Linux 或签名安装包。
 - macOS 首次运行未签名 app 可能触发 Gatekeeper 或系统缓存抖动，首次样本可能高于后续样本。
 - `ready-to-show` 表示窗口可展示，不等同于用户完成一次业务操作所需的端到端时间。
 
-Mitigation：
+复测要求：
 
 - macOS 和 Windows 各自运行 5 次，保留 JSON 产物和机器规格。
 - 正式发布包需要在签名、公证、安装后再重复测量。
 - 若均值接近 3 秒，继续拆分 renderer chunk、延迟加载 React Flow 低频面板，并复测。
 
-## Pitfalls
+## 常见问题
 
 - Electron 生产模式使用 `loadFile` 加载 `dist/index.html`，Vite `base` 必须保持 `./`，否则静态资源会按文件系统根路径解析导致白屏。
 - 不要在打包态直接使用 `.venv/bin/python`。该文件在很多机器上是指向 Homebrew/Miniconda 的绝对软链接，正式包会依赖构建机本地路径。当前 Electron 主进程打包态优先使用 `resources/backend/python/bin/python3.12`。
-- `pnpm add` 如遇到 store 路径不一致，需要使用项目内 store：`pnpm --store-dir .pnpm-store install`。
 - `electron-builder` 的 Windows 安装器依赖可能触发 pnpm build-script 审批提示，跨平台制品应在对应平台 CI 中单独验证。
 - Windows `.exe` 不会在 macOS 打包命令中出现；必须在 Windows 本机或 Windows CI 构建。
 - macOS 未签名产物会被 Gatekeeper（macOS 应用安全校验）拦截，不应直接发给终端用户。
 - `electron:dist:signed` 缺少 Apple Developer 或证书变量时会失败，这是预期的发布门禁。
 
-## Mitigation
+## 发布验证
 
 - 每次打包前执行 `pnpm build` 和 Electron 主进程语法检查。
 - 每次打包前执行 `pnpm backend:bundle:prepare` 和 `pnpm backend:bundle:verify`，确保随包 Python 与后端依赖可用。

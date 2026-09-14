@@ -4,7 +4,7 @@
 
 ## 一、产品定位
 
-Easy RPA 是一款运行在本地的桌面端 RPA（机器人流程自动化）工具。用户通过可视化画布搭建自动化流程，由内置的 RPA 助手辅助创建和调试。所有数据与执行均在本机完成，不依赖云服务。
+Easy RPA 是一款运行在本地的桌面端 RPA（机器人流程自动化）工具。用户通过可视化画布搭建自动化流程，由内置的 RPA 助手辅助创建和调试。流程存储与执行默认在本机；访问目标网站及调用配置的 AI 供应商需要网络，AI 请求会发送相关对话和工具证据。
 
 **主要用途**：
 - 网页数据采集（登录、填表、翻页、表格提取）
@@ -14,7 +14,7 @@ Easy RPA 是一款运行在本地的桌面端 RPA（机器人流程自动化）�
 
 **不适用场景**：
 - 桌面原生 GUI 自动化（只能操作网页，不能操作 QQ、微信、本机 Excel 桌面客户端）
-- 需要第三方 Python 包（仅内置 `json`、`os`、`re`、`csv`、`datetime`、`math`、`pathlib`、`urllib`、`hashlib`、`openpyxl`）
+- 依赖未随运行时提供的第三方 Python 包；脚本能力以 `backend/app/services/ai_tools/script_capabilities.py` 为准
 - 需要强持久登录态且有强反爬的平台（如银行 U 盾验证、微信公众号后台）
 - 实时音视频处理、WebRTC
 
@@ -25,10 +25,10 @@ Easy RPA 是一款运行在本地的桌面端 RPA（机器人流程自动化）�
 | 层           | 技术                                                             |
 | ------------ | ---------------------------------------------------------------- |
 | 桌面外壳     | Electron                                                         |
-| 前端         | React 18 + TypeScript + Tailwind CSS + @xyflow/react（流程画布） |
+| 前端         | React + TypeScript + Tailwind CSS + @xyflow/react（流程画布） |
 | 后端         | Python 3 + FastAPI（本机 HTTP 服务）                             |
 | 浏览器自动化 | Playwright（持久化 Browser Profile，Cookie 跨运行保留）          |
-| 轻量抓取     | `browser.fetch` 节点走 httpx 直接请求（无浏览器会话）            |
+| 轻量抓取     | `browser.fetch` 由 Scrapling 执行，按节点配置使用静态或浏览器抓取            |
 | AI 对话      | LiteLLM 多供应商路由 + Server-Sent Events 流式输出               |
 | 数据存储     | SQLite（流程/调度/任务记录）+ 本地文件（产物/日志）              |
 
@@ -127,7 +127,7 @@ Easy RPA 是一款运行在本地的桌面端 RPA（机器人流程自动化）�
 | `script.shell`      | Shell 命令，支持 `${var.xxx}` 插值；每个变量值在插入命令前会自动经过 `shlex.quote()` 转义，防止 Shell 注入——变量内容无法再携带 `&&`、`;`、`\|` 等元字符来拼接子命令；若需执行动态组合命令，改用 `script.python` 构造并调用 `subprocess`；变量同样通过 `RPA_VARIABLES_JSON` / `RPA_VARIABLES_FILE` 可读 |
 | `script.websocket`  | 建立 WebSocket 连接，发送并接收一条消息                                                                                                        |
 
-> Python 脚本中可直接用 `_vars['xxx']` 访问所有流程变量，无需额外导入。可用内置包仅限：`json`、`os`、`re`、`csv`、`datetime`、`math`、`pathlib`、`urllib`、`hashlib`、`openpyxl`。
+> Python 脚本中可直接用 `_vars['xxx']` 访问所有流程变量，无需额外导入。可用依赖与能力边界见下方脚本能力声明。
 
 **脚本的能力边界**（`backend/app/services/ai_tools/script_capabilities.py` 单点声明，写进节点说明的同时也是 lint 的放行范围）：
 
@@ -243,16 +243,9 @@ RPA 助手（对话面板）通过工具调用（Function Calling）直接操作
   时不发送 Tool Schema（工具参数定义）；拿到 URL、尚未完成页面检查时只暴露 `inspect_page`。
   前端生成的 `local-*` 草稿 ID 直接按空白流程处理，不查询不存在的后端流程，也不会误加载完整
   提示词和全部工具。
-- **状态块替代复检工具**：`get_flow` / `lint_flow` / `validate_flow` / `get_run_status` 已从 schema
-  撤下，改由每轮重算的状态块回答。旧设计在开场注入一次流程定义并用 `protect_prefix` 保护，
-  模型每写一次流程这份注入就过期一次，于是复检占掉了实测全部工具调用的 18%。状态块位于缓存锚点
-  之后，本来每轮都要重发，放这里不额外增加缓存开销。
-- **按阶段加载提示**：页面首轮只需要判断 URL 能否取得真实 DOM，不加载节点格式、脚本、运行审计等
-  构建手册。该阶段提示由 26,937 字符降到 1,620 字符，减少 **94.0%**；检查成功后才加载完整规则。
-- **few-shot 按复杂度注入**：20,619 字符的登录/日期/筛选/分页示例只用于确实包含这些复杂特征且
-  已提供 URL 的创建请求。缺 URL或只抓正文/简单列表时不注入，避免在澄清轮和简单任务重复付费。
-- **节点目录按需查询**：`list_node_types(types=[...])` 单次最多查询 8 个精确类型。查询两个类型时，
-  返回内容由原全量目录的 15,060 字符降到约 818 字符，减少 **94.6%**；无参调用只返回名称索引。
+- **状态块替代复检工具**：每轮刷新流程定义、静态检查与运行状态，替换上一份状态。
+- **按需加载上下文**：页面发现阶段使用精简提示；复杂创建任务才注入对应示例。
+- **节点目录按需查询**：`list_node_types` 无参返回索引，传入类型列表查询详细契约。
 - **网页访问在工具内降级**：`inspect_page` 直接读取导航响应状态。浏览器遇到 HTTP 4xx/5xx 或验证墙时，
   自动尝试 Scrapling 静态抓取；成功则返回 `inspection_source=scrapling_static`，助手只能据此构建
   `browser.fetch` 静态流程。两个通道都失败才返回终止状态，由编排层直接生成收尾，不再请求第二轮 LLM。
