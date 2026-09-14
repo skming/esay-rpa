@@ -416,13 +416,154 @@ async def test_extension_disabled_mid_session_prevents_interaction() -> None:
     assert len(bridge.calls) == before
 
 
-@pytest.mark.parametrize("args", [{"frame_selector": "iframe"}, {"tab_index": 1}, {"url": "https://other.test"}])
+@pytest.mark.parametrize("args", [{"frame_selector": "iframe"}, {"tab_index": 1}])
 async def test_extension_unsupported_requests_do_not_fallback(args) -> None:
+    """frame / tab 是扩展真做不到的（只绑一个标签页的主文档）。url 不在此列——
+    它由 page.begin 复用已开着的目标页或新开一个，见下面两条。"""
     bridge = FakeBridge()
     executor, _ = tool_executor(bridge)
     result = await executor.execute("inspect_page", {"browser_executor": "extension", **args})
     assert result["status"] == "unsupported_capability"
     assert bridge.calls == []
+
+
+async def test_inspect_with_url_sends_target_to_begin_and_reports_requested_url() -> None:
+    """带 url 的观察必须走 page.begin 的 targetUrl：扩展那边据它复用已登录的目标标签页，
+    换成后端自己发起请求就丢了登录态，抓回的 HTML 与模型正在看的页面无关。"""
+    bridge = FakeBridge({
+        "page.begin": [{"tab_id": 9, "requested_url": "https://example.com/#/workbench",
+                        "url": "https://example.com/#/workbench", "reused": True}],
+        "page.observe": [{"url": "https://example.com/#/workbench", "tables": [{"row_count": 3}]}],
+    })
+    executor, _ = tool_executor(bridge)
+
+    result = await executor.execute(
+        "inspect_page", {"browser_executor": "extension", "url": "https://example.com/#/workbench"}
+    )
+
+    begin = [c for c in bridge.calls if c["type"] == "page.begin"]
+    assert [c.get("targetUrl") for c in begin] == ["https://example.com/#/workbench"]
+    assert result["requested_url"] == "https://example.com/#/workbench"
+    assert result["session"]["tab_id"] == 9
+    assert result["page_outcome"] == "target_content_ready"
+
+
+async def test_inspect_with_new_url_rebinds_the_session_tab() -> None:
+    """同一轮里换目标页要重发 page.begin：绑定可能因此换到另一个标签页，
+    tab_id 不跟着更新的话，后续动作会发到上一个页面上。"""
+    bridge = FakeBridge({
+        "page.begin": [{"tab_id": 9}, {"tab_id": 11}],
+        "page.observe": [{"url": "https://a.test/one", "tables": [{}]},
+                         {"url": "https://b.test/two", "tables": [{}]}],
+    })
+    executor, _ = tool_executor(bridge)
+
+    first = await executor.execute("inspect_page", {"browser_executor": "extension", "url": "https://a.test/one"})
+    second = await executor.execute("inspect_page", {"browser_executor": "extension", "url": "https://b.test/two"})
+
+    assert sum(c["type"] == "page.begin" for c in bridge.calls) == 2
+    assert (first["session"]["tab_id"], second["session"]["tab_id"]) == (9, 11)
+
+
+async def test_inspect_requests_page_html_but_interact_does_not() -> None:
+    """整页 HTML 只在 inspect 时取：交互后那次观察走同一个动作，每次都搬一份整页 HTML
+    过 WebSocket，而那份正文绝大多数时候没人读。少取一次就少一次白搬。"""
+    bridge = FakeBridge({
+        "page.observe": [{"url": "https://example.com/list", "tables": [{}]},
+                          {"url": "https://example.com/list", "tables": [{}]}],
+        "page.resolveTarget": [{"matches": 1, "element_ref": "t1"}],
+    })
+    executor, _ = tool_executor(bridge)
+
+    await executor.execute("inspect_page", {"browser_executor": "extension", "url": "https://example.com/list"})
+    await executor.execute("interact_page", {"action": "click", "selector": "#go",
+                                             "observation_version": 1})
+
+    observes = [c for c in bridge.calls if c["type"] == "page.observe"]
+    assert [c.get("includeHtml") for c in observes] == [True, False]
+
+
+_LOGGED_IN_HTML = """
+<html><body>
+  <script>var token = 'rc-secret';</script>
+  <form><input type="password" value="hunter2"></form>
+  <table class="custom-table"><thead><tr><th>编号</th><th>名称</th></tr></thead>
+    <tbody><tr><td>A-1</td><td>甲</td></tr><tr><td>A-2</td><td>乙</td></tr></tbody></table>
+  <p>备注正文</p>
+</body></html>
+"""
+
+
+async def test_logged_in_html_becomes_trimmed_text_and_never_reaches_the_model() -> None:
+    """登录态 DOM 就地换成精简正文：原始 HTML 不出现在结果里，script 与 password 的 value
+    也不出现。这两样是探测脱敏的下界，服务端这一层不能把它们又带回来。"""
+    bridge = FakeBridge({
+        "page.observe": [{"url": "https://example.com/list",
+                          "tables": [{"row_selector": "tbody > tr", "row_count": 2}],
+                          "page_html": _LOGGED_IN_HTML}],
+    })
+    executor, _ = tool_executor(bridge)
+
+    result = await executor.execute("inspect_page", {"browser_executor": "extension", "url": "https://example.com/list"})
+
+    assert "page_html" not in result
+    assert "hunter2" not in repr(result) and "rc-secret" not in repr(result)
+    assert "A-1" in result["page_text_sample"] and "备注正文" in result["page_text_sample"]
+    # 结构证据是这一轮观察写的，不能被正文快照的副本盖回旧值
+    assert result["tables"] == [{"row_selector": "tbody > tr", "row_count": 2}]
+    assert result["page_outcome"] == "target_content_ready"
+
+
+async def test_trimming_failure_keeps_structure_evidence_and_offers_a_reread() -> None:
+    """正文取不到不是观察失败：探测能穿开放 shadow root、lxml 的 cssselect 不能，
+    同一个 scope_selector 在两边可以一个命中一个不命中。这时结构证据照样成立，
+    失败原因要如实写出来，并给回 snapshot_id 让调用方换个范围补读同一份快照。"""
+    bridge = FakeBridge({
+        "page.observe": [{"url": "https://example.com/list", "tables": [{"row_selector": "tbody > tr"}],
+                          "page_html": _LOGGED_IN_HTML}],
+    })
+    executor, _ = tool_executor(bridge)
+
+    result = await executor.execute("inspect_page", {"browser_executor": "extension",
+                                                    "url": "https://example.com/list",
+                                                    "scope_selector": ".not-in-serialized-html"})
+
+    assert "page_text_sample" not in result
+    assert result["page_content_unavailable"]["reason"]
+    assert result["tables"] == [{"row_selector": "tbody > tr"}]
+    assert result["snapshot_id"]
+
+
+async def test_cursor_reread_carries_this_round_warning() -> None:
+    """补读回来的正文必须带着本轮的结论：快照拿的就是这份观察对象，补读时原样返回。
+    annotate 先跑、或 evidence 不复制，任一条成立即可；两条同时断开，翻页读到的正文
+    会不带任何告警——模型于是拿登录表单的 DOM 当目标页结构去改 selector。"""
+    bridge = FakeBridge({
+        "page.observe": [{"url": "https://example.com/sso/login",
+                          "inputs": [{"type": "password"}], "buttons": [], "links": [], "tables": [],
+                          "page_html": _LOGGED_IN_HTML}],
+    })
+    executor, _ = tool_executor(bridge)
+
+    first = await executor.execute("inspect_page", {"browser_executor": "extension", "url": "https://example.com/list"})
+    assert first["redirected_to_login"] is True
+
+    again = await executor.execute("inspect_page", {"snapshot_id": first["snapshot_id"]})
+
+    assert again["warning"] == first["warning"]
+    assert again["page_outcome"] == "redirected_to_login"
+
+
+async def test_begin_without_tab_identity_fails_loudly() -> None:
+    """扩展没回 tab_id 就必须报错：临时 ref 的归属靠 tab 限定，
+    拿 None 当标签页身份会把动作发到用户正在看的任意页面上。"""
+    bridge = FakeBridge({"page.begin": [{"url": "https://example.com/"}]})
+    executor, _ = tool_executor(bridge)
+
+    result = await executor.execute("inspect_page", {"browser_executor": "extension"})
+
+    assert result["status"] == "extension_observation_failed"
+    assert "标签页身份" in result["error"]
 
 
 async def test_screenshot_uses_bound_extension_document() -> None:

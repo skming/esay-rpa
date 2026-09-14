@@ -3,4 +3,5 @@
 export declare const PAGE_PROBE: (args: {
   scope?: string | null;
   version?: number;
+  includeHtml?: boolean;
 }) => Record<string, unknown>;

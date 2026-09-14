@@ -23,10 +23,10 @@ from app.services.ai_orchestrator import (
     _unmet_verification_request,
 )
 from app.services.ai_tools.executor import (
-    _annotate_login_redirect,
     _profile_busy_block,
     _splice_branch_placeholder_noops,
 )
+from app.services.ai_tools.page_observation import annotate_observation, classify_page_outcome
 from app.services.ai_tools import RpaToolExecutor
 from app.services.ai_tools.diagnostics import (
     _check_structured_rows,
@@ -789,6 +789,30 @@ async def test_run_flow_threads_browser_executor_into_request_when_extension_con
     assert result.get("status") != "extension_not_connected"
 
 
+async def test_run_failure_includes_diagnostics_and_execution_signature(monkeypatch) -> None:
+    from unittest.mock import AsyncMock
+    from app.services.ai_tools.lint_diff import execution_signature
+
+    task_manager = FakeTaskManager()
+    task_manager.tasks = task_manager.tasks[:1]
+    executor = RpaToolExecutor(flow_service=_SimpleFlowService(), task_manager=task_manager)
+    diagnostics = AsyncMock(return_value={
+        "task_id": "task-0", "status": "error", "failed_node_id": "n1",
+        "inspect_hint": "inspect", "image_base64": "binary", "failure_screenshot_note": "attached",
+    })
+    monkeypatch.setattr(executor, "_get_run_error", diagnostics)
+    result = await executor._run_flow("flow-1")
+    assert result["error_summary"] == task_manager.tasks[0].error
+    assert len(result["execution_signature"]) == 64
+    assert result["failure_diagnostics"] == {"failed_node_id": "n1", "inspect_hint": "inspect"}
+    diagnostics.assert_awaited_once_with("task-0")
+    original = {"nodes": [{"id": "n1", "type": "browser.click", "selector": "button"}]}
+    layout = {"nodes": [{**original["nodes"][0], "position": {"x": 20}, "status": "success"}]}
+    changed = {"nodes": [{**original["nodes"][0], "selector": "a"}]}
+    assert execution_signature(original) == execution_signature(layout)
+    assert execution_signature(original) != execution_signature(changed)
+
+
 class _CredentialFlowService:
     """凭据就绪判定的测试流程：变量是否被节点引用由 definition 决定。"""
 
@@ -1183,7 +1207,7 @@ async def test_get_run_error_returns_root_cause_hints_for_login_detection_failur
     assert result["root_cause_hints"][0]["type"] == "login_detection_may_have_skipped_login"
 
 
-def test_lint_flow_blocks_single_navigation_login_flow() -> None:
+def test_lint_flow_blocks_login_without_a_submit_or_navigation() -> None:
     nodes = [
         {"id": "start", "type": "start"},
         {"id": "open", "type": "browser.open", "targetUrl": "https://example.com/"},
@@ -1203,7 +1227,7 @@ def test_lint_flow_blocks_single_navigation_login_flow() -> None:
     ]
 
     findings = _lint_flow(nodes, edges, input_variable_names=["username", "password"])
-    single_nav = next(finding for finding in findings if finding["issue"] == "single_navigation_node")
+    single_nav = next(finding for finding in findings if finding["issue"] == "login_without_navigation_to_data_page")
 
     assert single_nav["severity"] == "error"
 
@@ -1578,6 +1602,22 @@ async def test_get_run_error_returns_selector_diagnostic_for_zero_match() -> Non
 
     assert result["selector_diagnostic"]["kind"] == "selector_zero_match"
     assert result["selector_diagnostic"]["matched_count"] == 0
+
+
+async def test_failure_page_url_takes_precedence_over_earlier_navigation(monkeypatch) -> None:
+    from unittest.mock import AsyncMock
+
+    manager = FakeTaskManager()
+    manager.tasks[0].error = (
+        "Locator.wait_for: Timeout 30000ms exceeded. locator('#rows') "
+        "[失败时页面: https://example.com/login]"
+    )
+    monkeypatch.setattr(manager, "get_logs", AsyncMock(return_value=[TaskLogEntry(
+        taskId="task-0", level="info", message="打开页面", detail="https://example.com/data", nodeId="open",
+    )]))
+    result = await RpaToolExecutor(FakeFlowService(), manager)._get_run_error("task-0")
+    assert result["last_browser_url"] == "https://example.com/login"
+    assert "https://example.com/login" in result["inspect_hint"]
 
 
 def test_repeated_navigation_failures_end_in_asking_the_user_for_the_target_url() -> None:
@@ -1998,7 +2038,8 @@ def test_lint_flags_table_mode_selector_that_is_not_table_like() -> None:
     findings = _lint_flow(nodes, [])
 
     hit = next(f for f in findings if f["issue"] == "table_extract_selector_not_table_like")
-    assert hit["severity"] == "error"
+    # warn 且不阻断运行：判据是 selector 文本猜测，而圈错范围执行一次就有定论
+    assert hit["severity"] == "warn"
     assert hit["node_id"] == "n_extract"
 
 
@@ -2017,7 +2058,7 @@ def test_lint_does_not_flag_row_level_table_selector() -> None:
 def test_lint_reports_id_named_table_as_container_not_as_unknown_structure() -> None:
     """`#bill-table` 指的就是 <table id="bill-table">，两条 error 的分流必须落在容器那条。
 
-    两条都是 error、都拦运行，差别在 fix 文案：容器那条直说「改成行选择器」，
+    两条都是提示级，差别在 fix 文案：容器那条直说「改成行选择器」，
     而 not_table_like 那条会让模型怀疑目标压根不是表格、改用 extractMode='text'。
     判据只认 class 不认 id 时，最常见的 id 命名会被指去这条错的岔路。
     真实后果见 evals：模型为此连开 4 次 apply_node_fix、3 次 inspect_page 仍没修好。
@@ -2249,9 +2290,10 @@ def test_annotate_login_redirect_marks_target_page_inspect_that_landed_on_login(
         "inputs": [{"type": "text"}, {"type": "password"}],
     }
 
-    _annotate_login_redirect(result, "https://example.com/#/workbench")
+    annotate_observation(result, "https://example.com/#/workbench")
 
     assert result["redirected_to_login"] is True
+    assert result["page_outcome"] == "redirected_to_login"
     assert "不是目标页结构" in result["warning"]
 
 
@@ -2262,9 +2304,154 @@ def test_annotate_login_redirect_ignores_intentional_login_page_inspect() -> Non
         "inputs": [{"type": "text"}, {"type": "password"}],
     }
 
-    _annotate_login_redirect(result, "https://example.com/#/login")
+    annotate_observation(result, "https://example.com/#/login")
 
     assert "redirected_to_login" not in result
+    assert result["page_outcome"] == "page_observed"
+
+
+def test_annotate_without_requested_url_does_not_report_login_redirect() -> None:
+    """没给 requested_url 就不下「被送去登录」的结论——扩展通道每次观察都带着会话的
+    requested_url，interact_page 之后那次也带；若从结果里读，点击后落到登录页会只在
+    扩展通道报 redirected_to_login，Playwright 不报，两条通道的结论就此分叉。"""
+    landed_on_login = {
+        "url": "https://example.com/#/login?redirect=%2Fworkbench",
+        "inputs": [{"type": "text"}, {"type": "password"}],
+        "requested_url": "https://example.com/#/workbench",
+    }
+
+    annotate_observation(landed_on_login)
+
+    assert "redirected_to_login" not in landed_on_login
+    assert landed_on_login["page_outcome"] == "page_observed"
+
+
+def test_annotate_reports_still_loading_before_empty_content() -> None:
+    """加载指示 + 零元素必须报还在渲染：报成「页面就是这样」会让模型拿空列表写 selector。"""
+    result = {
+        "url": "https://example.com/#/workbench",
+        "page_classes": ["el-table", "is-loading"],
+        "inputs": [], "buttons": [], "links": [], "tables": [],
+    }
+
+    spa_loading = annotate_observation(result, "https://example.com/#/workbench")
+
+    assert spa_loading is True
+    assert result["page_outcome"] == "still_loading"
+    assert "页面元素为空" not in result["warning"]
+
+
+def test_annotate_reports_empty_content_for_a_rendered_but_empty_page() -> None:
+    result = {
+        "url": "https://example.com/#/workbench",
+        "page_classes": ["el-table"],
+        "inputs": [], "buttons": [], "links": [], "tables": [],
+    }
+
+    annotate_observation(result, "https://example.com/#/workbench")
+
+    assert result["page_outcome"] == "empty_content"
+    assert "页面元素为空" in result["warning"]
+
+
+def test_annotate_reports_target_content_ready_when_the_table_has_data_rows() -> None:
+    result = {
+        "url": "https://example.com/#/workbench",
+        "inputs": [], "buttons": [], "links": [],
+        "tables": [{"container_selector": ".custom-table", "row_count": 12}],
+    }
+
+    annotate_observation(result, "https://example.com/#/workbench")
+
+    assert result["page_outcome"] == "target_content_ready"
+    assert "warning" not in result
+
+
+def test_annotate_reports_page_observed_when_only_navigation_is_present() -> None:
+    """只有一排导航按钮：页面确实读到了，但没有任何目标区域的证据。
+    报 target_content_ready 会让模型拿导航页的 DOM 去写提取节点。"""
+    result = {
+        "url": "https://example.com/#/workbench",
+        "inputs": [], "links": [], "tables": [],
+        "buttons": [{"text": "首页"}, {"text": "报表"}],
+    }
+
+    annotate_observation(result, "https://example.com/#/workbench")
+
+    assert result["page_outcome"] == "page_observed"
+
+
+def test_annotate_reports_page_observed_for_an_article_page_with_no_controls() -> None:
+    """有正文没控件的文章页不是空页面：报 empty_content 会让模型去等一个
+    这页上永远不会出现的控件。"""
+    result = {
+        "url": "https://example.com/posts/1",
+        "inputs": [], "buttons": [], "links": [], "tables": [],
+        "page_layout": [{"tag": "article", "html": "<article>正文……</article>"}],
+    }
+
+    annotate_observation(result, "https://example.com/posts/1")
+
+    assert result["page_outcome"] == "page_observed"
+    assert "warning" not in result
+
+
+def test_annotate_reports_target_content_ready_when_scope_pinned_the_region() -> None:
+    result = {
+        "url": "https://example.com/#/workbench",
+        "scope_selector": "#report",
+        "inputs": [], "links": [], "tables": [],
+        "buttons": [{"text": "导出"}],
+    }
+
+    annotate_observation(result, "https://example.com/#/workbench")
+
+    assert result["page_outcome"] == "target_content_ready"
+
+
+def test_annotate_reports_target_content_ready_when_wait_selector_was_satisfied() -> None:
+    result = {
+        "url": "https://example.com/#/workbench",
+        "wait_result": {"status": "satisfied", "selector": "#report-table"},
+        "inputs": [], "links": [], "tables": [],
+        "buttons": [{"text": "导出"}],
+    }
+
+    annotate_observation(result, "https://example.com/#/workbench")
+
+    assert result["page_outcome"] == "target_content_ready"
+
+
+def test_classify_reports_access_failed_for_blocked_and_for_unread_dom() -> None:
+    """blocked_* 与「结构键一个都没有」都是没能开始观察，不是「页面是空的」。"""
+    blocked = {
+        "status": "blocked_challenge_page",
+        "url": "https://example.com/#/workbench",
+        "inputs": [], "buttons": [], "links": [], "tables": [],
+    }
+    unread = {"url": "https://example.com/#/workbench"}
+
+    assert classify_page_outcome(blocked, "https://example.com/#/workbench") == "access_failed"
+    assert classify_page_outcome(unread, "https://example.com/#/workbench") == "access_failed"
+
+
+def test_annotate_gives_no_page_outcome_when_scope_selector_missed() -> None:
+    """scope 没命中时探测没看整页：报空内容会把模型推去等一个不存在的元素，
+    而它该改的是 scope_selector（结果自带的 required_action 已经这么说）。"""
+    result = {
+        "url": "https://example.com/#/workbench",
+        "scope_selector": ".nope",
+        "scope_missing": True,
+        "error": "scope_selector 在当前页面上没有命中任何元素，未回退到整页探测。",
+        "required_action": "retry_without_scope_or_fix_selector",
+        "inputs": [], "buttons": [], "links": [], "tables": [],
+    }
+
+    annotate_observation(result, "https://example.com/#/workbench")
+
+    assert "page_outcome" not in result
+    assert "warning" not in result
+    assert result["required_action"] == "retry_without_scope_or_fix_selector"
 
 
 def test_login_redirected_inspect_does_not_unlock_selector_circuit_breaker() -> None:
@@ -2868,21 +3055,17 @@ def test_few_shot_example_declares_every_required_common_field() -> None:
     assert missing == [], f"这些示例节点缺 description：{missing}"
 
 
-def test_ensure_login_counts_as_a_navigation_node() -> None:
-    """browser.ensureLogin 会打开 targetUrl；不算导航的话，
-    「ensureLogin + 一个数据页 open」这个规范拓扑会被 single_navigation_node 误报。"""
+def test_login_submit_can_land_on_data_page_without_an_extra_open() -> None:
     nodes = [
         {"id": "n1", "type": "browser.ensureLogin", "title": "探测登录态", "targetUrl": "https://x.test/"},
         {"id": "n2", "type": "browser.fill", "title": "填密码", "selector": "input[type='password']", "inputValue": "${var.password}"},
-        {"id": "n3", "type": "browser.open", "title": "打开数据页", "targetUrl": "https://x.test/#/list"},
+        {"id": "n3", "type": "browser.click", "title": "提交登录", "selector": "button[type=submit]"},
         {"id": "n4", "type": "browser.extract", "title": "抓表格", "selector": "tbody tr", "extractMode": "table", "outputVariable": "rows"},
     ]
-    issues = [f["issue"] for f in _lint_flow(nodes, [], input_variable_names=["password"])]
+    edges = [{"source": "n1", "target": "n2"}, {"source": "n2", "target": "n3"}, {"source": "n3", "target": "n4"}]
+    issues = [f["issue"] for f in _lint_flow(nodes, edges, input_variable_names=["password"])]
     assert "single_navigation_node" not in issues
-
-    # 少了数据页那次 open，才是这条规则真正要抓的结构
-    issues_without_open = [f["issue"] for f in _lint_flow([n for n in nodes if n["id"] != "n3"], [], input_variable_names=["password"])]
-    assert "single_navigation_node" in issues_without_open
+    assert "login_without_navigation_to_data_page" not in issues
 
 
 def test_few_shot_follows_the_current_turn_not_the_whole_session() -> None:
@@ -3648,7 +3831,7 @@ def test_findings_that_will_block_a_run_say_so_in_the_tool_result() -> None:
     from app.services.ai_tools.lint import annotate_lint_findings
 
     marked, text = annotate_lint_findings([
-        {"issue": "table_extract_selector_targets_container", "severity": "warn", "node_id": "n2"},
+        {"issue": "client_side_filter_masks_page_filter", "severity": "warn", "node_id": "n2"},
         {"issue": "long_wait_timeout", "severity": "warn", "node_id": "n3"},
     ])
 

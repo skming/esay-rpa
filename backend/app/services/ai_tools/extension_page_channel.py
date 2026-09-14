@@ -46,8 +46,20 @@ class ExtensionPageChannel:
         self._closed = False
         self.tab_id: int | None = None
         self.document_id: str | None = None
+        self.requested_url: str | None = None
         self._idle_handle: asyncio.TimerHandle | None = None
         self._last_screenshot_at = 0.0
+
+    def apply_begin(self, result: Any) -> None:
+        """把 page.begin 的返回落到会话身上。换标签页时旧文档身份必须一并作废。"""
+        tab_id = result.get("tab_id") if isinstance(result, dict) else None
+        if type(tab_id) is not int:
+            raise RuntimeError("扩展未返回活动标签页身份，请更新扩展")
+        if self.tab_id is not None and self.tab_id != tab_id:
+            self.document_id = None
+        self.tab_id = tab_id
+        requested = result.get("requested_url") if isinstance(result, dict) else None
+        self.requested_url = requested if isinstance(requested, str) and requested else None
 
     @property
     def closed(self) -> bool:
@@ -91,11 +103,12 @@ class ExtensionPageChannel:
         finally:
             self.touch()
 
-    async def observe(self, scope_selector: str | None) -> dict[str, Any]:
+    async def observe(self, scope_selector: str | None, include_html: bool = False) -> dict[str, Any]:
         """在扩展当前标签页上跑一次探测。版本号由这里递增，内容脚本据它作废旧 ref 表。"""
         self.version += 1
         result = await self._send(
-            {"type": "page.observe", "scope": scope_selector, "observationVersion": self.version}
+            {"type": "page.observe", "scope": scope_selector, "observationVersion": self.version,
+             "includeHtml": include_html}
         )
         if not isinstance(result, dict):
             raise RuntimeError("扩展页面探测没有返回对象")
@@ -105,6 +118,8 @@ class ExtensionPageChannel:
         self.document_id = document_id
         result["observation_version"] = self.version
         result["tab_id"] = self.tab_id
+        if self.requested_url is not None:
+            result["requested_url"] = self.requested_url
         self.last_url = result.get("url") if isinstance(result.get("url"), str) else None
         return result
 
@@ -193,11 +208,12 @@ class ExtensionPageChannel:
     def capability_report(self) -> dict[str, Any]:
         return {
             "channel": "extension",
-            "observes": "会话开始时用户 Chrome 活动标签页的真实 DOM 与登录态",
+            "observes": "用户 Chrome 真实页面的 DOM 与登录态",
             "frame_targeted_observation": False,
             "closed_shadow_dom": False,
             "notes": [
-                "绑定开始时的标签页；用户切换标签页不会转移动作，关闭目标页后必须重新建立会话。",
+                "给 url 会复用已打开的目标标签页、没有就新开一个；省略 url 则观察会话绑定的那个标签页。",
+                "绑定期间用户切换标签页不会转移动作，关闭目标页后必须重新建立会话。",
                 "仅观察主文档和 open Shadow DOM；不支持 frame_selector、tab_index 或 full_page 截图。",
                 "截图与 DOM 是同一标签页的两次取证，不保证页面状态在两次取证之间不变。",
                 "配方中的 Playwright 专用 selector 必须按扩展语法验证后才能保存运行。",
@@ -231,7 +247,7 @@ def foreign_channel(token: str | None = None) -> ExtensionPageChannel | None:
     return channel
 
 
-async def open_channel(executor: Any, *, token: str | None = None) -> ExtensionPageChannel:
+async def open_channel(executor: Any, *, token: str | None = None, target_url: str | None = None) -> ExtensionPageChannel:
     global _current
     mine = _page_session.current_owner(token)
     async with _open_lock:
@@ -240,15 +256,21 @@ async def open_channel(executor: Any, *, token: str | None = None) -> ExtensionP
             if existing.token != mine:
                 raise _page_session.SessionOwnershipError("扩展探索会话属于另一轮对话")
             existing.touch()
+            if target_url is None:
+                return existing
+            # 指定了目标页就重发 page.begin：扩展那边负责复用已开着的目标标签页或新开一个，
+            # 绑定可能因此换到另一个标签页，tab_id 必须跟着更新。
+            result = await executor.page_action({"type": "page.begin", "targetUrl": target_url})
+            existing.apply_begin(result)
             return existing
         context = await executor.create_context(owner=CHANNEL_OWNER, manage_tabs=False)
         channel = ExtensionPageChannel(executor, context, token=mine)
         try:
-            result = await executor.page_action({"type": "page.begin"})
-            tab_id = result.get("tab_id") if isinstance(result, dict) else None
-            if type(tab_id) is not int:
-                raise RuntimeError("扩展未返回活动标签页身份，请更新扩展")
-            channel.tab_id = tab_id
+            action: dict[str, Any] = {"type": "page.begin"}
+            if target_url is not None:
+                action["targetUrl"] = target_url
+            result = await executor.page_action(action)
+            channel.apply_begin(result)
         except BaseException:
             await executor.close_context(context)
             raise

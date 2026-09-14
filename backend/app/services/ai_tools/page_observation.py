@@ -84,11 +84,21 @@ OBSERVATION_NOTE = (
     "ref 字段只在本次观察内有效，只能给 interact_page 用；"
     "存进流程的节点必须写 selector，ref 换一次观察就失效。"
     "matches>1 说明该 selector 命中多个元素，必须先用 container 收窄再写进流程。"
+    "tables[].headers 取自表头行（空列位置保留 ''），与 sample_rows 逐列对应；"
+    "row_count 与 sample_rows 是 row_selector 在本次页面上的实际命中，表头行已按 DOM 结构排除。"
+    "empty_state=true 表示有表头、零数据行——这张表此刻合法为空，不要继续等待。"
+    "等待用 ready_selector（目标区域出现），提取用 row_selector（数据行），两者不可互换。"
+    "row_selector_source 是这条路径按哪种结构推出来的：native_tbody / table_tr / aria_row "
+    "取自标准结构，biz_row_class / biz_scope_tr 取自自研组件的类名，属推断，写进流程前"
+    "应先用 interact_page 或再观察一次确认命中数。"
     "若 date_controls 字段存在，按 interaction_recipe.steps 构建节点（selector 直接用，"
     "日期文本/目标年月/节点数量按本次任务改写）；主路线走不通时才看 fallback_steps，"
     "notes 里是该框架与执行器的已知限制；"
     "actionable=false 表示槽位没解析出来（见 unresolved_slots），"
     "改用 interact_page 点开控件后再观察，不要照抄 panel_selectors_unverified。"
+    "page_outcome=page_observed 表示页面读到了，但没有任何针对目标区域的证据"
+    "（scope_selector 未命中唯一区域、wait_selector 未满足、表格零数据行）；"
+    "此时不能断定目标内容存在或不存在，应带 scope_selector 或 wait_selector 再观察一次。"
 )
 
 _SPA_LOADING_WARNING = (
@@ -104,23 +114,148 @@ _EMPTY_PAGE_WARNING = (
     "如果多次重试仍为空，请检查 url 是否正确、是否需要重新登录。"
 )
 
+# 观察结论在这里单点给出：两条通道各判一份的话，同一个页面会在扩展侧报「还在加载」、
+# 在 Playwright 侧报「空内容」，模型按看到的那份决定是等还是改流程拓扑。
+TARGET_CONTENT_READY = "target_content_ready"
+PAGE_OBSERVED = "page_observed"
+REDIRECTED_TO_LOGIN = "redirected_to_login"
+STILL_LOADING = "still_loading"
+EMPTY_CONTENT = "empty_content"
+ACCESS_FAILED = "access_failed"
 
-def annotate_observation(result: dict[str, Any]) -> bool:
-    """探测返回 → 交给模型的观察结果：字段说明、控件识别、加载态与空页告警。
+_STRUCTURE_KEYS = ("inputs", "buttons", "links", "tables")
+# page_layout 是探测取的页面骨架，page_text_sample 是后端精简出来的正文。只认前者不够：
+# page_layout 只取「文本长于 5 字的 body 直接子节点」，正文写在 body 上或拆成许多短段落
+# 时它就是空的，而那一页的正文是齐全的（实测两种形状都会被报成 empty_content）。
+_CONTENT_KEYS = ("page_layout", "page_text_sample")
+# 探测自己就没拿到 DOM 时用的状态；blocked_* 一律算访问失败，它们都表示「没能开始观察」。
+_ACCESS_FAILURE_STATUSES = frozenset({"error", "timed_out", "extension_observation_failed"})
 
-    两条观察通道都必须走这里。同一个页面在两条通道上给出的告警和配方一旦不同，
-    模型会按看到的那份去改流程拓扑，而两边都自称读的是真实 DOM。
+_LOGIN_URL_TOKENS = ("login", "signin", "sign-in", "auth", "sso", "passport")
+
+
+def _landed_on_login(result: dict[str, Any], requested_url: str | None) -> str | None:
+    """请求的是目标页、实际停在登录页。命中返回落地 URL。
+
+    两个判据缺一不可：只看 url 变化会把「本来就在查登录页」和「站点重定向」混为一谈；
+    只看有没有 password 输入框会把任何带密码框的页面都算成登录页。
+    带 redirect 参数的 SPA 还会保留原路径，光看 url 像是到了目标页，而返回的 DOM 是登录表单。
     """
+    if not requested_url:
+        return None
+    landed = str(result.get("url") or "")
+    if not landed or landed.rstrip("/") == requested_url.rstrip("/"):
+        return None
+    if not any(token in landed.lower() for token in _LOGIN_URL_TOKENS):
+        return None
+    has_password = any(
+        isinstance(item, dict) and item.get("type") == "password"
+        for item in result.get("inputs") or []
+    )
+    return landed if has_password else None
+
+
+def _observed_anything(result: dict[str, Any]) -> bool:
+    """页面上到底有没有东西。元素与正文任一非空即算读到了内容。
+
+    只数 inputs/buttons/links/tables，有正文没控件的文章页会被报成空页面，
+    模型于是拿着 wait_selector 去等一个这页上永远不会出现的控件。
+    """
+    if sum(len(result.get(key) or []) for key in _STRUCTURE_KEYS) > 0:
+        return True
+    return any(result.get(key) for key in _CONTENT_KEYS)
+
+
+def _target_evidence(result: dict[str, Any]) -> bool:
+    """有没有证据说明「要找的那块内容」在这一页上，而不只是这一页打开了。
+
+    三种都是对目标区域的直接观察：scope 命中唯一区域、wait_selector 等到了、
+    表格拿到了数据行。三种都没有时只能说页面已观察——页面上只有一排导航按钮，
+    元素数也大于零，据此报「目标内容就绪」，模型就会拿导航页的 DOM 去写提取节点。
+    """
+    if result.get("scope_selector") and not result.get("scope_missing") and not result.get("scope_matches"):
+        return True
+    wait_result = result.get("wait_result")
+    if isinstance(wait_result, dict) and wait_result.get("status") == "satisfied":
+        return True
+    return any(
+        isinstance(table, dict) and (table.get("row_count") or 0) > 0
+        for table in result.get("tables") or []
+    )
+
+
+def classify_page_outcome(result: dict[str, Any], requested_url: str | None = None) -> str:
+    """这次观察到底拿到了什么：目标内容 / 被送去登录 / 还在渲染 / 本来就是空的 / 根本没读到。
+
+    判据只来自本份结果，不读上一轮的结论——登录后重新观察必须自己报一次。
+
+    加载态读 result["spa_loading"]，即 finalize_observation 的判定，而不是自己再算一遍：
+    它依据的 all_classes 已经被 finalize_observation 摘掉了，这里重算只会得出更弱的结论。
+    所以这个函数跟在 finalize_observation 之后调用。
+    """
+    status = str(result.get("status") or "")
+    if status.startswith("blocked_") or status in _ACCESS_FAILURE_STATUSES:
+        return ACCESS_FAILED
+    # 结构键一个都没有 = 探测没读到 DOM（异常被上层转成了 error），与「读到了但里面没元素」
+    # 是两回事，后者才该报空内容。
+    if not any(key in result for key in _STRUCTURE_KEYS):
+        return ACCESS_FAILED
+    if _landed_on_login(result, requested_url):
+        return REDIRECTED_TO_LOGIN
+    # 加载态排在空内容之前：只有 logo 的页面元素数也是 1，先判空会把「还在渲染」
+    # 报成「页面就是这样」，模型于是拿一份空列表去写 selector。
+    if result.get("spa_loading"):
+        return STILL_LOADING
+    if not _observed_anything(result):
+        return EMPTY_CONTENT
+    return TARGET_CONTENT_READY if _target_evidence(result) else PAGE_OBSERVED
+
+
+def _login_redirect_warning(requested_url: str, landed: str) -> str:
+    return (
+        f"⚠️ 请求的是 {requested_url}，实际停在登录页 {landed}——"
+        "本次返回的是登录表单 DOM，不是目标页结构。\n"
+        "禁止据此修改目标页的 browser.wait / browser.extract selector，也不能据此断定"
+        "目标页「不是表格」或「结构不对」——你根本没看到目标页。\n"
+        "要拿到目标页 DOM：用扩展通道时，先在 Chrome 里完成登录再重新调用 inspect_page"
+        "（会复用同一个标签页的登录态）；用 Playwright 通道时，需运行一次含登录链路的流程，"
+        "或用 inspect_screenshot 确认登录态后重试。"
+    )
+
+
+def annotate_observation(result: dict[str, Any], requested_url: str | None = None) -> bool:
+    """统一观察通道的字段说明、控件配方与告警，返回 spa_loading。
+
+    requested_url 仅由本次显式请求 URL 的 inspect 调用传入，不从持久化会话结果推断，
+    避免扩展通道在交互后使用旧 URL 报告登录跳转。"""
     result["note"] = OBSERVATION_NOTE
     spa_loading = finalize_observation(result)
     result["spa_loading"] = spa_loading
-    if spa_loading:
+
+    # scope 没解析成功时不给页面级结论：探测根本没去看整页，报「空内容」会让模型加
+    # wait_selector 去等一个永远不会出现的元素，而它该做的是修 scope_selector——
+    # 这两件事的出路相反，而 scope 失败自己已经带了 error 与 required_action。
+    if result.get("scope_missing") or result.get("scope_matches"):
+        return spa_loading
+
+    outcome = classify_page_outcome(result, requested_url)
+    result["page_outcome"] = outcome
+
+    if outcome == ACCESS_FAILED:
+        return spa_loading
+    if outcome == REDIRECTED_TO_LOGIN:
+        landed = _landed_on_login(result, requested_url) or str(result.get("url") or "")
+        result["redirected_to_login"] = True
+        result["warning"] = _login_redirect_warning(str(requested_url), landed)
+        return spa_loading
+    if outcome == STILL_LOADING:
         result["warning"] = _SPA_LOADING_WARNING
         return True
-    # 空元素判定必须在加载态之后：只有 logo 的页面元素数也是 1，先判空会把「还在渲染」
-    # 报成「页面就是这样」，模型于是拿一份空列表去写 selector。
-    if sum(len(result.get(key) or []) for key in ("inputs", "buttons", "links", "tables")) == 0:
-        result["warning"] = _EMPTY_PAGE_WARNING
+    if outcome == EMPTY_CONTENT:
+        # 已经带了自己的 error 就不再叠一句「加 wait_selector 重试」：两句话的出路不同，
+        # 模型会照后一句去等元素，而该修的是前一句指出的东西。
+        if not result.get("error"):
+            result["warning"] = _EMPTY_PAGE_WARNING
     return False
 
 

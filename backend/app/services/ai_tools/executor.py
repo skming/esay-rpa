@@ -17,7 +17,7 @@ from collections.abc import Awaitable
 
 from app.core import storage
 from app.models.schemas import FlowAcceptanceContract, FlowUpdateRequest
-from app.services.acceptance_contract import contract_validation_errors
+from app.services.acceptance_contract import contract_validation_errors, pagination_caps_from_nodes
 from app.services.ai_checks import audit_run
 from app.services.ai_guards import exposed_credential_values
 from app.services import browser_profile_lock
@@ -66,7 +66,7 @@ from app.services.ai_tools.page_probe_js import PAGE_PROBE_JS
 # 不写 `from app.services.ai_tools import page_session`：那样加载期先跑包 __init__，
 # 而 __init__ 又导入本模块，test_ai_module_layering 会判定成循环 import。
 import app.services.ai_tools.page_session as _page_session
-from app.services.ai_tools.static_page_probe import inspect_static_page
+from app.services.ai_tools.static_page_probe import inspect_static_page, snapshot_from_html
 from app.services.ai_tools.static_page_content import clear_static_snapshot, read_static_snapshot
 from app.services.ai_tools.variables import _RUNTIME_BUILTINS, _collect_defined_vars, _validate_variable_refs
 
@@ -74,6 +74,33 @@ if TYPE_CHECKING:
     from app.services.flow_service import FlowService
     from app.services.scheduler_service import ScheduleService
     from app.services.task_manager import TaskManager
+
+
+def _merge_page_content(observation: dict[str, Any], scope_selector: str | None) -> None:
+    """把探测带回的整页 HTML 就地换成精简正文，原始 HTML 不交给模型。
+
+    取不到正文不影响本次观察：结构证据（inputs/buttons/tables/selector）照样成立，
+    只是少一份正文。失败原因如实写进 page_content_unavailable，不静默留空——
+    探测能穿开放 shadow root，lxml 的 cssselect 不能，同一个 scope_selector
+    在两边可以一个命中、一个不命中。
+    """
+    html_text = observation.pop("page_html", None)
+    if not isinstance(html_text, str) or not html_text:
+        return
+    try:
+        merged = snapshot_from_html(html_text, str(observation.get("url") or ""), observation, scope_selector)
+    except Exception as exc:
+        observation["page_content_unavailable"] = {"reason": f"正文快照建立失败：{exc}"}
+        return
+    if merged.get("status") == "error":
+        observation["page_content_unavailable"] = {"reason": merged.get("error") or "正文摘要读取失败"}
+        if merged.get("snapshot_id"):
+            observation["snapshot_id"] = merged["snapshot_id"]
+        return
+    # 只补 observation 里还没有的键：evidence 就是 observation 本身，snapshot.read 返回的是
+    # 它的副本加上正文字段，覆盖一遍等于用旧值盖掉这一轮刚写的结构证据。
+    for key, value in merged.items():
+        observation.setdefault(key, value)
 
 
 async def _observe_wait(wait: Awaitable[Any], selector: str) -> dict[str, Any]:
@@ -93,9 +120,6 @@ async def _observe_wait(wait: Awaitable[Any], selector: str) -> dict[str, Any]:
             raise
         return {"status": "timed_out", "selector": selector}
     return {"status": "satisfied", "selector": selector}
-
-
-_LOGIN_URL_TOKENS = ("login", "signin", "sign-in", "auth", "sso", "passport")
 
 
 _CONDITION_NODE_TYPES = ("control.condition",)
@@ -208,17 +232,9 @@ def _foreign_session_block(tool_name: str) -> dict[str, Any] | None:
 
 
 def _profile_busy_block(tool_name: str, *, allow_page_session: bool = False) -> dict[str, Any] | None:
-    """浏览器 profile 被别的运行占着时，返回一份「别修流程、去找用户」的阻断结果。
+    """按占用登记阻止共享 profile 冲突；暂停等待人工的任务仍持有浏览器。
 
-    按任务状态自查（原来只看 status == "running"）会漏掉 paused_for_human：等人工接管的运行
-    照样开着浏览器窗口，此时 inspect_page 会拿到一屏 Chrome 启动参数当报错，模型接着去改
-    selector——错的方向。占用登记表是唯一知道「谁开着浏览器」的地方。
-
-    allow_page_session：探索会话自己也在登记表里，所以「占用方是不是别人」必须区分出自己。
-    不区分的后果是第一次 inspect_page(url=...) 之后，任何不带 url 的再次观察和同会话截图都被
-    自己的登记挡成 blocked_browser_profile_busy——而通用日期配方的 fallback 正是让模型点开
-    弹层后再看一次当前页面。登记名是所有探索会话共用的，光比登记名会把另一轮对话的会话
-    也认成自己的，所以放行只认「本轮归属的会话确实存在」。
+    allow_page_session 仅放行本轮拥有的探索会话；共享登记名不能证明会话归属。
     """
     held = browser_profile_lock.holder(str(storage.resolve_browser_profile_dir()))
     if held is None:
@@ -242,33 +258,6 @@ def _profile_busy_block(tool_name: str, *, allow_page_session: bool = False) -> 
             "把上面这句话转告用户，等他处理完再继续。"
         ),
     }
-
-
-def _annotate_login_redirect(result: dict[str, Any], requested_url: str) -> None:
-    """标注 inspect_page 请求的是目标页、实际落到了登录页。
-
-    带 redirect 参数的 SPA 会保留原路径，光看 url 像是到了目标页；这时返回的 DOM
-    是登录表单而非目标页结构，据此写出来的 selector 必然对不上。
-    """
-    landed = str(result.get("url") or "")
-    if not landed or landed.rstrip("/") == requested_url.rstrip("/"):
-        return
-    landed_lower = landed.lower()
-    has_password_input = any(
-        isinstance(item, dict) and item.get("type") == "password"
-        for item in result.get("inputs") or []
-    )
-    if not (has_password_input and any(token in landed_lower for token in _LOGIN_URL_TOKENS)):
-        return
-    result["redirected_to_login"] = True
-    result["warning"] = (
-        f"⚠️ 请求的是 {requested_url}，实际停在登录页 {landed}——"
-        "本次返回的是登录表单 DOM，不是目标页结构。\n"
-        "禁止据此修改目标页的 browser.wait / browser.extract selector，也不能据此断定"
-        "目标页「不是表格」或「结构不对」——你根本没看到目标页。\n"
-        "要拿到目标页 DOM，需先在浏览器 profile 里完成登录：运行一次含登录链路的流程，"
-        "或用 inspect_screenshot 确认登录态后重试。"
-    )
 
 
 def _validated_contract(raw: dict[str, Any] | None) -> tuple[Any, dict[str, Any] | None]:
@@ -779,7 +768,11 @@ class RpaToolExecutor:
         if contract_invalid is not None:
             return contract_invalid
         defined_variables = _collect_defined_vars(nodes, iv_names)
-        contract_errors = contract_validation_errors(contract, defined_variables=set(defined_variables))
+        contract_errors = contract_validation_errors(
+            contract,
+            defined_variables=set(defined_variables),
+            pagination_caps=pagination_caps_from_nodes(nodes),
+        )
         if contract_errors:
             return {
                 "error": "acceptance_contract_invalid",
@@ -1591,6 +1584,7 @@ class RpaToolExecutor:
             flow.acceptance_contract,
             defined_variables=set(_collect_defined_vars(nodes, input_var_names)),
             input_values=merged_variables,
+            pagination_caps=pagination_caps_from_nodes(nodes),
         )
         if contract_errors:
             return {
@@ -2172,7 +2166,11 @@ class RpaToolExecutor:
             [iv.name for iv in flow.input_variables],
         )
         missing = sorted({item.variable for item in contract.deliverables if item.variable not in defined})
-        contract_errors = contract_validation_errors(contract, defined_variables=set(defined))
+        contract_errors = contract_validation_errors(
+            contract,
+            defined_variables=set(defined),
+            pagination_caps=pagination_caps_from_nodes(flow.definition.get("nodes")),
+        )
         if contract_errors:
             return {
                 "error": "验收契约无效",
@@ -2316,24 +2314,33 @@ class RpaToolExecutor:
     ) -> dict[str, Any]:
         if frame_selector not in (None, "main") or tab_index is not None:
             return {"status": "unsupported_capability", "error": "扩展探索仅支持绑定标签页的主文档，不支持 frame_selector 或 tab_index"}
-        if url is not None:
-            return {"status": "unsupported_capability", "error": "扩展探索读取当前活动网页。请在 Chrome 打开目标网页，然后省略 url 调用。"}
         blocked = self._extension_access_error()
         if blocked is not None:
             return blocked
         try:
             async with _page_session.guard:
                 await _page_session.close_current("switch_to_extension")
-                channel = await _extension_page.open_channel(self._task_manager.extension_exploration_executor())
+                channel = await _extension_page.open_channel(
+                    self._task_manager.extension_exploration_executor(), target_url=url,
+                )
                 wait_result = None
                 if wait_selector:
                     wait_result = await _observe_wait(channel.wait_for(wait_selector), wait_selector)
-                result = await channel.observe(scope_selector)
-                annotate_observation(result)
+                result = await channel.observe(scope_selector, include_html=True)
+                result["scope_selector"] = scope_selector
+                # wait_result 先进 result 再判结论：「等到了目标」正是目标内容的证据，
+                # 后补的话 classify_page_outcome 看不到，等到了也只报「页面已观察」。
+                # wait_result 先进 result 再判结论：「等到了目标」正是目标内容的证据，
+                # 后补的话 classify_page_outcome 看不到，等到了也只报「页面已观察」。
                 if wait_result is not None:
                     result["wait_result"] = wait_result
+                # 正文先合进来再判结论：page_outcome 要看 page_text_sample，而正文是这一步
+                # 才有的。顺序反过来，纯正文页（page_layout 取不到的那些形状）会被判成空页面。
+                # 快照的 evidence 就是这份 result（同一个对象、不复制），所以本轮结论仍然
+                # 进得去——补读时 read() 现取 dict(evidence)，拿到的是 annotate 写完的版本。
+                _merge_page_content(result, scope_selector)
+                annotate_observation(result, url)
                 result["inspection_source"] = "extension"
-                result["scope_selector"] = scope_selector
                 result["capabilities"] = channel.capability_report()
                 result["session"] = {"channel": "extension", "tab_id": channel.tab_id,
                                      "document_id": channel.document_id,
@@ -2582,13 +2589,15 @@ class RpaToolExecutor:
                         }
                     }
 
-                result = await session.observe(PAGE_PROBE_JS, scope_selector)
+                result = await session.observe(PAGE_PROBE_JS, scope_selector, include_html=True)
                 result["scope_selector"] = scope_selector
                 if url is not None:
                     result["requested_url"] = url
-                annotate_observation(result)
                 if wait_result is not None:
                     result["wait_result"] = wait_result
+                # 正文先合进来再判结论，理由同扩展通道那一处。
+                _merge_page_content(result, scope_selector)
+                annotate_observation(result, url)
 
                 # 子 frame 对主文档抽取不可见，需单独统计并告知 AI
                 try:
@@ -2621,9 +2630,6 @@ class RpaToolExecutor:
                 except Exception:
                     pass  # frame census is best-effort
 
-                # 放在最后：登录重定向比 spa_loading / 空元素更能解释异常，warning 以它为准
-                if url is not None:
-                    _annotate_login_redirect(result, url)
                 result["session"] = {
                     "tab_count": session.tab_count(),
                     "frame_selector": session.frame_selector,

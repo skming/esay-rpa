@@ -157,7 +157,7 @@ def _build_run_root_cause_hints(
                 "先用 inspect_page 或截图确认当前真实页面是登录页、应用页还是空白加载页",
                 "默认保留 Cookies/localStorage 复用登录态；只有用户要求重置登录或确认过期 token 卡死时，才临时清理存储",
                 "登录完成后显式 browser.open 到目标数据页，再等待目标表格",
-                "修复前看状态块诊断里的 single_navigation_node、登录检测和筛选控件相关警告",
+                "修复前对照失败时页面、导航轨迹、登录检测和筛选控件相关证据",
             ],
         })
 
@@ -773,6 +773,15 @@ def _build_quality_repair_plan(issues: list[dict[str, Any]]) -> list[dict[str, A
                 "重跑后看 acceptance_audit：行数应当与页面上的记录条数同量级，而不是 1 行。",
             ],
         })
+    if "deliverable_not_scalar" in issue_names:
+        plan.append({
+            "action": "produce_scalar_value",
+            "reason": "交付契约要求单值，实际产物是列表、对象或空值。",
+            "steps": [
+                "单元素回读用 browser.extract.firstValueVariable 绑定契约变量；outputVariable 保留给列表并使用不同变量名。",
+                "若来源是脚本，修正返回值类型，不能把整个列表强制转成字符串。修复后重新运行验收。",
+            ],
+        })
     if issue_names & {"deliverable_not_table", "unstructured_rows", "rows_not_objects"}:
         plan.append({
             "action": "produce_structured_rows",
@@ -928,4 +937,3 @@ def _build_quality_repair_plan(issues: list[dict[str, Any]]) -> list[dict[str, A
             ],
         })
     return plan
-

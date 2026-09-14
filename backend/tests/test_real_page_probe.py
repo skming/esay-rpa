@@ -451,3 +451,238 @@ async def test_same_class_does_not_prove_date_range_ownership(executor, name, ex
     assert all("end_input" not in control["interaction_recipe"] for control in controls)
     if expected == ["generic/date-unresolved"]:
         assert controls[0]["interaction_recipe"]["actionable"] is False
+
+
+async def test_a_prose_page_with_real_body_text_is_not_reported_as_empty(
+    executor: RpaToolExecutor,
+) -> None:
+    """有正文就不是空页面，哪怕一个控件都没有。
+
+    结构键（inputs/buttons/links/tables）全空的纯正文页报 empty_content，模型会拿
+    wait_selector 去等一个这页上永远不会出现的控件，等到超时都等不到。
+    正文摘要是 page_text_sample，判结论时必须已经合进来——它在状态判断之后才合入的话，
+    这条判据永远看不到正文。
+    """
+    result = await _observe(executor, "article_text_only.html")
+    assert result.get("page_text_sample"), result.keys()
+    assert "华东与华南" in result["page_text_sample"], result["page_text_sample"]
+    assert result["page_outcome"] != "empty_content", result.get("page_outcome")
+    assert not result.get("warning"), result.get("warning")
+
+
+def _table(result: dict[str, Any], container: str) -> dict[str, Any]:
+    tables = [t for t in result.get("tables") or [] if t.get("container_selector") == container]
+    assert tables, result.get("tables")
+    return tables[0]
+
+
+@pytest.mark.parametrize(("name", "container", "source", "row_selector"), [
+    ("table_no_tbody.html", "#order-table", "table_tr", "#order-table tr"),
+    ("table_mixed_th_td.html", "#summary-table", "native_tbody", "#summary-table > tbody > tr"),
+    ("table_aria_grid.html", "#task-grid", "aria_row", "#task-grid [role=row]:has([role=cell], [role=gridcell])"),
+])
+async def test_row_selector_comes_from_the_real_structure_of_each_table_shape(
+    executor: RpaToolExecutor, name: str, container: str, source: str, row_selector: str,
+) -> None:
+    """缺 tbody 的表上 `> tbody > tr` 零命中、ARIA 表上按标签名找行零命中——两种都返回
+    「成功抓到 0 行」而不是报错，流程跑完交出空数据。row_selector_source 把「按哪种结构
+    推出来的」写明，自研组件那两支本就是猜，模型据此知道哪条要回页面验。
+    """
+    table = _table(await _observe(executor, name), container)
+    assert (table["row_selector_source"], table["row_selector"]) == (source, row_selector), table
+
+
+@pytest.mark.parametrize(("name", "container", "sample_rows"), [
+    ("table_no_tbody.html", "#order-table", [["A-1", "甲公司", "1200"], ["A-2", "乙公司", ""]]),
+    ("table_mixed_th_td.html", "#summary-table", [["华东", "1200", "1350"], ["华南", "", "880"]]),
+    ("table_aria_grid.html", "#task-grid", [["导出报表", "张三", "进行中"], ["对账", "", "待开始"]]),
+])
+async def test_sample_rows_drop_header_rows_by_structure_and_keep_empty_columns(
+    executor: RpaToolExecutor, name: str, container: str, sample_rows: list[list[str]],
+) -> None:
+    """表头混进样例，字段映射会拿表头文字当第一条数据；空列塌掉，第 3 列的值顶到第 2 列，
+    整套映射错一位——两种都不报错，交出来的数据看着是满的。
+
+    混合 th/td 那张表的数据行首列是 <th scope="row">：按「这行里有 th」判表头会把每条
+    数据都摘掉，所以判据是「整行都是 th」。
+    """
+    table = _table(await _observe(executor, name), container)
+    assert table["sample_rows"] == sample_rows, table
+    assert table["row_count"] == 3, table
+
+
+@pytest.mark.parametrize(("name", "container", "headers"), [
+    ("table_no_tbody.html", "#order-table", ["编号", "客户", "金额"]),
+    ("table_mixed_th_td.html", "#summary-table", ["地区", "Q1", "Q2"]),
+    ("table_aria_grid.html", "#task-grid", ["任务", "负责人", "状态"]),
+    ("table_empty_body.html", "#order-table", ["编号", "", "金额"]),
+])
+async def test_headers_come_from_the_header_row_and_line_up_with_the_samples(
+    executor: RpaToolExecutor, name: str, container: str, headers: list[str],
+) -> None:
+    """列标题只能取自表头行，且要与 sample_rows 逐列对应。
+
+    把整张表的 th 一起收进来，混合表格的 <th scope="row"> 行标题会变成第 4/5/6 列
+    （表头成了 地区、Q1、Q2、华东、华南、华北）；再把空表头过滤掉，空列位置塌陷，
+    表头数比样例列数少一个。两种都让字段映射整体错位，而数据看着是满的。
+    """
+    table = _table(await _observe(executor, name), container)
+    assert table["headers"] == headers, table
+    for row in table["sample_rows"]:
+        assert len(row) == len(table["headers"]), table
+
+
+async def test_a_table_without_column_headers_reports_no_headers(
+    executor: RpaToolExecutor,
+) -> None:
+    """没有列标题就如实交空表头，不能退回「第一个 th 的父元素」。
+
+    首列是 <th scope="row"> 的表格里，那个 th 在数据行上：退回它的父元素会把第一行数据
+    （East / 12）当成列标题，字段名成了数据，而这一行同时还留在 sample_rows 里。
+    交空表头时提取侧会按列序号命名，数据不会错位。
+    """
+    table = _table(await _observe(executor, "table_row_headers_only.html"), "#sales-table")
+    assert table["headers"] == [], table
+    assert table["sample_rows"] == [["East", "12"], ["West", "9"]], table
+    assert table["row_count"] == 2, table
+    # 没有表头行，就没有「有表头、零数据行」的合法空表之说
+    assert table["empty_state"] is False, table
+
+
+async def test_a_confirmed_empty_table_extracts_zero_rows_instead_of_failing(
+    executor: RpaToolExecutor, tmp_path: Path,
+) -> None:
+    """合法空表要照常交零行，观察侧 empty_state=true 与提取侧必须是同一个结论。
+
+    报成范围错，模型会去改一个本来就对的选择器；而这一页观察时已经说了「有表头、
+    零数据行」。两条判据分家时，同一张表在观察和提取上给出相反的结论。
+    """
+    from app.services.browser_action_runner import BrowserActionRunner
+    from app.services.runtime_variables import RuntimeVariableStore
+
+    runner = BrowserActionRunner(str(tmp_path / "profile"))
+    try:
+        context = await runner.create_context(headless=True, owner="test_real_page_probe")
+    except Exception as exc:  # noqa: BLE001 - 环境缺件与实现缺陷要分开报
+        pytest.skip(f"无法在本机拉起浏览器：{exc}")
+    store = RuntimeVariableStore.from_initial({})
+    try:
+        await runner.run(
+            {"id": "n0", "type": "browser.open", "targetUrl": _url("table_empty_body.html")},
+            store, context, timeout_ms=15_000,
+        )
+        empty = await runner.run(
+            {"id": "n1", "type": "browser.extract", "selector": "#order-table", "extractMode": "table"},
+            store, context, timeout_ms=15_000,
+        )
+        assert empty.values == [], empty.values
+
+        # 什么表格都没圈到，才是选择器没命中——这一条不能被上面那条放行。
+        with pytest.raises(RuntimeError, match="没有任何表格行"):
+            await runner.run(
+                {"id": "n2", "type": "browser.extract", "selector": "h1", "extractMode": "table"},
+                store, context, timeout_ms=15_000,
+            )
+
+        await runner.run(
+            {"id": "n3", "type": "browser.open", "targetUrl": _url("table_mixed_th_td.html")},
+            store, context, timeout_ms=15_000,
+        )
+        # 表头行必须按结构剔掉：不剔，空表会把表头当成唯一一条数据交出去
+        # （实测 #order-table 返回过 {"编号": "编号", ...}），而这张表会多出一条表头行。
+        rows = await runner.run(
+            {"id": "n4", "type": "browser.extract", "selector": "#summary-table", "extractMode": "table"},
+            store, context, timeout_ms=15_000,
+        )
+        assert rows.values == [
+            '{"地区": "华东", "Q1": "1200", "Q2": "1350"}',
+            '{"地区": "华南", "Q1": "", "Q2": "880"}',
+            '{"地区": "华北", "Q1": "760", "Q2": "810"}',
+        ], rows.values
+    finally:
+        await runner.close_context(context)
+
+
+async def test_empty_table_is_told_apart_from_a_selector_that_missed(
+    executor: RpaToolExecutor,
+) -> None:
+    """有表头、零数据行 = 合法空表，等待到此为止。与「选择器没命中」同为零行，
+    但出路相反：前者该交零行，后者该报错重选，混在一起流程会一直等下去。"""
+    table = _table(await _observe(executor, "table_empty_body.html"), "#order-table")
+    assert (table["row_count"], table["empty_state"]) == (0, True), table
+    assert table["sample_rows"] == [], table
+    # 等待用容器、提取用行，是两个字段
+    assert table["ready_selector"] == "#order-table"
+    assert table["row_selector"] == "#order-table > tbody > tr"
+
+
+async def test_a_table_with_data_is_not_flagged_as_an_empty_state(
+    executor: RpaToolExecutor,
+) -> None:
+    table = _table(await _observe(executor, "table_mixed_th_td.html"), "#summary-table")
+    assert table["empty_state"] is False, table
+
+
+async def test_a_row_header_column_is_extracted_as_data_not_dropped(
+    executor: RpaToolExecutor, tmp_path: Path,
+) -> None:
+    """role=rowheader 的首列必须当数据交出，两条通道用同一份单元格判据。
+
+    漏掉时实测交出 {"工单号": "进行中", "状态": "8"}：四行齐全、字段名都在，每个值
+    却左移一位顶到了别的字段名下。
+    """
+    from app.services.browser_action_runner import BrowserActionRunner
+    from app.services.runtime_variables import RuntimeVariableStore
+
+    runner = BrowserActionRunner(str(tmp_path / "profile"))
+    try:
+        context = await runner.create_context(headless=True, owner="test_real_page_probe")
+    except Exception as exc:  # noqa: BLE001 - 环境缺件与实现缺陷要分开报
+        pytest.skip(f"无法在本机拉起浏览器：{exc}")
+    store = RuntimeVariableStore.from_initial({})
+    try:
+        await runner.run(
+            {"id": "n0", "type": "browser.open", "targetUrl": _url("eval_aria_table.html")},
+            store, context, timeout_ms=15_000,
+        )
+        whole = await runner.run(
+            {"id": "n1", "type": "browser.extract", "selector": "#task-grid", "extractMode": "table"},
+            store, context, timeout_ms=15_000,
+        )
+        assert whole.values == [
+            '{"工单号": "G-01", "状态": "进行中", "工时": "8"}',
+            '{"工单号": "G-02", "状态": "已完成", "工时": "5"}',
+            '{"工单号": "G-03", "状态": "进行中", "工时": "13"}',
+            '{"工单号": "G-04", "状态": "待开始", "工时": "2"}',
+        ], whole.values
+
+        # 圈到行本身时表头仍要取到：行的 closest 认 role="table"，取到的是同一张表的列标题，
+        # 与扩展侧 tableExtract.ts 对同一选择器的结论逐字相同。少认这个 role 会退回按位置
+        # 交出，同一页同一选择器两条通道给出两种形状。
+        rows = await runner.run(
+            {
+                "id": "n2",
+                "type": "browser.extract",
+                "selector": '#task-body [role="row"]',
+                "extractMode": "table",
+            },
+            store, context, timeout_ms=15_000,
+        )
+        assert rows.values == [
+            '{"工单号": "G-01", "状态": "进行中", "工时": "8"}',
+            '{"工单号": "G-02", "状态": "已完成", "工时": "5"}',
+            '{"工单号": "G-03", "状态": "进行中", "工时": "13"}',
+            '{"工单号": "G-04", "状态": "待开始", "工时": "2"}',
+        ], rows.values
+    finally:
+        await runner.close_context(context)
+
+
+async def test_observation_and_extraction_agree_on_the_aria_table(
+    executor: RpaToolExecutor,
+) -> None:
+    """观察侧对同一张 ARIA 表也必须给出三列：两边不一致时模型会照着观察去改提取。"""
+    table = _table(await _observe(executor, "eval_aria_table.html"), "#task-grid")
+    assert table["headers"] == ["工单号", "状态", "工时"], table
+    assert table["sample_rows"][:2] == [["G-01", "进行中", "8"], ["G-02", "已完成", "5"]], table
+    assert table["row_count"] == 4, table

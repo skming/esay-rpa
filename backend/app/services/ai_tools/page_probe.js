@@ -15,6 +15,7 @@
 export const PAGE_PROBE = (args) => {
     const scopeSelector = (args && args.scope) || null;
     const version = (args && args.version) || 0;
+    const includeHtml = !!(args && args.includeHtml);
     const MAX = 60;
 
     // ── 一次观察 = 一个 ref 注册表 ────────────────────────────────
@@ -402,41 +403,112 @@ export const PAGE_PROBE = (args) => {
     });
 
     // ── 表格：标准 HTML + ARIA grid/table，外加渲染出表头行的自研组件 ──
+    // 返回命中的分支名而不只是选择器：模型据此知道这条路径是按哪种结构推出来的，
+    // 自研组件那两支（biz_row_class / biz_scope_tr）本就是猜，写进流程前该回页面验一次。
     function bizRowSelector(tbl) {
         const tableScope = bestSelector(tbl).selector;
-        if (tbl.tagName === 'TABLE' && tbl.querySelector('tbody > tr')) {
-            return tableScope + ' > tbody > tr';
+        // 判据是「有没有 tbody」而不是「tbody 里现在有没有行」：后者让同一张表在空的时候
+        // 退到 ' tr'（连表头行一起圈进去），有数据时才收窄，推荐给流程的选择器随观察时刻变。
+        if (tbl.tagName === 'TABLE' && tbl.tBodies.length > 0) {
+            return { selector: tableScope + ' > tbody > tr', source: 'native_tbody' };
         }
         if (tbl.matches('[role=grid], [role=table]') && tbl.querySelector('[role=row]')) {
-            return tableScope + ' [role=row]:has([role=cell], [role=gridcell])';
+            return { selector: tableScope + ' [role=row]:has([role=cell], [role=gridcell])', source: 'aria_row' };
+        }
+        // tbody 缺失的 <table>：DOM API 往 <table> 上直接 append <tr> 不会补 tbody
+        // （HTML 解析器才补），上面那支落空，行仍然在 tr 里。
+        if (tbl.tagName === 'TABLE' && tbl.querySelector('tr')) {
+            return { selector: tableScope + ' tr', source: 'table_tr' };
         }
         const anc = nearestBizAncestor(tbl);
-        if (!anc) return null;
+        if (!anc) return { selector: null, source: null };
         const scope = '.' + CSS.escape(anc.cls);
         const rowEl = tbl.querySelector('[class*="row"], [class*="__row"], [class*="-row"]');
         if (rowEl) {
             const rowCls = [...rowEl.classList].find(c =>
                 /row|__row|-row|--row/.test(c) && !isLayoutOnly(c)
             );
-            if (rowCls) return scope + ' .' + CSS.escape(rowCls);
+            if (rowCls) return { selector: scope + ' .' + CSS.escape(rowCls), source: 'biz_row_class' };
         }
-        return scope + ' tr';
+        return { selector: scope + ' tr', source: 'biz_scope_tr' };
     }
+
+    // 表头行只按 DOM 结构判，不看文本：拿「像表头的字」当判据，第一行数据叫「合计」
+    // 就会被当表头摘掉，而真表头用了数据样的词就会混进样例行。
+    // 行标题（<th scope="row"> / role=rowheader）不算列标题单元格：它长在数据行上，
+    // 认了它，第一条数据就会被当成表头。
+    function isColumnHeaderCell(c) {
+        if (c.getAttribute('role') === 'rowheader') return false;
+        if (c.tagName === 'TH' && c.getAttribute('scope') === 'row') return false;
+        return c.tagName === 'TH' || c.getAttribute('role') === 'columnheader';
+    }
+
+    function isHeaderRow(row) {
+        if (row.closest('thead')) return true;
+        const cells = [...row.children];
+        if (cells.length === 0) return false;
+        return cells.every(isColumnHeaderCell);
+    }
+
+    // 空列位置保留 ''：塌掉空列，第 3 列的值会顶到第 2 列上，模型据此把字段映射整体错一位。
+    function rowCells(row) {
+        return [...row.children].map(c => text(c));
+    }
+
+    // 列标题只从表头行取：把整张表的 th 一起收进来，混合表格会把首列的行标题
+    // 「华东/华南/华北」也算成列标题，多出三列，字段映射整体错位。
+    function headerRow(tbl) {
+        const rows = [...tbl.querySelectorAll('tr, [role=row]')];
+        const head = rows.find(isHeaderRow);
+        if (head) return head;
+        // 有行、但没有一行是表头行 = 这张表没有列标题，如实交空数组，不退回「第一个 th 的父元素」
+        if (rows.length) return null;
+        // 自研组件可能一个行标记都不给（既没有 tr 也没有 [role=row]），这时才退回列标题
+        // 单元格的直接父元素——仍是结构判据，不看类名。
+        const cell = [...tbl.querySelectorAll('th, [role=columnheader]')].find(isColumnHeaderCell);
+        const parent = cell && cell.parentElement;
+        return parent && parent !== tbl ? parent : null;
+    }
+
+    // row_count 少算，合法空表与「选择器没命中」就分不开；样例行混进表头行，
+    // 字段映射会拿表头文字当第一条数据。
+    function rowEvidence(selector) {
+        if (!selector) return { row_count: null, sample_rows: [] };
+        let matched;
+        try { matched = queryAll(DOC_ROOTS, selector); } catch (e) { return { row_count: null, sample_rows: [] }; }
+        const dataRows = matched.filter(r => !isHeaderRow(r));
+        return { row_count: dataRows.length, sample_rows: dataRows.slice(0, 2).map(rowCells) };
+    }
+
     const tableElSet = new Set(queryAll(ROOTS, 'table, [role=grid], [role=table]'));
     queryAll(ROOTS, '[class]:not(table)').forEach(el => {
         // 标准表格的祖先只是布局容器，不是另一张表。
         if (el.querySelector('table, [role=grid], [role=table]') || el.closest('table, [role=grid], [role=table]')) return;
         if (el.querySelector('th, [role=columnheader]')) tableElSet.add(el);
     });
-    const tables = [...tableElSet].slice(0, 5).map(tbl => ({
-        headers: [...tbl.querySelectorAll('th, [role=columnheader]')].map(th => text(th)).filter(Boolean),
-        // 叫 container_selector 而不是 selector：browser.extract 要的是行路径，
-        // 而名字里带 selector 的字段会被原样抄进去。
-        container_selector: bestSelector(tbl).selector,
-        cls: String(tbl.className || '').slice(0, 60),
-        row_selector: bizRowSelector(tbl),
-        ref: ref(tbl),
-    }));
+    const tables = [...tableElSet].slice(0, 5).map(tbl => {
+        const row = bizRowSelector(tbl);
+        const head = headerRow(tbl);
+        const container = bestSelector(tbl).selector;
+        const evidence = rowEvidence(row.selector);
+        return {
+            headers: head ? rowCells(head) : [],
+            // 叫 container_selector 而不是 selector：browser.extract 要的是行路径，
+            // 而名字里带 selector 的字段会被原样抄进去。
+            container_selector: container,
+            // 等待与提取分成两个字段：共用一个时模型会拿行选择器去等，
+            // 合法空表上永远等不到，流程停在超时而不是交出空结果。
+            ready_selector: container,
+            cls: String(tbl.className || '').slice(0, 60),
+            row_selector: row.selector,
+            row_selector_source: row.source,
+            ...evidence,
+            // 有表头、零数据行 = 合法空表，等待到此为止；row_count 为 null 是没数出来
+            // （没有行选择器或选择器非法），那是证据缺失，不能当成空表放行。
+            empty_state: head !== null && evidence.row_count === 0,
+            ref: ref(tbl),
+        };
+    });
 
     // ── 当前已展开的浮层 ──────────────────────────────────────────
     // 组件库的下拉/日历面板几乎都挂在 body 下、绝对定位；这是「点开控件后下一次观察能看到
@@ -545,6 +617,30 @@ export const PAGE_PROBE = (args) => {
         html: safeLayoutHtml(el),
     }));
 
+    // ── 整页 HTML（按需） ─────────────────────────────────────────
+    // 给后端做精简正文用。默认不带：interact_page 每次动作后都会重新观察一次，
+    // 每次都搬整页 HTML 过 WebSocket，绝大多数时候那份正文根本没人读。
+    //
+    // 只做两件脱敏，与 safeLayoutHtml 同一套：去掉 script（内容是噪声，且不该外传），
+    // 抹掉 password 的 value（凭据一律不出页面）。「哪些算正文」不在这里判——
+    // 清理与分块由后端单点做，这里再判一次就会有两处各自决定什么是噪声。
+    //
+    // 超限不截断：HTML 从中间断开后，解析器的 recover 模式会静默产出一棵看似正常
+    // 的树，模型据此写出的 selector 在真实页面上不存在。所以只报为什么没带。
+    function capturePageHtml() {
+        const MAX_HTML = 2 * 1024 * 1024;
+        const root = document.documentElement;
+        if (!root) return { unavailable: { reason: 'no_document_element' } };
+        const raw = root.outerHTML || '';
+        if (raw.length > MAX_HTML) {
+            return { unavailable: { reason: 'page_html_too_large', length: raw.length, limit: MAX_HTML } };
+        }
+        const clone = root.cloneNode(true);
+        clone.querySelectorAll('script').forEach(node => node.remove());
+        clone.querySelectorAll('input[type="password"]').forEach(node => node.removeAttribute('value'));
+        return { html: clone.outerHTML };
+    }
+
     const result = {
         url: window.location.href,
         title: document.title,
@@ -560,6 +656,12 @@ export const PAGE_PROBE = (args) => {
         all_classes: allCls,   // 仅供服务端做组件识别/加载态判断，返回给模型前会被移除
         page_layout: pageLayout,
     };
+    if (includeHtml) {
+        const captured = capturePageHtml();
+        // page_html 仅供服务端建正文快照，返回给模型前会被摘掉（它看的是精简后的正文）。
+        if (captured.html !== undefined) result.page_html = captured.html;
+        else result.page_html_unavailable = captured.unavailable;
+    }
     if (scopeSelector) {
         result.scope_selector = scopeSelector;
         if (scopeMatches > 1) result.scope_matches = scopeMatches;

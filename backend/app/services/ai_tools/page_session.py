@@ -1,16 +1,7 @@
-"""AI 助手的浏览器探索会话：一次打开、多次观察与交互。
+"""按对话轮次持有浏览器探索会话，观察与截图复用交互后的页面状态。
 
-为什么需要它：一次性的 inspect_page 每次自己开上下文、goto、关掉，点开下拉/日历/弹窗后的
-状态在下一次调用里已经不存在，模型永远看不到「点开之后页面变成什么样」。截图同理——
-另开一个上下文再导航一次，拿到的不是刚才那次交互后的画面。
-
-会话占着浏览器 profile 锁，所以它必须能自己消失：空闲超时、显式关闭、失败与取消都要释放，
-否则用户的运行会一直被「AI 助手正在探索」挡住。
-
-会话按「哪一轮对话开的」归属：聊天流与自愈流共用同一个 orchestrator 实例，不区分归属时，
-第二轮的观察会落在第一轮打开的页面上，第二轮结束还会把第一轮的浏览器关掉。同一个 profile
-仍然只允许一个会话，另一轮拿到的是明确的「属于别人」，不是悄悄接管。
-"""
+空闲超时、关闭、失败和取消时释放 profile 锁。同一 profile 只允许一个会话；
+其他轮次不得接管页面或关闭其浏览器。"""
 
 from __future__ import annotations
 
@@ -198,13 +189,16 @@ class PageSession:
     def tab_count(self) -> int:
         return len([p for p in list(self.context.pages) if not _is_closed(p)])
 
-    async def observe(self, probe_js: str, scope_selector: str | None) -> dict[str, Any]:
+    async def observe(self, probe_js: str, scope_selector: str | None,
+                      include_html: bool = False) -> dict[str, Any]:
         """在当前目标（页面或 iframe）上跑一次探测，并把这次的观察版本号写进结果。"""
         self._require_open()
         self.touch()
         self.version += 1
         target = await self.target()
-        result = await target.evaluate(probe_js, {"scope": scope_selector, "version": self.version})
+        result = await target.evaluate(
+            probe_js, {"scope": scope_selector, "version": self.version, "includeHtml": include_html}
+        )
         if not isinstance(result, dict):
             raise RuntimeError("页面探测没有返回对象")
         result["observation_version"] = self.version

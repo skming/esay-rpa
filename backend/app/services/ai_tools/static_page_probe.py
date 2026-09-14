@@ -80,6 +80,22 @@ def _looks_like_block_page(document: Any, page_text: str, title: str, html_text:
     return False
 
 
+def snapshot_from_html(html_text: str, url: str, evidence: dict[str, Any],
+                       scope_selector: str | None = None) -> dict[str, Any]:
+    """从 HTML 副本生成正文快照，不发起网络请求。
+
+    evidence 由调用方提供：静态抓取与已登录 DOM 的能力边界不同，不能共用静态通道标记。
+    正文读取失败时返回带 snapshot_id 的错误，允许换 scope_selector 读取同一快照。"""
+    document = html.fromstring(html_text)
+    snapshot = StaticSnapshot(document=document, evidence=evidence)
+    save_static_snapshot(snapshot)
+    try:
+        return snapshot.read(scope_selector)
+    except Exception as exc:
+        return {"status": "error", "snapshot_id": snapshot.id, "url": url,
+                "error": f"静态摘要读取失败：{exc}"}
+
+
 async def inspect_static_page(url: str, *, timeout_ms: int = 20_000, scope_selector: str | None = None) -> dict[str, Any]:
     """用独立 HTTP 通道获取静态 HTML，避免把浏览器单通道失败误判成站点不可达。"""
     clear_static_snapshot()
@@ -138,10 +154,6 @@ async def inspect_static_page(url: str, *, timeout_ms: int = 20_000, scope_selec
         ),
     }
 
-    snapshot = StaticSnapshot(document=document, evidence=evidence)
-    save_static_snapshot(snapshot)
-    try:
-        return snapshot.read(scope_selector)
-    except Exception as exc:
-        return {"status": "error", "snapshot_id": snapshot.id, "url": final_url,
-                "error": f"静态摘要读取失败：{exc}"}
+    # 这里再解析一次 html_text（上面为拦截页判定已解析过一份）：多一次解析换「建快照」
+    # 只有一条路径，扩展通道与静态通道的清理、分块、补读因此不可能各自漂移。
+    return snapshot_from_html(html_text, final_url, evidence, scope_selector)

@@ -24,10 +24,9 @@ _ACCEPTANCE_CONTRACT_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
     "description": (
         "运行前冻结的交付验收契约。requirements 必须逐条记录用户原文来源；"
-        "deliverables 每项必须明确 id、variable、kind、requirement_ids；"
-        "kind 可为 table/document/file/scalar，并按需求填写 required_fields、"
-        "date_ranges、allowed_values、unique_by、required_terms、forbidden_terms 等后置条件。"
-        "审计只验这里声明的交付变量，不再根据变量名猜测。"
+        "审计只验这里声明的交付变量。"
+        "随输入变化的筛选值与行数界不能写字面量（契约会换输入重放），"
+        "改用对应的 *_variable 字段绑定输入变量。"
     ),
     "properties": {
         "requirements": {
@@ -59,9 +58,15 @@ _ACCEPTANCE_CONTRACT_SCHEMA: dict[str, Any] = {
                     "required": {"type": "boolean"},
                     "min_rows": {"type": "integer"},
                     "max_rows": {"type": "integer"},
+                    "min_rows_variable": {"type": "string"},
+                    "max_rows_variable": {"type": "string"},
                     "required_fields": {"type": "array", "items": {"type": "string"}},
                     "date_ranges": {"type": "array", "items": {"type": "object"}},
-                    "allowed_values": {"type": "array", "items": {"type": "object"}},
+                    "allowed_values": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "每项 {field, values?, value_variables?}，两者至少一个非空。",
+                    },
                     "unique_by": {"type": "array", "items": {"type": "string"}},
                     "min_chars": {"type": "integer"},
                     "required_terms": {"type": "array", "items": {"type": "string"}},
@@ -510,7 +515,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                     "browser_executor": {
                         "type": "string", "enum": ["playwright", "extension"],
-                        "description": "指定观察通道；省略沿用当前会话，初次默认 playwright。extension 读取 Chrome 当前活动网页和登录态，须省略 url；不支持 frame_selector/tab_index/full_page。",
+                        "description": "指定观察通道；省略沿用当前会话，初次默认 playwright。extension 读取 Chrome 的真实页面和登录态：给 url 会复用已打开的目标标签页、没有就新开一个，省略 url 则观察当前活动网页；不支持 frame_selector/tab_index/full_page。",
                     },
                     "url": {
                         "type": "string",
