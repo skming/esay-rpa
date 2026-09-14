@@ -62,6 +62,9 @@ _SEC['step0_clarify'] = """### 第零步：需求澄清（创建前必须确认�
 3. **要提取/操作的具体内容**：目标模糊（如"抓取数据"、"自动填表"）且**用户已提供 URL** → 优先调用 `inspect_page` 查看页面实际内容（表格字段、链接文字等），再基于真实内容向用户确认或直接提案；若**未提供 URL** 则问"请提供目标网址"（见上）
 4. **输出要求**：默认保存为 JSON，不为格式单独追问；只有用户明确要求 Excel 时才使用 `excel.*`。
 5. **冻结验收契约**：创建流程时必须通过 `acceptance_contract.requirements` 逐条保存用户原文 `source_quote`，每个 deliverable 用 `requirement_ids` 绑定来源，再明确交付变量、类型和行数、字段、日期、枚举、数值、排序、聚合、覆盖率等条件。低置信度或未确认推断必须先询问用户，不能写进契约；普通修复不得放宽契约。
+   - 样本条数不是业务上下限，不能把本次观察到的行数写成 min_rows/max_rows；只有用户明确要求时才设数量约束。输入驱动的数量或枚举使用变量绑定。
+   - 用户允许空结果时，表格交付物显式设 min_rows:0；required:true 仍要求产出变量，不能靠 required:false 跳过交付。
+   - scalar 交付物必须绑定单值；browser.extract 的日期/属性回读使用 firstValueVariable。cross_field_assertions 的两端都是结果字段；与输入变量比较使用 allowed_values.value_variables。
 
 **只问最关键的 1～3 个问题**，不要面面俱到；用户提供的信息越多，问得越少。信息足够时直接创建，不要多此一举地确认。
 
@@ -92,7 +95,7 @@ _SEC['step1_decompose'] = """### 第一步：需求拆解
 **登录链路的两个非直觉点**：
 
 - **登录态检测用 `browser.ensureLogin`**：`targetUrl`=系统首页，`selector`=已登录才出现的元素，`targetSelector`=未登录特征（`input[type='password']`），`firstValueVariable`=`login_status`；紧接 `control.condition`，表达式写 `login_status == 'login_required'`。
-- **登录成功 ≠ 已在数据页**：登录后浏览器停在首页/工作台，必须再导航一次（`browser.open` 目标 URL，或 `inspect_page` 拿到真实菜单 selector 后点击）才能取数。
+- **登录后确认落地页**：根据实际 URL 和目标区域判断是否已到数据页；已到达就等待并取数。仍停在首页/工作台时，才使用已验证的目标 URL 或菜单继续导航，保留必要的 query/hash 状态。
 4. **等待动态加载**：SPA/Vue/React 框架页面表格通常是异步渲染 → 加 `browser.wait` 等待数据行出现（**只加一个**，不要重复）
 5. **分页**：表格数据是否超过一页？→ 加 `browser.paginateNext` 或翻页循环
 6. **筛选/查询**：是否需要先设置筛选条件再查询？→ 加 `browser.fill`/`browser.click`/`browser.select` + 点击查询按钮

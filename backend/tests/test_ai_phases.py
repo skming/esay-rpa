@@ -103,7 +103,7 @@ def test_a_blank_flow_is_in_build_and_cannot_be_run() -> None:
 
 
 def test_blocking_diagnostics_put_the_session_in_fix_and_stop_the_run() -> None:
-    findings = [{"severity": "error", "issue": "single_navigation_node"}]
+    findings = [{"severity": "error", "issue": "login_without_navigation_to_data_page"}]
     state = _ready(blocking_diagnostics=findings)
     assert resolve_phase(state) is Phase.FIX
     blocked = _blocked_by("run_flow", state)

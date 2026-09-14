@@ -53,14 +53,12 @@ _CREDENTIAL_KEYWORDS = frozenset({
 
 # warn 级但照样会挡住运行的 issue：它们不会让流程报错，只会让它安静地跑出错数据
 # （只抽到一行、筛选没生效、登录后停在登录页），跑完才发现等于白跑一趟真实站点。
+# 只收「跑一次也定不了论」的：一次执行就能暴露的问题交执行裁决，不在这里用 selector
+# 文本猜测去挡——猜错时挡住的是一个本来能跑的流程。
 BLOCKING_LINT_ISSUES = frozenset({
     "critical_action_continue_on_error",
     "script_uses_browser_dom",
-    "single_navigation_node",
     "clear_storage_breaks_login_persistence",
-    "table_extract_selector_targets_container",
-    "table_extract_selector_not_table_like",
-    "table_extract_selector_too_broad",
     "client_side_filter_masks_page_filter",
     "date_filter_missing_verification",
     "submit_key_on_body",
@@ -161,7 +159,6 @@ def _lint_flow(
     findings.extend(_lint_critical_continue_on_error(nodes, edges))
     findings.extend(_lint_continue_on_error_output_defaults(nodes, edges))
 
-    findings.extend(_lint_single_navigation_node(nodes))
     if input_variable_names is not None:
         findings.extend(_lint_undefined_variable_refs(nodes, list(input_variable_names)))
 
@@ -526,46 +523,6 @@ def _lint_swallowed_fork_paths(nodes: list[Any], edges: list[Any]) -> list[dict[
             ),
         })
     return findings
-
-
-def _lint_single_navigation_node(nodes: list[Any]) -> list[dict[str, Any]]:
-    """只有一个 browser.open 却同时有登录+抽取节点，是空白页失败的常见根因
-    （登录后未导航到数据页），AI 常误诊为下游 selector 问题。
-    """
-    _EXTRACTION_TYPES = {"browser.extract", "browser.wait"}
-    _LOGIN_INDICATORS = {"input[type='password']", "password", "用户名", "账号", "登录"}
-
-    # ensureLogin 也会导航（打开 targetUrl），不算进去的话「ensureLogin + 一个数据页 open」
-    # 这个规范拓扑会被误判成只有一次导航
-    _NAVIGATION_TYPES = {"browser.open", "browser.ensureLogin"}
-    open_nodes = [n for n in nodes if isinstance(n, dict) and n.get("type") in _NAVIGATION_TYPES]
-    extraction_nodes = [n for n in nodes if isinstance(n, dict) and n.get("type") in _EXTRACTION_TYPES]
-    login_fill_nodes = [
-        n for n in nodes
-        if isinstance(n, dict) and n.get("type") == "browser.fill"
-        and any(kw in str(n.get("selector", "") + n.get("inputValue", "")).lower() for kw in _LOGIN_INDICATORS)
-    ]
-
-    if not (len(open_nodes) == 1 and extraction_nodes and login_fill_nodes):
-        return []
-
-    only_open = open_nodes[0]
-    return [{
-        "severity": "error",
-        "node_id": only_open.get("id", "?"),
-        "node_title": only_open.get("title", "browser.open"),
-        "issue": "single_navigation_node",
-        "message": (
-            f"流程只有一个 browser.open 节点（{only_open.get('targetUrl') or only_open.get('url','?')}），"
-            "但同时包含登录节点和数据提取节点。"
-            "登录后若目标数据在不同页面，必须添加第二个 browser.open（或菜单点击导航）跳转到数据页，"
-            "否则 browser.wait / browser.extract 节点会在登录成功页（仪表盘/首页）等待，永远等不到目标元素。"
-        ),
-        "fix": (
-            "在登录完成节点之后、数据提取节点之前，添加 browser.open 节点"
-            "（targetUrl 填目标页面地址，delayMs: 3000）并连线：登录完成 → 导航节点 → 等待/提取节点。"
-        ),
-    }]
 
 
 def _lint_undefined_variable_refs(nodes: list[Any], input_variable_names: list[str]) -> list[dict[str, Any]]:

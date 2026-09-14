@@ -1,17 +1,6 @@
-"""写入期差分检查：判据是「这次改动相对上一版做了什么」。
+"""写入前比较实际 before/after 定义，避免工具参数与最终落盘内容不一致。
 
-原来有三条 pre-tool 护栏在做这件事——execution_channel_preservation、
-field_oscillation、node_selector_fix_budget。它们判的都是变化，手上却只有工具参数，
-于是只能靠参数形状去推变化：`update_nodes` 的 patch 里没有 type，「剪断全部入边让
-节点静默孤立」得另写一套边模型去还原，同一件事在 update_flow 与 apply_node_fix 两个
-分支各写一遍还得保证两边结论一致。参数也不等于事实——记下来的是模型「想改成什么」，
-不是最终落盘的那一版。
-
-搬到写入前的那一刻，before/after 两份定义都在手上：一次图比较替掉三段参数解析，
-判的是真正会落盘的内容；以后新增改流程的工具或新的改法，都不必再补一遍判定。
-
-这里的每一条命中都拒绝写入（`ChangeReport.rejected`），不存在"提示级"结论：
-放行了再提醒，等于让模型先把坏改动写进去，下一轮再去撤。
+所有命中均拒绝写入（ChangeReport.rejected），不提供仅提示后放行的分支。
 """
 from __future__ import annotations
 
@@ -99,7 +88,7 @@ def _by_id(definition: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
     return {str(n["id"]): n for n in _nodes(definition) if n.get("id")}
 
 
-def _signature(definition: dict[str, Any] | None) -> str:
+def execution_signature(definition: dict[str, Any] | None) -> str:
     """语义指纹：只认会影响执行的内容，画布坐标与运行状态不算。
 
     sort_keys 让「同样的内容、不同的键顺序」得出同一个指纹；列表顺序保留不排序——
@@ -324,7 +313,7 @@ def inspect_change(
     context = context or ChangeContext()
     ledger = ledger or {}
 
-    if _signature(before) == _signature(after):
+    if execution_signature(before) == execution_signature(after):
         if allow_no_effective_change:
             return ChangeReport()
         return ChangeReport(findings=({

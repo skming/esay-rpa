@@ -1,15 +1,7 @@
-"""跨请求的会话检查点：让「上一轮已经付过的代价」在中断后依然算数。
+"""跨请求保留失败预算和未完成的修复要求，避免中断重置额度。
 
-失败预算（连续失败次数、导航/质量熔断）和未了结的义务（审计不合格必须先修、lint 阻断未清、
-必须先 inspect_page）只活在一次 stream() 的 guard_state 里。用户点停止、网络断、或者只是
-发下一条「还是不行」，这些计数就全部归零，同一条昂贵的路径（改一次跑一次，run_flow 常以
-分钟计）于是可以被重新走满额度。
-
-与 [[ai_repair_ledger]] 分开存，因为生命周期不同：台账记节点级轨迹、在流程跑通时清空；
-检查点记会话级预算、在**拿到最终回复**时就该清，否则明天的新需求会背着今天的熔断。
-
-写不进去一律当没有：检查点是省钱的优化，不是正确性的前提。
-"""
+最终回复后清空；节点级修复轨迹由生命周期不同的 ai_repair_ledger 管理。
+检查点写入失败不阻断任务，正确性不能依赖检查点可用。"""
 from __future__ import annotations
 
 import json
@@ -65,6 +57,7 @@ _PER_ROUND_KEYS = frozenset({
     # 「我过完验证了，再跑一次」），或者对同一段回复反复撤回重写
     "challenge_page_lock", "closing_statement_only", "terminal_response_only",
     "refusal_corrected", "result_claim_corrected", "verification_nudged",
+    "fake_tool_call_corrected",
     "transform_node_touched",
     # 另有归属：修复台账按 flow 单独落盘（ai_evidence_ledger），跨会话累计不靠这里
     "node_field_history", "node_selector_fix_counts",

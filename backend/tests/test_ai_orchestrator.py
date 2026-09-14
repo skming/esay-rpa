@@ -40,6 +40,8 @@ from app.services.ai_orchestrator import (
     _build_system_message,
     _detect_turn_intents,
     _FLOW_WRITE_TOOLS,
+    _fake_tool_call_text,
+    _looks_like_tool_call_text,
     _misapplied_refusal,
     _orchestrator_guard_after_tool,
     _orchestrator_guard_before_tool,
@@ -697,6 +699,185 @@ def test_misapplied_refusal_is_rewritten_only_when_the_turn_was_actionable() -> 
     assert _misapplied_refusal(
         "已把节点 n2 的选择器改成 table.data", GuardState(turn_intent_actionable=True)
     ) is None
+
+
+def test_fake_tool_call_text_is_corrected_once_per_session() -> None:
+    """正文写着调用、执行层一次没收到：要求经真实接口重试，且只要求一次——
+    第二次仍失败由编排层照实报调用失败，不能无限撤回。"""
+    state = GuardState()
+    faked = '我来看一下页面。\n{"tool_calls": [{"function": {"name": "inspect_page"}}]}'
+
+    assert _fake_tool_call_text(faked, state) is not None
+    assert state.fake_tool_call_corrected is True
+    assert _fake_tool_call_text(faked, state) is None
+    # 标志置上后判据本身仍然成立，编排层据此走「第二次失败」分支
+    assert _looks_like_tool_call_text(faked) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"tool_calls": [{"function": {"name": "inspect_page", "arguments": "{}"}}]}',
+        "<tool_use>\n<invoke name=\"inspect_page\">\n</invoke>\n</tool_use>",
+        'inspect_page({"url": "https://example.com/#/workbench"})',
+        "update_flow(flow_id='flow-1')",
+        "functions.inspect_page",
+        # 协议信封本身：不指名工具也算，那是协议泄漏进了正文
+        "<tool_call>\n{\"name\": \"whatever\"}\n</tool_call>",
+        # 代码块外还写了一次真调用：围栏里的示例不豁免围栏外的那次
+        '示例：\n```json\n{"tool_calls": []}\n```\n现在执行：inspect_page({"url": "https://a.test/"})',
+    ],
+)
+def test_tool_call_protocol_text_is_recognized(text: str) -> None:
+    assert _looks_like_tool_call_text(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "接下来我会用 inspect_page 看一下页面结构，再决定选择器。",
+        "已把节点 n2 的选择器改成 table.data，运行后 12 行数据都抓到了。",
+        "流程里有 update_flow 写入的三个节点：打开页面、等待表格、提取数据。",
+        "价格区间是 100<200，这一列没有抓到。",
+        # 讲协议本身：只有字段名、没有指向本项目的工具
+        '模型返回的响应里带 "tool_calls" 字段时，SDK 会走工具分支，否则当普通文本处理。',
+        "OpenAI 的旧协议叫 function_call，新协议改成了 tool_calls，两者结构不同。",
+        # 参数示例写在代码块里
+        '参数示例：\n```json\n{"tool_calls": [{"function": {"name": "inspect_page"}}]}\n```\n照这个形状填即可。',
+        '行内示例 `inspect_page({"url": "https://a.test/"})` 只是说明参数长什么样。',
+    ],
+)
+def test_ordinary_text_mentioning_tools_is_not_a_fake_call(text: str) -> None:
+    """只提工具名、讲协议字段、或给代码示例，都是正常回复。
+    判成伪调用会把一条本来正确的最终回复撤回重写。"""
+    assert _looks_like_tool_call_text(text) is False
+    assert _fake_tool_call_text(text, GuardState()) is None
+
+
+def test_a_fenced_tool_call_on_an_execution_turn_is_a_fake_call() -> None:
+    """要求干活的那一轮，围栏里的调用不是示例。
+
+    用户请求参数示例时，围栏里本就该有这些字符串（见上一条测试）；但本轮意图已被判定为
+    建流程/修流程/要运行时，模型把整次调用写进围栏、一次工具也没真调，这就是伪调用。
+    实测这条路径执行次数为 0 却直接 done——豁免整个围栏，这一轮就没有任何判据拦得住它。
+    """
+    fenced = '我来看一下页面。\n```json\n{"tool_calls": [{"function": {"name": "inspect_page"}}]}\n```'
+
+    assert _looks_like_tool_call_text(fenced) is False
+    assert _looks_like_tool_call_text(fenced, scan_code_examples=True) is True
+
+    state = GuardState(turn_intent_actionable=True)
+    assert _fake_tool_call_text(fenced, state) is not None
+    assert state.fake_tool_call_corrected is True
+    # 闲聊轮次里同一段文本仍是示例：讲协议、给参数样例都合法
+    assert _fake_tool_call_text(fenced, GuardState()) is None
+
+
+def test_fake_tool_call_correction_does_not_claim_page_evidence() -> None:
+    """伪调用路径绝不置页面证据：拿上一轮的旧观察冒充本轮已检查，
+    正是这条判据要拦的那种「看起来验过了」。"""
+    state = GuardState()
+
+    _fake_tool_call_text('{"tool_calls": []}\ninspect_page({"url": "https://a.test/"})', state)
+
+    assert state.page_evidence_done is False
+    assert state.page_evidence_source is None
+    assert state.fresh_page_evidence is False
+
+
+async def test_repeated_fake_tool_call_is_reported_as_a_call_failure(monkeypatch) -> None:
+    """两轮都把调用写在正文里：第一次撤回重试，第二次照实报调用失败。
+
+    关键是最终 done 之前没有把那段正文当成完成——伪造的调用文本一旦留在最终回复里，
+    用户看到的是「助手查过页面了」，而执行层一次也没被调用过。
+    """
+    import litellm
+
+    faked = '我来看一下页面。\n{"tool_calls": [{"function": {"name": "inspect_page", "arguments": "{}"}}]}'
+    rounds = iter([
+        _FakeStream([_chunk(content=faked, finish="stop")]),
+        _FakeStream([_chunk(content=faked, finish="stop")]),
+    ])
+
+    async def fake_acompletion(**kwargs: Any) -> Any:
+        return next(rounds)
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    executor = _FakeExecutor()
+    events = [e async for e in AiOrchestrator(tool_executor=executor).stream(  # type: ignore[arg-type]
+        messages=[{"role": "user", "content": "看一下 https://example.com/#/workbench 这个页面"}],
+        model="test-model",
+    )]
+
+    assert [e["reason"] for e in events if e["type"] == "retract"] == [
+        "工具调用没有真正发起，正在重试", "工具调用没有真正发起",
+    ]
+    errors = [e["message"] for e in events if e["type"] == "error"]
+    assert len(errors) == 1 and "没有一次真实调用到达执行层" in errors[0]
+    # 正文里的 JSON 绝不能被当成调用执行
+    assert executor.calls == []
+
+
+async def test_a_fenced_only_fake_call_does_not_finish_the_task(monkeypatch) -> None:
+    """整次调用写在围栏里、一次也没真调：不能直接 done。
+
+    这是实跑复现的那条路径——执行次数为 0，流程一个节点都没建，最终回复却收尾了，
+    用户看到的是「助手查过页面了」。围栏一律当示例豁免时，这一轮没有任何判据拦得住。
+    """
+    import litellm
+
+    fenced = (
+        "我来看一下页面。\n"
+        '```json\n{"tool_calls": [{"function": {"name": "inspect_page", "arguments": "{}"}}]}\n```'
+    )
+    rounds = iter([
+        _FakeStream([_chunk(content=fenced, finish="stop")]),
+        _FakeStream([_chunk(content=fenced, finish="stop")]),
+    ])
+
+    async def fake_acompletion(**kwargs: Any) -> Any:
+        return next(rounds)
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    executor = _FakeExecutor()
+    events = [e async for e in AiOrchestrator(tool_executor=executor).stream(  # type: ignore[arg-type]
+        messages=[{"role": "user", "content": "帮我创建一个流程，抓取 https://example.com/#/workbench 的表格"}],
+        model="test-model",
+    )]
+
+    assert [e["reason"] for e in events if e["type"] == "retract"] == [
+        "工具调用没有真正发起，正在重试", "工具调用没有真正发起",
+    ]
+    errors = [e["message"] for e in events if e["type"] == "error"]
+    assert len(errors) == 1 and "没有一次真实调用到达执行层" in errors[0]
+    assert executor.calls == []
+
+
+async def test_fake_tool_call_retry_that_makes_a_real_call_proceeds(monkeypatch) -> None:
+    """第一次伪造、第二次真调：撤回之后必须能正常往下走，不是判死。"""
+    import litellm
+
+    rounds = iter([
+        _FakeStream([_chunk(content='inspect_page({"url": "https://a.test/"})', finish="stop")]),
+        _FakeStream([_chunk(tool_calls=[_tool_call_chunk(
+            0, call_id="c1", name="list_node_types", arguments='{"types": ["browser.open"]}',
+        )], finish="tool_calls")]),
+        _FakeStream([_chunk(content="页面有一张表格，共 12 行。", finish="stop")]),
+    ])
+
+    async def fake_acompletion(**kwargs: Any) -> Any:
+        return next(rounds)
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    executor = _FakeExecutor()
+    events = [e async for e in AiOrchestrator(tool_executor=executor).stream(  # type: ignore[arg-type]
+        messages=[{"role": "user", "content": "看一下 https://a.test/ 这个页面"}],
+        model="test-model",
+    )]
+
+    assert [e["reason"] for e in events if e["type"] == "retract"] == ["工具调用没有真正发起，正在重试"]
+    assert [name for name, _ in executor.calls] == ["list_node_types"]
+    assert [e["type"] for e in events if e["type"] == "error"] == []
 
 
 async def test_local_draft_flow_uses_blank_creation_context() -> None:
@@ -2035,3 +2216,48 @@ def test_invalid_run_arguments_are_not_execution_evidence() -> None:
     assert not state.run_attempted
     assert state.attempt_budget["spent"] == 0
     assert _unmet_verification_request(state) is not None
+
+
+def test_table_scope_failure_at_runtime_is_kept_across_turns() -> None:
+    """静态那三条降为提示后，圈错范围只剩执行能定论——结论必须跨轮留下。
+
+    状态块每轮重算，不单独记的话下一轮模型看到的又只是一条静态 warn，
+    而它刚刚已经跑失败过一次了。
+    """
+    from app.services.ai_orchestrator import _after_run_flow
+
+    state = GuardState()
+    _after_run_flow({
+        "status": "error",
+        "error": "extractMode=table 但 selector '.stats-card' 命中的元素里没有任何表格行（tr / [role=row]）。",
+    }, state)
+
+    findings = state.runtime_escape_findings
+    assert [f["issue"] for f in findings] == ["table_extract_scope_runtime_escape"]
+    assert ".stats-card" in findings[0]["message"]
+    # 改 selector 之前必须先看一次真实 DOM
+    assert state.page_evidence_required is not None
+    assert state.page_evidence_done is False
+
+
+def test_a_normal_run_error_does_not_record_a_table_scope_escape() -> None:
+    from app.services.ai_orchestrator import _after_run_flow
+
+    state = GuardState()
+    _after_run_flow({"status": "error", "error": "Timeout 30000ms exceeded waiting for locator('#x')"}, state)
+    assert state.runtime_escape_findings == []
+
+
+def test_selector_text_guesses_no_longer_block_a_run() -> None:
+    """三条 table_extract_selector_* 靠 selector 文本猜是否表格样/容器/过宽。
+
+    执行一次就有定论（两条通道都会在圈错范围时硬失败），而猜错挡住的是一个本来能跑的流程。
+    """
+    from app.services.ai_tools.lint import is_blocking_finding
+
+    for issue in (
+        "table_extract_selector_not_table_like",
+        "table_extract_selector_targets_container",
+        "table_extract_selector_too_broad",
+    ):
+        assert not is_blocking_finding({"issue": issue, "severity": "warn"}), issue

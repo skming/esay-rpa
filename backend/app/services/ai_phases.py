@@ -1,37 +1,8 @@
-"""会话的阶段机与收敛判据：把「先做 X 再做 Y」和「别再原地打转」各收成一处。
+"""会话阶段准入与失败预算。
 
-这两件事原来摊在十条独立闸门里（`pre_create_inspect_gate`、`requires_inspect_page`、
-`pending_repair_gate`、`requires_lint_fix`、`requires_quality_fix`、`repair_autorun_lock`、
-`consecutive_inspect_limit`、`repair_cycle_lock`、`quality_budget_lock`、
-`navigation_budget_lock`）。每条自己判自己的 state 键、自己定自己的作用域，于是有两类问题：
-
-- **顺序靠人记。** 十条闸的相对优先级只存在于 GUARDS 的行号里。粗粒度熔断必须排在
-  按节点计数的预算之前，否则模型每轮换个节点改就一条都不触发——这条约束一旦被
-  重排破坏，没有任何症状，直到线上出现一次本该被拦下的空转。
-- **额度能被绕。** 七个计数器各管一个维度，模型换个维度就是一份新额度：改节点 A 跑一次、
-  改节点 B 跑一次、改 selector 跑一次，三次都不重复，三个计数器各自才 1。
-
-这里换成两条判据：
-
-1. **阶段**（`resolve_phase`）——由事实推导，不存。存下来的阶段是第二份真相，会像
-   S1 那份「注入一次的流程定义」一样过期；判据只能每轮从 state 重算。
-   阶段只约束「写流程」和「跑流程」两类工具，读工具永不受约束：挡掉读工具等于
-   没收诊断手段，模型只能在剩下几个工具间空转。
-2. **收敛**（`note_failed_attempt` / `note_evidence` / `note_guard_block`）——一份总预算 +
-   一份证据指纹集。预算的关键在计价：**重复的失败按两份算，新的失败按一份算**。于是同一条 3 的上限
-   同时复现了三个旧阈值：同一签名连错 2 次 = 1+2 = 3（旧 NAV_FAILURE_BUDGET / 质量预算），
-   三次各不相同的失败 = 1+1+1 = 3（旧 MAX_REPAIR_CYCLES）。换维度不再是换额度。
-   护栏拦截也走这一份（`note_guard_block`）：拦截的判定与历史无关，但「同一条拦截反复出现」
-   跟改了又跑还是没成没有区别，不计价它就是唯一没有上限的空转形态。
-
-与旧实现的两处刻意差异，都是拿一轮的余量换掉一种更贵的失败模式：
-
-- DISCOVER 不再挡 `get_run_output`（旧 `requires_inspect_page` 挡）。省一轮换来的是
-  「诊断手段永不没收」这条不变量没有例外。
-- 预算耗尽（REPORT）仍放行 `apply_node_fix`（旧 `repair_cycle_lock` 挡）。它是单节点
-  单字段的精准改动，做不成盲改循环的载体，而它滥用的那一面已经由
-  [[ai_tools/lint_diff]] 的 selector 预算和字段回摆判据各自挡着；`run_flow` 在 REPORT
-  是关的，所以这里改完也无法自证，模型仍然只能交回用户。
+阶段每轮从当前事实推导，避免持久化状态过期；阶段限制不阻断只读诊断工具。
+失败与护栏拦截共用预算，新失败计一份，重复失败计两份，避免换节点或操作重置额度。
+REPORT 禁止运行，但允许 apply_node_fix；写入仍受 lint_diff 的差分检查约束。
 """
 from __future__ import annotations
 
@@ -247,13 +218,7 @@ def _check_repeated_evidence(
     state: GuardState,
     phase: Phase,
 ) -> dict[str, Any] | None:
-    """同一次取证重复调用：证据已经在上下文里，再取一次只会拿到同一份。
-
-    判据是「这次调用与上次之间流程没有任何变化」——写入或运行成功会清空指纹集
-    （见 `note_progress`），所以改完再看同一个页面是正当的，连着看两次同一个页面不是。
-    比旧的「连续 3 次」严格更准：三次探测三个不同 URL 不再被误挡，
-    重复探测同一个 URL 在第 2 次就拦下而不是第 4 次。
-    """
+    """无进展时阻止重复取证。写入或运行成功由 note_progress 清空指纹，允许重新观察。"""
     if not evidence_already_collected(tool_name, args, state):
         return None
     return _blocked(
@@ -414,16 +379,10 @@ def note_failed_attempt(
     detail: str | None = None,
     charge_only_if_repeated: bool = False,
 ) -> dict[str, Any]:
-    """记一次「改了再跑还是没成」。
+    """记录失败，重复签名计两份预算。
 
-    重复签名计两份：这是把三个旧计数器合成一个的关键。同一个节点、同一个质量问题、
-    同一条错误连着失败两次，就等于花掉全部额度——换维度不再是换额度。
-
-    `charge_only_if_repeated` 给起跑前就被拒的运行用：这份额度定价的是「真跑过一次」的
-    代价，没起跑就收费会把一条本该由用户清除的拦路条件（凭据为空、扩展未连、熔断锁）
-    变成自我加固——拒绝在花掉产生这条拒绝的额度。但仍然要记签名：同一条拒绝再来一次
-    就是原地打转，从第二次起按普通重复失败计价，否则这类拒绝一条收口都没有。
-    """
+    charge_only_if_repeated 用于尚未起跑就被拒的运行：首次只记签名，
+    重复时再计价，避免阻塞条件消耗首次纠正机会或无限重试。"""
     budget = state.attempt_budget
     if not isinstance(budget, dict):
         budget = state.attempt_budget = new_budget()
@@ -449,20 +408,10 @@ def note_guard_block(
     tool_name: str,
     blocked: dict[str, Any],
 ) -> dict[str, Any]:
-    """把一次护栏拦截计入同一份收敛预算；额度见底时改判为收尾。
+    """将护栏拦截计入共享失败预算，耗尽后进入收尾。
 
-    护栏本身的判定与失败历史无关（见 [[ai_guards]] 的策略表注释），所以计价只能挂在
-    外面这一层。缺这一笔的代价实测过：acceptance_contract_sources_must_match_user
-    在一个会话里连拦 11 次，模型每轮换个说法重试，烧掉 294k prompt token，
-    而阶段机、失败预算、重复取证判据一个都数不到——护栏拦截对它们是不存在的事件。
-
-    首次不计价（`charge_only_if_repeated`）：护栏第一次拦下来是在纠正一个具体错误，
-    模型改对就能过，让这条拒绝花掉它自己的改正额度等于拒绝自我加固。同一条从第二次起
-    按重复失败计价，于是第三次撞上同一面墙时额度正好见底——与起跑前被拒的收口同一套定价。
-
-    签名只含 guard_id，不含工具名：同一条 check 换个工具调用是同一面墙，
-    带上工具名就又是一份新额度（见模块 docstring 的「换维度不再是换额度」）。
-    """
+    首次拦截不计价，重复拦截按重复失败计价，给模型保留首次纠正机会。
+    签名仅含 guard_id，避免更换工具绕过同一规则的预算。"""
     guard_id = str(blocked.get("guard_id") or "unknown")
     note_failed_attempt(
         state,

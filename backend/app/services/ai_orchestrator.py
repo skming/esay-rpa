@@ -1201,17 +1201,9 @@ def _detect_turn_intents(
 def _tool_schemas_for_round(
     state: GuardState, intents: _TurnIntents
 ) -> list[dict[str, Any]]:
-    """只暴露当前阶段与当前能力下能推进任务的工具。
+    """按阶段、调用方授权和模型能力筛选工具。
 
-    两类扣除，来源不同：
-    - 阶段准入由 ai_phases 唯一持有（暴露了却会被拦，等于故意让模型白花一轮）；
-    - 能力扣除是调用方授权（read_only）和模型自身能力（无视觉）——它们整轮固定，
-      不随阶段变化。这两条原来只有拦截没有隐藏，于是每轮都要先被模型试一次：
-      只读模式下它交出 update_flow，无视觉模型交出 inspect_screenshot，各烧一整轮。
-      能力缺失不是模型该去发现的事实，schema 里不出现就不会被调用。
-
-    拦截仍然保留在 `ai_guards`：只读是调用方给的授权边界，不能只靠"没暴露"来守
-    （工具名是模型能凭记忆猜出来的，schema 之外的调用也照样会到达执行器）。
+    隐藏工具不能替代 ai_guards 的执行时校验：模型仍可能调用未暴露的工具。
     """
     if state.terminal_response_only or state.closing_statement_only:
         return []
@@ -1380,15 +1372,10 @@ class AiOrchestrator:
     def _prefetch_read_only_tools(
         self, tool_items: list[tuple[int, dict[str, str]]], guard_state: GuardState
     ) -> dict[int, asyncio.Task[Any]]:
-        """只读工具先并发起跑，串行循环走到它时直接取结果，省掉逐个 await 的串行往返。
+        """并发预取至少两个只读工具的结果。
 
-        少于两个不预取：单个并发没收益，只多一层任务管理。
-
-        预取跑在串行门之前，所以「这次调用会不会被拒」必须在这里先问一遍：判漏了
-        就是真的多读了一次，事后再取消任务也追不回来（结果还会被丢掉，只留下一条
-        「已阻断」给用户看）。这四个工具唯一会撞上的门是重复取证——判据是指纹，
-        用 ai_phases 的纯查询版问，不能调门本身：门会记账，问第二遍就重复计价。
-        """
+        预取发生在串行校验前，必须先用无副作用的阶段查询检查重复取证；
+        不能调用会记账的护栏，否则串行执行时会重复扣减预算。"""
         prefetched: dict[int, asyncio.Task[Any]] = {}
         if sum(1 for _, call in tool_items if call["name"] in _PARALLEL_SAFE_TOOLS) <= 1:
             return prefetched
@@ -1665,6 +1652,31 @@ class AiOrchestrator:
                     # 这段是用户看到的回复，同样要过证据门
                     collected.text.append(thinking_text)
                 final_text = "".join(collected.text)
+                # 伪调用判在所有检查之前：正文写着调用、执行层一次也没收到，这时任何
+                # 「结论/验证」维度的更正都是对着一段没发生的事实说话。
+                # 两次机会——一次要求经真实接口重试，再不行就照实报调用失败，
+                # 绝不把正文里的 JSON 当结果读，也绝不置 page_evidence_* 冒充本轮已检查。
+                fake_call_correction = _fake_tool_call_text(final_text, guard_state)
+                if fake_call_correction is not None:
+                    full_messages.append({"role": "assistant", "content": final_text})
+                    full_messages.append({"role": "system", "content": fake_call_correction})
+                    yield {"type": "retract", "reason": "工具调用没有真正发起，正在重试"}
+                    yield {"type": "status", "delta": "正在重新发起工具调用…"}
+                    continue
+                if guard_state.fake_tool_call_corrected and _fake_call_text_for_turn(
+                    final_text, guard_state
+                ):
+                    yield {"type": "retract", "reason": "工具调用没有真正发起"}
+                    yield {
+                        "type": "error",
+                        "message": (
+                            "模型两次把工具调用写在了正文里，没有一次真实调用到达执行层，"
+                            "因此没有任何工具返回结果。本轮没有做出任何改动，也没有取得页面证据。"
+                            "请重试，或更换模型。"
+                        ),
+                    }
+                    yield {"type": "done"}
+                    return
                 # 顺序即优先级：先判「该干的活被推掉了」——模型一旦拿拒答模板收尾，
                 # 后两条会把它误诊成「结论越界」或「没做验证」，给出方向完全错的更正。
                 # 其余两条之间，说法不实比交付不全严重。
@@ -2140,6 +2152,81 @@ _SESSION_REQUIREMENT_MAX_CHARS = 2000
 _REFUSAL_TEMPLATE_MARKERS = ("我只能协助处理 RPA 流程", "只能协助处理 RPA 流程的创建")
 
 
+# 调用协议的信封标记：这几个是协议本体，出现在说明性正文里只可能是协议泄漏。
+_TOOL_ENVELOPE_MARKERS = (
+    "<tool_use", "</tool_use", "<tool_call", "</tool_call", "<function_call", "</function_call",
+    "<invoke", "</invoke", "<|", "[TOOL_CALL]",
+)
+
+# 协议里的 JSON 字段名。这些字符串在正常说明里也会出现（「响应里有 tool_calls 字段」），
+# 单凭它判会把一条正确的解释撤回重写，所以要同时指向本项目的真实工具才算。
+_TOOL_PROTOCOL_JSON_MARKERS = ('"tool_calls"', "'tool_calls'", '"function_call"', "'function_call'", "recipient_name")
+
+_TOOL_NAMES_ALT = "|".join(
+    re.escape(schema["function"]["name"])
+    for schema in TOOL_SCHEMAS
+    if isinstance(schema.get("function"), dict) and schema["function"].get("name")
+)
+
+_TOOL_NAME_RE = re.compile(r"\b(?:" + _TOOL_NAMES_ALT + r")\b")
+
+# 真实工具名后面直接跟参数体：inspect_page({...}) / update_flow(flow_id=...)，
+# 以及 OpenAI 协议里的 functions.inspect_page 形式。
+# 只提名字不带参数（「接下来我会用 inspect_page 看一下」）不算——那是说明意图，不是伪造调用。
+_TOOL_CALL_TEXT_RE = re.compile(
+    r"\bfunctions\.(?:" + _TOOL_NAMES_ALT + r")\b"
+    r"|\b(?:" + _TOOL_NAMES_ALT + r")\s*\(\s*[{\"'\w]"
+)
+
+# 围栏代码块与行内代码。未闭合的围栏一直吃到结尾：模型漏写收尾时，剩下的半块仍是示例。
+_CODE_EXAMPLE_RE = re.compile(r"```[\s\S]*?(?:```|\Z)|~~~[\s\S]*?(?:~~~|\Z)|`[^`\n]+`")
+
+
+def _looks_like_tool_call_text(text: str, *, scan_code_examples: bool = False) -> bool:
+    """正文里有没有「这是一次调用」的形态。
+
+    只判形态，不解析里面的 JSON。把那段 JSON 当结果读，等于让模型自己编造工具返回值，
+    比没调用更危险：伪造的观察会一路写进流程配置，而每一层看到的都是「有证据」。
+
+    scan_code_examples=False 时代码块与行内代码按示例放过。这个默认只在「本轮不是要求
+    干活」时成立，由调用方按本轮意图决定，见 _fake_call_text_for_turn。
+    """
+    prose = text if scan_code_examples else _CODE_EXAMPLE_RE.sub(" ", text)
+    lowered = prose.lower()
+    if any(marker.lower() in lowered for marker in _TOOL_ENVELOPE_MARKERS):
+        return True
+    if any(marker.lower() in lowered for marker in _TOOL_PROTOCOL_JSON_MARKERS):
+        # 协议字段 + 本项目真实工具名 = 在写一次调用；只有字段名是在讲协议。
+        return _TOOL_NAME_RE.search(prose) is not None
+    return _TOOL_CALL_TEXT_RE.search(prose) is not None
+
+
+def _fake_call_text_for_turn(text: str, state: GuardState) -> bool:
+    """按本轮意图判伪调用：要求干活的那一轮连围栏一起扫。
+
+    「用户请求参数示例」与「用户请求执行任务」是两回事，而 turn_intent_actionable 正是
+    本轮已被判定为建流程/修流程/要运行的那个事实。前者的回复里本就该有围栏里的协议
+    字符串，后者把调用写进围栏则是把活推掉了——这一轮执行层一次也没被调用。
+    """
+    return _looks_like_tool_call_text(text, scan_code_examples=state.turn_intent_actionable)
+
+
+def _fake_tool_call_text(text: str, state: GuardState) -> str | None:
+    """正文里写着工具调用，但这一轮一次工具也没真调。第一次命中给更正，只给一次。"""
+    if state.fake_tool_call_corrected or not _fake_call_text_for_turn(text, state):
+        return None
+
+    state.fake_tool_call_corrected = True
+    return (
+        "你上一条回复已被撤回，用户没有看到，请完整重写整段回复（不要只补一句更正）。\n"
+        "撤回原因：你在正文里写出了工具调用（调用协议文本或 tool_name(参数) 的形式），"
+        "但这一轮没有任何一次真实的工具调用到达执行层——那段文字没有执行，也没有返回值。\n"
+        "重写要求：要调用工具就经真实的工具接口发起调用，不要把调用写进正文；"
+        "不要凭空描述任何工具的返回内容，也不要沿用上一轮观察结果冒充本轮已检查。\n"
+        "确实不需要再调用工具，就直接给出不含任何调用文本的最终回复。"
+    )
+
+
 def _misapplied_refusal(text: str, state: GuardState) -> str | None:
     """用拒答模板回绝了一个已被判定为职责范围内的请求。
 
@@ -2204,13 +2291,9 @@ def _session_requirement_text(messages: list[dict[str, Any]]) -> str:
 
 
 def _fit_requirement_parts(parts: list[str]) -> str:
-    """把需求片段压进额度：保住首条和最新一条，先丢中间。
+    """压缩需求时保留首条和最新一条，优先舍弃中间片段。
 
-    截断方向不是风格问题。requirement_text 是 acceptance_contract_sources_must_match_user
-    判 sourceQuote 的底本，从尾部截掉等于让用户最新那句纠正不存在——模型改验收契约时
-    引什么都对不上，只能换个措辞再撞一次，而重复撞同一条护栏是最贵的一种空转。
-    首条也不能丢：验收契约的主条款引的就是原始需求那句。
-    """
+    原始需求与最新纠正都是 sourceQuote 校验的依据，不能因截断丢失。"""
     budget = _SESSION_REQUIREMENT_MAX_CHARS
     if len(parts) == 1:
         return parts[0][:budget]
@@ -2262,23 +2345,10 @@ def _orchestrator_guard_before_tool(
     args: dict[str, Any],
     state: GuardState,
 ) -> dict[str, Any] | None:
-    """硬性护栏：prompt 规则只是建议，这里强制少数不能靠模型记忆遵守的规则
-    （违反会导致昂贵或误导性的运行）。
+    """先检查 ai_guards 的参数与授权边界，再检查 ai_phases 的阶段准入。
 
-    两层，顺序有讲究：
-
-    1. `ai_guards.GUARDS` 判「这次调用本身不该发生」——凭据外泄、验收契约被改写、
-       调用方的只读授权边界。这类判定与失败历史无关，任何阶段都不该被绕过。
-    2. `ai_phases` 判「现在还不到做这件事的时候」——缺证据、流程还没建、诊断没修完、
-       额度已耗尽。
-
-    护栏在前：只读模式是调用方给的授权边界，让阶段先报一个「先去看页面」，
-    等于把一个同样会被拒的动作推荐给模型。
-
-    护栏拦截要过一遍 `note_guard_block` 记账：护栏自己不看历史，所以「同一条拦截
-    第几次了」只能在这里数。不数它，护栏就是唯一没有上限的空转形态——
-    实测有会话在同一条契约校验上连撞 11 次。
-    """
+    授权拒绝优先，避免阶段提示推荐同样未获授权的动作。
+    护栏拦截通过 note_guard_block 计入预算，防止重复拒绝形成无限循环。"""
     blocked = apply_pre_tool_guards(tool_name, args, state)
     if blocked is not None:
         return note_guard_block(state, tool_name, blocked)
@@ -2462,6 +2532,38 @@ def _note_undefined_variable_escape(result: dict[str, Any], state: GuardState) -
     state.runtime_escape_findings = (state.runtime_escape_findings or []) + [escape_finding]
 
 
+# 两条通道的 table scope guard 报错都以这句开头（browser_action_runner._raise_if_table_scope_error）。
+# 认这一句而不是认 issue 名：静态检查压根没报过这件事，它是执行才暴露的。
+_TABLE_SCOPE_ERROR_MARK = "extractMode=table 但 selector"
+
+
+def _note_table_scope_escape(result: dict[str, Any], state: GuardState) -> None:
+    """selector 圈错表格范围：静态文本判据放行了，执行给出了定论。
+
+    静态那三条 table_extract_selector_* 已降为提示——它们靠 selector 文本猜，猜错会挡住
+    本来能跑的流程。代价是猜漏的那次要跑一趟才暴露，所以执行的结论必须跨轮留下来：
+    状态块每轮重算，不记在这里，下一轮模型看到的又只是一条静态 warn。
+    """
+    err_msg = str(result.get("error") or "")
+    if _TABLE_SCOPE_ERROR_MARK not in err_msg:
+        return
+    escape_finding: dict[str, Any] = {
+        "severity": "error",
+        "issue": "table_extract_scope_runtime_escape",
+        "message": (
+            f"运行期捕获到表格抽取范围错误，这是页面上的实际命中结果，不是静态推测：{err_msg}"
+        ),
+        "fix": (
+            "调用 inspect_page 取该页真实结构，用返回的 tables[].row_selector 作为提取路径"
+            "（等待另用 ready_selector）；若目标不是表格，改用 extractMode='text' 或 'attribute'。"
+        ),
+    }
+    state.runtime_escape_findings = (state.runtime_escape_findings or []) + [escape_finding]
+    # 改 selector 之前必须先看一次这一页：上一次观察之后页面和流程都可能变了。
+    state.page_evidence_required = {"reason": "table_extract_scope_failed_at_runtime"}
+    state.page_evidence_done = False
+
+
 def _after_run_flow(result: dict[str, Any], state: GuardState) -> None:
     status = str(result.get("status") or "")
 
@@ -2495,6 +2597,7 @@ def _after_run_flow(result: dict[str, Any], state: GuardState) -> None:
 
     if status == "error":
         _note_undefined_variable_escape(result, state)
+        _note_table_scope_escape(result, state)
 
     if status == "blocked_by_failure_budget":
         state.failure_budget_lock = {
@@ -2618,13 +2721,10 @@ def _after_flow_write(result: dict[str, Any], state: GuardState) -> None:
 
 
 def _after_node_edit(result: dict[str, Any], state: GuardState) -> None:
-    """update_flow / apply_node_fix 共有：修复台账 + 解除各类失败标记。
+    """更新跨会话修复台账并解除失败标记。
 
-    台账记本流程每个受跟踪字段的取值轨迹与 selector 修改次数，跨会话累计。取执行器返回的
-    tracked_field_changes（写入前后的真实差分），不解析调用参数——参数记的是模型「想改成
-    什么」，归一化、字段清理、被拒的写入都会让两者不一致，而写入期差分检查正是拿这份历史
-    去判回摆的：记错一次，之后每一次判定都错。
-    """
+    只记录执行器返回的 tracked_field_changes：调用参数可能被归一化或拒绝，
+    不能代表实际落盘差分，也不能用于后续字段回摆判定。"""
     changes = [c for c in (result.get("tracked_field_changes") or []) if isinstance(c, dict)]
     field_history: dict[str, list[str]] = state.node_field_history
     for change in changes:

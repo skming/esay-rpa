@@ -1,15 +1,8 @@
-"""guard_state 的类型化载体：把散在三个模块间、靠字符串键对齐的状态包收成带 slots 的 dataclass。
+"""跨编排、阶段机和护栏共享的状态契约；slots 使未声明字段的写入立即失败。
 
-原先 guard_state 是 dict[str, Any]，36 个键分散在编排层写、ai_phases 与 ai_guards 读，
-全靠键名字符串对齐，而项目没有静态类型检查。写错一个键名（state["flow_has_node"]=…）不会报错，
-只会让读侧永远拿到默认值——阶段机会因此卡死在 BUILD 或漏判授权，表现和「没做过这个功能」一样。
-slots=True 让「写一个没声明的字段」在运行期立刻 AttributeError，测试即刻暴露，
-把这层跨模块隐式契约变成显式。
-
-放在这个无依赖的底层模块（而不是 ai_phases 或 ai_guards）是为了不破坏分层：ai_guards 只在
-TYPE_CHECKING 下引用它（运行期零 ai_* 依赖的性质保留），ai_phases 运行期引用它，两者不必互相依赖。
-持久化仍走 dict——检查点是 JSON，apply_checkpoint 只把已知字段写回，未知键（版本漂移）直接丢弃。
-"""
+项目没有静态类型检查，这些字段又分散在编排层写、ai_phases 与 ai_guards 读：键名写错时
+读侧只会永远拿到默认值，表现是阶段机卡在 BUILD 或漏判授权，与「没做过这个功能」无从区分。
+本模块不依赖其他 ai 模块，避免循环依赖。检查点使用 JSON，恢复时仅接收已知字段。"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
@@ -117,6 +110,7 @@ class GuardState:
     result_claim_corrected: bool = False
     verification_nudged: bool = False
     refusal_corrected: bool = False
+    fake_tool_call_corrected: bool = False
     closing_statement_only: bool = False
     terminal_response_only: bool = False
 

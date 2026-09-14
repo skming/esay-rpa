@@ -208,6 +208,34 @@ def test_an_empty_required_table_cannot_pass_as_delivered() -> None:
     assert [issue["issue"] for issue in audit["issues"]] == ["empty_rows"]
 
 
+def test_empty_table_exemption_follows_the_bound_row_bound_not_the_literal() -> None:
+    """minRows 绑定到输入变量时字面量恒为 None，照字面量判会把契约明确允许的空表判成 empty_rows。"""
+    contract = FlowAcceptanceContract.model_validate({
+        "deliverables": [{
+            "id": "order_table", "variable": "order_rows", "kind": "table",
+            "minRowsVariable": "expected_count",
+        }],
+    })
+    task = _task([], task_id="task-bound-empty").model_copy(update={
+        "acceptance_contract": contract,
+        "variables": [
+            RuntimeVariableSnapshot(name="order_rows", type="List", value="[]"),
+            RuntimeVariableSnapshot(name="expected_count", type="String", value="0"),
+        ],
+    })
+
+    assert audit_run(task, _flow())["passed"] is True
+
+    demanded = task.model_copy(update={
+        "task_id": "task-bound-one",
+        "variables": [
+            RuntimeVariableSnapshot(name="order_rows", type="List", value="[]"),
+            RuntimeVariableSnapshot(name="expected_count", type="String", value="1"),
+        ],
+    })
+    assert [issue["issue"] for issue in audit_run(demanded, _flow())["issues"]] == ["too_few_rows", "empty_rows"]
+
+
 async def test_state_block_recomputes_the_audit_for_a_run_that_finished_later() -> None:
     """run_flow 轮询到 90s 就返回 timeout——那一刻的返回里不可能有验收结论。
 

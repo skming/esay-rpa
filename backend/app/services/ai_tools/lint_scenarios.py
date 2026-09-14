@@ -790,9 +790,11 @@ def _lint_table_output_risks(nodes: list[dict[str, Any]]) -> list[dict[str, Any]
                 kw in selector
                 for kw in ("tbody", " tr", "__row", "-row", "--row", "[role=row]")
             )
+            # 不进 BLOCKING_LINT_ISSUES：圈错范围时两条通道都会硬失败，
+            # 执行带着实际命中数报回来，比 selector 文本判据准。
             if not container_like and not has_row_target:
                 findings.append({
-                    "severity": "error",
+                    "severity": "warn",
                     "node_id": str(node.get("id", "?")),
                     "node_title": str(node.get("title") or node.get("id", "?")),
                     "issue": "table_extract_selector_not_table_like",
@@ -809,7 +811,7 @@ def _lint_table_output_risks(nodes: list[dict[str, Any]]) -> list[dict[str, Any]
                 })
             if container_like and not has_row_target:
                 findings.append({
-                    "severity": "error",
+                    "severity": "warn",
                     "node_id": str(node.get("id", "?")),
                     "node_title": str(node.get("title") or node.get("id", "?")),
                     "issue": "table_extract_selector_targets_container",
@@ -1391,11 +1393,7 @@ def _reachable_from(start_ids: set[str], adjacency: dict[str, list[str]]) -> set
 def _lint_login_without_navigation_to_data_page(
     nodes: list[dict[str, Any]], edges: list[Any]
 ) -> list[dict[str, Any]]:
-    """登录之后必须再导航一次才能到数据页——登录成功停留的是首页/工作台。
-
-    少了这一段，下游 extract 会在登录后的落地页上找表格，报出来的却是 selector 超时，
-    于是修复精力全花在 selector 上。这是结构问题，看拓扑就能判定，不必等运行。
-    """
+    """填写凭据后缺少提交或导航动作；提交本身可以直接到达数据页。"""
     node_map = {str(n["id"]): n for n in nodes if isinstance(n, dict) and n.get("id")}
     adjacency: dict[str, list[str]] = {}
     for edge in edges:
@@ -1427,12 +1425,11 @@ def _lint_login_without_navigation_to_data_page(
         "issue": "login_without_navigation_to_data_page",
         "message": (
             f"填写密码之后直到取数节点 `{first_read.get('id')}` 之间没有任何导航动作。"
-            "登录成功后浏览器停在首页/工作台，取数节点会在这个页面上找目标元素，"
-            "表现为 selector 超时——改 selector 修不好。"
+            "填写凭据本身不代表已提交登录或到达数据页，需要确认登录动作完整。"
         ),
         "fix": (
-            "在登录完成之后、取数之前补一段导航：browser.open(目标数据页 URL)，"
-            "或用 inspect_page 拿到真实菜单 selector 后 browser.click；再 browser.wait 目标区域出现。"
+            "根据真实表单补齐登录提交，再确认落地页；仅在未到达数据页时继续导航，"
+            "不要无条件添加 browser.open。"
         ),
     }]
 
