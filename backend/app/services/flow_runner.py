@@ -6,7 +6,11 @@ from typing import TYPE_CHECKING
 from app.models.schemas import FlowRunRequest, FlowSnapshot, RunMode, RunTaskRequest, TaskSnapshot
 from app.services.flow_definition import FlowDefinitionSelector
 from app.services.execution_evidence import definition_digest
-from app.services.acceptance_contract import contract_validation_errors, definition_variable_names
+from app.services.acceptance_contract import (
+    contract_validation_errors,
+    definition_variable_names,
+    pagination_caps_from_nodes,
+)
 
 if TYPE_CHECKING:
     from app.services.task_manager import TaskManager
@@ -61,6 +65,7 @@ class FlowRunService:
                         if (variable.get("name") if isinstance(variable, dict) else variable.name)
                     ],
                 ),
+                pagination_caps=pagination_caps_from_nodes(flow.definition.get("nodes")),
             )
             if contract_errors:
                 raise ValueError(f"流程缺少完整验收契约：{'；'.join(contract_errors)}")

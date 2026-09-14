@@ -12,6 +12,7 @@ from uuid import uuid4
 from app.core import storage
 from app.models.schemas import ArtifactContent, ArtifactSnapshot, DebugControlCommand, QueueStats, RunConfigSnapshot, RunTaskRequest, RuntimeProgress, RuntimeVariableSnapshot, ScrapeResult, TaskLogEntry, TaskSnapshot, TaskStatus
 from app.services.artifact_store import ArtifactStore, LocalArtifactStore
+from app.services.acceptance_audit import freeze_contract_inputs
 from app.services.browser_action_runner import BrowserActionContext, BrowserActionResult, BrowserActionRunner, OverlayInfo, apply_browser_result_variables, detect_blocking_overlay, is_browser_action_node, try_auto_dismiss_overlay
 from app.services.browser_executor import BrowserExecutor
 from app.services.control_action_runner import BreakLoopSignal, ControlActionRunner, apply_control_result_variables, is_control_action_node, is_human_takeover_node, is_subprocess_node
@@ -228,6 +229,10 @@ class TaskManager:
         # 入口：拿不到定义就直接拒，不建任务记录。
         if request.flow_definition is None:
             raise ValueError("缺少 flowDefinition：运行请求必须带流程定义，或改用 POST /api/flows/{flowId}/run 按已保存流程运行")
+        frozen_contract = freeze_contract_inputs(
+            request.acceptance_contract, request.variables,
+            sensitive_names=set(request.sensitive_variables),
+        )
         executable_nodes = self._resolve_executable_nodes(request)
         task_id = f"t_{uuid4()}"
         now = datetime.now(UTC)
@@ -257,7 +262,7 @@ class TaskManager:
             variables=variables.snapshots(),
             flowRevision=request.flow_revision,
             definitionDigest=request.definition_digest or definition_digest(request.flow_definition),
-            acceptanceContract=request.acceptance_contract,
+            acceptanceContract=frozen_contract,
             executionEvidence=[],
             run_config=RunConfigSnapshot.from_request(request),
             created_at=now,

@@ -5,7 +5,11 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 from app.models.schemas import FlowCreateRequest, FlowSnapshot, FlowStatus, FlowUpdateRequest, FlowVersionSnapshot, TaskSnapshot
-from app.services.acceptance_contract import contract_validation_errors, definition_variable_names
+from app.services.acceptance_contract import (
+    contract_validation_errors,
+    definition_variable_names,
+    pagination_caps_from_nodes,
+)
 from app.services.flow_store import FlowStore, InMemoryFlowStore
 
 _TRAILING_NUMBER = re.compile(r"(\d+)$")
@@ -34,6 +38,7 @@ class FlowService:
                     request.definition,
                     [variable.name for variable in request.input_variables],
                 ),
+                pagination_caps=pagination_caps_from_nodes(request.definition.get("nodes")),
             )
             if contract_errors:
                 raise ValueError("；".join(contract_errors))
@@ -96,6 +101,7 @@ class FlowService:
                         next_definition,
                         [variable.name for variable in next_variables],
                     ),
+                    pagination_caps=pagination_caps_from_nodes(next_definition.get("nodes")),
                 )
                 if contract_errors:
                     raise ValueError("；".join(contract_errors))

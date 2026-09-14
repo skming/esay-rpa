@@ -143,8 +143,21 @@ class DateRangeAssertion(ApiModel):
 
 
 class AllowedValuesAssertion(ApiModel):
+    """固定业务枚举写 values；随输入变化的筛选值写 valueVariables，由审计每次运行现场解析。
+
+    契约冻结在流程上、换输入值重放，把某一轮的筛选值写成 values 字面量，别的输入下
+    逐字正确的数据会被判 allowed_values_violation。
+    """
+
     field: str = Field(min_length=1, max_length=120)
-    values: list[str] = Field(min_length=1, max_length=100)
+    values: list[str] = Field(default_factory=list, max_length=100)
+    value_variables: list[str] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def validate_source(self) -> "AllowedValuesAssertion":
+        if not self.values and not self.value_variables:
+            raise ValueError("allowedValues 至少需要 values 或 valueVariables")
+        return self
 
 
 class RequirementClause(ApiModel):
@@ -210,6 +223,9 @@ class DeliverableContract(ApiModel):
     required: bool = True
     min_rows: int | None = Field(default=None, ge=0)
     max_rows: int | None = Field(default=None, ge=0)
+    # 行数随输入变化时绑定变量，由审计现场解析；与同名字面量互斥——两条判据并存说不清哪条生效。
+    min_rows_variable: str | None = Field(default=None, max_length=120)
+    max_rows_variable: str | None = Field(default=None, max_length=120)
     required_fields: list[str] = Field(default_factory=list, max_length=100)
     date_ranges: list[DateRangeAssertion] = Field(default_factory=list, max_length=20)
     allowed_values: list[AllowedValuesAssertion] = Field(default_factory=list, max_length=20)
@@ -233,6 +249,12 @@ class DeliverableContract(ApiModel):
     def validate_bounds(self) -> "DeliverableContract":
         if self.min_rows is not None and self.max_rows is not None and self.min_rows > self.max_rows:
             raise ValueError("minRows 不能大于 maxRows")
+        for literal_name, literal, variable_name, variable in (
+            ("minRows", self.min_rows, "minRowsVariable", self.min_rows_variable),
+            ("maxRows", self.max_rows, "maxRowsVariable", self.max_rows_variable),
+        ):
+            if literal is not None and variable:
+                raise ValueError(f"{literal_name} 与 {variable_name} 只能二选一")
         return self
 
 

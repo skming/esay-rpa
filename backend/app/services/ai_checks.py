@@ -1,34 +1,13 @@
 """运行结束后的统一审计入口。
 
-审计过去是模型自己发起的一次工具调用（`assert_run_output`）。这带来三件事：
-
-- 它可以不调。于是「运行成功」被当成「验收通过」，而前者只说明节点没抛异常。
-  补救办法是提示词里反复写调用链、再加一道护栏在模型说「验收通过」时撤回回复。
-- 它可以拿旧任务的产物冒充新定义的证据。补救办法是工具内部再查一遍 revision 与
-  定义摘要，而这些检查只在模型愿意调的时候才跑。
-- 它的判据可以由模型自己填（`requirement_text`、`content_match_confirmed`）。补救
-  办法是再加一道护栏，把模型填的参数改写掉。
-
-三件补救全都是在「模型可能不做正确的事」外面套壳子。真正的问题是审计被设计成了一次
-可选的模型动作——而它是平台自己就能做、也必须做的事。
-
-这里改成：审计由平台在两个时刻跑，模型没有发起权也没有跳过权。
-
-- `run_flow` 拿到终态 success 时立刻审，结论随运行结果一起返回；
-- 状态块发现某个先前挂起的任务已经跑完时补审。
-
-两处调用同一个函数，结论只有一份。这是 S1 那条规矩（诊断只有一个来源，但允许多个
-刷新点）在运行证据上的延续。
-
-`revision` / 定义摘要这三道证据完整性检查留在这里，且比过去更要紧：状态块会在后续
-轮次重算审计，而流程可能已经被改过。它们回答的是「这份产物还能不能代表当前定义」。
-"""
+run_flow 成功返回时审计；先前挂起的任务完成后，由状态块补审。
+审计前检查任务与当前流程版本、定义是否一致，防止旧产物被用作当前定义的证据。"""
 from __future__ import annotations
 
 from typing import Any
 
 from app.core import storage
-from app.services.acceptance_audit import audit_acceptance_contract
+from app.services.acceptance_audit import audit_acceptance_contract, resolved_min_rows
 from app.services.ai_tools.diagnostics import (
     _build_quality_repair_plan,
     _check_structured_rows,
@@ -131,7 +110,7 @@ def _find_garbage_rows(contract: Any, variables: dict[str, Any]) -> list[dict[st
         if deliverable.kind != "table" or not isinstance(raw, list):
             continue
         # 契约显式声明允许空表时，「空」不是缺陷；行数归契约管，这里只判形状。
-        if not raw and deliverable.min_rows == 0:
+        if not raw and resolved_min_rows(deliverable, variables) == 0:
             continue
         finding = _check_structured_rows(_coerce_table_rows(raw) or raw)
         if finding is not None:

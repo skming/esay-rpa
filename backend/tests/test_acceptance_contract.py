@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from app.models.schemas import FlowAcceptanceContract
-from app.services.acceptance_contract import contract_validation_errors, unmatched_user_quotes
+from app.services.acceptance_contract import (
+    contract_validation_errors,
+    pagination_caps_from_nodes,
+    unmatched_user_quotes,
+)
 
 
 def test_contract_requires_traceable_requirements_and_bindings() -> None:
@@ -189,3 +193,115 @@ def test_file_without_document_constraints_remains_valid() -> None:
     assert contract_validation_errors(
         _document_contract(kind="file", minBytes=0), defined_variables={"summary_md"},
     ) == []
+
+
+def _table_contract(**deliverable) -> FlowAcceptanceContract:
+    return FlowAcceptanceContract.model_validate({
+        "requirements": [{
+            "id": "r3",
+            "description": "按类型筛选后汇总",
+            "sourceKind": "user",
+            "sourceQuote": "按类型筛选后汇总",
+            "confidence": 1,
+            "confirmed": True,
+        }],
+        "deliverables": [{
+            "id": "d2",
+            "variable": "rows",
+            "kind": "table",
+            "required": True,
+            "requirementIds": ["r3"],
+            **deliverable,
+        }],
+    })
+
+
+_SWEEP_NODES = [{
+    "id": "n1",
+    "type": "browser.paginateNext",
+    "maxIterations": "${var.max_pages}",
+    "outputVariable": "rows",
+}]
+
+
+def test_allowed_values_cannot_freeze_one_runs_filter_value() -> None:
+    # async_table_filter / login_redirect_filter 的真实失败形态：模型把第 1 轮的 kind
+    # 写成 allowedValues 字面量，换输入重放时逐字正确的数据被判 allowed_values_violation。
+    errors = contract_validation_errors(
+        _table_contract(allowedValues=[{"field": "类型", "values": ["报销"]}]),
+        defined_variables={"rows", "kind"},
+        input_values={"kind": "报销"},
+    )
+    assert any("allowedValues[0].values[0]" in error and "kind" in error for error in errors)
+    assert all("报销" not in error for error in errors)
+
+
+def test_allowed_values_bound_to_the_input_variable_is_accepted() -> None:
+    assert contract_validation_errors(
+        _table_contract(allowedValues=[{"field": "类型", "valueVariables": ["kind"]}]),
+        defined_variables={"rows", "kind"},
+        input_values={"kind": "报销"},
+    ) == []
+
+
+def test_fixed_business_enum_keeps_its_literals() -> None:
+    # 固定业务枚举与本次输入无关，必须继续写字面量，不能被这条判据误伤。
+    assert contract_validation_errors(
+        _table_contract(allowedValues=[{"field": "状态", "values": ["已完成", "待处理"]}]),
+        defined_variables={"rows", "kind"},
+        input_values={"kind": "报销"},
+    ) == []
+
+
+def test_page_cap_variable_cannot_be_bound_as_a_row_bound() -> None:
+    errors = contract_validation_errors(
+        _table_contract(minRowsVariable="max_pages"),
+        defined_variables={"rows", "max_pages"},
+        pagination_caps=pagination_caps_from_nodes(_SWEEP_NODES),
+    )
+    assert any("minRowsVariable" in error and "max_pages" in error for error in errors)
+
+
+def test_literal_row_bound_is_rejected_on_a_page_capped_deliverable() -> None:
+    # pagination_sweep 的真实失败形态：min_rows=3 冻自没有页数上限的那一轮，
+    # max_pages=2 抓回 2 行完全正确却被判 too_few_rows。
+    errors = contract_validation_errors(
+        _table_contract(minRows=3),
+        defined_variables={"rows", "max_pages"},
+        pagination_caps=pagination_caps_from_nodes(_SWEEP_NODES),
+    )
+    assert any("minRows" in error and "max_pages" in error for error in errors)
+
+
+def test_a_deliverable_outside_the_page_capped_node_keeps_its_literal_row_bound() -> None:
+    assert contract_validation_errors(
+        _table_contract(id="d3", variable="summary_rows", minRows=3),
+        defined_variables={"summary_rows", "max_pages"},
+        pagination_caps=pagination_caps_from_nodes(_SWEEP_NODES),
+    ) == []
+
+
+def test_row_bound_literal_equal_to_this_runs_input_value_is_rejected() -> None:
+    errors = contract_validation_errors(
+        _table_contract(minRows=12),
+        defined_variables={"rows", "expected_count"},
+        input_values={"expected_count": "12"},
+    )
+    assert any("minRows" in error and "expected_count" in error for error in errors)
+
+
+def test_single_digit_row_bound_is_not_attributed_to_an_input_value() -> None:
+    # 个位数与输入值相等几乎必然是巧合，按冻结判会把正常契约判成错。
+    assert contract_validation_errors(
+        _table_contract(minRows=2),
+        defined_variables={"rows", "retry_times"},
+        input_values={"retry_times": "2"},
+    ) == []
+
+
+def test_row_bound_variable_is_table_only() -> None:
+    errors = contract_validation_errors(
+        _table_contract(kind="scalar", minRowsVariable="expected_count"),
+        defined_variables={"rows", "expected_count"},
+    )
+    assert any("仅适用于 table" in error for error in errors)

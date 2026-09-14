@@ -10,6 +10,43 @@ from typing import Any
 from app.models.schemas import FlowAcceptanceContract, NodeExecutionEvidence
 
 
+def freeze_contract_inputs(
+    contract: FlowAcceptanceContract,
+    variables: dict[str, Any],
+    *,
+    sensitive_names: set[str] | None = None,
+) -> FlowAcceptanceContract:
+    """任务启动时冻结输入约束，避免节点覆写变量后改变验收标准。"""
+    frozen = contract.model_copy(deep=True)
+    sensitive = sensitive_names or set()
+    for deliverable in frozen.deliverables:
+        bound_names = {
+            deliverable.min_rows_variable, deliverable.max_rows_variable,
+            *(name for constraint in deliverable.allowed_values for name in constraint.value_variables),
+        }
+        if sensitive.intersection(bound_names):
+            raise ValueError("验收契约不能绑定敏感输入变量")
+        for field in ("min_rows", "max_rows"):
+            variable_field = f"{field}_variable"
+            variable_name = getattr(deliverable, variable_field)
+            if not variable_name:
+                continue
+            value, issue = _row_bound(deliverable, field, getattr(deliverable, field), variable_name, variables)
+            if issue:
+                raise ValueError(issue["message"])
+            setattr(deliverable, variable_field, None)
+            setattr(deliverable, field, value)
+        for constraint in deliverable.allowed_values:
+            if not constraint.value_variables:
+                continue
+            values, unresolved = _allowed_values(constraint, variables)
+            if unresolved or not values:
+                raise ValueError("验收契约枚举绑定缺少有效输入变量")
+            constraint.value_variables = []
+            constraint.values = sorted(values)
+    return FlowAcceptanceContract.model_validate(frozen.model_dump())
+
+
 def audit_acceptance_contract(
     contract: FlowAcceptanceContract,
     variables: dict[str, Any],
@@ -71,10 +108,13 @@ def _audit_table(deliverable, value: Any, variables: dict[str, Any]) -> list[dic
         return [_issue(deliverable, "deliverable_not_table", "交付变量不是数组，无法按表格验收。")]
     rows = value
     issues: list[dict[str, Any]] = []
-    if deliverable.min_rows is not None and len(rows) < deliverable.min_rows:
-        issues.append(_issue(deliverable, "too_few_rows", f"实际 {len(rows)} 行，小于要求的 {deliverable.min_rows} 行。"))
-    if deliverable.max_rows is not None and len(rows) > deliverable.max_rows:
-        issues.append(_issue(deliverable, "too_many_rows", f"实际 {len(rows)} 行，大于要求的 {deliverable.max_rows} 行。"))
+    min_rows, min_rows_issue = _row_bound(deliverable, "minRows", deliverable.min_rows, deliverable.min_rows_variable, variables)
+    max_rows, max_rows_issue = _row_bound(deliverable, "maxRows", deliverable.max_rows, deliverable.max_rows_variable, variables)
+    issues.extend(issue for issue in (min_rows_issue, max_rows_issue) if issue is not None)
+    if min_rows is not None and len(rows) < min_rows:
+        issues.append(_issue(deliverable, "too_few_rows", f"实际 {len(rows)} 行，小于要求的 {min_rows} 行。"))
+    if max_rows is not None and len(rows) > max_rows:
+        issues.append(_issue(deliverable, "too_many_rows", f"实际 {len(rows)} 行，大于要求的 {max_rows} 行。"))
     dict_rows = [row for row in rows if isinstance(row, dict)]
     if deliverable.required_fields:
         if len(dict_rows) != len(rows):
@@ -90,8 +130,15 @@ def _audit_table(deliverable, value: Any, variables: dict[str, Any]) -> list[dic
         ]
         if invalid:
             issues.append(_issue(deliverable, "date_range_violation", f"字段 `{constraint.field}` 有 {len(invalid)} 行超出日期范围。"))
-    for constraint in deliverable.allowed_values:
-        allowed = set(constraint.values)
+    for index, constraint in enumerate(deliverable.allowed_values):
+        allowed, unresolved = _allowed_values(constraint, variables)
+        if unresolved:
+            issues.append(_issue(
+                deliverable,
+                "allowed_values_variable_unresolved",
+                f"allowedValues[{index}] 绑定的变量 {unresolved} 本次运行没有产出，字段 `{constraint.field}` 的枚举无从判定。",
+            ))
+            continue
         invalid = sorted({str(row.get(constraint.field, "")) for row in dict_rows if str(row.get(constraint.field, "")) not in allowed})
         if invalid:
             issues.append(_issue(deliverable, "allowed_values_violation", f"字段 `{constraint.field}` 出现非法值：{invalid[:10]}。"))
@@ -493,3 +540,62 @@ def _render(value: Any) -> str:
 
 def _issue(deliverable, issue: str, message: str) -> dict[str, Any]:
     return {"issue": issue, "deliverable_id": deliverable.id, "message": message}
+
+
+def _allowed_values(constraint, variables: dict[str, Any]) -> tuple[set[str], list[str]]:
+    """绑定变量在每次运行现场解析并冻结成本轮判据；解析不出来交由调用方报 issue。
+
+    多选筛选的输入是数组，逐项取值，否则整个数组会变成一个 JSON 串去比单元格。
+    """
+    allowed = set(constraint.values)
+    unresolved: list[str] = []
+    for name in constraint.value_variables:
+        if name not in variables:
+            unresolved.append(name)
+            continue
+        raw = variables[name]
+        items = raw if isinstance(raw, (list, tuple, set)) else [raw]
+        allowed.update(_render(item) for item in items)
+    return allowed, sorted(unresolved)
+
+
+def _row_bound(
+    deliverable, field_name: str, literal: int | None, variable_name: str | None, variables: dict[str, Any],
+) -> tuple[int | None, dict[str, Any] | None]:
+    """绑定变量解析不出来必须报 issue，不能当「这条约束不存在」跳过——那正是要防的静默降级。
+
+    错误文本只给字段名与变量名：审计结论会回灌给模型，带上值等于把输入漏回去。
+    """
+    if not variable_name:
+        return literal, None
+    if variable_name not in variables:
+        return None, _issue(
+            deliverable, "row_bound_variable_unresolved",
+            f"{field_name}Variable 绑定的变量 `{variable_name}` 本次运行没有产出，行数界无从判定。",
+        )
+    bound = _non_negative_int(variables[variable_name])
+    if bound is None:
+        return None, _issue(
+            deliverable, "row_bound_variable_unresolved",
+            f"{field_name}Variable 绑定的变量 `{variable_name}` 不是非负整数，行数界无从判定。",
+        )
+    return bound, None
+
+
+def resolved_min_rows(deliverable, variables: dict[str, Any]) -> int | None:
+    """本次运行实际生效的 minRows。绑定变量时必须走这里，读字面量会拿到 None。
+
+    `ai_checks._find_garbage_rows` 靠「minRows 为 0」豁免空表；绑定写法下字面量恒为 None，
+    直接读它会把契约明确允许的空表判成 empty_rows。
+    """
+    bound, issue = _row_bound(deliverable, "minRows", deliverable.min_rows, deliverable.min_rows_variable, variables)
+    return None if issue is not None else bound
+
+
+def _non_negative_int(raw: Any) -> int | None:
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw >= 0 else None
+    text = str(raw).strip()
+    return int(text) if text.isdigit() else None

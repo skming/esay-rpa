@@ -1,26 +1,6 @@
-"""每轮重建的权威流程状态。
+"""每轮重建流程状态并替换消息尾部的上一份状态，避免模型依赖过期定义。
 
-旧设计在一轮对话开始时把流程定义注入一次，并用 `protect_prefix` 把它保护成最不可
-丢弃的内容。模型每写一次流程，这份注入就过期一次，而真正的新事实躺在随时会被压缩
-的工具返回里。于是模型只有两条路：翻自己的编辑历史，或者重新调 `get_flow` /
-`lint_flow` 确认——后者在实测里占掉了全部工具调用的 18%。
-
-那不是模型不听话，是它拿不到当前状态。用提示词、schema 摘除、护栏去禁止复检，
-只是把它的眼睛也一起蒙上。
-
-这里换成：每轮重算一份状态，放在消息尾部替换掉上一轮那份。三个后果——
-- `get_flow` / `lint_flow` / `validate_flow` / `get_run_status` 不必再作为工具暴露给
-  模型：它们回答的问题在每轮开头就已经答完了；
-- 「不要重复检查」这条规则不必存在：没有可调的工具，也没有悬着的问题；
-- 状态块位于缓存锚点之后，本来每轮都要重发，放这里不额外增加缓存开销。
-
-能力一件不减：这些读取仍然是 executor 的方法，只是唯一的调用方从模型换成了本模块。
-`get_run_error` 是例外，仍然留给模型——状态块给的是运行结论，失败现场（截图、
-导航轨迹、失败节点配置）体积大且不是每轮都要看，按需下钻。
-
-运行产物的审计（`audit_run`）走同一条路：它不是模型可以选择做或不做的一步，而是运行
-结束后平台自己得出的结论，每轮随状态块刷新。
-"""
+流程、静态检查、任务状态和运行审计由平台刷新；失败截图与导航轨迹由 get_run_error 按需读取。"""
 from __future__ import annotations
 
 import json
@@ -29,7 +9,7 @@ from dataclasses import dataclass, field as dc_field
 from typing import Any
 
 from app.models.schemas import FlowAcceptanceContract
-from app.services.acceptance_contract import contract_validation_errors
+from app.services.acceptance_contract import contract_validation_errors, pagination_caps_from_nodes
 from app.services.ai_tools.variables import _collect_defined_vars
 from app.services.execution_evidence import definition_digest
 
@@ -165,15 +145,10 @@ async def build_flow_state(
 def _contract_findings(
     flow: dict[str, Any], nodes: list[dict[str, Any]], state: FlowState
 ) -> list[dict[str, Any]]:
-    """验收契约不完整 —— run_flow 会在启动浏览器之前直接拒掉。
+    """复用 run_flow 的契约校验，提前呈现阻塞原因。
 
-    这个拒绝一直都在，但模型只能靠真去跑一次才知道，然后花一轮读懂返回、再花一轮补契约。
-    判据用的是 run_flow 调的同一个 `contract_validation_errors`，两处结论不会分岔。唯一例外
-    是「输入值冻进 required_terms」：它要运行期 input_values 才判得出，状态块拿不到，故不传
-    ——对这条保持沉默，不谎报也不误拦。
-
-    空画布不报：契约要引用节点产出的变量，还没有节点的时候它必然不完整，此时报出来只是噪声。
-    """
+    此处没有运行期 input_values，不检查输入值是否固化到 required_terms。
+    空画布不报契约缺失，因为交付变量尚未定义。"""
     if state.is_blank:
         return []
     raw = flow.get("acceptance_contract")
@@ -185,7 +160,11 @@ def _contract_findings(
     defined = set(_collect_defined_vars(
         list(nodes), [str(v.get("name")) for v in state.input_variables if v.get("name")]
     ))
-    errors = contract_validation_errors(contract, defined_variables=defined)
+    errors = contract_validation_errors(
+        contract,
+        defined_variables=defined,
+        pagination_caps=pagination_caps_from_nodes(nodes),
+    )
     if not errors:
         return []
     return [{
@@ -207,15 +186,9 @@ _NON_TERMINAL_RUN_STATUSES = frozenset({"running", "pending", "queued", "timeout
 async def _refresh_run(
     executor: Any, last_run: dict[str, Any] | None
 ) -> dict[str, Any] | None:
-    """任务还没跑完就刷一次状态，跑完了就补上验收结论。
+    """刷新尚未完成的任务，并在成功终态补审。
 
-    `run_flow` 轮询到 90s 就返回 `status="timeout"`，旧设计在返回里写「可用
-    get_run_status 查询当前状态」——那是让模型花一整轮去问一件平台自己就能答的事。
-    这里每轮替它问掉，超时不再是一个需要模型处理的事件。
-
-    审计同理，且更要紧：上一轮返回 timeout 的那次运行，它的 run_flow 返回里不可能带
-    审计结论（那时候还没跑完）。模型手上又没有审计工具，这里不补就永远没有人补。
-    """
+    run_flow 轮询超时不代表任务结束；其返回时未生成的审计结论必须在这里补齐。"""
     if not isinstance(last_run, dict):
         return None
     task_id = last_run.get("task_id")

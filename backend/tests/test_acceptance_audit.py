@@ -5,7 +5,31 @@ from pathlib import Path
 import pytest
 
 from app.models.schemas import FlowAcceptanceContract, NodeExecutionEvidence
-from app.services.acceptance_audit import audit_acceptance_contract
+from app.services.acceptance_audit import audit_acceptance_contract, freeze_contract_inputs
+
+
+def test_frozen_inputs_survive_runtime_overwrites() -> None:
+    contract = FlowAcceptanceContract.model_validate({"deliverables": [{
+        "id": "rows", "variable": "rows", "kind": "table", "minRowsVariable": "count",
+        "allowedValues": [{"field": "kind", "valueVariables": ["kind"]}],
+    }]})
+    inputs = {"count": "2", "kind": ["采购"]}
+    frozen = freeze_contract_inputs(contract, inputs)
+    inputs["count"] = "0"
+    inputs["kind"].append("报销")
+    assert frozen.deliverables[0].min_rows == 2
+    assert frozen.deliverables[0].allowed_values[0].values == ["采购"]
+    assert frozen.deliverables[0].min_rows_variable is None
+    assert contract.deliverables[0].min_rows_variable == "count"
+
+
+@pytest.mark.parametrize("inputs,sensitive", [({}, set()), ({"count": True}, set()), ({"count": "2"}, {"count"})])
+def test_freezing_rejects_invalid_or_sensitive_bindings(inputs, sensitive) -> None:
+    contract = FlowAcceptanceContract.model_validate({"deliverables": [{
+        "id": "rows", "variable": "rows", "kind": "table", "minRowsVariable": "count",
+    }]})
+    with pytest.raises(ValueError):
+        freeze_contract_inputs(contract, inputs, sensitive_names=sensitive)
 
 
 def test_table_contract_accepts_valid_rows_without_guessing_content_shape(tmp_path: Path) -> None:
@@ -327,3 +351,63 @@ def test_binary_document_still_checks_whether_declared_source_is_empty(tmp_path:
     )
     assert [issue["issue"] for issue in result["issues"]] == ["source_variable_empty"]
     assert [warning["issue"] for warning in result["warnings"]] == ["document_content_not_text_verifiable"]
+
+
+def _bound_table_contract(**deliverable) -> FlowAcceptanceContract:
+    return FlowAcceptanceContract.model_validate({
+        "deliverables": [{
+            "id": "rows",
+            "variable": "rows",
+            "kind": "table",
+            **deliverable,
+        }],
+    })
+
+
+_TWO_ROWS = [{"类型": "采购", "金额": "1"}, {"类型": "采购", "金额": "2"}]
+
+
+def test_allowed_values_bound_to_a_variable_follows_this_runs_input(tmp_path: Path) -> None:
+    contract = _bound_table_contract(allowedValues=[{"field": "类型", "valueVariables": ["kind"]}])
+
+    passing = audit_acceptance_contract(contract, {"rows": _TWO_ROWS, "kind": "采购"}, [], workspace_root=tmp_path)
+    assert passing["passed"] is True, passing["issues"]
+
+    failing = audit_acceptance_contract(contract, {"rows": _TWO_ROWS, "kind": "报销"}, [], workspace_root=tmp_path)
+    assert [issue["issue"] for issue in failing["issues"]] == ["allowed_values_violation"]
+
+
+def test_allowed_values_variable_accepts_a_multi_valued_filter(tmp_path: Path) -> None:
+    contract = _bound_table_contract(allowedValues=[{"field": "类型", "values": ["报销"], "valueVariables": ["kinds"]}])
+
+    result = audit_acceptance_contract(
+        contract, {"rows": _TWO_ROWS, "kinds": ["采购", "差旅"]}, [], workspace_root=tmp_path,
+    )
+    assert result["passed"] is True, result["issues"]
+
+
+def test_unresolvable_allowed_values_variable_is_an_issue_not_a_skipped_constraint(tmp_path: Path) -> None:
+    # 解析不出来当「这条约束不存在」跳过，正是这一轮要防的静默降级。
+    result = audit_acceptance_contract(
+        _bound_table_contract(allowedValues=[{"field": "类型", "valueVariables": ["kind"]}]),
+        {"rows": _TWO_ROWS}, [], workspace_root=tmp_path,
+    )
+    assert [issue["issue"] for issue in result["issues"]] == ["allowed_values_variable_unresolved"]
+
+
+def test_row_bound_bound_to_a_variable_follows_this_runs_input(tmp_path: Path) -> None:
+    contract = _bound_table_contract(minRowsVariable="expected_count")
+
+    passing = audit_acceptance_contract(contract, {"rows": _TWO_ROWS, "expected_count": "2"}, [], workspace_root=tmp_path)
+    assert passing["passed"] is True, passing["issues"]
+
+    failing = audit_acceptance_contract(contract, {"rows": _TWO_ROWS, "expected_count": "3"}, [], workspace_root=tmp_path)
+    assert [issue["issue"] for issue in failing["issues"]] == ["too_few_rows"]
+
+
+@pytest.mark.parametrize("variables", [{"rows": _TWO_ROWS}, {"rows": _TWO_ROWS, "expected_count": "两条"}])
+def test_unresolvable_row_bound_variable_is_an_issue(tmp_path: Path, variables) -> None:
+    result = audit_acceptance_contract(
+        _bound_table_contract(minRowsVariable="expected_count"), variables, [], workspace_root=tmp_path,
+    )
+    assert [issue["issue"] for issue in result["issues"]] == ["row_bound_variable_unresolved"]

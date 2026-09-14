@@ -1900,6 +1900,38 @@ async def test_task_manager_breaks_foreach_loop_and_runs_exit_edge(tmp_path) -> 
     assert any(log.node_id == "break" and "触发中断循环" in log.message for log in logs)
 
 
+async def test_task_contract_keeps_initial_input_after_node_overwrite(tmp_path) -> None:
+    from app.services.acceptance_audit import audit_acceptance_contract
+
+    manager = TaskManager(runner=RecordingRunner(), broker=LogBroker(), artifact_store=LocalArtifactStore(artifact_root=tmp_path))
+    request = RunTaskRequest(
+        targetUrl="https://example.com", selector="table", variables={"kind": "采购"},
+        acceptanceContract={"deliverables": [{
+            "id": "rows", "variable": "rows", "kind": "table",
+            "allowedValues": [{"field": "kind", "valueVariables": ["kind"]}],
+        }]},
+        flowDefinition={"nodes": [
+            {"id": "start", "type": "start"},
+            {"id": "set", "type": "variable.set", "variableName": "kind", "value": "销售"},
+        ], "edges": [{"source": "start", "target": "set"}]},
+    )
+    try:
+        snapshot = await manager.start_task(request)
+        done = await wait_for_status(manager, snapshot.task_id, {"success", "error"})
+        assert done.status == "success"
+        assert next(v.value for v in done.variables if v.name == "kind") == "销售"
+        persisted = await manager._task_store.get_task(snapshot.task_id)
+        result = audit_acceptance_contract(
+            persisted.acceptance_contract, {"kind": "销售", "rows": [{"kind": "销售"}]},
+            [], workspace_root=tmp_path,
+        )
+        assert result["passed"] is False
+        assert result["issues"][0]["issue"] == "allowed_values_violation"
+        assert request.acceptance_contract.deliverables[0].allowed_values[0].value_variables == ["kind"]
+    finally:
+        await manager.stop_workers()
+
+
 async def test_task_manager_runs_variable_message_actions(tmp_path) -> None:
     manager = TaskManager(runner=RecordingRunner(), broker=LogBroker(), artifact_store=LocalArtifactStore(artifact_root=tmp_path))
     snapshot = await manager.start_task(
