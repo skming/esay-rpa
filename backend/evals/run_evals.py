@@ -193,8 +193,8 @@ _SAMPLE_CONTRACT: dict[str, Any] = {
         "description": "抓取列表页表格数据并保存为 JSON",
         "sourceKind": "user",
         "sourceQuote": "抓取表格数据保存为 JSON",
-        "confidence": 1.0,
-        "confirmed": True,
+
+
     }],
     "deliverables": [{
         "id": "d1", "kind": "table", "variable": "rows", "required": True,

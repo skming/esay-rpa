@@ -166,15 +166,11 @@ class RequirementClause(ApiModel):
     source_kind: RequirementSourceKind = "user"
     source_quote: str | None = Field(default=None, max_length=1000)
     source_turn_id: str | None = Field(default=None, max_length=120)
-    confidence: float = Field(default=1.0, ge=0, le=1)
-    confirmed: bool = True
 
     @model_validator(mode="after")
     def validate_source(self) -> "RequirementClause":
         if self.source_kind == "user" and not (self.source_quote or "").strip():
             raise ValueError("用户需求条款必须提供 sourceQuote 原文")
-        if not self.confirmed:
-            raise ValueError("未确认的推断不能进入验收契约")
         return self
 
 

@@ -91,8 +91,8 @@ def build_flow(definition: dict[str, object] | None = None) -> FlowSnapshot:
                 "id": "test-requirement",
                 "description": "测试交付要求",
                 "sourceKind": "product_default",
-                "confidence": 1,
-                "confirmed": True,
+
+
             }],
             "deliverables": [{
                 "id": "test-output",

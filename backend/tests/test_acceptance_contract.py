@@ -15,8 +15,6 @@ def test_contract_requires_traceable_requirements_and_bindings() -> None:
             "description": "抓取全部订单",
             "sourceKind": "user",
             "sourceQuote": "抓取全部订单",
-            "confidence": 1,
-            "confirmed": True,
         }],
         "deliverables": [{
             "id": "rows",
@@ -31,24 +29,13 @@ def test_contract_requires_traceable_requirements_and_bindings() -> None:
     assert unmatched_user_quotes(contract, "只抓取退款订单") == ["orders"]
 
 
-def test_low_confidence_requirement_cannot_be_frozen() -> None:
-    contract = FlowAcceptanceContract.model_validate({
-        "requirements": [{
-            "id": "recent",
-            "description": "最近订单按七天理解",
-            "sourceKind": "product_default",
-            "confidence": 0.5,
-            "confirmed": True,
-        }],
-        "deliverables": [{
-            "id": "rows",
-            "variable": "order_rows",
-            "kind": "table",
-            "requirementIds": ["recent"],
-        }],
-    })
+def test_user_requirement_requires_source_quote() -> None:
+    import pytest
+    from pydantic import ValidationError
+    from app.models.schemas import RequirementClause
 
-    assert any("置信度过低" in issue for issue in contract_validation_errors(contract, defined_variables={"order_rows"}))
+    with pytest.raises(ValidationError, match="sourceQuote"):
+        RequirementClause(id="recent", description="最近订单", source_kind="user")
 
 
 def _daterange_contract(**deliverable) -> FlowAcceptanceContract:
@@ -58,8 +45,6 @@ def _daterange_contract(**deliverable) -> FlowAcceptanceContract:
             "description": "按起止日期筛选",
             "sourceKind": "user",
             "sourceQuote": "按起止日期筛选",
-            "confidence": 1,
-            "confirmed": True,
         }],
         "deliverables": [{
             "id": "d1",
@@ -129,8 +114,6 @@ def _document_contract(**deliverable) -> FlowAcceptanceContract:
             "description": "输出帖子总结",
             "sourceKind": "user",
             "sourceQuote": "输出帖子的总结",
-            "confidence": 1,
-            "confirmed": True,
         }],
         "deliverables": [{
             "id": "doc",
@@ -202,8 +185,6 @@ def _table_contract(**deliverable) -> FlowAcceptanceContract:
             "description": "按类型筛选后汇总",
             "sourceKind": "user",
             "sourceQuote": "按类型筛选后汇总",
-            "confidence": 1,
-            "confirmed": True,
         }],
         "deliverables": [{
             "id": "d2",
@@ -305,3 +286,17 @@ def test_row_bound_variable_is_table_only() -> None:
         defined_variables={"rows", "expected_count"},
     )
     assert any("仅适用于 table" in error for error in errors)
+
+
+def test_requirement_schema_rejects_self_reported_confirmation() -> None:
+    import pytest
+    from pydantic import ValidationError
+    from app.models.schemas import RequirementClause
+
+    assert not {"confidence", "confirmed"} & RequirementClause.model_fields.keys()
+    for field in ("confidence", "confirmed"):
+        with pytest.raises(ValidationError, match="extra_forbidden"):
+            RequirementClause.model_validate({
+                "id": "orders", "description": "抓取订单", "source_kind": "user",
+                "source_quote": "抓取订单", field: True,
+            })

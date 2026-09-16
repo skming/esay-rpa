@@ -77,8 +77,6 @@ def _valid_contract(variable: str) -> dict[str, Any]:
             "id": "test-requirement",
             "description": "测试交付要求",
             "source_kind": "product_default",
-            "confidence": 1,
-            "confirmed": True,
         }],
         "deliverables": [{
             "id": "test-deliverable",
@@ -174,7 +172,7 @@ def test_normalize_layout_keeps_realistic_login_and_navigation_flow_readable() -
     assert by_id["n_nav_sub"]["position"]["y"] > by_id["n_nav_menu"]["position"]["y"]
 
 
-async def test_create_flow_rejects_missing_or_unbound_acceptance_contract_before_persisting() -> None:
+async def test_create_flow_rejects_unbound_acceptance_contract_before_persisting() -> None:
     executor = RpaToolExecutor(  # type: ignore[arg-type]
         flow_service=SimpleNamespace(),
         task_manager=SimpleNamespace(),
@@ -187,14 +185,12 @@ async def test_create_flow_rejects_missing_or_unbound_acceptance_contract_before
         "position": {"x": 0, "y": 100},
     }]
 
-    missing = await executor.execute("create_flow", {"name": "订单", "nodes": nodes})
     unbound = await executor.execute("create_flow", {
         "name": "订单",
         "nodes": nodes,
         "acceptance_contract": _valid_contract("unknown"),
     })
 
-    assert missing["error"] == "invalid_arguments"
     assert unbound["error"] == "acceptance_contract_invalid"
     assert any("unknown" in issue for issue in unbound["contract_errors"])
 

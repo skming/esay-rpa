@@ -50,8 +50,6 @@ _CONTRACT = FlowAcceptanceContract.model_validate({
         "description": "抓取订单列表的编号与状态",
         "sourceKind": "user",
         "sourceQuote": "抓订单列表的编号和状态",
-        "confidence": 1,
-        "confirmed": True,
     }],
     "deliverables": [{
         "id": "order_table",

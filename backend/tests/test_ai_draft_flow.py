@@ -16,7 +16,7 @@ def generated_args():
         "name": "生成流程",
         "nodes": [{"id": "n1", "type": "variable.set", "variableName": "result", "value": "完成"}],
         "acceptance_contract": {
-            "requirements": [{"id": "r1", "description": "生成结果", "source_kind": "product_default", "confidence": 1, "confirmed": True}],
+            "requirements": [{"id": "r1", "description": "生成结果", "source_kind": "product_default"}],
             "deliverables": [{"id": "d1", "variable": "result", "kind": "scalar", "requirement_ids": ["r1"]}],
         },
     }
@@ -98,7 +98,7 @@ async def test_persisted_draft_survives_service_restart_and_generation(tmp_path)
         await engine.dispose()
 
 
-async def test_update_flow_activates_draft_only_when_business_nodes_written():
+async def test_update_flow_keeps_draft_until_contract_is_added():
     service = FlowService()
     draft = await service.create_flow(FlowCreateRequest(name="未命名流程"))
     executor = RpaToolExecutor(service, SimpleNamespace())
@@ -108,6 +108,11 @@ async def test_update_flow_activates_draft_only_when_business_nodes_written():
     result = await executor.execute("update_flow", {
         "flow_id": draft.flow_id,
         "add_nodes": [{"id": "n1", "type": "variable.set", "variableName": "result", "value": "完成"}],
+    })
+    assert result["status"] == "applied"
+    assert (await service.get_flow(draft.flow_id)).status == "draft"
+    result = await executor.execute("set_acceptance_contract", {
+        "flow_id": draft.flow_id, "acceptance_contract": generated_args()["acceptance_contract"],
     })
     assert result["status"] == "applied"
     assert (await service.get_flow(draft.flow_id)).status == "active"
@@ -128,3 +133,70 @@ async def test_generation_preserves_user_configured_draft_variables():
     assert result["status"] == "active"
     assert not result.get("validation_issues")
     assert (await service.get_flow(draft.flow_id)).input_variables[0].value == "already-configured"
+
+
+async def test_contract_can_be_added_to_saved_draft_without_recreating_nodes():
+    service = FlowService()
+    executor = RpaToolExecutor(service, SimpleNamespace(list_tasks=AsyncMock(return_value=[])))
+    args = generated_args()
+    contract = args.pop("acceptance_contract")
+    created = await executor.execute("create_flow", args)
+    assert created["status"] == "draft"
+    flow_id = created["flow_id"]
+    before = await service.get_flow(flow_id)
+    from app.services.ai_flow_state import build_flow_state
+    restored = await build_flow_state(executor, flow_id)
+    assert restored.acceptance_contract_initialized is False
+    blocked = await executor.execute("run_flow", {"flow_id": flow_id})
+    assert blocked["status"] == "blocking_acceptance_contract"
+    applied = await executor.execute("set_acceptance_contract", {
+        "flow_id": flow_id, "acceptance_contract": contract,
+    })
+    assert applied["status"] == "applied"
+    after = await service.get_flow(flow_id)
+    assert after.status == "active"
+    assert after.definition == before.definition
+    assert after.revision > before.revision
+    assert len(await service.list_flows()) == 1
+    restored = await build_flow_state(executor, flow_id)
+    assert restored.acceptance_contract_initialized is True
+
+
+@pytest.mark.parametrize("status", ["paused", "disabled", "archived"])
+async def test_setting_contract_preserves_non_draft_status(status):
+    args = generated_args()
+    service = FlowService()
+    flow = await service.create_flow(FlowCreateRequest(
+        name=args["name"], status=status, definition={"nodes": args["nodes"]},
+    ))
+    result = await RpaToolExecutor(service, SimpleNamespace()).execute("set_acceptance_contract", {
+        "flow_id": flow.flow_id, "acceptance_contract": args["acceptance_contract"],
+    })
+    assert result["status"] == "applied"
+    assert (await service.get_flow(flow.flow_id)).status == status
+
+
+def test_initial_contract_still_requires_real_user_source_and_existing_contract_requires_change_quote():
+    from app.services.ai_guards import _check_acceptance_contract_change, _check_acceptance_contract_sources
+    contract = {"requirements": [{"id": "r", "description": "输出订单", "source_kind": "user", "source_quote": "输出订单"}]}
+    state = GuardState(acceptance_contract_initialized=False, user_requirement_text="输出订单", latest_user_message="继续")
+    args = {"acceptance_contract": contract}
+    assert _check_acceptance_contract_change("set_acceptance_contract", args, state) is None
+    assert _check_acceptance_contract_sources("set_acceptance_contract", args, state) is None
+    state.user_requirement_text = "其他需求"
+    assert _check_acceptance_contract_sources("set_acceptance_contract", args, state) is not None
+    state.acceptance_contract_initialized = True
+    assert _check_acceptance_contract_change("set_acceptance_contract", args, state) is not None
+
+
+@pytest.mark.parametrize("field", ["confidence", "confirmed"])
+@pytest.mark.parametrize("tool", ["create_flow", "set_acceptance_contract"])
+def test_model_cannot_supply_confirmation_claims(field, tool):
+    from app.services.ai_tools.schemas import validate_tool_arguments
+    args = generated_args()
+    args["acceptance_contract"]["requirements"][0][field] = True
+    if tool == "set_acceptance_contract":
+        args = {"flow_id": "draft", "acceptance_contract": args["acceptance_contract"]}
+    result = validate_tool_arguments(tool, args)
+    assert result["error"] == "invalid_arguments"
+    assert any(field in issue.get("fields", []) for issue in result["issues"])

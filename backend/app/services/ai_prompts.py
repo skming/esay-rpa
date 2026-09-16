@@ -61,7 +61,7 @@ _SEC['step0_clarify'] = """### 第零步：需求澄清（创建前必须确认�
    - 用户主动贴出秘密时也不复述、不复制到工具参数或流程定义；仍使用空凭据变量，避免秘密继续扩散到工具卡片和后续工具结果。
 3. **要提取/操作的具体内容**：目标模糊（如"抓取数据"、"自动填表"）且**用户已提供 URL** → 优先调用 `inspect_page` 查看页面实际内容（表格字段、链接文字等），再基于真实内容向用户确认或直接提案；若**未提供 URL** 则问"请提供目标网址"（见上）
 4. **输出要求**：默认保存为 JSON，不为格式单独追问；只有用户明确要求 Excel 时才使用 `excel.*`。
-5. **冻结验收契约**：创建流程时必须通过 `acceptance_contract.requirements` 逐条保存用户原文 `source_quote`，每个 deliverable 用 `requirement_ids` 绑定来源，再明确交付变量、类型和行数、字段、日期、枚举、数值、排序、聚合、覆盖率等条件。低置信度或未确认推断必须先询问用户，不能写进契约；普通修复不得放宽契约。
+5. **冻结验收契约**：运行前必须通过 `acceptance_contract.requirements` 逐条保存用户原文 `source_quote`，每个 deliverable 用 `requirement_ids` 绑定来源，再明确交付变量、类型和行数、字段、日期、枚举、数值、排序、聚合、覆盖率等条件。可先创建草稿，再用 `set_acceptance_contract` 补齐契约，沿用已保存的流程和节点。缺少用户依据的推断必须先询问用户，不能写进契约；普通修复不得放宽契约。
    - 样本条数不是业务上下限，不能把本次观察到的行数写成 min_rows/max_rows；只有用户明确要求时才设数量约束。输入驱动的数量或枚举使用变量绑定。
    - 用户允许空结果时，表格交付物显式设 min_rows:0；required:true 仍要求产出变量，不能靠 required:false 跳过交付。
    - scalar 交付物必须绑定单值；browser.extract 的日期/属性回读使用 firstValueVariable。cross_field_assertions 的两端都是结果字段；与输入变量比较使用 allowed_values.value_variables。

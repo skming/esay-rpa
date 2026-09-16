@@ -62,6 +62,7 @@ class GuardState:
     """
 
     # 阶段机读的事实（见 ai_phases.resolve_phase）
+    acceptance_contract_initialized: bool = True
     flow_has_nodes: bool = False
     page_evidence_required: dict[str, Any] | None = None
     page_evidence_done: bool = False

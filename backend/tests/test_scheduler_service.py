@@ -21,8 +21,8 @@ def acceptance_contract(variable: str) -> dict:
             "id": "scheduled-output",
             "description": "调度测试交付",
             "sourceKind": "product_default",
-            "confidence": 1,
-            "confirmed": True,
+
+
         }],
         "deliverables": [{
             "id": "scheduled-result",

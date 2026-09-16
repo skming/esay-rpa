@@ -63,6 +63,7 @@ class FlowState:
 
     # 读取失败时置位：状态块会明说这一轮没拿到流程，避免模型把空状态当成空流程
     load_failed: bool = False
+    acceptance_contract_initialized: bool = True
 
     @property
     def has_browser_chain(self) -> bool:
@@ -116,6 +117,8 @@ async def build_flow_state(
     raw_nodes: list[dict[str, Any]] = []
     definition = flow.get("definition")
     if isinstance(definition, dict):
+        raw_contract = flow.get("acceptance_contract") or {}
+        state.acceptance_contract_initialized = bool(raw_contract.get("requirements") or raw_contract.get("deliverables"))
         state.definition_digest = definition_digest(definition)
         raw_nodes = [n for n in definition.get("nodes", []) if isinstance(n, dict)]
         raw_edges = [e for e in definition.get("edges", []) if isinstance(e, dict)]

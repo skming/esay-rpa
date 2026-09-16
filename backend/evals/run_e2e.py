@@ -828,8 +828,7 @@ def _self_check_flow(case: E2ECase, base_url: str) -> dict[str, Any]:
         "acceptance_contract": {
             "requirements": [
                 {"id": "r1", "description": "按日期区间筛选账单并取出筛选后的表格",
-                 "source_kind": "user", "source_quote": case.requirement[:80],
-                 "confidence": 0.95, "confirmed": True}
+                 "source_kind": "user", "source_quote": case.requirement[:80]}
             ],
             "deliverables": [
                 {"id": "d1", "variable": "rows", "kind": "table", "required": True,

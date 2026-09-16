@@ -303,8 +303,6 @@ export type RequirementClause = {
   sourceKind: 'user' | 'product_default';
   sourceQuote?: string | null;
   sourceTurnId?: string | null;
-  confidence: number;
-  confirmed: boolean;
 };
 
 export type FlowAcceptanceContract = {

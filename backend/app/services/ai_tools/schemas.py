@@ -40,10 +40,8 @@ _ACCEPTANCE_CONTRACT_SCHEMA: dict[str, Any] = {
                     "source_kind": {"type": "string", "enum": ["user", "product_default"]},
                     "source_quote": {"type": "string"},
                     "source_turn_id": {"type": "string"},
-                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                    "confirmed": {"type": "boolean"},
                 },
-                "required": ["id", "description", "source_kind", "confidence", "confirmed"],
+                "required": ["id", "description", "source_kind"],
             },
         },
         "deliverables": {
@@ -128,7 +126,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "name": "create_flow",
             "description": (
                 "创建全新流程；已有 flow_id 时改用 update_flow。所有节点字段平铺在节点根层。"
-                "acceptance_contract 必须绑定用户原文与交付变量。返回 flow_id、revision、"
+                "可省略 acceptance_contract 先存草稿，再用 set_acceptance_contract 补齐；未补齐禁止运行。返回 flow_id、revision、"
                 "changed_nodes 和带 blocks_run 标记的 lint_findings。凭据变量只声明空值，"
                 "不得把账号、密码或 Token 写入参数。"
             ),
@@ -146,6 +144,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "edges": {
                         "type": "array",
                         "description": "连线列表",
+                        # 不封闭：条件分支靠边上的 label/sourceHandle/targetHandle 认 true/false
+                        # （flow_control._read_branch），封成 id/source/target 就没法声明走哪一支。
                         "items": {
                             "type": "object",
                             "properties": {
@@ -170,9 +170,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         ),
                         "items": {"type": "object"},
                     },
-                    "acceptance_contract": _ACCEPTANCE_CONTRACT_SCHEMA,
+                    "acceptance_contract": {"type": "object", "description": "可选，完整结构见 set_acceptance_contract；省略时保存不可运行的草稿。"},
                 },
-                "required": ["name", "nodes", "acceptance_contract"],
+                "required": ["name", "nodes"],
             },
         },
     },

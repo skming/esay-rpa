@@ -181,6 +181,8 @@ def _check_acceptance_contract_change(
     args: dict[str, Any],
     state: GuardState,
 ) -> dict[str, Any] | None:
+    if not state.acceptance_contract_initialized:
+        return None
     quote = str(args.get("requirement_change_quote") or "").strip()
     latest = str(state.latest_user_message or "")
     if quote and quote in latest:
@@ -216,12 +218,6 @@ def _check_acceptance_contract_sources(
                 violations.append("requirements 包含无效条目")
                 continue
             requirement_id = str(requirement.get("id") or "?")
-            try:
-                confidence = float(requirement.get("confidence", 1))
-            except (TypeError, ValueError):
-                confidence = 0
-            if requirement.get("confirmed", True) is not True or confidence < 0.75:
-                violations.append(f"{requirement_id} 尚未可靠确认")
             source_kind = requirement.get("sourceKind", requirement.get("source_kind", "user"))
             if source_kind == "product_default" and requirement_id != "default-output-format":
                 violations.append(f"{requirement_id} 不是允许的产品默认条款")
@@ -236,7 +232,7 @@ def _check_acceptance_contract_sources(
         guard_id="acceptance_contract_sources_must_match_user",
         required_action="clarify_or_trace_requirements",
         violations=violations,
-        message="验收契约必须逐条绑定用户原文；低置信度或未确认推断必须先向用户澄清。",
+        message="验收契约必须逐条绑定用户原文；无法溯源的推断必须先向用户澄清。",
     )
 
 
@@ -427,14 +423,14 @@ GUARDS: tuple[Guard, ...] = (
         summary="验收契约的用户需求条款必须绑定真实用户原文",
         scope=ToolScope(include=frozenset({"create_flow", "set_acceptance_contract"})),
         check=_check_acceptance_contract_sources,
-        contract="验收条款必须引用用户原文；未经确认或低置信度推断不得写入契约。",
+        contract="验收条款必须引用用户原文；缺少用户依据的推断不得写入契约。",
     ),
     Guard(
         id="acceptance_contract_change_requires_user_quote",
         summary="修改验收契约必须引用用户本轮明确变更需求的原话",
         scope=ToolScope(include=frozenset({"set_acceptance_contract"})),
         check=_check_acceptance_contract_change,
-        contract="验收契约只能因用户明确改变需求而修改，普通修复不得放宽交付条件。",
+        contract="无契约草稿可补齐契约；已有契约只能因用户明确改变需求而修改，普通修复不得放宽交付条件。",
     ),
     Guard(
         id="read_only_mode",

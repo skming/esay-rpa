@@ -261,8 +261,8 @@ def test_acceptance_contract_sources_must_match_user_requirement_text() -> None:
                 "description": "导出 CSV",
                 "source_kind": "user",
                 "source_quote": "导出 CSV",
-                "confidence": 1,
-                "confirmed": True,
+
+
             }],
             "deliverables": [],
         },

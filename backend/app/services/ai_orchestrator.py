@@ -89,6 +89,10 @@ def _after_write_directive(result: dict[str, Any], state: GuardState) -> str:
             f"{head}但检测到连通性问题：{result.get('connectivity_warning')}\n"
             "先补连线，再谈运行。"
         )
+    if not state.acceptance_contract_initialized:
+        return f"{head}流程仍为草稿。调用 set_acceptance_contract 补齐需求来源与交付条件，不要重新创建流程；契约有效后才能运行。"
+    if state.blocking_diagnostics or state.audit_findings:
+        return f"{head}先修复当前阻断项；修复配置不需要再次询问运行授权。"
     if not state.run_authorized:
         return (
             f"{head}本轮用户只要求改动、没有要求运行：向用户说明改了什么、为什么，"
@@ -427,8 +431,6 @@ def _build_few_shot_messages() -> list[dict[str, Any]]:
             "description": "按用户指定日期范围和项目进度抓取项目列表",
             "sourceKind": "user",
             "sourceQuote": "筛选创建时间 2026-06-01 至 2026-06-24，项目进度为「项目通过/待尽调」",
-            "confidence": 1,
-            "confirmed": True,
         }],
         "deliverables": [{
             "id": "project-list",
@@ -1155,6 +1157,36 @@ def _task_state_message(state: _ResumableTaskState) -> dict[str, Any] | None:
     }
 
 
+def _continued_run_authorization(messages: list[dict[str, Any]], flow_id: str | None) -> bool:
+    if not flow_id:
+        return False
+    latest = _latest_user_message(messages)
+    if _NEW_TASK_RE.search(latest) or _URL_IN_TEXT_RE.search(latest):
+        return False
+    if any(p in latest for p in _NO_RUN_REQUEST_PHRASES):
+        return False
+    if not (_RESUME_TASK_RE.search(latest) or any(k in latest.lower() for k in _REPAIR_INTENT_KEYWORDS)
+            or re.search(r"不完整|未采集完整|统计为空|数据为空|结果为空", latest)):
+        return False
+    # 只继承当前流程未完成任务中的用户授权；工具输出和模型建议都不能授予权限。
+    for message in reversed(messages[:-1]):
+        if message.get("role") == "user":
+            text = str(message.get("content") or "")
+            if any(p in text for p in _NO_RUN_REQUEST_PHRASES) or _NEW_TASK_RE.search(text):
+                return False
+            if _RUN_AUTHORIZATION_RE.search(text):
+                return True
+        elif message.get("role") == "assistant":
+            if message.get("verificationStatus") == "accepted":
+                return False
+            for call in message.get("toolCalls") or []:
+                result = _tool_call_payload(call, "result")
+                target = result.get("flow_id") or _tool_call_payload(call, "args").get("flow_id")
+                if target and target != flow_id:
+                    return False
+    return False
+
+
 def _detect_turn_intents(
     messages: list[dict[str, Any]],
     flow_id: str | None,
@@ -1173,7 +1205,8 @@ def _detect_turn_intents(
     # 用户明确说了要跑/要验收就是授权，即使同一句里还带着修复词。
     # 显式的「不要运行」优先级最高：它是撤回授权，不是没给授权。
     run_refused = any(phrase in user_text for phrase in _NO_RUN_REQUEST_PHRASES)
-    intents.run_authorized = bool(_RUN_AUTHORIZATION_RE.search(user_text)) and not run_refused
+    intents.run_authorized = (bool(_RUN_AUTHORIZATION_RE.search(user_text))
+                              or _continued_run_authorization(messages, flow_id)) and not run_refused
     # 结构性 guard，故意不靠关键字门控：用户描述问题的措辞（"抓不全"/"内容少了一半"等）
     # 是关键字列表永远无法穷举的集合。
     if flow_id and flow_state.has_browser_chain and not _is_explicit_channel_switch_request(user_text_lower):
@@ -1481,11 +1514,9 @@ class AiOrchestrator:
             # 阶段机读的事实。默认局面是「证据不作要求」；下面的意图接线才会逐项收紧。
             # blocking_diagnostics 每轮由状态块的诊断集重算，见主循环。
             flow_has_nodes=not flow_state.is_blank,
+            acceptance_contract_initialized=flow_state.acceptance_contract_initialized,
             page_evidence_done=task_state.phase == "page_inspected",
-            # 运行授权只由本轮用户这句话给（见 _detect_turn_intents），不能默认放开：
-            # run_flow 会拉起真实浏览器去操作站点，而检查点刻意不存这个字段
-            # （ai_session_checkpoint._PERSISTED_KEYS），默认给 True 就等于把那道防线绕开——
-            # 断流恢复后的第一轮又是「未经授权也能跑」。
+            # 授权来自用户当前请求或同一流程未完成任务的历史请求，不从检查点继承。
             run_authorized=bool(intents.run_authorized),
             # 本轮请求已被判定为「建流程 / 修流程 / 要运行」，即职责范围之内。
             # 拿拒答模板收尾会被撤回重写（见 _misapplied_refusal）。
@@ -1568,6 +1599,7 @@ class AiOrchestrator:
             # 直接补了节点，也可能把节点删空。存一份「上轮的阶段」就是第二份真相。
             guard_state.blocking_diagnostics = _blocking_diagnostics(flow_state, guard_state)
             guard_state.flow_has_nodes = not flow_state.is_blank
+            guard_state.acceptance_contract_initialized = flow_state.acceptance_contract_initialized
             _mark_history_cache_anchor(full_messages, model, relayed)
             collected: _RoundOutput = _RoundOutput()
             round_started_at = time.monotonic()
@@ -2127,14 +2159,24 @@ def _overstated_result_claim(text: str, state: GuardState) -> str | None:
     return None
 
 
-_NO_RUN_REQUEST_PHRASES = ("不要运行", "不用运行", "别运行", "不要跑", "不用跑", "别跑", "只看结构", "不要执行")
+_NO_RUN_REQUEST_PHRASES = ("不要运行", "不用运行", "别运行", "不要跑", "不用跑", "别跑", "只看结构", "不要执行", "只改配置", "只修复配置", "先不运行", "暂不运行", "停止运行", "停止执行", "取消任务")
 
 
 def _unmet_verification_request(state: GuardState) -> str | None:
     """只对已授权且可进入运行阶段的任务催跑；模型措辞不作为阻断证据。"""
-    if state.verification_nudged or state.run_attempted or not state.run_authorized:
+    if state.verification_nudged or state.read_only_tools or state.closing_statement_only or state.terminal_response_only:
         return None
-    if resolve_phase(state) is not Phase.VERIFY:
+    phase = resolve_phase(state)
+    if phase is Phase.FIX and state.turn_intent_actionable:
+        state.verification_nudged = True
+        return (
+            "上一条回复已撤回。当前创建/修复任务仍有阻断项，请依据当前诊断继续修复，"
+            "不要为了继续修复配置再次询问许可。若确实缺少用户信息，明确指出缺少什么；"
+            "运行仍须遵守已有授权与工具护栏。"
+        )
+    if state.run_attempted or not state.run_authorized:
+        return None
+    if phase is not Phase.VERIFY:
         return None
     # 复用纯查询护栏，不调用会记账的 _orchestrator_guard_before_tool。
     if apply_pre_tool_guards("run_flow", {"flow_id": state.flow_id}, state) is not None:
@@ -2713,6 +2755,8 @@ def _after_flow_write(result: dict[str, Any], state: GuardState) -> None:
     # 流程一被改动，之前那次运行和审计就不再针对当前这份定义，证据全部作废。
     state.run_succeeded = False
     state.audit_passed = False
+    state.run_attempted = False
+    state.verification_nudged = False
     # 页面和运行结果都可能因为这次改动而不同，重探同一个目标不再算原地打转
     note_progress(state)
     # 取 changed_nodes 而不是调用参数：update_nodes 的 patch 里没有 type，
@@ -2790,6 +2834,8 @@ def _after_create_flow(result: dict[str, Any], state: GuardState) -> None:
     # 本轮内就得脱离 BUILD：不然刚建完的流程在同一轮里仍被判成「还不存在」，
     # 模型接下来那次 run_flow 会被自己刚满足的前置门挡掉。
     state.flow_has_nodes = True
+    contract = result.get("acceptance_contract") or {}
+    state.acceptance_contract_initialized = bool(contract.get("requirements") or contract.get("deliverables"))
 
 
 def _after_update_flow(result: dict[str, Any], state: GuardState) -> None:
@@ -2812,6 +2858,7 @@ def _after_apply_node_fix(result: dict[str, Any], state: GuardState) -> None:
 def _after_set_acceptance_contract(result: dict[str, Any], state: GuardState) -> None:
     if result.get("error"):
         return
+    state.acceptance_contract_initialized = True
     _after_flow_write(result, state)
 
 

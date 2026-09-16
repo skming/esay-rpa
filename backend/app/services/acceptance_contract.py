@@ -64,10 +64,6 @@ def contract_validation_errors(
     elif not any(deliverable.required for deliverable in contract.deliverables):
         errors.append("验收契约至少需要一个 required=true 的 deliverable")
 
-    for requirement in contract.requirements:
-        if requirement.confidence < 0.75:
-            errors.append(f"需求条款 {requirement.id} 置信度过低，必须先向用户确认")
-
     for deliverable in contract.deliverables:
         if not deliverable.requirement_ids:
             errors.append(f"交付物 {deliverable.id} 没有关联 requirementIds")

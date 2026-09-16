@@ -779,7 +779,7 @@ class RpaToolExecutor:
             defined_variables=set(defined_variables),
             pagination_caps=pagination_caps_from_nodes(nodes),
         )
-        if contract_errors:
+        if acceptance_contract is not None and contract_errors:
             return {
                 "error": "acceptance_contract_invalid",
                 "contract_errors": contract_errors,
@@ -791,7 +791,7 @@ class RpaToolExecutor:
             definition=definition,
             input_variables=iv_snapshots,
             acceptance_contract=contract,
-            status="active" if any(node.get("type") not in {"start", "end"} for node in nodes) else "draft",
+            status="active" if acceptance_contract is not None and any(node.get("type") not in {"start", "end"} for node in nodes) else "draft",
         )
         if draft_flow_id:
             # 草稿中用户已配置的变量（尤其凭据）不能被模型生成的空默认值清掉。
@@ -954,10 +954,15 @@ class RpaToolExecutor:
             }
 
         generated_business_nodes = any(node.get("type") not in {"start", "end"} for node in nodes)
+        contract_ready = not contract_validation_errors(
+            flow.acceptance_contract,
+            defined_variables=set(_collect_defined_vars(nodes, [iv.name for iv in flow.input_variables])),
+            pagination_caps=pagination_caps_from_nodes(nodes),
+        )
         req = FlowUpdateRequest(
             definition=definition,
             name=new_name,
-            status="active" if flow.status == "draft" and generated_business_nodes else None,
+            status="active" if flow.status == "draft" and generated_business_nodes and contract_ready else None,
         )
         updated = await self._flow_service.update_flow(flow_id, req)
         if updated is None:
@@ -2179,7 +2184,7 @@ class RpaToolExecutor:
         self,
         flow_id: str,
         acceptance_contract: dict[str, Any],
-        requirement_change_quote: str,
+        requirement_change_quote: str = "",
     ) -> dict[str, Any]:
         del requirement_change_quote
         flow = await self._flow_service.get_flow(flow_id)
@@ -2207,7 +2212,12 @@ class RpaToolExecutor:
             }
         updated = await self._flow_service.update_flow(
             flow_id,
-            FlowUpdateRequest(acceptance_contract=contract),
+            FlowUpdateRequest(
+                acceptance_contract=contract,
+                status="active" if flow.status == "draft" and any(
+                    node.get("type") not in {"start", "end"} for node in flow.definition.get("nodes", [])
+                ) else None,
+            ),
         )
         if updated is None:
             return {"error": f"流程 {flow_id} 不存在"}

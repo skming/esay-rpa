@@ -36,8 +36,8 @@ async def test_flow_service_persists_crud_with_sqlalchemy(tmp_path) -> None:
                     "id": "orders-required",
                     "description": "测试订单交付",
                     "sourceKind": "product_default",
-                    "confidence": 1,
-                    "confirmed": True,
+
+
                 }],
                 "deliverables": [{
                     "id": "orders",
@@ -78,8 +78,8 @@ async def test_flow_service_persists_crud_with_sqlalchemy(tmp_path) -> None:
                     "id": "row-count-required",
                     "description": "测试计数交付",
                     "sourceKind": "product_default",
-                    "confidence": 1,
-                    "confirmed": True,
+
+
                 }],
                 "deliverables": [{
                     "id": "row-count",
@@ -157,8 +157,8 @@ async def test_update_flow_rejects_clearing_existing_acceptance_contract(tmp_pat
                     "id": "orders-required",
                     "description": "测试订单交付",
                     "sourceKind": "product_default",
-                    "confidence": 1,
-                    "confirmed": True,
+
+
                 }],
                 "deliverables": [{
                     "id": "orders",

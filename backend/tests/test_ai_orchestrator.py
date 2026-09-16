@@ -2311,6 +2311,56 @@ def test_unchanged_flow_with_different_error_still_counts_as_repeat():
     assert state.attempt_budget["attempts"][-1]["repeat"] is True
 
 
+@pytest.mark.parametrize("latest", ["继续", "未采集完整", "数据统计为空", "帮我修复"])
+def test_unfinished_repair_keeps_existing_run_authorization(latest):
+    messages = [
+        {"role": "user", "content": "修复后重新运行"},
+        {"role": "assistant", "verificationStatus": "modified_unverified", "toolCalls": [
+            {"tool": "apply_node_fix", "args": {"flow_id": "flow-1"}, "result": {"flow_id": "flow-1"}}
+        ]},
+        {"role": "user", "content": latest},
+    ]
+    assert _detect_turn_intents(messages, "flow-1", FlowState(is_blank=False)).run_authorized
+
+
+@pytest.mark.parametrize("middle,latest", [
+    ({"role": "user", "content": "不要运行"}, "继续修复"),
+    ({"role": "user", "content": "只改配置"}, "继续修复"),
+    ({"role": "user", "content": "取消任务"}, "继续"),
+    ({"role": "assistant", "verificationStatus": "accepted"}, "继续"),
+    ({"role": "assistant", "toolCalls": [{"tool": "apply_node_fix", "args": {"flow_id": "other"}}]}, "继续"),
+    ({"role": "assistant", "content": "已修改"}, "新任务，继续修复"),
+    ({"role": "assistant", "content": "已修改"}, "给导出文件名加日期"),
+    ({"role": "assistant", "content": "已修改"}, "继续修复 https://other.test"),
+])
+def test_historical_authorization_stops_at_task_or_permission_boundaries(middle, latest):
+    messages = [{"role": "user", "content": "修复后重新运行"}, middle,
+                {"role": "user", "content": latest}]
+    assert not _detect_turn_intents(messages, "flow-1", FlowState(is_blank=False)).run_authorized
+
+
+def test_assistant_suggestion_never_authorizes_run():
+    messages = [{"role": "assistant", "content": "建议重新运行"}, {"role": "user", "content": "继续"}]
+    assert not _detect_turn_intents(messages, "flow-1", FlowState(is_blank=False)).run_authorized
+
+
+def test_real_edit_reopens_verification_without_resetting_failure_budget():
+    from app.services.ai_orchestrator import _after_flow_write
+    state = _ready(run_attempted=True, verification_nudged=True)
+    state.attempt_budget["spent"] = 1
+    _after_flow_write({"revision": 2, "lint_findings": []}, state)
+    assert _unmet_verification_request(state) is not None
+    assert state.attempt_budget["spent"] == 1
+
+
+def test_fix_stage_continues_without_asking_for_execution_permission():
+    from app.services.ai_orchestrator import _after_write_directive
+    state = _ready(run_authorized=False, turn_intent_actionable=True,
+                   blocking_diagnostics=[{"issue": "script_inputs_not_declared"}])
+    assert "先修复" in _after_write_directive({"revision": 2}, state)
+    assert _unmet_verification_request(state) is not None
+    assert _unmet_verification_request(state) is None
+
 
 def test_invalid_create_arguments_exhaust_existing_budget_without_recording_a_flow():
     from app.services.ai_orchestrator import _orchestrator_guard_after_tool
@@ -2365,3 +2415,4 @@ async def test_invalid_batch_gets_feedback_before_retrying(monkeypatch):
     assert [r["status"] for r in results] == ["error", "skipped"]
     batch = next(m for m in requests[1] if m.get("tool_calls"))
     response_ids = {m.get("tool_call_id") for m in requests[1] if m["role"] == "tool"}
+    assert {c["id"] for c in batch["tool_calls"]} <= response_ids
