@@ -472,7 +472,7 @@ class ExtensionExecutor:
                 await asyncio.sleep(_WAIT_POLL_INTERVAL_SECONDS)
                 continue
             raw_values = result.get("values")
-            if not isinstance(raw_values, list) or raw_values or time.monotonic() >= deadline:
+            if not _table_values_still_rendering(raw_values) or time.monotonic() >= deadline:
                 return raw_values
             await asyncio.sleep(_WAIT_POLL_INTERVAL_SECONDS)
 
@@ -782,6 +782,18 @@ class ExtensionExecutor:
             trigger_matches=None,
             unit=" 页",
         )
+
+
+def _table_values_still_rendering(raw_values: object) -> bool:
+    """这一探的结果还可能被「再等一会儿」改写吗。
+
+    空列表＝圈到了表壳、数据行未到；no_rows_in_scope＝此刻一张表都没圈到。两种都是
+    「表还没长出来」而不是结论，页面渲染完就会变。multiple_tables_in_scope 不在此列——
+    那是 selector 圈得太宽，再等只会让更多表渲染出来，等到超时仍是同一个错。
+    """
+    if isinstance(raw_values, list):
+        return not raw_values
+    return isinstance(raw_values, dict) and raw_values.get("__table_scope_error") == "no_rows_in_scope"
 
 
 def _fingerprint_rows(rows: list[object]) -> str:
