@@ -12,27 +12,33 @@ const NODE_STATUS: Record<NodeStatus, {
   label: string; icon: LucideIcon; bar: string; pill: string; spin?: boolean;
 }> = {
   running: {
-    label: '运行中', icon: Loader2, spin: true,
+    label: '运行中',
+    icon: Loader2,
+    spin: true,
     bar: 'bg-running-strip animate-shimmer',
     pill: 'bg-live-soft text-live-ink ring-1 ring-[var(--color-live-line)]'
   },
   done: {
-    label: '完成', icon: CheckCircle2,
+    label: '完成',
+    icon: CheckCircle2,
     bar: 'bg-emerald-500',
     pill: 'bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200'
   },
   error: {
-    label: '失败', icon: AlertCircle,
+    label: '失败',
+    icon: AlertCircle,
     bar: 'bg-red-500',
     pill: 'bg-red-50 text-red-600 ring-1 ring-red-200'
   },
   pending: {
-    label: '待运行', icon: Circle,
+    label: '待运行',
+    icon: Circle,
     bar: 'bg-slate-200',
     pill: 'bg-slate-100 text-slate-500 ring-1 ring-slate-200/70'
   },
   skipped: {
-    label: '跳过', icon: Ban,
+    label: '跳过',
+    icon: Ban,
     bar: 'bg-slate-200',
     pill: 'bg-slate-100 text-slate-500 ring-1 ring-slate-200/70'
   },
@@ -53,7 +59,6 @@ function NodeStatusPill({ status }: { status: NodeStatus }): ReactElement {
       title={s.label}
     >
       <Icon className={cn('h-3 w-3', s.spin === true && 'animate-spin')} strokeWidth={2} />
-      <span>{s.label}</span>
     </span>
   );
 }
