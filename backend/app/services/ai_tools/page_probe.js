@@ -30,6 +30,14 @@ export const PAGE_PROBE = (args) => {
             .trim().replace(/\s+/g, ' ').slice(0, 80);
     }
 
+    // 只认渲染文本，不碰 value：text() 为了读出 <input type=submit> 的按钮文字会回落到
+    // el.value，任意选择器都能被指到表单控件上，那一落就是用户输入的明文（含 password）。
+    // 脱敏边界与 inputs[].value 同一条——凭据不出页面，所以这里对表单控件直接不给文本。
+    function renderedText(el) {
+        if (/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) return '';
+        return (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80);
+    }
+
     // ── 开放 shadow root 穿透 ─────────────────────────────────────
     // 闭合 shadow root 在页面脚本里和「没有 shadow root」完全无法区分，
     // 所以只声明开放的那部分，另外把可疑的自定义元素单独报出去。
@@ -311,9 +319,18 @@ export const PAGE_PROBE = (args) => {
             };
         }
         if (found.length > 1) {
+            // 只报命中几个，模型手上没有可选的东西，收窄只能再猜一个 selector 再撞一次。
+            // 候选带上各自的唯一选择器与首段文本，它才能直接挑中那一个容器。
             return {url: window.location.href, observation_version: version,
                 scope_selector: scopeSelector, scope_matches: found.length,
-                error: 'scope_selector 命中多个容器，请收窄范围；未选择第一个容器。',
+                scope_candidates: found.slice(0, 8).map(el => {
+                    const bs = bestSelector(el);
+                    const cand = {selector: bs.selector, tag: el.tagName.toLowerCase(), text: renderedText(el)};
+                    if (bs.matches !== 1) cand.matches = bs.matches;
+                    return cand;
+                }),
+                error: 'scope_selector 命中多个容器，请收窄范围；未选择第一个容器。'
+                    + '候选容器见 scope_candidates，从中挑一个改写 scope_selector。',
                 required_action: 'narrow_scope_selector'};
         }
         scopeEl = found[0];

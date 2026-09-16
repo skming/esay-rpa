@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import json
 from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
@@ -686,3 +687,38 @@ async def test_observation_and_extraction_agree_on_the_aria_table(
     assert table["headers"] == ["工单号", "状态", "工时"], table
     assert table["sample_rows"][:2] == [["G-01", "进行中", "8"], ["G-02", "已完成", "5"]], table
     assert table["row_count"] == 4, table
+
+
+async def test_an_ambiguous_scope_names_the_containers_it_matched(
+    executor: RpaToolExecutor,
+) -> None:
+    """备选式 scope_selector 命中多个容器时必须交出候选：只报命中数，模型手上没有可挑的
+    东西，唯一出路是再猜一个 selector 再撞一次——线上就是这样白烧一轮。"""
+    # 这里不能走 _observe：本次结果带 error 是判据本身，不是环境缺件。
+    result = await executor._inspect_page_via_browser(
+        url=_url("eval_login.html"), scope_selector="form, .login, main, body"
+    )
+    if "_browser_blocked" in result:
+        pytest.skip(f"浏览器通道不可用：{result['_browser_blocked']}")
+
+    assert result.get("required_action") == "narrow_scope_selector", result
+    assert result.get("scope_matches") == 2, result
+    candidates = result.get("scope_candidates") or []
+    assert [c["selector"] for c in candidates] == ["html > body", "#login-form"], candidates
+    assert all(c.get("matches") is None for c in candidates), candidates
+
+
+async def test_ambiguous_scope_candidates_never_carry_form_values(
+    executor: RpaToolExecutor,
+) -> None:
+    """候选文本不能读 value：scope 命中多个 input 时，回落到 value 交出去的就是明文口令。"""
+    result = await executor._inspect_page_via_browser(
+        url=_url("scope_ambiguous_secret.html"), scope_selector="input"
+    )
+    if "_browser_blocked" in result:
+        pytest.skip(f"浏览器通道不可用：{result['_browser_blocked']}")
+
+    candidates = result.get("scope_candidates") or []
+    assert [c["selector"] for c in candidates] == ["#account", "#secret"], candidates
+    assert all(c["text"] == "" for c in candidates), candidates
+    assert "PROBE-LEAK-CANARY" not in json.dumps(result, ensure_ascii=False), result
