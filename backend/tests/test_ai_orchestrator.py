@@ -1279,6 +1279,18 @@ def test_identical_repeated_tool_result_is_elided_but_a_changed_one_is_not() -> 
     assert "_unchanged" not in other
 
 
+def test_set_valued_arguments_fold_regardless_of_element_order() -> None:
+    """list_node_types(types=[...]) 是集合语义，换个顺序不该让同一份节点目录再进一次上下文。"""
+    seen: dict[tuple[str, str], str] = {}
+    big = {"node_types": ["x" * _ELIDE_MIN_CHARS]}
+
+    _elide_repeated_result("list_node_types", '{"types":["browser.open","file.write"]}', big, seen)
+    reordered = _elide_repeated_result(
+        "list_node_types", '{"types":["file.write","browser.open"]}', big, seen
+    )
+    assert '"_unchanged": true' in reordered
+
+
 def test_small_repeated_results_are_resent_in_full() -> None:
     """指针本身也占字符，小结果重发比指回去更省。"""
     seen: dict[tuple[str, str], str] = {}

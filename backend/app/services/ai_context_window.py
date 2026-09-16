@@ -266,6 +266,31 @@ def _compact_tool_messages(
 _ELIDE_MIN_CHARS = 2_000  # 小结果重发比指回去更省，指针本身也要占字符
 
 
+def _canonical_args(arguments: str) -> str:
+    """折叠键用的参数规范形：对象按键排序，数组按元素规范形排序。
+
+    数组也排序是因为 `list_node_types(types=[...])` 一类参数是集合语义，同一批类型换个顺序
+    就绕过折叠，同一份三千多字符的节点目录进两次上下文。归一化过头没有风险：它只决定查哪个桶，
+    是否折叠仍要求两次返回逐字相同，所以最坏是漏折叠一次，不会把不同的返回当成同一份。
+    """
+    try:
+        parsed = json.loads(arguments)
+    except (TypeError, ValueError):
+        return arguments
+
+    def canonical(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: canonical(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return sorted(
+                (canonical(item) for item in value),
+                key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True),
+            )
+        return value
+
+    return json.dumps(canonical(parsed), ensure_ascii=False, sort_keys=True)
+
+
 def _elide_repeated_result(
     tool_name: str, arguments: str, result: Any, seen: dict[tuple[str, str], str]
 ) -> str:
@@ -275,7 +300,7 @@ def _elide_repeated_result(
     才折叠，不是跳过调用——页面被点击改变过就不会相等，也就不会折叠，不存在读到旧状态的风险。
     """
     payload = json.dumps(result, ensure_ascii=False)
-    key = (tool_name, arguments)
+    key = (tool_name, _canonical_args(arguments))
     if seen.get(key) == payload and len(payload) >= _ELIDE_MIN_CHARS:
         return json.dumps({
             "_unchanged": True,
