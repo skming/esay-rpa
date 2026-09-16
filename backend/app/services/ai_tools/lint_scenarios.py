@@ -1101,10 +1101,16 @@ def _lint_unavailable_artifact_format(nodes: list[dict[str, Any]]) -> list[dict[
     return findings
 
 
-# 用户看得见的地方声称做了语义加工：节点标题、说明、输出变量名、产物文件名
+# 用户看得见的能力宣称：节点标题、说明，以及产物自带的名字（文件名、工作表标签页）。
+# outputVariable / variableName 是流程内部标识，用户拿到的东西里没有它们，不构成宣称。
+_SEMANTIC_CLAIM_FIELDS = ("title", "description", "path", "sheetName")
+# 英文词干只认独立单词：summary_file、summaryFile 是标识符（description 里也会写成
+# 「…写入 JSON 文件 → summary_file」），不是「做了摘要」的说法。[a-z] 段不能带
+# IGNORECASE，否则会吃掉驼峰里的大写字母，summaryFile 又被当成一句完整的英文。
 _SEMANTIC_CLAIM_PATTERN = re.compile(
-    r"总结|摘要|概述|归纳|提炼|润色|改写|翻译|summar|abstract|rewrite|paraphrase|translat",
-    re.IGNORECASE,
+    r"总结|摘要|概述|归纳|提炼|润色|改写|翻译"
+    r"|\b(?:(?i:summar|abstract|rewrit|paraphras|translat))[a-z]*\b"
+    r"|\b(?:SUMMAR|ABSTRACT|REWRIT|PARAPHRAS|TRANSLAT)[A-Z]*\b"
 )
 # 已经说清楚是规则产物的说法，不算冒充
 _SEMANTIC_HONEST_MARKERS = ("原文摘录", "摘录", "要点提取", "节选", "excerpt")
@@ -1120,6 +1126,17 @@ _SEMANTIC_CLAIM_EXEMPT_TYPES = frozenset({
 })
 
 
+def _matched_semantic_claim(node: dict[str, Any]) -> tuple[str, str] | None:
+    values = {field: str(node.get(field) or "") for field in _SEMANTIC_CLAIM_FIELDS}
+    if any(marker in value for value in values.values() for marker in _SEMANTIC_HONEST_MARKERS):
+        return None
+    for field, value in values.items():
+        match = _SEMANTIC_CLAIM_PATTERN.search(value)
+        if match:
+            return field, match.group(0)
+    return None
+
+
 def _lint_claimed_semantic_capability(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """没有会调模型的节点时，不许把规则处理命名成「总结」——这条必须是 error。
 
@@ -1129,6 +1146,9 @@ def _lint_claimed_semantic_capability(nodes: list[dict[str, Any]]) -> list[dict[
     「## 关键词」是正则噪音，助手回的是「已验收通过」，全程没说这不是总结。
 
     出路是改说法 + 告诉用户，不是换个写法再切一次——所以判据放在节点的对外字段上。
+    反例同样要放过：flow f9393893 里数值求和节点的 outputVariable 叫 summary_file，
+    这条 error 连报 13 次，模型把标题改了 8 遍都命不中真正命中的字段，一次 run_flow
+    都没跑成。所以判据只看用户看得见的字段，并且把命中的字段和词交回去。
     """
     if semantic_rewrite_node_types():
         return []
@@ -1137,30 +1157,26 @@ def _lint_claimed_semantic_capability(nodes: list[dict[str, Any]]) -> list[dict[
         node_type = str(node.get("type") or "")
         if node_type.startswith(_SEMANTIC_CLAIM_EXEMPT_PREFIXES) or node_type in _SEMANTIC_CLAIM_EXEMPT_TYPES:
             continue
-        claims = " ".join(
-            str(node.get(field) or "")
-            # 各节点类型给产物起名的字段不同：脚本/转换用 outputVariable，variable.set 用
-            # variableName，写文件用 path，excel 用 sheetName——少收一个就少拦一类节点。
-            for field in ("title", "description", "outputVariable", "variableName", "path", "sheetName")
-        )
-        if not _SEMANTIC_CLAIM_PATTERN.search(claims):
+        matched = _matched_semantic_claim(node)
+        if matched is None:
             continue
-        if any(marker in claims for marker in _SEMANTIC_HONEST_MARKERS):
-            continue
+        field, claim = matched
         findings.append({
             "severity": "error",
             "node_id": str(node.get("id", "?")),
             "node_title": str(node.get("title") or node.get("id", "?")),
             "issue": "claimed_semantic_capability_unavailable",
+            "field": field,
             "message": (
-                "节点对外声称做总结/摘要/改写一类的语义加工，但当前没有任何会调模型的节点类型，"
-                "脚本只能截取、正则、统计——产出必然是原文的子集，不是新表述。"
+                f"节点 {field} 里的「{claim}」对外声称做总结/摘要/改写一类的语义加工，"
+                "但当前没有任何会调模型的节点类型，脚本只能截取、正则、统计——产出必然是原文的子集，不是新表述。"
                 "这类冒充不会报错：流程 success、文件非空、内容也确实来自抓取数据。"
             ),
             "fix": (
                 "先告诉用户「平台没有语义加工能力，只能给原文摘录/要点提取，要真总结需要接入模型节点」，"
-                "由用户决定接受还是改需求；用户接受后，把节点标题、description、输出变量名和文档里的标题"
+                f"由用户决定接受还是改需求；用户接受后，把 {field} 里的「{claim}」和文档里对应的标题"
                 "都改成实际做的事（如「原文摘录」「要点提取」），不要保留「总结」的说法。"
+                "只判 title / description / path / sheetName，数值求和叫 summary_file 这类内部变量名不在其列。"
             ),
         })
     return findings

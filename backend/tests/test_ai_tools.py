@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import json
 
+import pytest
+
 from app.models.schemas import (
     FlowSnapshot,
     RuntimeProgress,
@@ -3703,13 +3705,50 @@ def test_the_same_claim_is_caught_whichever_node_type_assembles_it() -> None:
     disguises = [
         {"id": "a", "type": "data.string.transform", "title": "生成总结", "outputVariable": "digest"},
         {"id": "b", "type": "excel.write", "title": "写入报表", "sheetName": "内容摘要"},
-        {"id": "c", "type": "variable.set", "title": "汇总", "variableName": "summary_text"},
+        {"id": "c", "type": "variable.set", "title": "登记总结正文", "variableName": "summary_text"},
         {"id": "d", "type": "file.write", "title": "输出", "path": "out/总结.md"},
     ]
 
     for node in disguises:
         findings = _lint_claimed_semantic_capability([node])
         assert [f["issue"] for f in findings] == ["claimed_semantic_capability_unavailable"], node["type"]
+
+
+def test_a_numeric_rollup_is_not_a_semantic_claim_because_a_variable_is_named_summary() -> None:
+    """事故复盘 flow f9393893：数值求和节点的 outputVariable 叫 summary_file，这条 error
+    连报 13 次，模型把标题改了 8 遍都改不掉——真正命中的是它没被告知的字段，
+    而 description 里「→ summary_file」是在引用这个变量名，同样不是对用户的宣称。
+    整个会话一次 run_flow 都没跑成。内部标识不判，判了就没有收敛的出路。
+    """
+    rollup = [
+        {
+            "id": "n10_totals_file",
+            "type": "script.python",
+            "title": "写入 token 费用统计文件",
+            "description": "对 usage_rows 中的 token 与费用字段做数值求和并写入 JSON 文件 → summary_file",
+            "outputVariable": "summary_file",
+        },
+        {"id": "n11", "type": "variable.set", "title": "设置交付路径", "variableName": "summary_file"},
+        {"id": "n12", "type": "file.write", "title": "导出合计", "path": "out/summary_2026.json"},
+    ]
+
+    assert _lint_claimed_semantic_capability(rollup) == []
+
+
+def test_the_blocked_claim_names_the_field_and_the_word_that_matched() -> None:
+    """只说「声称做了语义加工」，模型得挨个字段猜；猜错就是上面那 13 轮。"""
+    node = {
+        "id": "n4",
+        "type": "script.python",
+        "title": "导出用量",
+        "description": "把抓取结果翻译成英文写入报告",
+        "outputVariable": "report_path",
+    }
+
+    findings = _lint_claimed_semantic_capability([node])
+
+    assert findings[0]["field"] == "description"
+    assert "翻译" in findings[0]["message"] and "description" in findings[0]["message"]
 
 
 def test_reading_something_that_is_already_a_summary_is_not_a_claim() -> None:
@@ -4231,3 +4270,15 @@ async def test_static_scope_error_is_not_reported_as_page_access_denied(monkeypa
     assert result["snapshot_id"]
     recovered = await executor.execute("inspect_page", {"snapshot_id": result["snapshot_id"], "scope_selector": "article"})
     assert recovered["status"] == "success"
+
+
+@pytest.mark.parametrize("title", ["Summarize report", "SUMMARIZE REPORT", "TRANSLATE REPORT", "Translate report", "summarize report"])
+def test_semantic_claims_are_detected_in_normal_letter_cases(title):
+    assert _lint_claimed_semantic_capability([{"id": "n", "type": "script.python", "title": title}])
+
+
+@pytest.mark.parametrize("identifier", ["summary_file", "summaryFile", "SUMMARY_FILE", "translateResult"])
+def test_internal_identifiers_in_descriptions_are_not_semantic_claims(identifier):
+    assert not _lint_claimed_semantic_capability([
+        {"id": "n", "type": "script.python", "description": f"结果写入 {identifier}"}
+    ])
