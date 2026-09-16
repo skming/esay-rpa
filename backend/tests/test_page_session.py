@@ -573,3 +573,24 @@ async def test_cancelled_wait_propagates():
 
     with pytest.raises(asyncio.CancelledError):
         await _observe_wait(wait(), "#panel")
+
+
+async def test_driver_timeout_outside_playwrights_class_is_still_evidence():
+    """持久化上下文首选 patchright 分支，它的 TimeoutError 与 playwright 的类无继承关系；
+    漏判会让整次观察被 `_inspect_page_via_browser` 的兜底吞成一句超时。"""
+    from app.services.ai_tools.executor import _observe_wait
+
+    async def wait():
+        raise type("TimeoutError", (Exception,), {})("patchright fixture")
+
+    assert await _observe_wait(wait(), "#panel") == {"status": "timed_out", "selector": "#panel"}
+
+
+async def test_non_timeout_driver_error_propagates():
+    from app.services.ai_tools.executor import _observe_wait
+
+    async def wait():
+        raise type("Error", (Exception,), {})("selector 语法无法解析")
+
+    with pytest.raises(Exception, match="selector 语法无法解析"):
+        await _observe_wait(wait(), "#panel")

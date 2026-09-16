@@ -104,7 +104,13 @@ def _merge_page_content(observation: dict[str, Any], scope_selector: str | None)
 
 
 async def _observe_wait(wait: Awaitable[Any], selector: str) -> dict[str, Any]:
-    """等待条件超时仍可取证；传输超时不能证明元素未出现。"""
+    """等待条件超时仍可取证；传输超时不能证明元素未出现。
+
+    驱动超时按异常类名认，不按 isinstance：持久化上下文首选 scrapling 的 patchright 分支，
+    它的 TimeoutError 与 `playwright.async_api.TimeoutError` 没有继承关系，isinstance 漏判后
+    超时会逃到 `_inspect_page_via_browser` 的兜底，把整次观察连已判出的 redirected_to_login
+    一起丢掉。传进来的一律是驱动的等待；选择器语法错抛 Error 不抛 TimeoutError，仍照实抛出。
+    """
     try:
         result = await wait
         if isinstance(result, dict) and result.get("status") in {"satisfied", "timed_out"}:
@@ -112,11 +118,7 @@ async def _observe_wait(wait: Awaitable[Any], selector: str) -> dict[str, Any]:
     except TimeoutError:
         return {"status": "unknown", "selector": selector}
     except Exception as exc:
-        if find_spec("playwright") is None:
-            raise
-        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-
-        if not isinstance(exc, PlaywrightTimeoutError):
+        if type(exc).__name__ != "TimeoutError":
             raise
         return {"status": "timed_out", "selector": selector}
     return {"status": "satisfied", "selector": selector}
