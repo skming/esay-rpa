@@ -50,6 +50,9 @@ _PER_ROUND_KEYS = frozenset({
     # 每轮由状态块或对话历史重算：存一份只会在事实已经变了之后还按旧的判
     "blocking_diagnostics", "flow_has_nodes", "run_succeeded", "audit_passed",
     "page_evidence_done", "evidence_collected", "fresh_page_evidence",
+    # 每轮由 build_flow_state 从流程的 acceptance_contract 重算（草稿无契约即为 False）。
+    # 存下来只会在用户中途补齐契约后还按旧的「仍是草稿」挡着运行。
+    "acceptance_contract_initialized",
     # 本轮用户这句话的意图。跨轮留着就是把上一句的授权当这一句的——
     # run_authorized 尤其不能存：那等于在用户没点运行的情况下拉起浏览器操作真实站点
     "run_authorized", "repair_intent", "browser_chain_node_ids", "run_attempted",
