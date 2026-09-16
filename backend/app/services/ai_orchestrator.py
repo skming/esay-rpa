@@ -36,6 +36,7 @@ from app.services.ai_phases import (
     apply_phase_gate,
     evidence_already_collected,
     note_evidence,
+    note_execution_signature,
     note_failed_attempt,
     note_guard_block,
     note_progress,
@@ -2372,6 +2373,11 @@ def _build_change_context(state: GuardState) -> _ChangeContext:
     )
 
 
+def _run_error_text(result: dict[str, Any]) -> str:
+    # 已执行任务用 error_summary，起跑前拒绝和工具异常用 error/message。
+    return str(result.get("error_summary") or result.get("error") or result.get("message") or "")
+
+
 def _run_failure_signature(result: dict[str, Any]) -> str:
     """把一次运行失败压成可比对的签名。
 
@@ -2380,7 +2386,7 @@ def _run_failure_signature(result: dict[str, Any]) -> str:
     """
     import re as _re
 
-    text = str(result.get("error") or result.get("message") or "")
+    text = _run_error_text(result)
     normalized = _re.sub(r"\d+", "#", text)[:120]
     return f"run:{result.get('status') or 'error'}:{normalized}"
 
@@ -2392,6 +2398,7 @@ def _count_repair_cycle(
     kind: str,
     signature: str,
     charge_only_if_repeated: bool = False,
+    force_repeat: bool = False,
 ) -> None:
     """记一次「改了又跑、跑了又没成」。
 
@@ -2404,6 +2411,7 @@ def _count_repair_cycle(
         signature=signature,
         detail=str(last_error or "")[:200] or None,
         charge_only_if_repeated=charge_only_if_repeated,
+        force_repeat=force_repeat,
     )
 
 
@@ -2511,7 +2519,7 @@ def _note_undefined_variable_escape(result: dict[str, Any], state: GuardState) -
     它不在静态诊断集里（漏网就是它的定义），所以单独记一处：状态块每轮重算，
     写进 blocking_diagnostics 会被下一轮直接冲掉。
     """
-    err_msg = str(result.get("error", ""))
+    err_msg = _run_error_text(result)
     if "变量未定义" not in err_msg:
         return
     escaped_var = (re.search(r"变量未定义[：:]\s*(\S+)", err_msg) or [None, err_msg])[1]
@@ -2544,7 +2552,7 @@ def _note_table_scope_escape(result: dict[str, Any], state: GuardState) -> None:
     本来能跑的流程。代价是猜漏的那次要跑一趟才暴露，所以执行的结论必须跨轮留下来：
     状态块每轮重算，不记在这里，下一轮模型看到的又只是一条静态 warn。
     """
-    err_msg = str(result.get("error") or "")
+    err_msg = _run_error_text(result)
     if _TABLE_SCOPE_ERROR_MARK not in err_msg:
         return
     escape_finding: dict[str, Any] = {
@@ -2589,13 +2597,19 @@ def _after_run_flow(result: dict[str, Any], state: GuardState) -> None:
         never_started = status in _RUN_NOT_STARTED_STATUSES or invalid_arguments
         _count_repair_cycle(
             state,
-            result.get("error") or result.get("message"),
+            _run_error_text(result),
             kind="run_refused" if never_started else "run_error",
             signature=_run_failure_signature(result),
             charge_only_if_repeated=never_started,
+            # 同一份可执行定义又跑了一遍还是失败。报错文案换个说法签名就不同，
+            # 只按签名判会让「什么都没改就重跑」永远攒不满预算。
+            force_repeat=note_execution_signature(state, result.get("execution_signature")),
         )
 
     if status == "error":
+        # 失败现场随 run_flow 一起回来（executor 的 failure_diagnostics），取证义务就地生效：
+        # 否则要等模型自己再调一次 get_run_error，而失败后的那一轮往往直接去改 selector。
+        _require_page_evidence(result.get("failure_diagnostics"), state)
         _note_undefined_variable_escape(result, state)
         _note_table_scope_escape(result, state)
 
@@ -2609,6 +2623,20 @@ def _after_run_flow(result: dict[str, Any], state: GuardState) -> None:
         }
 
 
+def _require_page_evidence(diagnostics: Any, state: GuardState) -> None:
+    """报出 selector/可见性错误就要求真去看一次 DOM：静态诊断读不到页面，
+    不看就改等于按上一次的想象再猜一遍。run_flow 的内联诊断和 get_run_error 共用。"""
+    if not isinstance(diagnostics, dict) or not diagnostics.get("inspect_hint"):
+        return
+    last_url = diagnostics.get("last_browser_url")
+    suggested: dict[str, Any] = {"reason": "run_failed_on_page_element"}
+    if isinstance(last_url, str) and last_url:
+        suggested["url"] = last_url
+    suggested["wait_selector"] = "table, [role=grid], nav, main"
+    state.page_evidence_required = suggested
+    state.page_evidence_done = False
+
+
 def _after_get_run_error(result: dict[str, Any], state: GuardState) -> None:
     _note_read_evidence("get_run_error", result, state)
     # 带回失败现场截图也算新证据。
@@ -2618,14 +2646,7 @@ def _after_get_run_error(result: dict[str, Any], state: GuardState) -> None:
         return
 
     last_url = result.get("last_browser_url")
-    suggested: dict[str, Any] = {"reason": "run_failed_on_page_element"}
-    if isinstance(last_url, str) and last_url:
-        suggested["url"] = last_url
-    suggested["wait_selector"] = "table, [role=grid], nav, main"
-    # 报出 selector/可见性错误就要求真去看一次 DOM：静态诊断读不到页面，
-    # 不看就改等于按上一次的想象再猜一遍。
-    state.page_evidence_required = suggested
-    state.page_evidence_done = False
+    _require_page_evidence(result, state)
 
     failed_node = result.get("failed_node_config") if isinstance(result.get("failed_node_config"), dict) else {}
     failed_node_id = str(result.get("failed_node_id") or failed_node.get("id") or "")

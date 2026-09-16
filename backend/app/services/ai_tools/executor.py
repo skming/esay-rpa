@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import copy
+import hashlib
 import json
 import re
 from datetime import UTC, datetime
@@ -40,7 +41,7 @@ from app.services.ai_tools.diagnostics import (
 )
 from app.services.ai_tools.graph import _unreachable_node_ids
 from app.services.ai_tools.lint import _lint_flow, annotate_lint_findings
-from app.services.ai_tools.lint_diff import ChangeContext, inspect_change
+from app.services.ai_tools.lint_diff import ChangeContext, execution_signature, inspect_change
 from app.services.ai_tools.normalize import (
     _choose_layout_lane,
     _next_layout_lane,
@@ -131,6 +132,9 @@ _PLACEHOLDER_FLOW_NAMES = frozenset({"新建 RPA 流程", "未命名流程"})
 
 # run_flow 的调用参数名。塞进 variables 既不报错也不生效，是最难自查的一类静默失效
 _RUN_CALL_PARAM_NAMES = frozenset({"browser_executor", "flow_id", "task_id"})
+
+# 运行器失败时追加到 task.error 的失败现场 URL（task_manager._append_exc_context）
+_FAILURE_PAGE_URL_RE = re.compile(r"\[失败时页面:\s*(https?://\S+?)\]")
 
 # apply_node_fix 只改单节点的配置字段。id/type 决定这个节点是什么、连线还指不指向它，
 # 一旦可改，这个工具就是「不过结构校验的 update_flow」：_validate_update_structure、
@@ -1677,6 +1681,24 @@ class RpaToolExecutor:
                 )
         if task.error:
             result["error_summary"] = task.error
+        if task.status == "error":
+            # 这份指纹标的是「跑的是哪一份可执行定义」。definition_digest 把画布坐标和节点
+            # status 一起算进去，拖一下节点就变，用它判断「失败之后流程有没有真的改过」
+            # 会把挪位置当成改动；execution_signature 只认影响执行的内容。
+            result["execution_signature"] = hashlib.sha256(
+                execution_signature(flow.definition).encode("utf-8")
+            ).hexdigest()
+            # 失败现场的三条杠杆随运行结果一起交回：「哪个节点断的、该去看哪一页」本来要
+            # 多花一轮 get_run_error 才拿到，而失败后的那一轮往往被拿去盲改 selector。
+            # 只带这几个键——错误日志、失败截图这些完整证据仍然只在 get_run_error 里。
+            diagnostics = await self._get_run_error(task.task_id)
+            inline = {
+                key: diagnostics[key]
+                for key in ("failed_node_id", "inspect_hint", "last_browser_url")
+                if diagnostics.get(key)
+            }
+            if inline:
+                result["failure_diagnostics"] = inline
         if task.status == "success":
             # 审计随运行结果一起交出，不作为模型可选的下一步：run_flow 的 success 只说明
             # 节点没抛异常，产物合不合格由流程冻结的验收契约裁决。
@@ -1804,11 +1826,18 @@ class RpaToolExecutor:
         error_lower = error_text.lower()
 
         last_browser_url: str | None = None
-        for log in reversed(all_logs):
-            detail = log.detail or ""
-            if detail.startswith("http://") or detail.startswith("https://"):
-                last_browser_url = detail
-                break
+        failure_page = _FAILURE_PAGE_URL_RE.search(error_text)
+        if failure_page:
+            # 运行器在失败那一刻把当页 URL 写进了 task.error。导航日志给的是「最后一次
+            # 主动打开过哪一页」——中途被重定向到登录页、或前端自己换了路由，日志都不会
+            # 再记一条，照它去 inspect_page 看的是另一页，改完再跑还是同一个失败。
+            last_browser_url = failure_page.group(1)
+        else:
+            for log in reversed(all_logs):
+                detail = log.detail or ""
+                if detail.startswith("http://") or detail.startswith("https://"):
+                    last_browser_url = detail
+                    break
 
         # 成功运行返回精简结果，不带 error_logs，避免诱使 AI 去"修复"本就按预期工作的 continueOnError 节点
         if is_success:
@@ -2109,7 +2138,6 @@ class RpaToolExecutor:
 
         # Re-validate after fix — include lint so navigation topology issues surface
         input_var_names = [iv.name for iv in flow.input_variables]
-        remaining_issues = _validate_variable_refs(nodes, input_var_names)
         edges: list[Any] = list(definition.get("edges", []))
         lint_findings = _lint_flow(nodes, edges, input_variable_names=input_var_names)
         # Emit actual field values from patched node to let AI verify the fix landed
@@ -2122,12 +2150,9 @@ class RpaToolExecutor:
         result: dict[str, Any] = {
             "flow_id": flow_id,
             "node_id": node_id,
-            "applied_patch": config_patch,
             "patched_field_snapshot": patched_field_snapshot,
             "verify_hint": "确认 patched_field_snapshot 中各字段值与修改意图一致，不一致则重新 apply_node_fix。",
             "status": "patched" if updated else "error",
-            "remaining_issues": remaining_issues,
-            "all_clear": len(remaining_issues) == 0 and not any(f["severity"] == "error" for f in lint_findings),
         }
         if change.tracked_field_changes:
             result["tracked_field_changes"] = [dict(c) for c in change.tracked_field_changes]
@@ -2330,8 +2355,6 @@ class RpaToolExecutor:
                     wait_result = await _observe_wait(channel.wait_for(wait_selector), wait_selector)
                 result = await channel.observe(scope_selector, include_html=True)
                 result["scope_selector"] = scope_selector
-                # wait_result 先进 result 再判结论：「等到了目标」正是目标内容的证据，
-                # 后补的话 classify_page_outcome 看不到，等到了也只报「页面已观察」。
                 # wait_result 先进 result 再判结论：「等到了目标」正是目标内容的证据，
                 # 后补的话 classify_page_outcome 看不到，等到了也只报「页面已观察」。
                 if wait_result is not None:

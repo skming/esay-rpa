@@ -378,16 +378,20 @@ def note_failed_attempt(
     signature: str,
     detail: str | None = None,
     charge_only_if_repeated: bool = False,
+    force_repeat: bool = False,
 ) -> dict[str, Any]:
     """记录失败，重复签名计两份预算。
 
     charge_only_if_repeated 用于尚未起跑就被拒的运行：首次只记签名，
-    重复时再计价，避免阻塞条件消耗首次纠正机会或无限重试。"""
+    重复时再计价，避免阻塞条件消耗首次纠正机会或无限重试。
+
+    force_repeat 给「签名不同但调用方已认定是同一次失败」用（同一份可执行定义
+    又跑了一遍）：报错文案换个说法签名就不同，只按签名判会让原地重跑永远不计重复。"""
     budget = state.attempt_budget
     if not isinstance(budget, dict):
         budget = state.attempt_budget = new_budget()
     signatures: dict[str, int] = budget.setdefault("signatures", {})
-    repeat = signature in signatures
+    repeat = force_repeat or signature in signatures
     if repeat:
         cost = 2
     else:
@@ -401,6 +405,22 @@ def note_failed_attempt(
         "repeat": repeat,
     })
     return budget
+
+
+def note_execution_signature(state: GuardState, signature: str | None) -> bool:
+    """记下这次失败跑的是哪一份可执行定义，并回答「跟上一次失败是不是同一份」。
+
+    只有预算 dict 跨轮留存（见 ai_session_checkpoint._PERSISTED_KEYS），所以记在它里面：
+    中断续跑之后照样认得出「什么都没改又跑了一遍」。指纹由 run_flow 给，不含画布坐标。
+    """
+    budget = state.attempt_budget
+    if not isinstance(budget, dict):
+        budget = state.attempt_budget = new_budget()
+    if not signature:
+        return False
+    previous = budget.get("last_execution_signature")
+    budget["last_execution_signature"] = signature
+    return signature == previous
 
 
 def note_guard_block(

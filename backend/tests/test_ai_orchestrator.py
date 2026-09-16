@@ -2261,3 +2261,40 @@ def test_selector_text_guesses_no_longer_block_a_run() -> None:
         "table_extract_selector_too_broad",
     ):
         assert not is_blocking_finding({"issue": issue, "severity": "warn"}), issue
+
+
+@pytest.mark.parametrize("field", ["error_summary", "error", "message"])
+@pytest.mark.parametrize("error,issue", [
+    ("变量未定义: order_no", "undefined_variable_ref_runtime_escape"),
+    ("extractMode=table 但 selector 无表格行", "table_extract_scope_runtime_escape"),
+])
+def test_run_error_fields_reach_runtime_guards(field, error, issue):
+    from app.services.ai_orchestrator import _after_run_flow
+
+    state = GuardState()
+    _after_run_flow({"status": "error", field: error}, state)
+    assert state.runtime_escape_findings[0]["issue"] == issue
+    assert state.attempt_budget["attempts"][0]["detail"] == error
+
+
+def test_changed_flow_with_different_error_is_not_charged_as_repeat():
+    from app.services.ai_orchestrator import _after_run_flow
+
+    state = GuardState()
+    for signature, error in [("first", "connection refused"), ("repaired", "file missing")]:
+        _after_run_flow({"status": "error", "error_summary": error,
+                         "execution_signature": signature}, state)
+    assert state.attempt_budget["spent"] == 2
+    assert all(not attempt["repeat"] for attempt in state.attempt_budget["attempts"])
+
+
+def test_unchanged_flow_with_different_error_still_counts_as_repeat():
+    from app.services.ai_orchestrator import _after_run_flow
+
+    state = GuardState()
+    for error in ("connection refused", "file missing"):
+        _after_run_flow({"status": "error", "error_summary": error,
+                         "execution_signature": "unchanged"}, state)
+    assert state.attempt_budget["spent"] == 3
+    assert state.attempt_budget["attempts"][-1]["repeat"] is True
+
