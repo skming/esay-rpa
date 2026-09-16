@@ -1268,6 +1268,11 @@ def _after_tool_guidance(
     if not isinstance(result, dict):
         return None, False
     state = state or GuardState()
+    if result.get("error") == "invalid_arguments" and tool_name in WRITE_TOOLS:
+        return (
+            "本次写入/运行未执行。按 issues 的 path 和 fields 修正参数，下一轮重新调用；"
+            "本轮后续调用尚未看到错误反馈，已跳过。不要重复提交原参数。", True
+        )
     if result.get("required_action") == "ask_user":
         return _GUIDANCE_AFTER_ASK_USER, True
     if _is_terminal_result(result):
@@ -1892,7 +1897,7 @@ class AiOrchestrator:
                 for _skip_stream_idx, _skip_tc in tool_items[_stop_after + 1:]:
                     _skip_result = {
                         "status": "skipped",
-                        "message": "该调用未执行：流程刚被创建/修改，请先按系统引导完成后续校验，再视需要重新发起。",
+                        "message": "该调用未执行：前序工具要求重新判断下一步，请先读取其结果和系统引导，再按需调用。",
                     }
                     if _skip_stream_idx not in collected.emitted_tool_starts:
                         yield {"type": "tool_start", "tool": _skip_tc["name"], "args": _skip_tc["arguments"], "call_id": _skip_tc["call_id"]}
@@ -2852,6 +2857,13 @@ def _orchestrator_guard_after_tool(tool_name: str, result: Any, state: GuardStat
     # terminal_response_only 会走模板回复，把「改了哪个节点的哪个字段」那段顶掉。
     if result.get("required_action") == "ask_user":
         state.closing_statement_only = True
+    if result.get("error") == "invalid_arguments" and tool_name != "run_flow":
+        note_failed_attempt(
+            state, kind="invalid_arguments",
+            signature=f"{tool_name}:" + json.dumps(result.get("issues", []), sort_keys=True, ensure_ascii=False),
+            detail="工具参数不符合 schema", charge_only_if_repeated=True,
+        )
+        return
     # 被阻断的调用不携带真实工具输出，不应影响 state
     if result.get("status") == "blocked_by_orchestrator_guard":
         return

@@ -2298,3 +2298,58 @@ def test_unchanged_flow_with_different_error_still_counts_as_repeat():
     assert state.attempt_budget["spent"] == 3
     assert state.attempt_budget["attempts"][-1]["repeat"] is True
 
+
+
+def test_invalid_create_arguments_exhaust_existing_budget_without_recording_a_flow():
+    from app.services.ai_orchestrator import _orchestrator_guard_after_tool
+    from app.services.ai_phases import resolve_phase, Phase
+    state = GuardState()
+    result = {"status": "error", "error": "invalid_arguments", "issues": [{"path": [], "fields": ["acceptance_contract"]}]}
+    _orchestrator_guard_after_tool("create_flow", result, state)
+    assert state.attempt_budget["spent"] == 0
+    for _ in range(2):
+        _orchestrator_guard_after_tool("create_flow", result, state)
+    assert resolve_phase(state) is Phase.REPORT
+    assert not state.flow_has_nodes
+
+
+def test_invalid_write_arguments_return_feedback_before_remaining_batch_calls():
+    from app.services.ai_orchestrator import _after_tool_guidance
+    result = {"status": "error", "error": "invalid_arguments"}
+    guidance, stop = _after_tool_guidance("create_flow", result)
+    assert stop is True
+    assert "下一轮" in guidance
+    assert _after_tool_guidance("inspect_page", result) == (None, False)
+
+
+async def test_invalid_batch_gets_feedback_before_retrying(monkeypatch):
+    import litellm
+
+    class InvalidExecutor(_FakeExecutor):
+        async def execute(self, tool_name, args, progress_sink=None, change_context=None):
+            self.calls.append((tool_name, args))
+            return {"status": "error", "error": "invalid_arguments", "issues": [
+                {"path": [], "fields": ["acceptance_contract"]}
+            ]}
+
+    rounds = iter([
+        _FakeStream([
+            _chunk(tool_calls=[_tool_call_chunk(0, name="create_flow", arguments='{}')]),
+            _chunk(tool_calls=[_tool_call_chunk(1, name="create_flow", arguments='{}')], finish="tool_calls"),
+        ]),
+        _FakeStream([_chunk(content="创建参数无效，流程尚未保存。", finish="stop")]),
+    ])
+    requests = []
+    async def complete(**kwargs):
+        requests.append(kwargs["messages"][:])
+        return next(rounds)
+    monkeypatch.setattr(litellm, "acompletion", complete)
+    executor = InvalidExecutor()
+    events = [event async for event in AiOrchestrator(tool_executor=executor).stream(
+        messages=[{"role": "user", "content": "创建一个流程"}], model="test-model"
+    )]
+    assert len(executor.calls) == 1
+    results = [e["result"] for e in events if e["type"] == "tool_result"]
+    assert [r["status"] for r in results] == ["error", "skipped"]
+    batch = next(m for m in requests[1] if m.get("tool_calls"))
+    response_ids = {m.get("tool_call_id") for m in requests[1] if m["role"] == "tool"}
