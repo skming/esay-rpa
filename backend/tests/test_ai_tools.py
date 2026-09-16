@@ -3575,6 +3575,19 @@ def test_node_catalog_is_returned_on_demand() -> None:
     assert index["available_types"] == [entry["type"] for entry in NODE_TYPE_CATALOG]
 
 
+def test_paging_nodes_document_extract_mode() -> None:
+    """翻页/加载更多的 extractMode 作用在 targetSelector 上，缺省 text。
+
+    目录是模型唯一能看到的节点字段清单：不写这个字段，抓表格的翻页节点就会静默按
+    text 抽出整行文本，运行不报错，列结构到落盘才发现丢了。
+    """
+    entries = {entry["type"]: entry for entry in NODE_TYPE_CATALOG}
+    for node_type in ("browser.paginateNext", "browser.clickLoadMore"):
+        entry = entries[node_type]
+        assert "extractMode" in entry["key_fields"]
+        assert "extractMode='table'" in entry["description"]
+
+
 async def test_eval_mock_filters_the_real_node_catalog() -> None:
     import sys
     from pathlib import Path
@@ -4207,6 +4220,21 @@ def test_argument_gate_keeps_nodes_patch_and_variable_dicts_open() -> None:
         assert validate_tool_arguments(name, args) is None, name
 
 
+def test_argument_gate_rejects_flat_node_patch() -> None:
+    """update_nodes 的外层字段集是固定的（只有 id 和 patch）。
+
+    平铺写法过去被整条静默丢弃：patch_map 只收 {id, patch} 齐全的项，
+    模型以为节点改过了，下一轮拿旧定义继续猜。
+    """
+    flat = validate_tool_arguments(
+        "update_flow",
+        {"flow_id": "f", "update_nodes": [{"id": "extract", "selector": ".rows tr"}]},
+    )
+    assert flat is not None
+    assert flat["error"] == "invalid_arguments"
+    assert any("selector" in (issue.get("fields") or []) for issue in flat["issues"])
+
+
 
 async def test_inspect_page_continues_static_snapshot_without_refetch(monkeypatch):
     from scrapling.engines.toolbelt.custom import Response
@@ -4282,3 +4310,10 @@ def test_internal_identifiers_in_descriptions_are_not_semantic_claims(identifier
     assert not _lint_claimed_semantic_capability([
         {"id": "n", "type": "script.python", "description": f"结果写入 {identifier}"}
     ])
+
+
+def test_missing_argument_feedback_names_only_missing_fields_once():
+    result = validate_tool_arguments("create_flow", {"name": "flow"})
+    required = [issue for issue in result["issues"] if issue["rule"] == "required"]
+    assert len(required) == 1
+    assert required[0]["fields"] == ["nodes"]

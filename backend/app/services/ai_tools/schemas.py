@@ -204,8 +204,13 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "update_nodes": {
                         "type": "array",
                         "description": "修改节点，每项包含 id 和 patch 字段",
+                        # 外层只读 id 和 patch（executor._apply_structural_changes），字段集是固定的：
+                        # 平铺写 {id, selector} 而不是 {id, patch:{selector}} 会被整条静默丢弃，
+                        # 模型以为改了。封闭后这种写法直接报 invalid_arguments 并列出多余字段。
+                        # patch 本身必须保持开放——节点字段由节点类型目录决定。
                         "items": {
                             "type": "object",
+                            "additionalProperties": False,
                             "properties": {
                                 "id": {"type": "string"},
                                 "patch": {"type": "object"},
@@ -427,7 +432,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "set_acceptance_contract",
             "description": (
-                "仅在用户本轮明确改变交付目标或业务约束时，替换流程验收契约。"
+                "为尚无契约的草稿补齐验收契约；已有契约仅在用户本轮明确改变需求时替换。"
                 "普通节点修复不得调用此工具放宽验收条件；调用后流程 revision 递增，旧运行证据全部失效。"
             ),
             "parameters": {
@@ -435,19 +440,13 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "additionalProperties": False,
                 "properties": {
                     "flow_id": {"type": "string"},
-                    # 这里不复用 create_flow 的完整契约 schema：多这一份要占 2.6k 字符，
-                    # 而工具表每轮都在上下文里（见 test_ai_prompts 的 16k 硬预算）。
-                    # 扩展字段由 executor 的 _validated_contract 拦，只是晚一步、不早退。
-                    "acceptance_contract": {
-                        "type": "object",
-                        "description": "完整替换契约；字段与 create_flow 的 acceptance_contract 完全一致，不接受额外字段。",
-                    },
+                    "acceptance_contract": _ACCEPTANCE_CONTRACT_SCHEMA,
                     "requirement_change_quote": {
                         "type": "string",
                         "description": "用户本轮原话中明确改变需求的连续片段，系统会核对。",
                     },
                 },
-                "required": ["flow_id", "acceptance_contract", "requirement_change_quote"],
+                "required": ["flow_id", "acceptance_contract"],
             },
         },
     },
@@ -531,7 +530,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                     "scope_selector": {
                         "type": "string",
-                        "description": "只在该选择器范围内提取元素，适合聚焦表单区域或弹窗（如 .search-form、.el-dialog）",
+                        "description": (
+                            "只在该选择器范围内提取元素，适合聚焦表单区域或弹窗（如 .search-form、.el-dialog）。"
+                            "必须唯一命中一个容器：与 wait_selector 不同，这里写 'form, main, body' 这种备选列表会命中多个而直接失败。"
+                        ),
                     },
                     "frame_selector": {
                         "type": "string",
@@ -566,8 +568,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "- wait_result（指定 wait_selector 时）：satisfied=等到目标；timed_out=等待条件超时；"
                 "unknown=通道超时，无法确认条件。超时后仍返回可获取的当前观察，不要重复执行原动作来取证。\n"
                 "- business_check：业务后置条件一律未验证。筛选真的生效、表单真的提交，只能靠抓回的"
-                "数据断言，不能拿 effect.changed=true 当结论。\n"
-                "注意：ref 是临时的，绝不能写进流程节点；流程里只能用验证过的稳定 selector。"
+                "数据断言，不能拿 effect.changed=true 当结论。"
             ),
             "parameters": {
                 "type": "object",
@@ -596,7 +597,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                     "scope_selector": {
                         "type": "string",
-                        "description": "操作后重新观察时只看这个范围（可选）",
+                        "description": "操作后重新观察时只看这个范围（可选，必须唯一命中一个容器）",
                     },
                     "wait_selector": {
                         "type": "string",
@@ -616,15 +617,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "inspect_screenshot",
             "description": (
-                "在当前探索通道截取页面截图，以图片形式返回给模型直接查看。\n\n"
-                "**何时使用**（仅限支持视觉的模型）：\n"
-                "• inspect_page 返回的 DOM 信息不足以判断页面状态（canvas 渲染、复杂弹层、视觉布局问题）\n"
-                "• 同一 selector 已失败 2 次且 inspect_page 无法解释原因，需要亲眼确认页面长什么样\n"
-                "• 需要确认筛选/操作后页面的实际视觉结果（如日期选择器是否真的选中了）\n\n"
-                "**注意**：\n"
-                "• inspect_page 依然是获取精确 selector 的首选；截图用于确认状态，不用于抄 selector\n"
-                "• 使用持久化浏览器 Profile（含登录 Cookie）\n"
-                "• 当前模型不支持图片时该工具会被阻止，请改用 inspect_page"
+                "在当前探索通道截取页面截图，以图片形式返回给模型直接查看。"
+                "当前模型不支持图片时该工具会被阻止，改用 inspect_page。"
             ),
             "parameters": {
                 "type": "object",
@@ -632,7 +626,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "properties": {
                     "browser_executor": {
                         "type": "string", "enum": ["playwright", "extension"],
-                        "description": "指定观察通道；省略沿用当前会话，初次默认 playwright。extension 读取 Chrome 当前活动网页和登录态，须省略 url；不支持 frame_selector/tab_index/full_page。",
+                        "description": "同 inspect_page 的 browser_executor；extension 只能截 Chrome 当前活动网页，须省略 url，且不支持 full_page。",
                     },
                     "url": {
                         "type": "string",
@@ -677,10 +671,16 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 ]
 
 
-_ARGUMENT_VALIDATORS = {
-    tool["function"]["name"]: Draft202012Validator(tool["function"]["parameters"])
-    for tool in TOOL_SCHEMAS
-}
+# 完整契约只展示一次，两个写入口仍使用相同的严格校验。
+_ARGUMENT_VALIDATORS = {}
+for _tool in TOOL_SCHEMAS:
+    _name = _tool["function"]["name"]
+    _parameters = _tool["function"]["parameters"]
+    if _name in {"create_flow", "set_acceptance_contract"}:
+        _parameters = {**_parameters, "properties": {
+            **_parameters["properties"], "acceptance_contract": _ACCEPTANCE_CONTRACT_SCHEMA,
+        }}
+    _ARGUMENT_VALIDATORS[_name] = Draft202012Validator(_parameters)
 
 
 def validate_tool_arguments(name: str, args: Any) -> dict[str, Any] | None:
@@ -695,6 +695,10 @@ def validate_tool_arguments(name: str, args: Any) -> dict[str, Any] | None:
             "rule": error.validator,
             "expected": error.validator_value,
         }
+        if error.validator == "required" and isinstance(error.instance, dict):
+            issue["fields"] = [field for field in error.validator_value if field not in error.instance]
+            if issue in issues:
+                continue
         if error.validator == "additionalProperties" and isinstance(error.instance, dict):
             issue["fields"] = sorted(set(error.instance) - set(error.schema.get("properties", {})))
         issues.append(issue)

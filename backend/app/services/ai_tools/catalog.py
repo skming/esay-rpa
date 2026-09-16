@@ -65,7 +65,7 @@ NODE_TYPE_CATALOG: list[dict[str, str]] = [
         "key_fields": "selector, extractMode",
         "output_var_field": "outputVariable（必填，提取结果存入该变量）",
         "description": (
-            "提取元素到变量，extractMode: text|html|attribute|count|table。"
+            "提取元素到变量，extractMode: text|html|attribute|count|table（缺省 text）。"
             "table 模式（selector 指向 tbody tr 数据行）会自动识别表头并把每行存为 {列名:值} 对象、"
             "自动剔除框架影子残行，可直接 file.write/excel 导出干净结构化数据，无需额外的表头节点或清洗脚本。"
             "可选 outputSchema（JSON 数组）：声明期望输出字段，如 "
@@ -142,7 +142,7 @@ NODE_TYPE_CATALOG: list[dict[str, str]] = [
     },
     {
         "type": "browser.paginateNext",
-        "key_fields": "selector, targetSelector（点击式）／urlTemplate, targetSelector（URL 式）, maxIterations",
+        "key_fields": "selector, targetSelector（点击式）／urlTemplate, targetSelector（URL 式）, extractMode, maxIterations",
         "output_var_field": "outputVariable（逐页累计提取到的内容列表，可选）",
         "description": (
             "逐页抓取，两种模式二选一。"
@@ -152,15 +152,22 @@ NODE_TYPE_CATALOG: list[dict[str, str]] = [
             "pageStep（默认 1；offset 型分页如 `?start=${page}` 配 startPage=0 + pageStep=20）。"
             "**数字页码站点（1 2 3 … 下一页）必须用 URL 式**：点到第 2 页后页码控件位置就变了，点击式会当场失效。"
             "两种模式都用 targetSelector 提取本页内容，结果累计存入 outputVariable，页数存入 pageCountVariable；"
+            "**抓表格必须显式写 extractMode='table'**（语义同 browser.extract，作用在 targetSelector 上）——"
+            "这个字段缺省是 text，漏写不会报错，只会每页交出一堆整行文本，列结构当场丢掉；"
             "**限页数只有 maxIterations 这一个字段**（默认 20，最多翻多少页；需求说「最多 N 页」就填它，可写 `${var.x}`）；"
             "支持 outputSchema（同 browser.extract）"
         ),
     },
     {
         "type": "browser.clickLoadMore",
-        "key_fields": "selector, targetSelector",
+        "key_fields": "selector, targetSelector, extractMode",
         "output_var_field": "outputVariable（累计提取到的全部内容列表，可选）",
-        "description": "反复点击“加载更多”按钮（selector）直到无更多，期间用 targetSelector 累计提取内容；适合无限滚动/瀑布流页面，结果存入 outputVariable。支持 outputSchema（同 browser.extract）",
+        "description": (
+            "反复点击“加载更多”按钮（selector）直到无更多，期间用 targetSelector 累计提取内容；"
+            "适合无限滚动/瀑布流页面，结果存入 outputVariable。"
+            "抓表格必须显式写 extractMode='table'，缺省 text 只会得到整行文本。"
+            "支持 outputSchema（同 browser.extract）"
+        ),
     },
     {
         "type": "browser.drag",
