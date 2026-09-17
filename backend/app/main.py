@@ -96,7 +96,7 @@ from app.services.notifier import DingTalkNotifier
 from app.services.extension_bridge_service import ExtensionBridgeService
 from app.services.extension_config_service import ExtensionConfigService
 from app.services.overlay_analyzer import OverlayAnalyzer
-from app.services.picker_service import PickerService
+from app.services.picker_service import PickerCloseRequest, PickerOpenRequest, PickerService
 from app.services.runtime_factory import create_runtime_services
 from app.services.scheduler_service import SchedulerLoop
 from app.services.site_analyzer import SiteAnalyzer
@@ -113,7 +113,6 @@ dingtalk_notifier = DingTalkNotifier(config_service=notification_config_service)
 overlay_analyzer = OverlayAnalyzer(config_service=ai_config_service)
 ai_chat_store = AiChatStore()
 _browser_session_dir = str(storage.resolve_browser_profile_dir())
-picker_service = PickerService(session_dir=_browser_session_dir)
 extension_bridge_service = ExtensionBridgeService()
 extension_config_service = ExtensionConfigService()
 _setup_file_logging(
@@ -127,6 +126,7 @@ task_manager = runtime_services.task_manager
 task_manager.set_notifier(dingtalk_notifier)
 task_manager.set_overlay_analyzer(overlay_analyzer)
 task_manager.set_extension_bridge(extension_bridge_service, is_extension_enabled=lambda: bool(extension_config_service.load()["enabled"]))
+picker_service = PickerService(session_dir=_browser_session_dir, extension_provider=task_manager.extension_exploration_executor)
 code_generator = ScraplingCodeGenerator()
 site_analyzer = SiteAnalyzer()
 flow_service = runtime_services.flow_service
@@ -195,6 +195,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        await picker_service.close()
         await scheduler_loop.stop()
         await task_manager.stop_workers()
         await runtime_services.close()
@@ -910,19 +911,19 @@ async def delete_chat_session(session_key: str) -> dict:
 
 
 @app.post("/api/browser/picker/open")
-async def open_picker(payload: dict) -> dict:
-    target_url = str(payload.get("targetUrl", "")).strip()
-    mode = str(payload.get("mode", "pick")).strip()
-    if not target_url.startswith(("http://", "https://")):
-        raise HTTPException(status_code=422, detail="targetUrl 必须以 http:// 或 https:// 开头")
-    await picker_service.open(target_url, mode=mode)
-    return {"status": "opened", "mode": mode}
+async def open_picker(payload: PickerOpenRequest) -> dict:
+    try:
+        return await picker_service.open(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (RuntimeError, ConnectionError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/api/browser/picker/close")
-async def close_picker() -> dict:
-    await picker_service.close()
-    return {"status": "closed"}
+async def close_picker(payload: PickerCloseRequest) -> dict:
+    await picker_service.close(payload.requestId)
+    return {"status": "closed", "requestId": payload.requestId}
 
 
 @app.get("/api/extension/status")

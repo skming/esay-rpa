@@ -19,17 +19,30 @@ def _state_service(websocket: WebSocket, name: str) -> Any:
 @router.websocket("/ws/picker")
 async def picker_socket(websocket: WebSocket) -> None:
     picker_service = _state_service(websocket, "picker_service")
+    request_id = websocket.query_params.get("requestId")
+    if not request_id:
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
+    result_task = asyncio.create_task(picker_service.wait_for_result(request_id))
+    disconnect_task = asyncio.create_task(websocket.receive())
     try:
-        result = await picker_service.wait_for_result()
-        if result is None:
-            await websocket.send_json({"type": "cancel"})
-        else:
-            await websocket.send_json({"type": "capture", **result})
+        done, _ = await asyncio.wait({result_task, disconnect_task}, return_when=asyncio.FIRST_COMPLETED)
+        if result_task in done:
+            await websocket.send_json(result_task.result())
+    except ValueError as exc:
+        await websocket.send_json({"type": "error", "requestId": request_id, "message": str(exc)})
     except (asyncio.CancelledError, WebSocketDisconnect):
         pass
     finally:
-        await websocket.close()
+        result_task.cancel()
+        disconnect_task.cancel()
+        await asyncio.gather(result_task, disconnect_task, return_exceptions=True)
+        await picker_service.close(request_id)
+        try:
+            await websocket.close()
+        except RuntimeError:
+            pass
 
 
 @router.websocket("/ws/extension/bridge")
