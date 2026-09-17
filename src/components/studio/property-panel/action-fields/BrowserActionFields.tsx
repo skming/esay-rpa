@@ -27,6 +27,18 @@ export function BrowserActionFields({ draft, electron, flowTargetUrl, node, onDr
   const actionType = node.data.action?.type ?? DEFAULT_ACTION_TYPE_BY_KIND[node.data.kind];
   const resolvedTargetUrl = draft.targetUrl?.trim() || flowTargetUrl;
   const availableVariables = electron.variableViews;
+  const renderSelectorField = (field: 'selector' | 'targetSelector', label: string, selectionMode: 'single' | 'multiple' = 'single'): ReactElement => (
+    <SelectorField
+      electron={electron}
+      field={field}
+      label={label}
+      nodeId={node.id}
+      onChange={(value) => onDraftPatch(field, value)}
+      selectionMode={selectionMode}
+      targetUrl={resolvedTargetUrl}
+      value={draft[field]}
+    />
+  );
   if (actionType === 'browser.clickLoadMore' || actionType === 'browser.paginateNext') {
     const isNextPagination = actionType === 'browser.paginateNext';
     // 翻页方式由 urlTemplate 是否有值决定，而不是另存一个 mode 字段：执行器就是这么分派的，
@@ -54,15 +66,9 @@ export function BrowserActionFields({ draft, electron, flowTargetUrl, node, onDr
             <InlineHint text="按 offset 分页的站点（如 start=0/20/40）把起始页号设为 0、步长设为每页条数。" />
           </>
         ) : (
-          <SelectorField
-            electron={electron}
-            label={isNextPagination ? '下一页按钮 (CSS)' : '加载按钮 (CSS)'}
-            onChange={(value) => onDraftPatch('selector', value)}
-            targetUrl={resolvedTargetUrl}
-            value={draft.selector}
-          />
+          renderSelectorField('selector', isNextPagination ? '下一页按钮 (CSS)' : '加载按钮 (CSS)')
         )}
-        <Field label="列表项选择器" mono onChange={(event) => onDraftPatch('targetSelector', event.target.value)} placeholder=".item::text" value={draft.targetSelector} />
+        {renderSelectorField('targetSelector', '列表项选择器', draft.extractMode === 'attribute' ? 'single' : 'multiple')}
         <ExtractModeField onChange={(value) => onDraftPatch('extractMode', value)} value={draft.extractMode} />
         {draft.extractMode === 'attribute' &&<Field label="属性名" mono onChange={(event) => onDraftPatch('attribute', event.target.value)} placeholder="href" value={draft.attribute} />}
         <Field label={isNextPagination ? '最大页数' : '最大点击次数'} onChange={(event) => onDraftPatch('maxIterations', Math.max(1, Number.parseInt(event.target.value, 10) || 1))} type="number" value={String(draft.maxIterations)} />
@@ -74,14 +80,8 @@ export function BrowserActionFields({ draft, electron, flowTargetUrl, node, onDr
   if (actionType === 'browser.dismiss') {
     return (
       <>
-        <SelectorField
-          electron={electron}
-          label="弹窗候选选择器"
-          onChange={(value) => onDraftPatch('selector', value)}
-          targetUrl={resolvedTargetUrl}
-          value={draft.selector}
-        />
-        <Field label="关闭后等待目标" mono onChange={(event) => onDraftPatch('targetSelector', event.target.value)} placeholder=".content-ready" value={draft.targetSelector} />
+        {renderSelectorField('selector', '弹窗候选选择器')}
+        {renderSelectorField('targetSelector', '关闭后等待目标')}
         <Field label="最大尝试次数" onChange={(event) => onDraftPatch('maxIterations', Math.max(1, Number.parseInt(event.target.value, 10) || 1))} type="number" value={String(draft.maxIterations)} />
         <Field label="点击后等待(ms)" onChange={(event) => onDraftPatch('delayMs', Math.max(0, Number.parseInt(event.target.value, 10) || 0))} type="number" value={String(draft.delayMs)} />
         <VariableNameField label="输出变量" mode="target" onChange={(value) => onDraftPatch('responseVariable', value)} placeholder="dismiss_result" value={draft.responseVariable} variables={availableVariables} />
@@ -94,7 +94,7 @@ export function BrowserActionFields({ draft, electron, flowTargetUrl, node, onDr
   if (actionType === 'browser.press') {
     return (
       <>
-        <SelectorField electron={electron} label="输入控件 (CSS)" onChange={(value) => onDraftPatch('selector', value)} targetUrl={resolvedTargetUrl} value={draft.selector} />
+        {renderSelectorField('selector', '输入控件 (CSS)')}
         <Field label="按键" mono onChange={(event) => onDraftPatch('inputValue', event.target.value)} placeholder="Enter" value={draft.inputValue} />
         <VariableNameField label="输出变量" mode="target" onChange={(value) => onDraftPatch('responseVariable', value)} placeholder="search_submit_key" value={draft.responseVariable} variables={availableVariables} />
       </>
@@ -109,7 +109,7 @@ export function BrowserActionFields({ draft, electron, flowTargetUrl, node, onDr
   if (actionType === 'browser.select') {
     return (
       <>
-        <SelectorField electron={electron} label="下拉元素 (CSS)" onChange={(value) => onDraftPatch('selector', value)} targetUrl={resolvedTargetUrl} value={draft.selector} />
+        {renderSelectorField('selector', '下拉元素 (CSS)')}
         <VariablePickerField label="选项值" onChange={(value) => onDraftPatch('inputValue', value)} value={draft.inputValue} variables={availableVariables} />
         <VariableNameField label="输出变量" mode="target" onChange={(value) => onDraftPatch('responseVariable', value)} placeholder="selected_value" value={draft.responseVariable} variables={availableVariables} />
       </>
@@ -118,7 +118,7 @@ export function BrowserActionFields({ draft, electron, flowTargetUrl, node, onDr
   if (actionType === 'browser.check') {
     return (
       <>
-        <SelectorField electron={electron} label="复选元素 (CSS)" onChange={(value) => onDraftPatch('selector', value)} targetUrl={resolvedTargetUrl} value={draft.selector} />
+        {renderSelectorField('selector', '复选元素 (CSS)')}
         <CheckedStateField onChange={(value) => onDraftPatch('checked', value)} value={draft.checked} />
         <VariableNameField label="输出变量" mode="target" onChange={(value) => onDraftPatch('responseVariable', value)} placeholder="check_result" value={draft.responseVariable} variables={availableVariables} />
       </>
@@ -135,14 +135,8 @@ export function BrowserActionFields({ draft, electron, flowTargetUrl, node, onDr
           placeholder="https://example.com/"
           value={draft.targetUrl}
         />
-        <SelectorField electron={electron} label="已登录特征 (CSS)" onChange={(value) => onDraftPatch('selector', value)} targetUrl={resolvedTargetUrl} value={draft.selector} />
-        <Field
-          label="未登录特征 (CSS)"
-          mono
-          onChange={(event) => onDraftPatch('targetSelector', event.target.value)}
-          placeholder="input[type='password']"
-          value={draft.targetSelector}
-        />
+        {renderSelectorField('selector', '已登录特征 (CSS)')}
+        {renderSelectorField('targetSelector', '未登录特征 (CSS)')}
         <VariableNameField label="登录态输出变量" mode="target" onChange={(value) => onDraftPatch('statusVariable', value)} placeholder="login_status" value={draft.statusVariable} variables={availableVariables} />
       </>
     );
@@ -165,9 +159,7 @@ export function BrowserActionFields({ draft, electron, flowTargetUrl, node, onDr
           value={draft.targetUrl}
         />
       )}
-      {usesSelector && (
-        <SelectorField electron={electron} label={selectorLabel} onChange={(value) => onDraftPatch('selector', value)} targetUrl={resolvedTargetUrl} value={draft.selector} />
-      )}
+      {usesSelector && renderSelectorField('selector', selectorLabel, hasExtractMode && draft.extractMode !== 'attribute' ? 'multiple' : 'single')}
       {(actionType === 'browser.fetch' || isFill) && (
         <InlineHint
           tone={readBrowserHintTone(actionType, draft)}
@@ -248,7 +240,7 @@ export function BrowserActionFields({ draft, electron, flowTargetUrl, node, onDr
           <VariableNameField label="命中数量变量" mode="target" onChange={(value) => onDraftPatch('statusVariable', value)} placeholder="match_count" value={draft.statusVariable} variables={availableVariables} />
         </>
       )}
-      {actionType === 'ui.drag' && <Field label="目标控件" mono onChange={(event) => onDraftPatch('targetSelector', event.target.value)} placeholder="#target" value={draft.targetSelector} />}
+      {(actionType === 'browser.drag' || actionType === 'ui.drag') && renderSelectorField('targetSelector', '目标控件 (CSS)')}
       {actionType === 'ui.check' && <CheckedStateField onChange={(value) => onDraftPatch('checked', value)} value={draft.checked} />}
       {isFill && (
         // UI 选项"直接赋值"落到后端 fillMode 值 'js'（走 JS 赋值执行路径），与展示文案不同名
@@ -266,4 +258,3 @@ export function BrowserActionFields({ draft, electron, flowTargetUrl, node, onDr
     </>
   );
 }
-

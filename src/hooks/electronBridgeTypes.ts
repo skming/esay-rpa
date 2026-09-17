@@ -5,6 +5,8 @@ import type {
   BackendServiceStatus,
   FlowSnapshot,
   GeneratedScriptResult,
+  PickerOpenPayload,
+  PickerRequest,
   PickerResult,
   QueueStats,
   RunMode,
@@ -40,7 +42,9 @@ export type ElectronBridgeState = {
   artifacts: ArtifactSnapshot[];
   artifactContent: ArtifactContent | null;
   windowId: number | null;
-  lastPickerResult: PickerResult | null;
+  /** 最近一次已归属的 capture，仅供发起它的字段按 requestId 消费。 */
+  pickerResult: PickerResult | null;
+  activePickerRequest: PickerRequest | null;
   pickerActive: boolean;
   inputPrompt: string | null;
   humanTakeoverMessage: string | null;
@@ -82,8 +86,8 @@ export type ElectronBridgeState = {
   renameCurrentFlow: (name: string) => Promise<void>;
   setDefaultBrowserExecutor: (browserExecutor: import('../types/electron').BrowserExecutorKind) => Promise<void>;
   exportLogs: (content: string) => Promise<void>;
-  openPicker: (targetUrl?: string, type?: 'pick' | 'browse') => Promise<void>;
-  closePicker: () => Promise<void>;
+  openPicker: (payload: PickerOpenPayload) => Promise<void>;
+  closePicker: (requestId: string) => Promise<void>;
   startRun: (options?: RunMode | StartRunOptions) => Promise<void>;
   stopRun: () => Promise<void>;
   provideInput: (value: string) => Promise<void>;

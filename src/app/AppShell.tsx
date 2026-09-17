@@ -74,7 +74,14 @@ export function AppShell(context: AppRuntimeContext): ReactElement {
         url={context.electron.pausedPageUrl}
         onResume={(mode) => { void context.electron.resumeHumanTakeover(mode); }}
         onStop={() => { void context.electron.stopRun(); }}
-        onOpenPage={(url) => { void context.electron.openPicker(url, 'browse'); }}
+        onOpenPage={(targetUrl) => {
+          void context.electron.openPicker({
+            browserExecutor: context.electron.currentFlow?.defaultBrowserExecutor ?? 'playwright',
+            mode: 'browse',
+            requestId: crypto.randomUUID(),
+            targetUrl: targetUrl.trim() || undefined
+          });
+        }}
       />
     </div>
   );

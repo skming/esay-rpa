@@ -38,7 +38,6 @@ function renderActions(callBridge: Parameters<typeof useElectronBridgeActions>[0
     currentFlow: null,
     flowCanvas: { nodes: initialNodes, edges: initialEdges },
     flows: [],
-    lastPickerResult: null,
     pushToast: vi.fn(() => 1),
     dismissToast: vi.fn(),
     inputVariables: draftVariables,
@@ -64,7 +63,7 @@ function renderActions(callBridge: Parameters<typeof useElectronBridgeActions>[0
     setLogs: vi.fn(),
     setInputPrompt: vi.fn(),
     setHumanTakeoverMessage: vi.fn(),
-    setPickerActive: vi.fn(),
+    setActivePickerRequest: vi.fn(),
     setCanvasFitVersion: vi.fn(),
   };
   let actions!: ElectronBridgeActions;

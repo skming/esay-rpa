@@ -21,7 +21,8 @@ import type {
   BridgeResult,
   FlowSnapshot,
   GeneratedScriptResult,
-  PickerResult,
+  PickerOpenPayload,
+  PickerRequest,
   QueueStats,
   RpaBridge,
   BrowserExecutorKind,
@@ -46,7 +47,6 @@ type UseElectronBridgeActionsParams = {
   currentFlow: FlowSnapshot | null;
   flowCanvas: FlowCanvasSnapshot;
   flows: FlowSnapshot[];
-  lastPickerResult: PickerResult | null;
   pushToast: (type: BridgeToast['type'], message: string, icon?: string) => number;
   dismissToast: (toastId: number) => void;
   inputVariables: RuntimeVariable[];
@@ -73,7 +73,7 @@ type UseElectronBridgeActionsParams = {
   setLogs: Dispatch<SetStateAction<RunLogEntry[]>>;
   setInputPrompt: Dispatch<SetStateAction<string | null>>;
   setHumanTakeoverMessage: Dispatch<SetStateAction<string | null>>;
-  setPickerActive: Dispatch<SetStateAction<boolean>>;
+  setActivePickerRequest: Dispatch<SetStateAction<PickerRequest | null>>;
   setCanvasFitVersion: Dispatch<SetStateAction<number>>;
 };
 
@@ -102,8 +102,8 @@ export type ElectronBridgeActions = {
   renameCurrentFlow: (name: string) => Promise<void>;
   setDefaultBrowserExecutor: (browserExecutor: BrowserExecutorKind) => Promise<void>;
   exportLogs: (content: string) => Promise<void>;
-  openPicker: (targetUrl?: string) => Promise<void>;
-  closePicker: () => Promise<void>;
+  openPicker: (payload: PickerOpenPayload) => Promise<void>;
+  closePicker: (requestId: string) => Promise<void>;
   startRun: (options?: RunMode | StartRunOptions) => Promise<void>;
   stopRun: () => Promise<void>;
   provideInput: (value: string) => Promise<void>;
@@ -171,7 +171,6 @@ export function useElectronBridgeActions({
   currentFlow,
   flowCanvas,
   flows,
-  lastPickerResult,
   pushToast,
   dismissToast,
   inputVariables,
@@ -197,7 +196,7 @@ export function useElectronBridgeActions({
   setLogs,
   setInputPrompt,
   setHumanTakeoverMessage,
-  setPickerActive,
+  setActivePickerRequest,
   setCanvasFitVersion
 }: UseElectronBridgeActionsParams): ElectronBridgeActions {
   return useMemo(
@@ -543,18 +542,22 @@ export function useElectronBridgeActions({
           pushToast('success', `已导出 ${result.name}`);
         }
       },
-      openPicker: async (targetUrl?: string, type: 'pick' | 'browse' = 'pick') => {
-        const url = targetUrl?.trim() || lastPickerResult?.url || '';
-        if (type === 'browse') {
-          await callBridge((api) => api.openPicker({ targetUrl: url, mode: 'browse' }));
+      openPicker: async (payload: PickerOpenPayload) => {
+        if (payload.mode === 'browse') {
+          await callBridge((api) => api.openPicker(payload));
           return;
         }
-        setPickerActive(true);
-        await callBridge((api) => api.openPicker({ targetUrl: url, mode: 'pick' }), '元素拾取器已启动');
+        setActivePickerRequest(payload);
+        const opened = await callBridge((api) => api.openPicker(payload), '元素拾取器已启动');
+        if (opened === null) {
+          setActivePickerRequest((current) => current?.requestId === payload.requestId ? null : current);
+        }
       },
-      closePicker: async () => {
-        setPickerActive(false);
-        await callBridge((api) => api.closePicker(), '元素拾取器已关闭');
+      closePicker: async (requestId: string) => {
+        const result = await callBridge((api) => api.closePicker({ requestId }));
+        if (result !== null) {
+          setActivePickerRequest((current) => current?.requestId === requestId ? null : current);
+        }
       },
       startRun: async (options = 'run') => {
         const runOptions: StartRunOptions = typeof options === 'string' ? { mode: options } : options;
@@ -657,10 +660,10 @@ export function useElectronBridgeActions({
             flowId: currentFlow?.flowId ?? undefined,
             flowName,
             scope,
-            selector: executableNode.selector ?? lastPickerResult?.selector ?? '',
+            selector: executableNode.selector ?? '',
             screenshot: runOptions.screenshot ?? true,
             startNodeId: runOptions.startNodeId,
-            targetUrl: executableNode.targetUrl ?? lastPickerResult?.url ?? '',
+            targetUrl: executableNode.targetUrl ?? '',
             timeoutMs: executableNode.timeoutMs ?? runOptions.timeoutMs ?? 30_000,
             overrideVariables: buildRuntimeVariablePayload(runOptions.overrideVariables ?? []),
             variables: buildRuntimeVariablePayload(runVariables)
@@ -718,7 +721,7 @@ export function useElectronBridgeActions({
         }
       },
       analyzeCurrentSite: async () => {
-        const scriptTarget = readBrowserScriptTarget(flowCanvas, lastPickerResult, { actionLabel: '站点分析', requireSelector: false });
+        const scriptTarget = readBrowserScriptTarget(flowCanvas, { actionLabel: '站点分析', requireSelector: false });
         if (scriptTarget.error !== null) {
           pushToast('info', scriptTarget.error);
           return;
@@ -942,8 +945,7 @@ export function useElectronBridgeActions({
       flowCanvas,
       flows,
       inputVariables,
-      lastPickerResult,
-      pushToast,
+          pushToast,
       resetRunView,
       setLastRunOverrides,
       setCurrentFlow,
@@ -958,7 +960,7 @@ export function useElectronBridgeActions({
       setCanvasFitVersion,
       setGeneratedScript,
       setLogs,
-      setPickerActive,
+      setActivePickerRequest,
       setQueueStats,
       setRuntimeStatus,
       setRuns,
@@ -1136,15 +1138,14 @@ type BrowserScriptTarget =
 
 function readBrowserScriptTarget(
   flowCanvas: FlowCanvasSnapshot,
-  lastPickerResult: PickerResult | null,
   options: { actionLabel: string; requireSelector: boolean }
 ): BrowserScriptTarget {
   const openNode = flowCanvas.nodes.find((node) => node.data.action?.type === 'browser.open' || node.data.action?.type === 'browser.tab.open');
   const fetchNode = flowCanvas.nodes.find((node) => node.data.action?.type === 'browser.fetch' || node.data.action?.type === 'browser.extract');
   const flowUrl = openNode?.data.action?.targetUrl ?? openNode?.data.action?.url;
   const flowSelector = fetchNode?.data.action?.selector;
-  const targetUrl = lastPickerResult?.url ?? normalizeNonEmptyString(flowUrl);
-  const selector = lastPickerResult?.selector ?? normalizeNonEmptyString(flowSelector);
+  const targetUrl = normalizeNonEmptyString(flowUrl);
+  const selector = normalizeNonEmptyString(flowSelector);
 
   if (!isHttpUrl(targetUrl)) {
     return {

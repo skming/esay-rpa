@@ -160,28 +160,59 @@ export type ExportScriptPayload = {
   filename?: string;
 };
 
-export type PickerResult = {
+export type PickerField = 'selector' | 'targetSelector';
+export type PickerSelectionMode = 'single' | 'multiple';
+
+export type PickerRequest = {
+  requestId: string;
+  mode: 'pick' | 'browse';
+  browserExecutor: BrowserExecutorKind;
+  targetUrl?: string;
+  flowId?: string;
+  nodeId?: string;
+  field?: PickerField;
+  selectionMode?: PickerSelectionMode;
+};
+
+export type PickerResult = PickerRequest & {
+  type: 'capture';
   selector: string;
   strategy: 'css' | 'xpath' | 'text';
-  /** 0–100 score indicating how stable/unique the generated selector is. */
-  confidence: number;
   text: string;
   url: string;
+  matches: number;
+  selectedIncluded: boolean;
+  usesPosition: boolean;
+  documentId?: string;
+  tabId?: number;
   capturedAt: string;
+};
+
+export type PickerCancel = PickerRequest & {
+  type: 'cancel';
+  reason?: 'cancelled' | 'closed' | 'replaced';
+};
+
+export type PickerError = PickerRequest & {
+  type: 'error';
+  message: string;
 };
 
 export type PickerOpenResult = {
   status: 'ready';
   mode: 'selector-picker' | 'browse';
+  requestId: string;
 };
 
-export type PickerOpenPayload = {
-  targetUrl?: string;
-  mode?: 'pick' | 'browse';
+export type PickerOpenPayload = PickerRequest;
+
+export type PickerClosePayload = {
+  requestId: string;
 };
 
 export type PickerCloseResult = {
   status: 'closed';
+  requestId: string;
 };
 
 export type WindowStateResult = {
@@ -511,8 +542,8 @@ export type BackendTaskLogEntry = {
 
 // window.rpaBridge；纯浏览器开发模式下由 polyfill 注入
 export type RpaBridge = {
-  openPicker: (payload?: PickerOpenPayload) => Promise<BridgeResult<PickerOpenResult>>;
-  closePicker: () => Promise<BridgeResult<PickerCloseResult>>;
+  openPicker: (payload: PickerOpenPayload) => Promise<BridgeResult<PickerOpenResult>>;
+  closePicker: (payload: PickerClosePayload) => Promise<BridgeResult<PickerCloseResult>>;
   openFlow: () => Promise<BridgeResult<FlowFileResult>>;
   saveFlow: (payload: SaveFlowPayload) => Promise<BridgeResult<FlowFileResult>>;
   exportLogs: (payload: ExportLogsPayload) => Promise<BridgeResult<FlowFileResult>>;
@@ -567,8 +598,9 @@ export type RpaBridge = {
   minimizeWindow: () => Promise<BridgeResult<WindowStateResult>>;
   toggleMaximizeWindow: () => Promise<BridgeResult<WindowStateResult>>;
   closeWindow: () => Promise<BridgeResult<WindowStateResult>>;
-  onPickerResult: (callback: (selector: PickerResult) => void) => () => void;
-  onPickerCancel: (callback: () => void) => () => void;
+  onPickerResult: (callback: (result: PickerResult) => void) => () => void;
+  onPickerCancel: (callback: (event: PickerCancel) => void) => () => void;
+  onPickerError: (callback: (event: PickerError) => void) => () => void;
   onRunEvent: (callback: (event: RunEvent) => void) => () => void;
   onBackendStatusChanged: (callback: (status: BackendServiceStatus) => void) => () => void;
 };

@@ -1,7 +1,8 @@
 import { Crosshair, Gauge, Loader2 } from 'lucide-react';
-import type { ReactElement } from 'react';
+import { useEffect, useRef, type ReactElement } from 'react';
 
 import type { ElectronBridgeState } from '../../../../hooks/useElectronBridge';
+import type { PickerField, PickerSelectionMode } from '../../../../types/electron';
 import { Badge } from '../../../ui/badge';
 import { Button } from '../../../ui/button';
 import { Input } from '../../../ui/input';
@@ -48,29 +49,87 @@ export function CheckedStateField({ onChange, value }: { onChange: (value: boole
 
 export function SelectorField({
   electron,
+  field,
   label,
+  nodeId,
   onChange,
+  selectionMode,
   targetUrl,
   value
 }: {
   electron: ElectronBridgeState;
+  field: PickerField;
   label: string;
+  nodeId: string;
   onChange: (value: string) => void;
+  selectionMode: PickerSelectionMode;
   targetUrl?: string;
   value: string;
 }): ReactElement {
   const effectiveUrl = targetUrl?.trim() || undefined;
-
+  const activeRequestIdRef = useRef<string | null>(null);
+  const consumedRequestIdRef = useRef<string | null>(null);
+  const closePickerRef = useRef(electron.closePicker);
+  const flowId = electron.currentFlow?.flowId;
+  const browserExecutor = electron.currentFlow?.defaultBrowserExecutor ?? 'playwright';
+  const requiresTargetUrl = browserExecutor === 'playwright';
   const picking = electron.pickerActive;
+
+  useEffect(() => {
+    closePickerRef.current = electron.closePicker;
+  }, [electron.closePicker]);
+
+  useEffect(() => {
+    const result = electron.pickerResult;
+    if (
+      result === null
+      || result.requestId !== activeRequestIdRef.current
+      || result.requestId === consumedRequestIdRef.current
+      || result.flowId !== flowId
+      || result.nodeId !== nodeId
+      || result.field !== field
+    ) {
+      return;
+    }
+    if (result.flowId !== flowId || result.nodeId !== nodeId || result.field !== field) return;
+    consumedRequestIdRef.current = result.requestId;
+    activeRequestIdRef.current = null;
+    onChange(result.selector);
+  }, [electron.pickerResult, field, flowId, nodeId, onChange]);
+
+  useEffect(() => {
+    return () => {
+      const requestId = activeRequestIdRef.current;
+      activeRequestIdRef.current = null;
+      if (requestId !== null) {
+        void closePickerRef.current(requestId);
+      }
+    };
+  }, [field, flowId, nodeId]);
 
   // 拾取器依赖已解析的目标网址（本节点 targetUrl 或流程级 flowTargetUrl），缺失时静默拒绝并仅提示，不抛错
   const handlePickerClick = (): void => {
     if (picking) return;
-    if (!effectiveUrl) {
+    if (requiresTargetUrl && !effectiveUrl) {
       electron.pushToast('info', '请先在"打开网页"节点配置目标页面地址');
       return;
     }
-    void electron.openPicker(effectiveUrl);
+    if (flowId === undefined) {
+      electron.pushToast('info', '请先创建流程后再启动元素拾取器');
+      return;
+    }
+    const requestId = crypto.randomUUID();
+    activeRequestIdRef.current = requestId;
+    void electron.openPicker({
+      browserExecutor,
+      field,
+      flowId,
+      mode: 'pick',
+      nodeId,
+      requestId,
+      selectionMode,
+      targetUrl: effectiveUrl
+    });
   };
 
   return (
@@ -81,7 +140,7 @@ export function SelectorField({
           className="h-6 px-2 text-indigo-500"
           disabled={picking}
           onClick={handlePickerClick}
-          title={picking ? '拾取器已打开，请在浏览器中点击元素' : effectiveUrl ? `启动拾取器（${effectiveUrl}）` : '启动元素拾取器'}
+          title={picking ? '拾取器已打开，请在浏览器中点击元素' : effectiveUrl ? `启动拾取器（${effectiveUrl}）` : browserExecutor === 'extension' ? '在当前 Chrome 标签页启动拾取器' : '启动元素拾取器'}
           variant="ghost"
         >
           {picking ? (

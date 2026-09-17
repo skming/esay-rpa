@@ -13,7 +13,10 @@ import type {
   FlowFileResult,
   FlowSavePayload,
   GenerateScriptPayload,
+  PickerCancel,
+  PickerClosePayload,
   PickerCloseResult,
+  PickerError,
   PickerOpenPayload,
   PickerOpenResult,
   PickerResult,
@@ -47,6 +50,8 @@ type ActiveBrowserRun = {
 
 type RunListener = (event: RunEvent) => void;
 type PickerListener = (result: PickerResult) => void;
+type PickerCancelListener = (event: PickerCancel) => void;
+type PickerErrorListener = (event: PickerError) => void;
 
 function success<T>(data: T): BridgeResult<T> {
   return { data, ok: true };
@@ -60,16 +65,12 @@ function failure<T = never>(error: unknown): BridgeResult<T> {
 export function createBrowserBridge({ backendClient = new BackendClient() }: BrowserBridgeOptions = {}): RpaBridge {
   const runListeners = new Set<RunListener>();
   const pickerListeners = new Set<PickerListener>();
+  const pickerCancelListeners = new Set<PickerCancelListener>();
+  const pickerErrorListeners = new Set<PickerErrorListener>();
   let activeRun: ActiveBrowserRun | null = null;
-  let lastPickerResult: PickerResult | null = null;
 
   const emitRunEvent = (event: RunEvent): void => {
     runListeners.forEach((listener) => listener(event));
-  };
-
-  const emitPickerResult = (result: PickerResult): void => {
-    lastPickerResult = result;
-    pickerListeners.forEach((listener) => listener(result));
   };
 
   const clearActiveRun = (): void => {
@@ -262,7 +263,7 @@ export function createBrowserBridge({ backendClient = new BackendClient() }: Bro
         return failure(error);
       }
     },
-    closePicker: async (): Promise<BridgeResult<PickerCloseResult>> => success({ status: 'closed' }),
+    closePicker: async ({ requestId }: PickerClosePayload): Promise<BridgeResult<PickerCloseResult>> => success({ requestId, status: 'closed' }),
     closeWindow: async (): Promise<BridgeResult<WindowStateResult>> => success({ closed: false }),
     debugRun: async (runId, command) => {
       if (activeRun === null || activeRun.runId !== runId) {
@@ -524,7 +525,14 @@ export function createBrowserBridge({ backendClient = new BackendClient() }: Bro
       pickerListeners.add(callback);
       return () => pickerListeners.delete(callback);
     },
-    onPickerCancel: (_callback) => () => { },
+    onPickerCancel: (callback) => {
+      pickerCancelListeners.add(callback);
+      return () => pickerCancelListeners.delete(callback);
+    },
+    onPickerError: (callback) => {
+      pickerErrorListeners.add(callback);
+      return () => pickerErrorListeners.delete(callback);
+    },
     onRunEvent: (callback) => {
       runListeners.add(callback);
       return () => runListeners.delete(callback);
@@ -537,11 +545,7 @@ export function createBrowserBridge({ backendClient = new BackendClient() }: Bro
         return failure(error);
       }
     },
-    openPicker: async (payload?: PickerOpenPayload): Promise<BridgeResult<PickerOpenResult>> => {
-      const result = createPreviewPickerResult(payload, lastPickerResult);
-      window.setTimeout(() => emitPickerResult(result), 0);
-      return success({ mode: 'selector-picker', status: 'ready' });
-    },
+    openPicker: async (_payload: PickerOpenPayload): Promise<BridgeResult<PickerOpenResult>> => failure('元素拾取仅支持桌面端，请在 Electron 应用中打开流程'),
     readArtifact: async (taskId, artifactId): Promise<BridgeResult<ArtifactContent>> => {
       try {
         return success(await backendClient.readArtifact(taskId, artifactId));
@@ -766,17 +770,6 @@ function normalizeLogLevel(level: string): RunLogLevel {
 
 function formatLogTime(date: Date): string {
   return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}:${String(date.getSeconds()).padStart(2, '0')}.${String(date.getMilliseconds()).padStart(3, '0')}`;
-}
-
-function createPreviewPickerResult(payload: PickerOpenPayload | undefined, lastPickerResult: PickerResult | null): PickerResult {
-  return {
-    capturedAt: new Date().toISOString(),
-    confidence: 0.82,
-    selector: lastPickerResult?.selector ?? '',
-    strategy: 'css',
-    text: '浏览器预览模式选择器',
-    url: payload?.targetUrl ?? lastPickerResult?.url ?? ''
-  };
 }
 
 function readFlowName(definition: Record<string, unknown>): string {

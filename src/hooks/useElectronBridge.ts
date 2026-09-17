@@ -20,6 +20,7 @@ import type {
   FlowSnapshot,
   BridgeResult,
   GeneratedScriptResult,
+  PickerRequest,
   PickerResult,
   QueueStats,
   RpaBridge,
@@ -58,8 +59,9 @@ export function useElectronBridge({
   const [currentFlow, setCurrentFlow] = useState<FlowSnapshot | null>(null);
   const [siteAnalysis, setSiteAnalysis] = useState<SiteAnalysisResult | null>(null);
   const [windowId, setWindowId] = useState<number | null>(null);
-  const [lastPickerResult, setLastPickerResult] = useState<PickerResult | null>(null);
-  const [pickerActive, setPickerActive] = useState(false);
+  const [pickerResult, setPickerResult] = useState<PickerResult | null>(null);
+  const [activePickerRequest, setActivePickerRequest] = useState<PickerRequest | null>(null);
+  const activePickerRequestRef = useRef<PickerRequest | null>(null);
   const [activeRunFlowId, setActiveRunFlowId] = useState<string | null>(null);
   const [lastRunId, setLastRunId] = useState<string | null>(null);
   const [logs, setLogs] = useState<RunLogEntry[]>([]);
@@ -85,6 +87,12 @@ export function useElectronBridge({
   const overrideFlowKey = useRunConfigStore((state) => state.flowKey);
   const setLastRunOverrides = useRunConfigStore((state) => state.setLastRunOverrides);
   const setLastOpenedFlowId = useWorkspaceStore((state) => state.setLastOpenedFlowId);
+
+  const updateActivePickerRequest = useCallback((next: SetStateAction<PickerRequest | null>): void => {
+    const resolved = typeof next === 'function' ? next(activePickerRequestRef.current) : next;
+    activePickerRequestRef.current = resolved;
+    setActivePickerRequest(resolved);
+  }, []);
 
   const pushToast = useCallback((type: BridgeToast['type'], message: string): number => {
     const now = Date.now();
@@ -239,7 +247,6 @@ export function useElectronBridge({
     currentFlow,
     flowCanvas,
     flows,
-    lastPickerResult,
     pushToast,
     dismissToast,
     inputVariables,
@@ -266,7 +273,7 @@ export function useElectronBridge({
     setLogs,
     setInputPrompt,
     setHumanTakeoverMessage,
-    setPickerActive,
+    setActivePickerRequest: updateActivePickerRequest,
     setCanvasFitVersion
   });
 
@@ -309,12 +316,25 @@ export function useElectronBridge({
       }
     });
     const unsubscribePicker = bridge.onPickerResult((result) => {
-      setLastPickerResult(result);
-      setPickerActive(false);
+      if (activePickerRequestRef.current?.requestId !== result.requestId) {
+        return;
+      }
+      setPickerResult(result);
+      updateActivePickerRequest(null);
       pushToast('success', `已捕获选择器 ${result.selector}`);
     });
-    const unsubscribePickerCancel = bridge.onPickerCancel(() => {
-      setPickerActive(false);
+    const unsubscribePickerCancel = bridge.onPickerCancel((event) => {
+      if (activePickerRequestRef.current?.requestId !== event.requestId) {
+        return;
+      }
+      updateActivePickerRequest(null);
+    });
+    const unsubscribePickerError = bridge.onPickerError((event) => {
+      if (activePickerRequestRef.current?.requestId !== event.requestId) {
+        return;
+      }
+      updateActivePickerRequest(null);
+      pushToast('error', event.message);
     });
     const unsubscribeRun = bridge.onRunEvent((event) => {
       applyRunEvent(event);
@@ -325,10 +345,11 @@ export function useElectronBridge({
     return () => {
       unsubscribePicker();
       unsubscribePickerCancel();
+      unsubscribePickerError();
       unsubscribeRun();
       unsubscribeBackend();
     };
-  }, [applyRunEvent, bridge, pushToast]);
+  }, [applyRunEvent, bridge, pushToast, updateActivePickerRequest]);
 
   return useMemo(
     () => ({
@@ -342,8 +363,9 @@ export function useElectronBridge({
       currentFlow,
       siteAnalysis,
       windowId,
-      lastPickerResult,
-      pickerActive,
+      pickerResult,
+      activePickerRequest,
+      pickerActive: activePickerRequest !== null,
       inputPrompt,
       humanTakeoverMessage,
       pausedPageUrl,
@@ -407,9 +429,9 @@ export function useElectronBridge({
       siteAnalysis,
       inputPrompt,
       activeRunFlowId,
-      lastPickerResult,
+      pickerResult,
       lastRunId,
-      pickerActive,
+      activePickerRequest,
       humanTakeoverMessage,
       pausedPageUrl,
       logs,

@@ -1,9 +1,7 @@
 import type { Node } from '@xyflow/react';
 import type { ReactElement } from 'react';
-import { useEffect, useEffectEvent } from 'react';
 
 import type { ElectronBridgeState } from '../../../hooks/useElectronBridge';
-import type { PickerResult } from '../../../types/electron';
 import { DEFAULT_ACTION_TYPE_BY_KIND, type RpaNodeConfigDraft, type RpaNodeData } from '../../../types/rpa';
 import { Field } from '../../ui/FormControls';
 import { ActionFields } from './ActionFields';
@@ -29,22 +27,6 @@ export function ConfigTab({
 
   const actionType = node.data.action?.type ?? DEFAULT_ACTION_TYPE_BY_KIND[node.data.kind];
   const isNoExec = actionType === 'control.noop' || actionType === 'control.break';
-
-  // 不能因 draft 变化重跑：用户手改过的 selector 会被上一次的拾取结果盖回去
-  const applyPickerResult = useEffectEvent((result: PickerResult): void => {
-    onDraftChange({
-      ...draft,
-      selector: result.selector,
-      targetUrl: result.url
-    });
-  });
-
-  useEffect(() => {
-    if (electron.lastPickerResult === null || node.data.kind !== 'browser') {
-      return;
-    }
-    applyPickerResult(electron.lastPickerResult);
-  }, [electron.lastPickerResult, node.data.kind]);
 
   return (
     <>
