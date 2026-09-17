@@ -208,9 +208,14 @@ app.whenReady().then(() => {
         mainWindow.webContents.send(IPC_CHANNELS.picker.result, result);
       }
     },
-    onCancel: () => {
+    onCancel: (event) => {
       if (mainWindow !== null && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send(IPC_CHANNELS.picker.cancelled);
+        mainWindow.webContents.send(IPC_CHANNELS.picker.cancelled, event);
+      }
+    },
+    onError: (event) => {
+      if (mainWindow !== null && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(IPC_CHANNELS.picker.error, event);
       }
     }
   });

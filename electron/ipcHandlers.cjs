@@ -259,7 +259,7 @@ function registerIpcHandlers({
       return failure(error);
     }
   });
-  handle(IPC_CHANNELS.picker.close, async () => success(pickerService.closePicker()));
+  handle(IPC_CHANNELS.picker.close, async (_event, payload = {}) => success(await pickerService.closePicker(payload)));
 
   handle(IPC_CHANNELS.run.start, async (event, payload) => {
     try {

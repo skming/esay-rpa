@@ -1,93 +1,219 @@
-const { ipcMain } = require('electron');
 const { DEFAULT_BACKEND_URL } = require('./backendClient.cjs');
-const { IPC_CHANNELS } = require('./ipcChannels.cjs');
 const { buildWebSocketUrl } = require('./websocket.cjs');
 
-function createPickerService({ onResult, onCancel }) {
-  let resultSocket = null;
-  let _settled = false;  // prevent double-firing cancel on close after capture
-
-  function _fireCancel() {
-    if (_settled) return;
-    _settled = true;
-    onCancel?.();
+function createPickerService({ onResult, onCancel, onError, fetchImpl = fetch, WebSocketCtor = WebSocket }) {
+  let activeSession = null;
+  let operations = Promise.resolve();
+  function serialize(action) {
+    const next = operations.then(action);
+    operations = next.catch(() => {});
+    return next;
   }
 
-  function closePicker() {
-    if (resultSocket !== null) {
-      try { resultSocket.close(1000); } catch {}
-      resultSocket = null;
+  function settle(session, terminal) {
+    if (session.settled) return;
+    session.settled = true;
+    if (activeSession === session) {
+      activeSession = null;
     }
-    // Best-effort close on the backend side
-    fetch(`${DEFAULT_BACKEND_URL}/api/browser/picker/close`, { method: 'POST' }).catch(() => {});
-    return { status: 'closed' };
+    if (terminal.type === 'capture') {
+      onResult?.(terminal);
+    } else if (terminal.type === 'cancel') {
+      onCancel?.(terminal);
+    } else {
+      onError?.(terminal);
+    }
+    try { session.socket?.close(1000); } catch {}
+  }
+
+  function settleError(session, message) {
+    settle(session, { ...session.request, message, type: 'error' });
+  }
+
+  function settleCancel(session, reason = 'cancelled') {
+    settle(session, { ...session.request, reason, type: 'cancel' });
+  }
+
+  async function closePicker(payload = {}) {
+    const requestId = readRequiredString(payload.requestId, 'requestId');
+    const session = activeSession;
+    if (session === null || session.request.requestId !== requestId) {
+      return { requestId, status: 'closed' };
+    }
+    if (session.closePromise !== null) {
+      return session.closePromise;
+    }
+
+    session.closePromise = (async () => {
+      const response = await fetchImpl(`${DEFAULT_BACKEND_URL}/api/browser/picker/close`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ requestId })
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.detail ?? `元素拾取器关闭失败 (${response.status})`);
+      }
+      settleCancel(session, 'closed');
+      return { requestId, status: 'closed' };
+    })();
+    try {
+      return await session.closePromise;
+    } catch (error) {
+      session.closePromise = null;
+      throw error;
+    }
   }
 
   async function openPicker(_parentWindow, payload = {}) {
-    const targetUrl = normalizeTargetUrl(payload.targetUrl);
-    const mode = payload.mode === 'browse' ? 'browse' : 'pick';
+    const request = normalizePickerRequest(payload);
 
-    // Close any previous session first
-    _settled = false;
-    closePicker();
+    if (activeSession !== null) {
+      await closePicker({ requestId: activeSession.request.requestId });
+    }
 
-    // Ask backend to open the headed Playwright browser (shares full session state)
-    const openRes = await fetch(`${DEFAULT_BACKEND_URL}/api/browser/picker/open`, {
+    const openRes = await fetchImpl(`${DEFAULT_BACKEND_URL}/api/browser/picker/open`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ targetUrl, mode })
+      body: JSON.stringify(request)
     });
     if (!openRes.ok) {
       const body = await openRes.json().catch(() => ({}));
       throw new Error(body.detail ?? `浏览器启动失败 (${openRes.status})`);
     }
 
-    // Browse mode: just open the browser, no picker UI or WS needed
-    if (mode === 'browse') {
-      return { status: 'ready', mode: 'browse' };
+    if (request.mode === 'browse') {
+      return { requestId: request.requestId, status: 'ready', mode: 'browse' };
     }
 
-    // 拾取器结果也从统一工具派生 WebSocket 地址，确保 http/https 与末尾斜杠处理一致。
-    const wsUrl = buildWebSocketUrl(DEFAULT_BACKEND_URL, '/ws/picker');
-    const ws = new WebSocket(wsUrl);
-    resultSocket = ws;
+    const session = createSession(request);
+    activeSession = session;
+    const wsUrl = new URL(buildWebSocketUrl(DEFAULT_BACKEND_URL, '/ws/picker'));
+    wsUrl.searchParams.set('requestId', request.requestId);
 
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(String(event.data));
-        if (msg.type === 'capture') {
-          _settled = true;
-          onResult({
-            selector: String(msg.selector || ''),
-            strategy: 'css',
-            confidence: Number.isFinite(msg.confidence) ? msg.confidence : 0.78,
-            text: String(msg.text || ''),
-            url: String(msg.url || targetUrl),
-            capturedAt: new Date().toISOString()
-          });
-        } else if (msg.type === 'cancel') {
-          _fireCancel();
+    try {
+      const ws = new WebSocketCtor(wsUrl);
+      session.socket = ws;
+      ws.onmessage = (event) => {
+        if (activeSession !== session || session.settled) return;
+        try {
+          const message = JSON.parse(String(event.data));
+          if (message.requestId !== request.requestId) {
+            settleError(session, '拾取器返回了不匹配的请求标识');
+            return;
+          }
+          if (message.type === 'capture') {
+            const selector = typeof message.selector === 'string' ? message.selector : '';
+            if (!selector || !Number.isInteger(message.matches) || message.matches < 1 || message.selectedIncluded !== true
+                || (request.selectionMode === 'single' && message.matches !== 1)) {
+              settleError(session, '拾取结果未通过定位校验');
+              return;
+            }
+            settle(session, {
+              ...request,
+              capturedAt: typeof message.capturedAt === 'string' ? message.capturedAt : new Date().toISOString(),
+              documentId: typeof message.documentId === 'string' ? message.documentId : undefined,
+              matches: Number.isFinite(message.matches) ? message.matches : undefined,
+              selectedIncluded: typeof message.selectedIncluded === 'boolean' ? message.selectedIncluded : undefined,
+              selector,
+              strategy: message.strategy === 'xpath' || message.strategy === 'text' ? message.strategy : 'css',
+              tabId: Number.isInteger(message.tabId) ? message.tabId : undefined,
+              text: typeof message.text === 'string' ? message.text : '',
+              type: 'capture',
+              url: typeof message.url === 'string' ? message.url : request.targetUrl ?? '',
+              usesPosition: typeof message.usesPosition === 'boolean' ? message.usesPosition : undefined
+            });
+            return;
+          }
+          if (message.type === 'cancel') {
+            settleCancel(session, normalizeCancelReason(message.reason));
+            return;
+          }
+          if (message.type === 'error') {
+            settleError(session, typeof message.message === 'string' && message.message.trim() ? message.message : '元素拾取器发生错误');
+            return;
+          }
+          settleError(session, '拾取器返回了未知结果类型');
+        } catch {
+          settleError(session, '拾取器返回了无效结果');
         }
-      } catch {}
-      resultSocket = null;
-    };
+      };
+      ws.onclose = () => {
+        if (activeSession === session && !session.settled) {
+          settleCancel(session, 'closed');
+        }
+      };
+      ws.onerror = () => {
+        if (activeSession === session && !session.settled) {
+          settleError(session, '元素拾取器连接失败');
+        }
+      };
+    } catch {
+      session.settled = true;
+      if (activeSession === session) activeSession = null;
+      await fetchImpl(`${DEFAULT_BACKEND_URL}/api/browser/picker/close`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ requestId: request.requestId })
+      }).catch(() => {});
+      throw new Error('元素拾取器连接失败');
+    }
 
-    ws.onclose = () => { resultSocket = null; _fireCancel(); };
-    ws.onerror = () => { resultSocket = null; _fireCancel(); };
-
-    return { status: 'ready', mode: 'selector-picker' };
+    return { requestId: request.requestId, status: 'ready', mode: 'selector-picker' };
   }
 
-  ipcMain.on(IPC_CHANNELS.picker.cancel, () => {
-    closePicker();
-  });
-
-  return { closePicker, openPicker };
+  return {
+    closePicker: (payload) => serialize(() => closePicker(payload)),
+    openPicker: (parent, payload) => serialize(() => openPicker(parent, payload))
+  };
 }
 
-function normalizeTargetUrl(value) {
+function createSession(request) {
+  return {
+    closePromise: null,
+    request,
+    settled: false,
+    socket: null
+  };
+}
+
+function normalizePickerRequest(payload) {
+  const mode = payload.mode === 'browse' ? 'browse' : 'pick';
+  const browserExecutor = payload.browserExecutor === 'extension' ? 'extension' : 'playwright';
+  const request = {
+    browserExecutor,
+    mode,
+    requestId: readRequiredString(payload.requestId, 'requestId')
+  };
+  const targetUrl = normalizeTargetUrl(payload.targetUrl, { required: browserExecutor === 'playwright' });
+  if (targetUrl !== undefined) {
+    request.targetUrl = targetUrl;
+  }
+  if (mode === 'pick') {
+    request.flowId = readRequiredString(payload.flowId, 'flowId');
+    request.nodeId = readRequiredString(payload.nodeId, 'nodeId');
+    request.field = payload.field === 'targetSelector' ? 'targetSelector' : payload.field === 'selector' ? 'selector' : invalidField();
+    request.selectionMode = payload.selectionMode === 'multiple' ? 'multiple' : 'single';
+  }
+  return request;
+}
+
+function invalidField() {
+  throw new Error('field 必须是 selector 或 targetSelector');
+}
+
+function readRequiredString(value, name) {
   if (typeof value !== 'string' || !value.trim()) {
-    throw new Error('请先配置目标页面地址后再启动拾取器');
+    throw new Error(`${name} 不能为空`);
+  }
+  return value.trim();
+}
+
+function normalizeTargetUrl(value, { required }) {
+  if (typeof value !== 'string' || !value.trim()) {
+    if (required) {
+      throw new Error('请先配置目标页面地址后再启动拾取器');
+    }
+    return undefined;
   }
   const trimmed = value.trim();
   if (trimmed.includes('${')) {
@@ -97,6 +223,10 @@ function normalizeTargetUrl(value) {
     throw new Error('目标页面地址必须以 http:// 或 https:// 开头');
   }
   return trimmed;
+}
+
+function normalizeCancelReason(value) {
+  return value === 'replaced' || value === 'closed' ? value : 'cancelled';
 }
 
 module.exports = {

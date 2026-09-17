@@ -26,10 +26,9 @@ const IPC_CHANNELS = Object.freeze({
   picker: Object.freeze({
     open: 'picker:open',
     close: 'picker:close',
-    cancel: 'picker:cancel',
-    capture: 'picker:capture',
     result: 'picker:result',
-    cancelled: 'picker:cancelled'
+    cancelled: 'picker:cancelled',
+    error: 'picker:error'
   }),
   flow: Object.freeze({
     open: 'flow:open',

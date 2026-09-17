@@ -29,10 +29,9 @@ const IPC_CHANNELS = Object.freeze({
   picker: Object.freeze({
     open: 'picker:open',
     close: 'picker:close',
-    cancel: 'picker:cancel',
-    capture: 'picker:capture',
     result: 'picker:result',
-    cancelled: 'picker:cancelled'
+    cancelled: 'picker:cancelled',
+    error: 'picker:error'
   }),
   flow: Object.freeze({
     open: 'flow:open',
@@ -117,7 +116,7 @@ function createRpaBridge(ipcRenderer) {
 
   return {
     openPicker: (payload) => invoke(IPC_CHANNELS.picker.open, payload),
-    closePicker: () => invoke(IPC_CHANNELS.picker.close),
+    closePicker: (payload) => invoke(IPC_CHANNELS.picker.close, payload),
     openFlow: () => invoke(IPC_CHANNELS.flow.open),
     saveFlow: (payload) => invoke(IPC_CHANNELS.flow.save, payload),
     exportLogs: (payload) => invoke(IPC_CHANNELS.logs.export, payload),
@@ -173,11 +172,8 @@ function createRpaBridge(ipcRenderer) {
     toggleMaximizeWindow: () => invoke(IPC_CHANNELS.window.toggleMaximize),
     closeWindow: () => invoke(IPC_CHANNELS.window.close),
     onPickerResult: (callback) => subscribe(IPC_CHANNELS.picker.result, callback),
-    onPickerCancel: (callback) => {
-      const listener = () => callback();
-      ipcRenderer.on(IPC_CHANNELS.picker.cancelled, listener);
-      return () => ipcRenderer.removeListener(IPC_CHANNELS.picker.cancelled, listener);
-    },
+    onPickerCancel: (callback) => subscribe(IPC_CHANNELS.picker.cancelled, callback),
+    onPickerError: (callback) => subscribe(IPC_CHANNELS.picker.error, callback),
     onRunEvent: (callback) => subscribe(IPC_CHANNELS.run.event, callback),
     onBackendStatusChanged: (callback) => subscribe(IPC_CHANNELS.backend.statusChanged, callback)
   };
