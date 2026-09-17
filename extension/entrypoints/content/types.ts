@@ -31,6 +31,8 @@ export interface ContentAction {
   | 'page.waitFor'
   | 'page.end'
   | 'page.observe'
+  | 'page.picker'
+  | 'page.pickerCancel'
   | 'page.effectSignature'
   | 'page.targetState'
   | 'page.resolveTarget'
@@ -89,4 +91,8 @@ export interface ContentAction {
   includeHtml?: boolean;
   documentId?: string;
   explorationTabId?: number;
+  /** page.picker/page.pickerCancel：只允许同一个请求结束自己的拾取会话。 */
+  pickerRequestId?: string;
+  /** page.picker：single 要求唯一命中，multiple 允许组合多个同类元素。 */
+  selectionMode?: 'single' | 'multiple';
 }

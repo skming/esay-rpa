@@ -30,6 +30,8 @@ interface BridgeInstruction {
     documentId?: string; // page.observe 返回的文档身份；内容脚本导航重建后自动变化
     observationVersion?: number;
     scope?: string | null;
+    pickerRequestId?: string; // page.picker/page.pickerCancel：拾取会话身份
+    selectionMode?: 'single' | 'multiple'; // page.picker：单选或同类多选
   };
 }
 

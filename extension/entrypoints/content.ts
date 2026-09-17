@@ -19,6 +19,65 @@ import { dispatchExtract, dispatchExtractAll } from './content/extract';
 import { markAutomationActivity, moveCursorTo, pulseClickAt, highlightElement, setPageBlocked } from './content/automationVisual';
 import { hideTakeoverBanner, showTakeoverBanner } from './content/takeoverBanner';
 import { dismissBlockingOverlays } from './content/modalGuard';
+// Shared browser code is plain ESM so Playwright can inject the same source without a build step.
+// @ts-expect-error The runtime contract is narrowed by PickerEvent and the callback below.
+import { startPicker } from '../../backend/app/services/picker_overlay.js';
+
+type PickerEvent = Record<string, unknown> & { type: 'capture' | 'cancel' | 'error' };
+
+interface ActivePicker {
+  requestId: string;
+  settled: boolean;
+  dispose: () => void;
+  resolve: (event: PickerEvent) => void;
+}
+
+let activePicker: ActivePicker | null = null;
+
+function finishPicker(session: ActivePicker, event: PickerEvent): void {
+  if (session.settled) return;
+  session.settled = true;
+  if (activePicker === session) activePicker = null;
+  session.dispose();
+  session.resolve({ ...event, requestId: session.requestId });
+}
+
+function cancelPicker(reason: string, requestId?: string): boolean {
+  const session = activePicker;
+  if (session === null || (requestId !== undefined && session.requestId !== requestId)) return false;
+  finishPicker(session, { type: 'cancel', reason });
+  return true;
+}
+
+function runPicker(action: ContentAction): Promise<PickerEvent> {
+  if (!action.pickerRequestId) throw new Error('page.picker 需要 pickerRequestId');
+  if (action.selectionMode !== 'single' && action.selectionMode !== 'multiple') {
+    throw new Error('page.picker 需要合法的 selectionMode');
+  }
+  cancelPicker('replaced');
+
+  return new Promise((resolve, reject) => {
+    const session: ActivePicker = {
+      requestId: action.pickerRequestId as string,
+      settled: false,
+      dispose: () => undefined,
+      resolve,
+    };
+    activePicker = session;
+    try {
+      const dispose = startPicker(
+        { requestId: session.requestId, selectionMode: action.selectionMode as 'single' | 'multiple' },
+        (event: PickerEvent) => finishPicker(session, event),
+      );
+      session.dispose = dispose;
+      if (session.settled) dispose();
+    } catch (error) {
+      if (activePicker === session) activePicker = null;
+      session.settled = true;
+      reject(error);
+    }
+  });
+}
 
 function dispatchClick(el: Element): void {
   const rect = el.getBoundingClientRect();
@@ -312,7 +371,15 @@ async function handleAction(action: ContentAction): Promise<unknown> {
     case 'page.observe': {
       return { ...observePage({ scope: action.scope, version: action.observationVersion, includeHtml: action.includeHtml }), document_id: documentId };
     }
+    case 'page.picker': {
+      return runPicker(action);
+    }
+    case 'page.pickerCancel': {
+      if (!action.pickerRequestId) throw new Error('page.pickerCancel 需要 pickerRequestId');
+      return { ok: true, cancelled: cancelPicker('cancelled', action.pickerRequestId) };
+    }
     case 'page.end': {
+      cancelPicker('page_ended');
       setPageBlocked(false);
       return { ok: true };
     }
@@ -365,6 +432,7 @@ async function handleAction(action: ContentAction): Promise<unknown> {
 export default defineContentScript({
   matches: ['<all_urls>'],
   main() {
+    window.addEventListener('pagehide', () => cancelPicker('page_navigated'), { capture: true });
     browser.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       if (typeof message !== 'object' || message === null || message.source !== 'rpa-studio-bridge') {
         return undefined;
