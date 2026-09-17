@@ -6,12 +6,14 @@
  * 一旦不同，同一页在两条通道上会得出不同的配方，而两边都自称观察过真实 DOM。
  *
  * 因此这个文件只许写两边都能跑的纯 DOM 代码：
- * - 不 import 任何东西（Playwright 侧是 evaluate 一个表达式，没有模块系统）；
- * - 除下面这一行 export 外不出现任何模块语法（Python 侧按这行切开取表达式）；
+ * - 只 import shared_dom_locator.js；Python loader 会把这一个依赖与本表达式组合；
+ * - 除该 import 与下面这一行 export 外不出现模块语法；
  * - 不用 TypeScript 语法（同上）；
  * - 只用内容脚本隔离世界里也成立的 API：document/getComputedStyle/CSS.escape 都是共享的，
  *   而 window 不是——window.__rpaProbe 在扩展侧落在隔离世界，页面脚本改不到它，正好。
  */
+import { createDomLocator } from '../dom_locator.js';
+
 export const PAGE_PROBE = (args) => {
     const scopeSelector = (args && args.scope) || null;
     const version = (args && args.version) || 0;
@@ -38,100 +40,12 @@ export const PAGE_PROBE = (args) => {
         return (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80);
     }
 
-    // ── 开放 shadow root 穿透 ─────────────────────────────────────
-    // 闭合 shadow root 在页面脚本里和「没有 shadow root」完全无法区分，
-    // 所以只声明开放的那部分，另外把可疑的自定义元素单独报出去。
-    function collectRoots(node, out) {
-        out.push(node);
-        let all = [];
-        try { all = node.querySelectorAll('*'); } catch (e) { all = []; }
-        for (const el of all) if (el.shadowRoot) collectRoots(el.shadowRoot, out);
-        return out;
-    }
-    function queryAll(roots, sel) {
-        const out = [];
-        for (const r of roots) {
-            try { r.querySelectorAll(sel).forEach(e => out.push(e)); } catch (e) { /* 非法选择器 */ }
-        }
-        return out;
-    }
-
-    const DOC_ROOTS = collectRoots(document, []);
-    const inShadow = new WeakSet();
-    for (const r of DOC_ROOTS) {
-        if (r.host) { try { r.querySelectorAll('*').forEach(e => inShadow.add(e)); } catch (e) {} }
-    }
-
-    // ── 选择器：先求唯一，求不到就如实报命中数 ──────────────────
-    const countCache = new Map();
-    function countDoc(sel) {
-        if (countCache.has(sel)) return countCache.get(sel);
-        let n = -1;   // -1 = 该选择器在浏览器里非法，命中数不可知
-        try { n = queryAll(DOC_ROOTS, sel).length; } catch (e) { n = -1; }
-        countCache.set(sel, n);
-        return n;
-    }
-
-    // 属性值里带引号或反斜杠时不构造属性选择器：转义规则在两个执行器上不完全一致，
-    // 拼错的选择器会静默零命中，不如直接退到结构路径。
-    function attrSel(tag, name, value) {
-        if (!value || /["\\]/.test(value) || value.length > 60) return null;
-        return tag + '[' + name + '="' + value + '"]';
-    }
-
-    function candidates(el) {
-        const tag = el.tagName.toLowerCase();
-        const out = [];
-        if (el.id && !/^\d/.test(el.id)) out.push('#' + CSS.escape(el.id));
-        const attrs = [['name', el.getAttribute('name')], ['placeholder', el.getAttribute('placeholder')], ['title', el.getAttribute('title')],
-                       ['aria-label', el.getAttribute('aria-label')], ['data-testid', el.getAttribute('data-testid')]];
-        for (const [k, v] of attrs) { const s = attrSel(tag, k, v); if (s) out.push(s); }
-        if (el.type && el.type !== 'text') { const s = attrSel(tag, 'type', el.type); if (s) out.push(s); }
-        return out;
-    }
-
-    // 结构路径：一定合法、一定唯一，两个执行器都能解析。停在最近的唯一 id 祖先。
-    function cssPath(el) {
-        const parts = [];
-        let cur = el;
-        while (cur && cur.nodeType === 1 && parts.length < 8) {
-            if (cur.id && !/^\d/.test(cur.id) && countDoc('#' + CSS.escape(cur.id)) === 1) {
-                parts.unshift('#' + CSS.escape(cur.id));
-                return parts.join(' > ');
-            }
-            const parent = cur.parentElement;
-            const tag = cur.tagName.toLowerCase();
-            if (!parent) { parts.unshift(tag); break; }
-            const sibs = [...parent.children].filter(c => c.tagName === cur.tagName);
-            parts.unshift(sibs.length > 1 ? tag + ':nth-of-type(' + (sibs.indexOf(cur) + 1) + ')' : tag);
-            cur = parent;
-        }
-        return parts.join(' > ');
-    }
-
-    // ── 业务类名 / 框架类名 ───────────────────────────────────────
-    // 业务类名 = 既不是组件库前缀、也不是通用布局词，能唯一指认页面上某个具体区域。
-    const FRAMEWORK_RE = /^(el|ant|arco|vxe|n|van|ivu|layui|semi|tdesign|varlet|vc|v)-/;
-    const LAYOUT_WORDS = new Set([
-        'app','page','main','layout','content','wrapper','container',
-        'inner','outer','shell','frame','view','root','section',
-        'area','panel','box','wrap','base','center','body','fluid','fixed','scroll',
-    ]);
-    function isLayoutOnly(cls) {
-        const words = cls.toLowerCase().split(/[-_]/).filter(Boolean);
-        return words.length > 0 && words.every(w => LAYOUT_WORDS.has(w));
-    }
-    function isBusinessClass(cls) {
-        return cls.length > 2 && !FRAMEWORK_RE.test(cls) && !isLayoutOnly(cls);
-    }
-    function classesOf(el) {
-        return String(el.className || '').split(/\s+/).filter(Boolean);
-    }
-    function parentOf(el) {
-        if (el.parentElement) return el.parentElement;
-        const r = el.getRootNode();
-        return (r && r.host) ? r.host : null;
-    }
+    // 开放 shadow root 穿透、选择器候选和命中计数与 picker 共用；闭合 root 仍不可见。
+    const locator = createDomLocator(document);
+    const {
+        FRAMEWORK_RE, classesOf, collectRoots, inShadow, isBusinessClass, isLayoutOnly,
+        nearestBusinessAncestor, parentOf, queryAll, roots: DOC_ROOTS, bestSelector, tableRowSelector,
+    } = locator;
 
     let uidSeq = 0;
     const uidMap = new WeakMap();
@@ -139,37 +53,6 @@ export const PAGE_PROBE = (args) => {
         let u = uidMap.get(el);
         if (u === undefined) { u = ++uidSeq; uidMap.set(el, u); }
         return u;
-    }
-
-    // 同一个祖先会被几十个输入框反复走到，选择器计算必须缓存，否则整页探测退化成上千次全文档匹配。
-    const selCache = new WeakMap();
-    function bestSelector(el) {
-        const hit = selCache.get(el);
-        if (hit) return hit;
-        let out = null;
-        const cands = candidates(el);
-        for (const c of cands) if (countDoc(c) === 1) { out = { selector: c, matches: 1 }; break; }
-        if (!out) {
-            // 裸选择器不唯一时先用祖先限定，比 nth-of-type 路径可读，也不随兄弟节点增减而失效
-            for (const c of cands) {
-                let cur = parentOf(el), depth = 0;
-                while (cur && cur.nodeType === 1 && depth++ < 6) {
-                    const anchors = [];
-                    if (cur.id && !/^\d/.test(cur.id)) anchors.push('#' + CSS.escape(cur.id));
-                    for (const cls of classesOf(cur)) if (isBusinessClass(cls)) anchors.push('.' + CSS.escape(cls));
-                    for (const a of anchors) {
-                        const scoped = a + ' ' + c;
-                        if (countDoc(scoped) === 1) { out = { selector: scoped, matches: 1 }; break; }
-                    }
-                    if (out) break;
-                    cur = parentOf(cur);
-                }
-                if (out) break;
-            }
-        }
-        if (!out) { const p = cssPath(el); out = { selector: p, matches: countDoc(p) }; }
-        selCache.set(el, out);
-        return out;
     }
 
     // ── 语义与状态 ────────────────────────────────────────────────
@@ -372,15 +255,6 @@ export const PAGE_PROBE = (args) => {
     });
 
     // ── 按钮：重复的同文本按钮必须暴露出来 ────────────────────────
-    function nearestBizAncestor(el) {
-        let cur = parentOf(el);
-        while (cur && cur !== document.body) {
-            const bizCls = classesOf(cur).find(isBusinessClass);
-            if (bizCls) return { el: cur, cls: bizCls };
-            cur = parentOf(cur);
-        }
-        return null;
-    }
     const buttonEls = queryAll(ROOTS, 'button, input[type=submit], input[type=button], [role=button], a:not([href])')
         .filter(el => {
             const t = text(el);
@@ -403,7 +277,7 @@ export const PAGE_PROBE = (args) => {
             // 同文本按钮有几个，模型必须知道：页面上 12 个「编辑」时，
             // 裸文本选择器命中的是第一行，而任务要点的是目标那一行。
             out.same_text_count = item.group_size;
-            const anc = nearestBizAncestor(el);
+            const anc = nearestBusinessAncestor(el);
             if (anc) out.container = bestSelector(anc.el).selector;
         }
         return out;
@@ -420,35 +294,7 @@ export const PAGE_PROBE = (args) => {
     });
 
     // ── 表格：标准 HTML + ARIA grid/table，外加渲染出表头行的自研组件 ──
-    // 返回命中的分支名而不只是选择器：模型据此知道这条路径是按哪种结构推出来的，
-    // 自研组件那两支（biz_row_class / biz_scope_tr）本就是猜，写进流程前该回页面验一次。
-    function bizRowSelector(tbl) {
-        const tableScope = bestSelector(tbl).selector;
-        // 判据是「有没有 tbody」而不是「tbody 里现在有没有行」：后者让同一张表在空的时候
-        // 退到 ' tr'（连表头行一起圈进去），有数据时才收窄，推荐给流程的选择器随观察时刻变。
-        if (tbl.tagName === 'TABLE' && tbl.tBodies.length > 0) {
-            return { selector: tableScope + ' > tbody > tr', source: 'native_tbody' };
-        }
-        if (tbl.matches('[role=grid], [role=table]') && tbl.querySelector('[role=row]')) {
-            return { selector: tableScope + ' [role=row]:has([role=cell], [role=gridcell])', source: 'aria_row' };
-        }
-        // tbody 缺失的 <table>：DOM API 往 <table> 上直接 append <tr> 不会补 tbody
-        // （HTML 解析器才补），上面那支落空，行仍然在 tr 里。
-        if (tbl.tagName === 'TABLE' && tbl.querySelector('tr')) {
-            return { selector: tableScope + ' tr', source: 'table_tr' };
-        }
-        const anc = nearestBizAncestor(tbl);
-        if (!anc) return { selector: null, source: null };
-        const scope = '.' + CSS.escape(anc.cls);
-        const rowEl = tbl.querySelector('[class*="row"], [class*="__row"], [class*="-row"]');
-        if (rowEl) {
-            const rowCls = [...rowEl.classList].find(c =>
-                /row|__row|-row|--row/.test(c) && !isLayoutOnly(c)
-            );
-            if (rowCls) return { selector: scope + ' .' + CSS.escape(rowCls), source: 'biz_row_class' };
-        }
-        return { selector: scope + ' tr', source: 'biz_scope_tr' };
-    }
+    // 行选择器与 picker 的 multiple 模式共用，避免同一张表在两个入口得到不同范围。
 
     // 表头行只按 DOM 结构判，不看文本：拿「像表头的字」当判据，第一行数据叫「合计」
     // 就会被当表头摘掉，而真表头用了数据样的词就会混进样例行。
@@ -504,7 +350,7 @@ export const PAGE_PROBE = (args) => {
         if (el.querySelector('th, [role=columnheader]')) tableElSet.add(el);
     });
     const tables = [...tableElSet].slice(0, 5).map(tbl => {
-        const row = bizRowSelector(tbl);
+        const row = tableRowSelector(tbl);
         const head = headerRow(tbl);
         const container = bestSelector(tbl).selector;
         const evidence = rowEvidence(row.selector);
