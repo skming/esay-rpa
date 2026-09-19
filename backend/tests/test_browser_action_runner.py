@@ -1232,3 +1232,24 @@ async def test_navigation_does_not_retry_non_timeout_failures() -> None:
         await _goto_with_retry(page, "https://example.com", timeout=30_000)
 
     assert page.timeouts == [15_000]
+
+
+class FakeBlankMidPaginatePage(FakePaginatePage):
+    """第 2 页一行都没抽到，而「下一页」仍可点。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pages = [["A1"], [], ["C1"]]
+
+
+async def test_browser_paginate_next_rejects_blank_mid_sweep_page() -> None:
+    page = FakeBlankMidPaginatePage()
+    context = BrowserActionContext(playwright=object(), browser=object(), page=page)
+
+    with pytest.raises(ValueError, match="一行数据都没抽到"):
+        await BrowserActionRunner().run(
+            {"type": "browser.paginateNext", "selector": "a.next", "targetSelector": ".row::text", "delayMs": 0},
+            RuntimeVariableStore.from_initial({}),
+            context,
+            timeout_ms=1000,
+        )

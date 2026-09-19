@@ -177,6 +177,20 @@ def build_first_page_stop_error(
     return "".join(lines)
 
 
+def build_blank_page_error(*, page_number: int, target_selector: str) -> str:
+    """翻页中途抽到零行、而「下一页」还可点时报错，不按「本页没有数据」继续。
+
+    真·空表只出现在末页，那时按钮已 hidden/disabled；「后面还要翻」这个前提本身就否掉了
+    「这页就是空的」。
+    """
+    return (
+        f"翻页到第 {page_number} 页时，targetSelector `{target_selector}` 一行数据都没抽到，"
+        "但「下一页」还可点。继续翻会把这一页整页丢掉，交出去的数据看不出缺口。"
+        "两种常见原因：这一页还没渲染完（调大该节点的 timeoutMs 或 delayMs），"
+        "或翻页后行选择器失效（用 inspect_page 核对当前页真实的行选择器）。"
+    )
+
+
 async def probe_pagination_evidence_playwright(page: Any) -> PaginationEvidence:
     try:
         raw = await page.evaluate(PAGINATION_PROBE_JS)

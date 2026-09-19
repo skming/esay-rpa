@@ -14,6 +14,7 @@ from app.services import browser_profile_lock
 from app.services.pagination_probe import (
     FIRST_PAGE_STOP_REASONS,
     SINGLE_PAGE_VERDICT,
+    build_blank_page_error,
     build_first_page_stop_error,
     probe_pagination_evidence_playwright,
 )
@@ -707,6 +708,12 @@ class BrowserActionRunner:
             if await _is_locator_disabled(next_button):
                 stop_reason = "next_button_disabled"
                 break
+            # 必须排在三个终止判据之后：末页的空表由 hidden/disabled 收尾，走不到这里
+            if not current_values:
+                raise ValueError(build_blank_page_error(
+                    page_number=pages_visited,
+                    target_selector=target_selector_config.selector,
+                ))
 
             before_url = _read_page_url(page)
             before_fingerprint = _build_page_fingerprint(before_url, current_values)
@@ -1887,7 +1894,14 @@ _TABLE_READY_PROBE = (
     " const els = hit(selector);"
     " if (els === null) return 'unsupported';"
     " const rows = sourceRowsOf(els);"
-    " if (rows.some((r) => !isHeaderRow(r))) return 'rows_present';"
+    # 骨架行（tr 已在 DOM、单元格还空着）不算就绪：下游 _normalize_table_rows 会把整行丢掉，
+    # 就绪判据与行数各说各话时，这一页秒判就绪、贡献 0 行，而页数照加——交付数据看不出缺口。
+    " const hasRowContent = (r) => !!(r.innerText ? String(r.innerText).trim() : '');"
+    " const dataRows = rows.filter((r) => !isHeaderRow(r));"
+    " if (dataRows.some(hasRowContent)) return 'rows_present';"
+    # 必须排在 matched_no_table 之前：没有表头行的骨架表在 hasFramedHeader 下不成立，
+    # 排到后面就会被判成「圈到的不是表格」秒回，等待形同虚设
+    " if (dataRows.length) return 'framed_empty';"
     " if (hasFramedHeader(els, rows)) return 'framed_empty';"
     " if (els.length) return 'matched_no_table';"
     # 行选择器打在空表上一个元素都命中不到（tbody 已清空），此时能证明「表在、只是没数据」的
