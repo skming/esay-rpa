@@ -1,7 +1,9 @@
 <!-- 首列表头是空 <th>、数据侧对应空 <td>：两条通道的表头命名判据在这一页上分家过——
      丢掉空表头会让后面每个值整体左移一位顶到别的字段名下。片段形式是为了让
-     test_real_extension_page_channel 原样嵌进它的页面，两条通道跑的是同一份 DOM。 -->
+     test_real_extension_page_channel 原样嵌进它的页面，两条通道跑的是同一份 DOM。
+     Usage 列的三个块级子节点是取文本判据的分家点：textContent 不补分隔，交出的是
+     "4,572194296.2K"，三个数字粘成一个。 -->
 <section class="outer"><section class="inner"><div class="custom-table">
-<table id="pricing"><thead><tr><th></th><th>Model Name</th><th>Ratio</th><th>Price</th></tr></thead>
-<tbody><tr><td></td><td>model-a</td><td>1.5</td><td>$3</td></tr>
-<tr><td></td><td>model-b</td><td>3</td><td>$6</td></tr></tbody></table></div></section></section>
+<table id="pricing"><thead><tr><th></th><th>Model Name</th><th>Ratio</th><th>Price</th><th>Usage</th></tr></thead>
+<tbody><tr><td></td><td>model-a</td><td>1.5</td><td>$3</td><td><div>4,572</div><div>194</div><div>296.2K</div></td></tr>
+<tr><td></td><td>model-b</td><td>3</td><td>$6</td><td><div>1,208</div><div>77</div><div>41.9K</div></td></tr></tbody></table></div></section></section>

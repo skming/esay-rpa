@@ -1,0 +1,30 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>先渲染骨架行的表格</title>
+<!-- 骨架行：tr 已在 DOM、单元格还空着，回填在后。它与渲染完的表只差单元格有没有内容，
+     只按行数判就绪会秒判通过，抽到整页空白行，再被 _normalize_table_rows 整行丢掉交出零行——
+     行数与就绪各说各话，这一页贡献 0 行而页数照加，交付数据看不出缺口。
+     第二张表没有表头行：就绪判据若先问「有没有表头」，这种骨架表会落到「圈到的不是表格」秒回。 -->
+<body>
+  <table id="headed">
+    <thead><tr><th>单号</th><th>金额</th></tr></thead>
+    <tbody>
+      <tr><td></td><td></td></tr>
+      <tr><td></td><td></td></tr>
+    </tbody>
+  </table>
+  <table id="bare">
+    <tbody>
+      <tr><td></td><td></td></tr>
+    </tbody>
+  </table>
+  <script>
+    setTimeout(() => {
+      document.querySelector('#headed tbody').innerHTML =
+        '<tr><td>A-01</td><td>1200</td></tr><tr><td>A-02</td><td>860</td></tr>';
+    }, 800);
+    setTimeout(() => {
+      document.querySelector('#bare tbody').innerHTML = '<tr><td>B-01</td><td>430</td></tr>';
+    }, 1600);
+  </script>
+</body>

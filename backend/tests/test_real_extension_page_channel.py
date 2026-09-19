@@ -108,8 +108,8 @@ async def test_extension_observe_act_and_document_boundaries(tmp_path, monkeypat
                 assert await page.locator(first["tables"][0]["row_selector"]).count() == 2
                 table_result = await bridge.execute({"type": "browser.extract", "selector": "#pricing tr", "extractMode": "table"})
                 assert table_result["values"] == [
-                    {"列1": "", "Model Name": "model-a", "Ratio": "1.5", "Price": "$3"},
-                    {"列1": "", "Model Name": "model-b", "Ratio": "3", "Price": "$6"},
+                    {"列1": "", "Model Name": "model-a", "Ratio": "1.5", "Price": "$3", "Usage": "4,572 194 296.2K"},
+                    {"列1": "", "Model Name": "model-b", "Ratio": "3", "Price": "$6", "Usage": "1,208 77 41.9K"},
                 ]
                 assert first.get("date_controls"), first
                 recipe = first["date_controls"][0]["interaction_recipe"]

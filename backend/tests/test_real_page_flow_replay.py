@@ -397,6 +397,27 @@ async def test_a_blank_header_column_keeps_its_slot_on_both_channels(replay: Any
     ]
     store = await replay(nodes)
     assert store.get("rows") == [
-        {"列1": "", "Model Name": "model-a", "Ratio": "1.5", "Price": "$3"},
-        {"列1": "", "Model Name": "model-b", "Ratio": "3", "Price": "$6"},
+        {"列1": "", "Model Name": "model-a", "Ratio": "1.5", "Price": "$3", "Usage": "4,572 194 296.2K"},
+        {"列1": "", "Model Name": "model-b", "Ratio": "3", "Price": "$6", "Usage": "1,208 77 41.9K"},
     ], store.get("rows")
+
+
+async def test_skeleton_rows_are_waited_out_instead_of_counted_as_ready(replay: Any) -> None:
+    """骨架行在场时不算就绪：秒判就绪会交出零行（空白行被 _normalize_table_rows 整行丢掉）。
+
+    第二张表没有表头行，专测「有行但全空」必须排在 matched_no_table 之前——排到后面这张表
+    会被判成「圈到的不是表格」立刻返回。
+    """
+    nodes = [
+        {"id": "s1", "type": "browser.open", "targetUrl": _url("table_skeleton_rows.html")},
+        {"id": "s2", "type": "browser.extract", "selector": "#headed tbody tr",
+         "extractMode": "table", "outputVariable": "headed"},
+        {"id": "s3", "type": "browser.extract", "selector": "#bare tbody tr",
+         "extractMode": "table", "outputVariable": "bare"},
+    ]
+    store = await replay(nodes)
+    assert store.get("headed") == [
+        {"单号": "A-01", "金额": "1200"},
+        {"单号": "A-02", "金额": "860"},
+    ], store.get("headed")
+    assert store.get("bare") == [["B-01", "430"]], store.get("bare")
