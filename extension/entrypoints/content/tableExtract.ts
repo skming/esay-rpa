@@ -15,8 +15,12 @@ interface HeaderReadOptions {
   allowFirstRowFallback?: boolean;
 }
 
+// innerText 而非 textContent：与 _TABLE_EXTRACT_SCRIPT 的 txt 同一份契约（理由见该文件
+// _TEXT_EXTRACT_SCRIPT 上方）。两侧不一致时同一格会交出 "4,572194296.2K" 与 "4,572 194 296.2K"。
+// 不用 instanceof HTMLElement 收窄类型：跨 frame 的元素来自另一个 realm，判不过会让整格变空。
 function normalizeCellText(el: Element): string {
-  return (el.textContent ?? '').replace(/\s+/g, ' ').trim();
+  const visible = (el as Partial<HTMLElement>).innerText;
+  return (typeof visible === 'string' ? visible : '').replace(/\s+/g, ' ').trim();
 }
 
 function uniqueHeaders(rawHeaders: string[]): string[] {
