@@ -40,6 +40,7 @@ from app.services.pagination_probe import (
     FIRST_PAGE_STOP_REASONS,
     SINGLE_PAGE_VERDICT,
     PaginationEvidence,
+    build_blank_page_error,
     build_first_page_stop_error,
 )
 from app.services.runtime_variables import RuntimeVariableStore
@@ -429,8 +430,9 @@ class ExtensionExecutor:
             button_selector = variables.resolve_text(_read_required_string(node, "selector"))
             target_selector_config = _read_target_selector_config(node, variables)
             outcome = await self._click_load_more_and_extract(button_selector, target_selector_config, variables, node, timeout_seconds=timeout_seconds)
+            rows, schema_note = _apply_output_schema(outcome.rows, node)
             detail = f"{button_selector} -> {target_selector_config.selector} · {outcome.note}"
-            return _build_extract_result(action_type, detail, outcome.rows)
+            return _build_extract_result(action_type, _with_schema_note(detail, schema_note), rows)
 
         if action_type == "browser.paginateNext":
             url_template = _read_optional_string(node, "urlTemplate")
@@ -442,13 +444,15 @@ class ExtensionExecutor:
                 outcome = await self._paginate_by_url_and_extract(
                     resolved_template, target_selector_config, variables, node, timeout_seconds=timeout_seconds
                 )
+                rows, schema_note = _apply_output_schema(outcome.rows, node)
                 detail = f"{resolved_template} -> {target_selector_config.selector} · {outcome.note}"
-                return _build_extract_result(action_type, detail, outcome.rows)
+                return _build_extract_result(action_type, _with_schema_note(detail, schema_note), rows)
             next_selector = variables.resolve_text(_read_required_string(node, "selector"))
             target_selector_config = _read_target_selector_config(node, variables)
             outcome = await self._paginate_next_and_extract(next_selector, target_selector_config, variables, node, timeout_seconds=timeout_seconds)
+            rows, schema_note = _apply_output_schema(outcome.rows, node)
             detail = f"{next_selector} -> {target_selector_config.selector} · {outcome.note}"
-            return _build_extract_result(action_type, detail, outcome.rows)
+            return _build_extract_result(action_type, _with_schema_note(detail, schema_note), rows)
 
         selector = variables.resolve_text(_read_required_string(node, "selector"))
         await self._wait_for_selector(selector, timeout_ms=timeout_ms)
@@ -661,6 +665,12 @@ class ExtensionExecutor:
             if state.get("disabled", False):
                 stop_reason = "next_button_disabled"
                 break
+            # 必须排在三个终止判据之后：末页的空表由 hidden/disabled 收尾，走不到这里
+            if not current_values:
+                raise ValueError(build_blank_page_error(
+                    page_number=pages_visited,
+                    target_selector=target_selector_config.selector,
+                ))
 
             before_fingerprint = _fingerprint_rows(current_values)
             await self._bridge.execute({"type": "browser.click", "selector": next_selector}, timeout=timeout_seconds)
@@ -790,9 +800,11 @@ def _table_values_still_rendering(raw_values: object) -> bool:
     空列表＝圈到了表壳、数据行未到；no_rows_in_scope＝此刻一张表都没圈到。两种都是
     「表还没长出来」而不是结论，页面渲染完就会变。multiple_tables_in_scope 不在此列——
     那是 selector 圈得太宽，再等只会让更多表渲染出来，等到超时仍是同一个错。
+
+    「有没有行」必须与下游取行数用同一条判据，理由见 _TABLE_READY_PROBE 上方。
     """
     if isinstance(raw_values, list):
-        return not raw_values
+        return not _normalize_table_rows(raw_values)
     return isinstance(raw_values, dict) and raw_values.get("__table_scope_error") == "no_rows_in_scope"
 
 

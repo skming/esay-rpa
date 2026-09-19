@@ -793,3 +793,86 @@ async def test_table_extract_retries_missing_scope_until_rows_arrive() -> None:
     )
     assert result.structured == rows
     assert len(action_calls(bridge)) == 2
+
+
+_SWEEP_SCHEMA = [
+    {"name": "token", "aliases": ["Token"], "required": True},
+    {"name": "费用", "required": True},
+]
+
+
+async def test_paginate_next_applies_output_schema() -> None:
+    bridge = FakeBridge(responses={
+        "browser.extract": [{"values": [{"Token": "1", "费用": "$1"}]}],
+        "browser.elementState": [{"exists": True, "hidden": True, "disabled": False}],
+    })
+    executor, context = await make_context(bridge)
+    result = await executor.run(
+        {"type": "browser.paginateNext", "selector": ".next", "targetSelector": ".row",
+         "extractMode": "table", "delayMs": 0, "outputSchema": _SWEEP_SCHEMA},
+        RuntimeVariableStore.from_initial({}), context, timeout_ms=1000,
+    )
+    assert result.structured == [{"token": "1", "费用": "$1"}]
+
+
+async def test_paginate_by_url_applies_output_schema() -> None:
+    bridge = FakeBridge(responses={"browser.extract": [
+        {"values": [{"Token": "1", "费用": "$1"}]},
+        {"values": []},
+    ]})
+    executor, context = await make_context(bridge)
+    result = await executor.run(
+        {"type": "browser.paginateNext", "urlTemplate": "https://e.test/?p=${page}",
+         "targetSelector": ".row", "extractMode": "table", "delayMs": 0, "outputSchema": _SWEEP_SCHEMA},
+        RuntimeVariableStore.from_initial({}), context, timeout_ms=1000,
+    )
+    assert result.structured == [{"token": "1", "费用": "$1"}]
+
+
+async def test_click_load_more_applies_output_schema() -> None:
+    bridge = FakeBridge(responses={
+        "browser.extract": [{"values": [{"Token": "1", "费用": "$1"}]}],
+        "browser.elementState": [{"exists": False, "hidden": True, "disabled": False}],
+    })
+    executor, context = await make_context(bridge)
+    result = await executor.run(
+        {"type": "browser.clickLoadMore", "selector": ".more", "targetSelector": ".row",
+         "extractMode": "table", "delayMs": 0, "outputSchema": _SWEEP_SCHEMA},
+        RuntimeVariableStore.from_initial({}), context, timeout_ms=1000,
+    )
+    assert result.structured == [{"token": "1", "费用": "$1"}]
+
+
+async def test_table_extract_waits_out_skeleton_rows() -> None:
+    rows = [{"token": "1", "费用": "$1"}]
+    bridge = FakeBridge(responses={"browser.extract": [
+        {"values": [{"token": "", "费用": ""}, {"token": "", "费用": ""}]},
+        {"values": rows},
+    ]})
+    executor, context = await make_context(bridge)
+    result = await executor.run(
+        {"type": "browser.extract", "selector": "#t tr", "extractMode": "table"},
+        RuntimeVariableStore.from_initial({}), context, timeout_ms=1000,
+    )
+    assert result.structured == rows
+    assert len(action_calls(bridge)) == 2
+
+
+async def test_paginate_next_rejects_blank_mid_sweep_page() -> None:
+    bridge = FakeBridge(responses={
+        "browser.extract": [
+            {"values": ["row1"]},   # 第 1 页
+            {"values": ["row2"]},   # 点击后的对比抓取
+            {"values": []},         # 第 2 页：一行都没抽到
+        ],
+        "browser.elementState": [
+            {"exists": True, "hidden": False, "disabled": False},
+            {"exists": True, "hidden": False, "disabled": False},
+        ],
+    })
+    executor, context = await make_context(bridge)
+    with pytest.raises(ValueError, match="一行数据都没抽到"):
+        await executor.run(
+            {"type": "browser.paginateNext", "selector": ".next", "targetSelector": ".row", "delayMs": 0},
+            RuntimeVariableStore.from_initial({}), context, timeout_ms=1000,
+        )
