@@ -71,8 +71,20 @@ export function showTakeoverBanner(message: string, taskId: string): void {
     // isTrusted 是页面伪造不了的那一位：少了它，人工已确认就成了任意网页能替用户点下的动作，
     // 而它放行的恰恰是流程特意留给人判断的那一步。
     if (!event.isTrusted) return;
-    void browser.runtime.sendMessage({ source: 'rpa-studio-bridge-event', type: 'takeoverResume', taskId: currentTakeoverTaskId });
-    hideTakeoverBanner();
+    // 淡出的 160ms 里横幅还在 DOM 里、还能点，而 taskId 已被 hideTakeoverBanner 清空；
+    // 背景页只认 string，放过去就是后端收不到 resume、这边横幅却已经收掉。
+    const resumeTaskId = currentTakeoverTaskId;
+    if (resumeTaskId === null) return;
+    button.disabled = true;
+    // 收横幅必须等后端真的 resume 成功：这是用户恢复 paused_for_human 流程的唯一入口，
+    // 提前收掉就只剩重开流程一条路。失败时留着横幅并放开按钮，让用户能再点一次。
+    browser.runtime
+      .sendMessage({ source: 'rpa-studio-bridge-event', type: 'takeoverResume', taskId: resumeTaskId })
+      .catch(() => false)
+      .then((resumed) => {
+        if (resumed === true) hideTakeoverBanner();
+        else button.disabled = false;
+      });
   });
   banner.append(content, button);
   document.documentElement.append(banner);

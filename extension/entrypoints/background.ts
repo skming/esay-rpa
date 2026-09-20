@@ -852,22 +852,30 @@ browser.runtime.onMessage.addListener((message) => {
 
   if ((message as { source?: string }).source === 'rpa-studio-bridge-event') {
     const event = message as { type?: string; taskId?: string };
+    // resume 的真实结果要回给 Banner：它据此决定收不收横幅，丢掉结果横幅就会在没恢复成功时也消失。
     if (event.type === 'takeoverResume' && typeof event.taskId === 'string') {
-      void resumeHumanTakeover(event.taskId);
+      return resumeHumanTakeover(event.taskId);
     }
   }
   return undefined;
 });
 
-async function resumeHumanTakeover(taskId: string): Promise<void> {
+async function resumeHumanTakeover(taskId: string): Promise<boolean> {
   try {
-    await fetch(`${BACKEND_BASE_URL}/api/tasks/${taskId}/resume`, {
+    const response = await fetch(`${BACKEND_BASE_URL}/api/tasks/${taskId}/resume`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ resume_mode: 'next_node' }),
     });
+    // fetch 只有网络层出错才 reject：任务已结束/不存在返回的是 4xx，不看 ok 就会把「后端拒绝了」当成恢复成功。
+    if (!response.ok) {
+      console.error(`[rpa-studio-bridge] 恢复人工接管失败：HTTP ${response.status}`);
+      return false;
+    }
+    return true;
   } catch (error) {
     console.error('[rpa-studio-bridge] 恢复人工接管失败', error);
+    return false;
   }
 }
 
