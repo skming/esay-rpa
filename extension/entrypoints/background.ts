@@ -55,7 +55,9 @@ const UNREACHABLE_MAX_PERIOD_MINUTES = 5;
 const HEARTBEAT_INTERVAL_MS = 20000;
 // 后端顶替本连接时发的私有 close code：说明另一个浏览器（另一个 profile / 另一台 Chrome）也接上了同一座桥。
 // 必须与普通断线区分开：普通断线该 3s 快速重连，被顶替时快速重连就是互相顶替的死循环，每次顶替都会让
-// 对面正在跑的动作直接失败。故按 15s→60s 递增退避，且只有用户主动打开 popup 才清零。
+// 对面正在跑的动作直接失败。故按 15s→60s 递增退避，用户主动打开 popup 时清零。
+// 简化取舍：退避次数只在模块变量里，而退避期间没有 socket 撑着 MV3 worker，worker 一被回收递增就归零，
+// 两个浏览器长期抢同一座桥时实际稳定在 15s 一轮、到不了 60s；要真递增得把次数写进 chrome.storage（manifest 现无此权限）。
 const REPLACED_CONNECTION_CLOSE_CODE = 4409;
 const REPLACED_CONNECTION_BACKOFF_MS = 15000;
 const REPLACED_CONNECTION_MAX_BACKOFF_MS = 60000;
@@ -717,7 +719,9 @@ async function dispatchTrustedInput(action: BridgeInstruction['action']): Promis
       await chrome.debugger.sendCommand(debuggee, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
       await chrome.debugger.sendCommand(debuggee, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
       await chrome.debugger.sendCommand(debuggee, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
-      void sendToActiveTab({ type: 'automation.pointer', x, y, pulse: true });
+      // 光标脉冲纯装饰，且它的取标签页路径会在标签页刚被关掉时 reject：
+      // 点击已经由 CDP 落下，少画一圈不该把成功的动作变成未处理的 rejection。
+      void sendToActiveTab({ type: 'automation.pointer', x, y, pulse: true }).catch(() => undefined);
 
       if (action.type === 'browser.fill') {
         if (action.inputValue === undefined) return { ok: false, error: 'browser.fill 需要 inputValue' };
