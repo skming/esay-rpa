@@ -49,6 +49,9 @@ const NAVIGATION_TIMEOUT_MS = 15000;
 // MV3 worker 空闲 ~30s 会被杀；heartbeat 保活，alarm 仅低频兜底，避免与唤醒/重连叠加刷爆连接日志。
 const KEEPALIVE_ALARM_NAME = 'rpa-studio-bridge-keepalive';
 const KEEPALIVE_PERIOD_MINUTES = 1;
+// ERR_CONNECTION_REFUSED 由内核直接打进控制台、JS 拦不掉，只能靠少连几次少刷几条；
+// 代价是桌面端重开后最多晚这么久才自动接上。
+const UNREACHABLE_MAX_PERIOD_MINUTES = 5;
 const HEARTBEAT_INTERVAL_MS = 20000;
 // 后端顶替本连接时发的私有 close code：说明另一个浏览器（另一个 profile / 另一台 Chrome）也接上了同一座桥。
 // 必须与普通断线区分开：普通断线该 3s 快速重连，被顶替时快速重连就是互相顶替的死循环，每次顶替都会让
@@ -56,10 +59,9 @@ const HEARTBEAT_INTERVAL_MS = 20000;
 const REPLACED_CONNECTION_CLOSE_CODE = 4409;
 const REPLACED_CONNECTION_BACKOFF_MS = 15000;
 const REPLACED_CONNECTION_MAX_BACKOFF_MS = 60000;
-const HANDSHAKE_FAILURE_BACKOFF_MS = 15000;
-// ERR_CONNECTION_REFUSED 由内核直接打进控制台、JS 拦不掉；桌面应用没开时只能靠退避降低刷屏。
-const HANDSHAKE_FAILURE_MAX_BACKOFF_MS = 60000;
-// 退避涨到 60s 后打开 popup 视为用户在等，按此间隔清零重试；不跟 2s 轮询走，否则刷爆握手。
+// 连接开着突然断（后端重启/热更新）：后端刚才还在，值得快重试一次。再失败就归 alarm 周期管。
+const DROPPED_CONNECTION_RETRY_MS = 15000;
+// 退避涨到分钟级之后打开 popup 视为用户在等，按此间隔清零重试；不跟 2s 轮询走，否则刷爆握手。
 const FOREGROUND_RETRY_INTERVAL_MS = 10000;
 const CONTENT_SCRIPT_FILE = '/content-scripts/content.js';
 const RECEIVING_END_MISSING_MESSAGE = 'Could not establish connection. Receiving end does not exist.';
@@ -68,7 +70,6 @@ let socket: WebSocket | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let reconnectDelayMs = INITIAL_RECONNECT_DELAY_MS;
-let handshakeFailureDelayMs = HANDSHAKE_FAILURE_BACKOFF_MS;
 let replacedConnectionDelayMs = REPLACED_CONNECTION_BACKOFF_MS;
 let lastForegroundRetryAt = 0;
 
@@ -477,6 +478,26 @@ function startHeartbeat(currentSocket: WebSocket): void {
   }, HEARTBEAT_INTERVAL_MS);
 }
 
+// 退避只能存在 alarm 周期里：worker 空闲即被杀，模块变量每次唤醒都归零。
+async function backOffKeepaliveAlarm(): Promise<void> {
+  const current = await browser.alarms.get(KEEPALIVE_ALARM_NAME);
+  const minutes = Math.min((current?.periodInMinutes ?? KEEPALIVE_PERIOD_MINUTES) * 2, UNREACHABLE_MAX_PERIOD_MINUTES);
+  await browser.alarms.create(KEEPALIVE_ALARM_NAME, { periodInMinutes: minutes });
+  console.debug(`[rpa-studio-bridge] 后端未就绪，${minutes} 分钟后再试`);
+}
+
+// create 会重置计时，周期没变就不重建，否则保活 alarm 永远等不到触发。
+async function restoreKeepaliveAlarm(): Promise<void> {
+  const current = await browser.alarms.get(KEEPALIVE_ALARM_NAME);
+  if (current?.periodInMinutes === KEEPALIVE_PERIOD_MINUTES) return;
+  await browser.alarms.create(KEEPALIVE_ALARM_NAME, { periodInMinutes: KEEPALIVE_PERIOD_MINUTES });
+}
+
+async function ensureKeepaliveAlarm(): Promise<void> {
+  if (await browser.alarms.get(KEEPALIVE_ALARM_NAME)) return;
+  await browser.alarms.create(KEEPALIVE_ALARM_NAME, { periodInMinutes: KEEPALIVE_PERIOD_MINUTES });
+}
+
 function scheduleReconnect(delayOverrideMs?: number): void {
   if (reconnectTimer !== null || isSocketActive()) return;
   const delayMs = delayOverrideMs ?? reconnectDelayMs;
@@ -495,7 +516,7 @@ function retryConnectionNow(): void {
   if (now - lastForegroundRetryAt < FOREGROUND_RETRY_INTERVAL_MS) return;
   lastForegroundRetryAt = now;
   reconnectDelayMs = INITIAL_RECONNECT_DELAY_MS;
-  handshakeFailureDelayMs = HANDSHAKE_FAILURE_BACKOFF_MS;
+  void restoreKeepaliveAlarm();
   // 被顶替的退避只在这里清零：用户打开了 popup，才说明他要的是当前这个浏览器。若改到 open 里清零，
   // 两个浏览器会稳定地每 15s 互相顶替一次，退避形同没有。
   replacedConnectionDelayMs = REPLACED_CONNECTION_BACKOFF_MS;
@@ -517,7 +538,7 @@ function connect(): void {
     if (socket !== nextSocket) return;
     hasOpened = true;
     reconnectDelayMs = INITIAL_RECONNECT_DELAY_MS;
-    handshakeFailureDelayMs = HANDSHAKE_FAILURE_BACKOFF_MS;
+    void restoreKeepaliveAlarm();
     console.log('[rpa-studio-bridge] connected to backend');
     startHeartbeat(nextSocket);
   });
@@ -560,11 +581,15 @@ function connect(): void {
       replacedConnectionDelayMs = Math.min(replacedConnectionDelayMs * 2, REPLACED_CONNECTION_MAX_BACKOFF_MS);
       return;
     }
-    if (!hasOpened || event.code === 1006) {
-      // 后端重启/端口未就绪/握手被重置都会走到这里（未完成 WS open），放慢重试避免刷失败握手。
-      console.warn(`[rpa-studio-bridge] websocket handshake failed, retrying in ${handshakeFailureDelayMs / 1000}s`);
-      scheduleReconnect(handshakeFailureDelayMs);
-      handshakeFailureDelayMs = Math.min(handshakeFailureDelayMs * 2, HANDSHAKE_FAILURE_MAX_BACKOFF_MS);
+    if (!hasOpened) {
+      // 握手没成过 = 桌面端没在跑。不起自己的定时器：worker 空闲 30s 即被杀，定时器随之丢失，
+      // 下次唤醒又从最短间隔重来，退避等于没有。
+      void backOffKeepaliveAlarm();
+      return;
+    }
+    if (event.code === 1006) {
+      console.warn(`[rpa-studio-bridge] websocket dropped, retrying in ${DROPPED_CONNECTION_RETRY_MS / 1000}s`);
+      scheduleReconnect(DROPPED_CONNECTION_RETRY_MS);
       return;
     }
     scheduleReconnect();
@@ -848,7 +873,8 @@ async function resumeHumanTakeover(taskId: string): Promise<void> {
 
 export default defineBackground(() => {
   connect();
-  void browser.alarms.create(KEEPALIVE_ALARM_NAME, { periodInMinutes: KEEPALIVE_PERIOD_MINUTES });
+  // 只在缺失时建：每次唤醒都跑到这里，无条件 create 会把退避周期打回 1 分钟。
+  void ensureKeepaliveAlarm();
   browser.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name !== KEEPALIVE_ALARM_NAME) return;
     if (!isSocketActive()) scheduleReconnect();
