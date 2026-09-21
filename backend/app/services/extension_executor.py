@@ -200,7 +200,7 @@ class ExtensionExecutor:
     async def _highlight_best_effort(self, selector: str) -> None:
         """纯视觉反馈，失败或超时不应影响实际动作。"""
         try:
-            await self._bridge.execute({"type": "highlight", "selector": selector, "durationMs": 900}, timeout=2.0)
+            await self._bridge.execute({"type": "highlight", "selector": selector}, timeout=2.0)
         except Exception:
             pass
 
