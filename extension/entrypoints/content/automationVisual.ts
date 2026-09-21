@@ -274,7 +274,9 @@ export function pulseClickAt(x: number, y: number): void {
   }, 320);
 }
 
-export function highlightElement(el: Element, _durationMs: number): void {
+// 「高亮」就是把光标挪到元素中心，不画停留时长的高亮框：合成光标本身已经是可见反馈，
+// 再叠一层框会把它盖住。调用方因此不需要传时长。
+export function highlightElement(el: Element): void {
   const rect = el.getBoundingClientRect();
   moveCursorTo(rect.x + rect.width / 2, rect.y + rect.height / 2);
 }

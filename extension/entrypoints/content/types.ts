@@ -66,8 +66,6 @@ export interface ContentAction {
   limit?: number;
   /** browser.scroll 使用：page-level 滚动像素数，对齐 BrowserActionRunner 的 distance 字段名 */
   distance?: number;
-  /** highlight 使用：高亮框保留时长（毫秒），默认 900 */
-  durationMs?: number;
   /** takeover.show 使用：展示给用户的接管说明文案 */
   message?: string;
   /** takeover.show 使用：所属的后端任务 id，点击"继续"按钮时带回去调 resume 接口 */

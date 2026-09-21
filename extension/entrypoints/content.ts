@@ -347,7 +347,7 @@ async function handleAction(action: ContentAction): Promise<unknown> {
       return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
     }
     case 'highlight': {
-      highlightElement(resolveElement(action), action.durationMs ?? 900);
+      highlightElement(resolveElement(action));
       return { ok: true };
     }
     case 'automation.activity': {
