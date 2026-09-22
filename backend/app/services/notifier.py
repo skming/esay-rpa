@@ -24,7 +24,7 @@ def _sign(secret: str, timestamp_ms: int) -> str:
 
 
 class DingTalkNotifier:
-    """从不抛出异常——通知渠道配置错误或不可达不应影响流程执行。"""
+    """业务通知失败只记日志；连接测试将错误返回给设置页。"""
 
     def __init__(self, config_service: NotificationConfigService | None = None) -> None:
         self._config_service = config_service or NotificationConfigService()
@@ -44,6 +44,20 @@ class DingTalkNotifier:
             return
         secret = str(config.get("dingtalk_secret") or "").strip()
 
+        try:
+            await self._send(webhook_url=webhook_url, secret=secret, markdown_text=markdown_text)
+        except Exception as exc:
+            logger.warning("Failed to send DingTalk notification: %s", exc)
+
+    async def test(self, *, webhook_url: str, secret: str) -> None:
+        await self._send(
+            webhook_url=webhook_url,
+            secret=secret,
+            markdown_text="#### Easy RPA 测试通知\n通知渠道连接正常。",
+        )
+
+    @staticmethod
+    async def _send(*, webhook_url: str, secret: str, markdown_text: str) -> None:
         url = webhook_url
         if secret:
             timestamp_ms = int(time.time() * 1000)
@@ -60,7 +74,15 @@ class DingTalkNotifier:
                 response = await client.post(url, json=payload)
                 response.raise_for_status()
                 result = response.json()
-                if result.get("errcode") not in (0, None):
-                    logger.warning("DingTalk notification rejected: %s", result)
-        except Exception:
-            logger.exception("Failed to send DingTalk notification")
+        except httpx.TimeoutException:
+            raise RuntimeError("钉钉 Webhook 请求超时") from None
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(f"钉钉 Webhook 返回 HTTP {exc.response.status_code}") from None
+        except httpx.RequestError:
+            raise RuntimeError("无法连接钉钉 Webhook") from None
+        except ValueError:
+            raise RuntimeError("钉钉 Webhook 返回了无法解析的响应") from None
+        if not isinstance(result, dict):
+            raise RuntimeError("钉钉 Webhook 返回了无法解析的响应")
+        if result.get("errcode") not in (0, None):
+            raise RuntimeError(str(result.get("errmsg") or f"钉钉拒绝通知：{result['errcode']}"))

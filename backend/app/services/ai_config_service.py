@@ -280,7 +280,10 @@ class AiConfigService:
         current = self._read_file()
 
         if "default_model" in patch and isinstance(patch["default_model"], str):
-            current["default_model"] = patch["default_model"]
+            default_model = patch["default_model"].strip()
+            if not any(model.get("id") == default_model for model in AI_MODEL_CATALOG):
+                raise ValueError(f"默认模型不在目录中: {default_model or '(empty)'}")
+            current["default_model"] = default_model
 
         if "provider_models" in patch and isinstance(patch["provider_models"], dict):
             pm: dict[str, Any] = {}

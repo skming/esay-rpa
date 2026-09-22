@@ -82,6 +82,15 @@ def test_save_ignores_masked_placeholder_value(service: AiConfigService) -> None
     assert service.load()["api_keys"] == {_ENV_KEY: "sk-ant-test-123"}
 
 
+def test_save_rejects_unknown_default_model(service: AiConfigService) -> None:
+    with pytest.raises(ValueError, match="默认模型不在目录中"):
+        service.save({"default_model": "missing-model"})
+
+    model_id = AI_MODEL_CATALOG[0]["id"]
+    service.save({"default_model": model_id})
+    assert service.load()["default_model"] == model_id
+
+
 class _MemoryCatalogStore:
     """内存版 ModelCatalogStore，避免 init_catalog 的测试碰真实数据库。"""
 

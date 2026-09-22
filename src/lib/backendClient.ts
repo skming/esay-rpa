@@ -67,6 +67,8 @@ export type NotificationConfig = {
   dingtalk_secret: string;
 };
 
+export type NotificationTestResult = { status: 'sent' };
+
 export type CsvPreviewData = {
   path: string;
   headers: string[];
@@ -440,6 +442,10 @@ export class BackendClient {
 
   async setNotificationConfig(payload: Record<string, unknown>): Promise<NotificationConfig> {
     return await this.request<NotificationConfig>('/api/notifications/config', { body: payload, method: 'PUT', timeoutMs: 5000 });
+  }
+
+  async testNotification(payload: Record<string, unknown>): Promise<NotificationTestResult> {
+    return await this.request<NotificationTestResult>('/api/notifications/test', { body: payload, method: 'POST', timeoutMs: 8000 });
   }
 
   async previewCsv(path: string): Promise<CsvPreviewData> {

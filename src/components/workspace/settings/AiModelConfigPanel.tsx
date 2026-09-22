@@ -21,7 +21,7 @@ import { Button, IconButton } from '../../ui/button';
 import { Checkbox } from '../../ui/checkbox';
 import { Collapsible } from '../../ui/collapsible';
 import { Dialog, DialogBody, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '../../ui/dialog';
-import { SettingsContent } from './SettingsContent';
+import { SettingsContent, SettingsLoadError } from './SettingsContent';
 
 
 type ProviderGroup = { key: string; label: string; env_key: string; placeholder: string; docsUrl: string };
@@ -102,7 +102,9 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
   const [deleteTarget, setDeleteTarget] = useState<AiModelMeta | null>(null);
   const [draftCatalogModel, setDraftCatalogModel] = useState<DraftCatalogModel>(EMPTY_DRAFT_MODEL);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [draftDefaultModel, setDraftDefaultModel] = useState('');
   const [draftKeys, setDraftKeys] = useState<Record<string, string>>({});
   const [draftBaseUrls, setDraftBaseUrls] = useState<Record<string, string>>({});
   const [showKeys, setShowKeys] = useState<Record<string, boolean>>({});
@@ -127,20 +129,29 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
   // 不该把整个面板打回骨架屏
   const load = useCallback(async () => {
     try {
-      const cfg = electron.available && bridge
-        ? (await bridge.getAiConfig()).data
-        : await backend.getAiConfig();
+      const cfg = await (async (): Promise<AiConfig> => {
+        if (!electron.available || !bridge) return await backend.getAiConfig();
+        const result = await bridge.getAiConfig();
+        if (!result.ok || !result.data) throw new Error(result.error ?? 'AI 配置读取失败');
+        return result.data;
+      })();
       if (cfg) {
         // config 是「后端存了哪些密钥」的唯一来源：漏掉它，storedValue 恒为空，
         // 已配置的服务商会显示成未配置，测试连接也拿不到密钥。
         setConfig(cfg);
         setDraftBaseUrls(cfg.base_urls ?? {});
+        setDraftDefaultModel(cfg.default_model);
       }
-      applyModelsResult(electron.available && bridge
-        ? (await bridge.listAiModels()).data
-        : await backend.listAiModels());
-    } catch {
-      // 配置读取失败不阻断设置页渲染，用户仍可通过保存操作重试。
+      const models = await (async (): Promise<AiModelsResult> => {
+        if (!electron.available || !bridge) return await backend.listAiModels();
+        const result = await bridge.listAiModels();
+        if (!result.ok || !result.data) throw new Error(result.error ?? '模型目录读取失败');
+        return result.data;
+      })();
+      applyModelsResult(models);
+      setLoadError(null);
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : 'AI 配置读取失败');
     } finally {
       setLoading(false);
     }
@@ -157,10 +168,12 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
         // 空字符串表示"清除该密钥"，必须发给后端；只过滤含掩码的中间态输入。
         api_keys: Object.fromEntries(Object.entries(draftKeys).filter(([, v]) => !v.includes('****'))),
         base_urls: draftBaseUrls,
+        default_model: draftDefaultModel,
       };
       let updated: AiConfig | undefined;
       if (electron.available && bridge) {
         const res = await bridge.setAiConfig(payload);
+        if (!res.ok || !res.data) throw new Error(res.error ?? 'AI 配置保存失败');
         updated = res.data;
       } else {
         updated = await backend.setAiConfig(payload);
@@ -168,10 +181,12 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
       if (updated) {
         setConfig(updated);
         setDraftKeys({});
+        setDraftBaseUrls(updated.base_urls ?? {});
+        setDraftDefaultModel(updated.default_model);
       }
       electron.pushToast('success', 'AI 配置已保存');
-    } catch {
-      electron.pushToast('error', 'AI 配置保存失败，请检查后端服务');
+    } catch (error) {
+      electron.pushToast('error', error instanceof Error ? error.message : 'AI 配置保存失败');
     } finally {
       setSaving(false);
     }
@@ -322,6 +337,10 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
         return await backend.deleteAiModel(model.id);
       })();
       applyModelsResult(refreshed);
+      if (refreshed?.default) {
+        setDraftDefaultModel(refreshed.default);
+        setConfig((current) => current === null ? current : { ...current, default_model: refreshed.default });
+      }
       setDeleteTarget(null);
       electron.pushToast('success', '模型已删除');
     } catch (error) {
@@ -332,6 +351,11 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
   };
 
   const providerGroups = toProviderGroups(providerMeta, modelCatalog);
+  const hasChanges = config !== null && (
+    Object.keys(draftKeys).length > 0
+    || draftDefaultModel !== config.default_model
+    || JSON.stringify(draftBaseUrls) !== JSON.stringify(config.base_urls ?? {})
+  );
 
   const configuredCount = providerGroups.filter(g => {
     const draft = draftKeys[g.env_key];
@@ -357,6 +381,32 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
       title="AI 模型配置"
     >
       <div className="@container grid max-w-300 gap-6">
+        {loadError !== null && (
+          <SettingsLoadError
+            message={loadError}
+            onRetry={() => {
+              setLoading(true);
+              setLoadError(null);
+              void load();
+            }}
+          />
+        )}
+        {config !== null && modelCatalog.length > 0 && (
+          <div className="grid gap-1.5">
+            <label className="text-[11px] font-medium text-ink-2" htmlFor="default-ai-model">后台分析默认模型</label>
+            <select
+              className={aiFieldClass}
+              id="default-ai-model"
+              onChange={(event) => setDraftDefaultModel(event.target.value)}
+              value={draftDefaultModel}
+            >
+              {modelCatalog.map((model) => (
+                <option key={model.id} value={model.id}>{model.label} · {model.id}</option>
+              ))}
+            </select>
+            <p className="text-[11px] text-ink-3">用于页面遮罩分析、自愈和未指定模型的请求。</p>
+          </div>
+        )}
         <div className="grid gap-2">
           <div className="flex items-center justify-between gap-3">
             <span className="text-[11px] font-medium text-ink-2">服务商密钥</span>
@@ -431,16 +481,18 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
                       />
 
                       <div className="flex h-7 items-center justify-end gap-1 @min-3xl:gap-0.5 @min-3xl:rounded-md @min-3xl:bg-surface @min-3xl:p-0.5">
-                        <IconButton
-                          className="h-6 w-6 text-ink-4 hover:text-ink"
-                          label={`打开 ${g.label} API Key 页面`}
-                          variant="ghost"
-                          asChild
-                        >
-                          <a href={g.docsUrl} rel="noreferrer" target="_blank">
-                            <ExternalLink className="h-3.5 w-3.5" strokeWidth={1.5} />
-                          </a>
-                        </IconButton>
+                        {g.docsUrl !== '' && (
+                          <IconButton
+                            className="h-6 w-6 text-ink-4 hover:text-ink"
+                            label={`打开 ${g.label} API Key 页面`}
+                            variant="ghost"
+                            asChild
+                          >
+                            <a href={g.docsUrl} rel="noreferrer" target="_blank">
+                              <ExternalLink className="h-3.5 w-3.5" strokeWidth={1.5} />
+                            </a>
+                          </IconButton>
+                        )}
                         <IconButton
                           active={modelDialog?.mode === 'add' && modelDialog.provider.key === g.key}
                           className="h-6 w-6 text-ink-4 hover:text-ink"
@@ -464,7 +516,7 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
                                 busy={catalogBusy === `delete:${model.id}`}
                                 key={model.id}
                                 model={model}
-                                testDisabled={!isConfigured && !draftValue}
+                                testDisabled={!isConfigured && !(draftBaseUrls[g.env_key] ?? '').trim()}
                                 testResult={getTestResult(model.id)}
                                 onDelete={() => setDeleteTarget(model)}
                                 onEdit={() => handleStartEditModel(model)}
@@ -498,7 +550,7 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
       <div className="flex items-center justify-end gap-3 pt-3">
         <Button
           className="h-8 rounded-md px-4 text-[11px]"
-          disabled={saving || loading}
+          disabled={saving || loading || !hasChanges}
           onClick={() => void handleSave()}
           variant="subtle"
         >
@@ -569,7 +621,7 @@ function ManagedModelTag({
   const title = `${model.label} · ${model.id}${context ? ` · ${context}` : ''} · 点击编辑`;
   const ts = testResult.status;
   const testTitle = (() => {
-    if (testDisabled) return '先填写该服务商的 API Key';
+    if (testDisabled) return '先填写该服务商的 API Key 或 Base URL';
     if (ts === 'testing') return '测试连接中';
     if (ts === 'ok') {
       const latency = testResult.latencyMs ? `，${testResult.latencyMs}ms` : '';

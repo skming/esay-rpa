@@ -71,6 +71,52 @@ async def test_health_and_code_generation_endpoints() -> None:
         assert "scrapling.fetchers" in payload["content"]
 
 
+async def test_code_generation_rejects_flow_that_cannot_run_standalone() -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        response = await client.post(
+            "/api/code/generate",
+            json={
+                "flowName": "交互流程",
+                "flowDefinition": {
+                    "nodes": [{"id": "click", "type": "browser.click", "title": "点击登录"}],
+                    "edges": [],
+                },
+            },
+        )
+
+    assert response.status_code == 422
+    assert "点击登录（browser.click）" in response.json()["detail"]
+
+
+async def test_notification_config_rejects_invalid_enabled_state() -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        response = await client.put("/api/notifications/config", json={
+            "dingtalk_enabled": True,
+            "dingtalk_webhook_url": "",
+        })
+    assert response.status_code == 422
+    assert "Webhook URL" in response.json()["detail"]
+
+
+async def test_notification_test_uses_draft_without_saving(monkeypatch) -> None:
+    import app.main as main_module
+
+    sent: dict[str, str] = {}
+
+    async def fake_test(*, webhook_url: str, secret: str) -> None:
+        sent.update(webhook_url=webhook_url, secret=secret)
+
+    monkeypatch.setattr(main_module.dingtalk_notifier, "test", fake_test)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        response = await client.post("/api/notifications/test", json={
+            "dingtalk_webhook_url": "https://example.test/draft-hook",
+            "dingtalk_secret": "draft-secret",
+        })
+    assert response.status_code == 200
+    assert response.json() == {"status": "sent"}
+    assert sent == {"webhook_url": "https://example.test/draft-hook", "secret": "draft-secret"}
+
+
 async def test_site_analyze_endpoint_returns_selector_risk(monkeypatch) -> None:
     class FakeAnalyzer:
         async def analyze(self, request: AnalyzeSiteRequest):

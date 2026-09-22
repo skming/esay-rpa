@@ -92,7 +92,7 @@ from app.services.ai_tools import RpaToolExecutor
 from app.services.ai_orchestrator import AiOrchestrator
 from app.services.code_generator import ScraplingCodeGenerator
 from app.services.log_broker import LogBroker
-from app.services.notification_config_service import NotificationConfigService
+from app.services.notification_config_service import NotificationConfigService, validate_dingtalk_webhook_url
 from app.services.notifier import DingTalkNotifier
 from app.services.extension_bridge_service import ExtensionBridgeService
 from app.services.extension_config_service import ExtensionConfigService
@@ -543,7 +543,10 @@ async def get_ai_config() -> dict:
 
 @app.put("/api/ai/config")
 async def set_ai_config(payload: dict) -> dict:
-    ai_config_service.save(payload)
+    try:
+        ai_config_service.save(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     # Re-apply keys to env so newly configured keys take effect immediately
     ai_config_service.apply_to_env(ai_config_service.load())
     return ai_config_service.get_masked_config()
@@ -556,8 +559,29 @@ async def get_notification_config() -> dict:
 
 @app.put("/api/notifications/config")
 async def set_notification_config(payload: dict) -> dict:
-    notification_config_service.save(payload)
+    try:
+        notification_config_service.save(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return notification_config_service.get_masked_config()
+
+
+@app.post("/api/notifications/test")
+async def test_notification(payload: dict) -> dict:
+    stored = notification_config_service.load()
+    try:
+        webhook_url = validate_dingtalk_webhook_url(
+            str(payload.get("dingtalk_webhook_url", stored["dingtalk_webhook_url"]))
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    secret_value = payload.get("dingtalk_secret")
+    secret = str(stored["dingtalk_secret"] if secret_value is None or "****" in str(secret_value) else secret_value).strip()
+    try:
+        await dingtalk_notifier.test(webhook_url=webhook_url, secret=secret)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"status": "sent"}
 
 
 @app.get("/api/ai/models")

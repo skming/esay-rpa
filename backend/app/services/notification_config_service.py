@@ -3,10 +3,19 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from app.core import storage
 
 _CONFIG_FILENAME = "notifications.json"
+
+
+def validate_dingtalk_webhook_url(value: str) -> str:
+    url = value.strip()
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise ValueError("钉钉 Webhook 必须是有效的 HTTPS URL")
+    return url
 
 
 def _mask_secret(value: str) -> str:
@@ -66,6 +75,12 @@ class NotificationConfigService:
                 current["dingtalk_secret"] = stripped
             elif stripped == "":
                 current["dingtalk_secret"] = ""
+
+        webhook_url = str(current["dingtalk_webhook_url"])
+        if webhook_url:
+            current["dingtalk_webhook_url"] = validate_dingtalk_webhook_url(webhook_url)
+        if current["dingtalk_enabled"] and not webhook_url:
+            raise ValueError("启用钉钉通知前必须填写 Webhook URL")
 
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._path.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")

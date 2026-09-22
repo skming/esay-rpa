@@ -1,13 +1,13 @@
 import { Check, Copy, ExternalLink, FolderOpen, Loader2, Puzzle } from 'lucide-react';
 import type { ReactElement } from 'react';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { backend, type ExtensionStatus } from '../../../lib/backendClient';
 import type { ElectronBridgeState } from '../../../hooks/useElectronBridge';
 import type { ExtensionInstallInfo } from '../../../types/electron';
 import { cn } from '../../../lib/utils';
 import { Button } from '../../ui/button';
 import { Switch } from '../../ui/switch';
-import { SettingsContent } from './SettingsContent';
+import { SettingsContent, SettingsLoadError } from './SettingsContent';
 
 const POLL_INTERVAL_MS = 3000;
 
@@ -33,20 +33,21 @@ function formatConnectedDuration(connectedSince: string | null): string | null {
 export function ExtensionConfigPanel({ electron }: { electron: ElectronBridgeState }): ReactElement {
   const [status, setStatus] = useState<ExtensionStatus | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [savingEnabled, setSavingEnabled] = useState(false);
   const [installInfo, setInstallInfo] = useState<ExtensionInstallInfo | null>(null);
   const [openingFolder, setOpeningFolder] = useState(false);
   const [openingChromePage, setOpeningChromePage] = useState(false);
   const [pathCopied, setPathCopied] = useState(false);
-  const wasConnectedRef = useRef(false);
 
   const bridge = typeof window !== 'undefined' ? (window.rpaBridge ?? null) : null;
 
   const load = useCallback(async () => {
     try {
       setStatus(await backend.getExtensionStatus());
-    } catch {
-      // 拉取失败时保留上一次的状态展示，用户仍可重试保存操作触发下一次拉取。
+      setLoadError(null);
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : '扩展状态读取失败');
     } finally {
       setLoading(false);
     }
@@ -59,14 +60,6 @@ export function ExtensionConfigPanel({ electron }: { electron: ElectronBridgeSta
     const interval = setInterval(() => { void load(); }, POLL_INTERVAL_MS);
     return () => clearInterval(interval);
   }, [load]);
-
-  useEffect(() => {
-    const connectedNow = status?.connected ?? false;
-    if (connectedNow && !wasConnectedRef.current) {
-      electron.pushToast('success', '浏览器扩展已连接');
-    }
-    wasConnectedRef.current = connectedNow;
-  }, [status?.connected, electron]);
 
   useEffect(() => {
     if (bridge === null) return;
@@ -100,6 +93,8 @@ export function ExtensionConfigPanel({ electron }: { electron: ElectronBridgeSta
       if (!result.ok) {
         electron.pushToast('error', result.error ?? '打开文件夹失败');
       }
+    } catch (error) {
+      electron.pushToast('error', error instanceof Error ? error.message : '打开文件夹失败');
     } finally {
       setOpeningFolder(false);
     }
@@ -126,15 +121,19 @@ export function ExtensionConfigPanel({ electron }: { electron: ElectronBridgeSta
       } else if (!result.ok) {
         electron.pushToast('error', result.error ?? '打开扩展管理页面失败');
       }
+    } catch (error) {
+      electron.pushToast('error', error instanceof Error ? error.message : '打开扩展管理页面失败');
     } finally {
       setOpeningChromePage(false);
     }
   };
 
   const connected = status?.connected ?? false;
+  const canExecute = status?.canExecute ?? false;
   const enabled = status?.enabled ?? true;
   const connectedDuration = formatConnectedDuration(status?.connectedSince ?? null);
-  const showInstallAssist = !connected || !enabled;
+  const reconnecting = connected && !canExecute;
+  const showInstallAssist = status !== null && enabled && !connected && !loading;
 
   return (
     <SettingsContent
@@ -143,12 +142,22 @@ export function ExtensionConfigPanel({ electron }: { electron: ElectronBridgeSta
       title="浏览器扩展"
     >
       <div className="grid w-full max-w-300 gap-4">
+        {loadError !== null && (
+          <SettingsLoadError
+            message={loadError}
+            onRetry={() => {
+              setLoading(true);
+              setLoadError(null);
+              void load();
+            }}
+          />
+        )}
         <div className="rounded-lg border border-rule-2 bg-paper-sunk/60 p-4">
           <div className="flex items-center justify-between gap-3">
             <div className="flex items-center gap-2">
-              <span className={cn('h-2 w-2 shrink-0 rounded-full', connected ? 'bg-live' : 'bg-ink-4')} />
+              <span className={cn('h-2 w-2 shrink-0 rounded-full', canExecute ? 'bg-emerald-600' : reconnecting ? 'bg-amber-500' : 'bg-ink-4')} />
               <span className="text-[12px] font-medium text-ink-2">
-                {connected ? '已连接到浏览器扩展' : '未连接'}
+                {canExecute ? '已连接到浏览器扩展' : reconnecting ? '连接已中断，正在重连' : '未连接'}
               </span>
             </div>
             <Switch
@@ -163,62 +172,62 @@ export function ExtensionConfigPanel({ electron }: { electron: ElectronBridgeSta
               ? '流程运行时可选择浏览器插件执行。'
               : '已关闭：运行配置中将无法选择「使用浏览器插件执行」，即使有扩展连接也不会被使用。'}
           </p>
-          {connected && connectedDuration !== null && (
+          {canExecute && connectedDuration !== null && (
             <p className="mt-1.5 text-[11px] text-ink-3">{connectedDuration}</p>
           )}
         </div>
 
         {showInstallAssist && (
-          <div className="rounded-lg border border-rule-2 p-4">
-            <p className="text-[11px] font-medium text-ink-2">
-              {installInfo?.found === false ? '尚未找到扩展安装包' : '还没有连接？帮你安装'}
+          <div className="rounded-lg border border-rule-2 bg-paper p-4">
+            <p className="text-[12px] font-medium text-ink-2">
+              {installInfo?.found === false ? '扩展文件不可用' : '安装浏览器扩展'}
+            </p>
+            <p className="mt-1 text-[11px] leading-relaxed text-ink-3">
+              {installInfo?.found === false
+                ? '客户端中没有找到扩展文件，请重新安装 Easy RPA。'
+                : '扩展已包含在 Easy RPA 中，Chrome 需要你确认加载一次。'}
             </p>
 
-            {installInfo?.found !== false && installInfo?.unpackedDir != null && (
-              <div className="mt-2 flex items-center gap-1.5 rounded-md bg-paper-sunk px-2 py-1.5">
-                <code className="min-w-0 flex-1 truncate font-mono text-[11px] text-ink-3">{installInfo.unpackedDir}</code>
-                <button
-                  className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-ink-3 hover:bg-paper hover:text-ink-2"
-                  onClick={() => void handleCopyPath()}
-                  type="button"
-                >
-                  {pathCopied ? <Check className="h-3 w-3 text-live" /> : <Copy className="h-3 w-3" />}
-                  {pathCopied ? '已复制' : '复制路径'}
-                </button>
-              </div>
+            {installInfo?.found !== false && bridge !== null && (
+              <>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <Button
+                    disabled={openingChromePage}
+                    onClick={() => void handleOpenChromeExtensionsPage()}
+                    size="sm"
+                    variant="secondary"
+                  >
+                    {openingChromePage ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ExternalLink className="h-3.5 w-3.5" />}
+                    打开扩展管理
+                  </Button>
+                  <Button
+                    disabled={openingFolder}
+                    onClick={() => void handleOpenFolder()}
+                    size="sm"
+                    variant="ghost"
+                  >
+                    {openingFolder ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FolderOpen className="h-3.5 w-3.5" />}
+                    显示扩展文件夹
+                  </Button>
+                </div>
+                <ol className="mt-3 grid gap-1.5 text-[11px] leading-relaxed text-ink-3">
+                  <li>1. 在扩展管理页开启「开发者模式」。</li>
+                  <li>2. 点击「加载已解压的扩展程序」，选择刚打开的扩展文件夹。</li>
+                </ol>
+                {installInfo?.unpackedDir != null && (
+                  <button
+                    className="mt-2 flex items-center gap-1 text-[11px] text-ink-3 hover:text-ink-2"
+                    onClick={() => void handleCopyPath()}
+                    type="button"
+                  >
+                    {pathCopied ? <Check className="h-3 w-3 text-live" /> : <Copy className="h-3 w-3" />}
+                    {pathCopied ? '路径已复制' : '复制扩展路径'}
+                  </button>
+                )}
+              </>
             )}
-
-            <ol className="mt-3 grid gap-1.5 text-[11px] leading-relaxed text-ink-3">
-              <li>1. 打开 Chrome 扩展管理页面，开启右上角「开发者模式」。</li>
-              <li>2. 点击「加载已解压的扩展程序」，粘贴上方路径（或用「在文件夹中显示」定位）。</li>
-              <li>3. 点击工具栏上的插件图标，确认弹窗显示"已连接到 Easy RPA"，并保持该浏览器窗口打开。</li>
-            </ol>
-            {bridge !== null ? (
-              <div className="mt-3 flex flex-wrap gap-2">
-                <Button
-                  disabled={openingChromePage}
-                  onClick={() => void handleOpenChromeExtensionsPage()}
-                  size="sm"
-                  variant="secondary"
-                >
-                  {openingChromePage ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ExternalLink className="h-3.5 w-3.5" />}
-                  打开 Chrome 扩展管理页面
-                </Button>
-                <Button
-                  disabled={openingFolder || installInfo?.found === false}
-                  onClick={() => void handleOpenFolder()}
-                  size="sm"
-                  variant="ghost"
-                >
-                  {openingFolder ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FolderOpen className="h-3.5 w-3.5" />}
-                  在文件夹中显示
-                </Button>
-              </div>
-            ) : (
-              <p className="mt-3 text-[11px] text-ink-3">在浏览器网页模式下无法自动打开文件夹，请在桌面客户端中操作，或手动在 Chrome 地址栏输入 chrome://extensions/。</p>
-            )}
-            {installInfo?.found === false && (
-              <p className="mt-2 text-[11px] text-ink-3">未在应用目录中找到扩展构建产物，请先在 extension/ 目录执行构建。</p>
+            {installInfo?.found !== false && bridge === null && (
+              <p className="mt-3 text-[11px] text-ink-3">请在 Easy RPA 桌面客户端中完成安装。</p>
             )}
           </div>
         )}

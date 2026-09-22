@@ -1,4 +1,4 @@
-import { ArrowDownToLine, Cpu, ExternalLink, Loader2, RefreshCw, Trash2 } from 'lucide-react';
+import { ArrowDownToLine, Cpu, ExternalLink, Loader2, RefreshCw } from 'lucide-react';
 import type { ReactElement, ReactNode } from 'react';
 import { useEffect, useState } from 'react';
 import { cn } from '../../../lib/utils';
@@ -12,17 +12,10 @@ const UPDATE_ERROR_LABELS: Record<string, string> = {
   'update-dev-mode': '开发模式下不检查更新',
 };
 
-export function SystemInfoPanel({
-  clearing,
-  electron,
-  onClear,
-}: {
-  clearing: 'cache' | 'all' | null;
-  electron: ElectronBridgeState;
-  onClear: (scope: 'cache' | 'all') => Promise<void>;
-}): ReactElement {
+export function SystemInfoPanel({ electron }: { electron: ElectronBridgeState }): ReactElement {
   const [status, setStatus] = useState<AppUpdateStatus>({ status: 'idle' });
   const [checkedAt, setCheckedAt] = useState<Date | null>(null);
+  const [restarting, setRestarting] = useState(false);
   const bridge = typeof window !== 'undefined' ? (window.rpaBridge ?? null) : null;
 
   useEffect(() => {
@@ -43,6 +36,14 @@ export function SystemInfoPanel({
   const isDownloading = status.status === 'downloading';
   const isReady = status.status === 'ready';
   const isAvailable = status.status === 'available';
+  const restartBackend = async (): Promise<void> => {
+    setRestarting(true);
+    try {
+      await electron.restartBackend();
+    } finally {
+      setRestarting(false);
+    }
+  };
 
   const statusLabel = (() => {
     switch (status.status) {
@@ -76,8 +77,8 @@ export function SystemInfoPanel({
 
         <SystemGroup
           action={
-            <IconButton className="h-6 w-6 text-ink-4 hover:text-ink" label="重启后端服务" onClick={() => electron.restartBackend()}>
-              <RefreshCw className="h-3.5 w-3.5" strokeWidth={1.5} />
+            <IconButton className="h-6 w-6 text-ink-4 hover:text-ink" disabled={restarting} label={restarting ? '正在重启后端服务' : '重启后端服务'} onClick={() => void restartBackend()}>
+              <RefreshCw className={cn('h-3.5 w-3.5', restarting && 'animate-spin')} strokeWidth={1.5} />
             </IconButton>
           }
           title="服务"
@@ -138,38 +139,6 @@ export function SystemInfoPanel({
           )}
         </SystemGroup>
 
-        <SystemGroup title="本地数据">
-          <div className="grid gap-x-8 gap-y-1 sm:grid-cols-2">
-            <LocalDataAction
-              action={
-                <IconButton
-                  className="h-6 w-6 text-ink-4 hover:text-ink"
-                  disabled={clearing !== null}
-                  label={clearing === 'cache' ? '清除中' : '清除缓存'}
-                  onClick={() => void onClear('cache')}
-                >
-                  <Trash2 className="h-3.5 w-3.5" strokeWidth={1.5} />
-                </IconButton>
-              }
-              description="不影响已保存流程"
-              title="缓存"
-            />
-            <LocalDataAction
-              action={
-                <IconButton
-                  className="h-6 w-6 text-red-500 hover:bg-red-50 hover:text-red-600"
-                  disabled={clearing !== null}
-                  label={clearing === 'all' ? '重置中' : '重置全部本地数据'}
-                  onClick={() => void onClear('all')}
-                >
-                  <Trash2 className="h-3.5 w-3.5" strokeWidth={1.5} />
-                </IconButton>
-              }
-              description="清除草稿与偏好"
-              title="本地状态"
-            />
-          </div>
-        </SystemGroup>
       </div>
     </SettingsContent>
   );
@@ -257,32 +226,21 @@ function InfoRow({
   );
 }
 
-function LocalDataAction({
-  action,
-  description,
-  title,
-}: {
-  action: ReactElement;
-  description: string;
-  title: string;
-}): ReactElement {
-  return (
-    <div className="flex min-w-0 items-center justify-between gap-3 py-1">
-      <span className="min-w-0">
-        <span className="block text-[11px] font-medium text-ink-2">{title}</span>
-        <span className="block truncate text-[11px] text-ink-3">{description}</span>
-      </span>
-      {action}
-    </div>
-  );
-}
-
 function DataDirRow({ appDataDir, electron }: { appDataDir: string; electron: ElectronBridgeState }): ReactElement {
-  const openDir = (): void => {
-    void (electron.available
-      ? (window.rpaBridge?.openDataDir() ?? Promise.resolve())
-      : navigator.clipboard.writeText(appDataDir)
-    );
+  const openDir = async (): Promise<void> => {
+    try {
+      if (electron.available) {
+        const bridge = window.rpaBridge;
+        if (!bridge) throw new Error('桌面桥接服务不可用');
+        const result = await bridge.openDataDir();
+        if (!result.ok) throw new Error(result.error ?? '打开数据目录失败');
+        return;
+      }
+      await navigator.clipboard.writeText(appDataDir);
+      electron.pushToast('success', '数据目录已复制');
+    } catch (error) {
+      electron.pushToast('error', error instanceof Error ? error.message : '数据目录操作失败');
+    }
   };
 
   return (
@@ -297,7 +255,7 @@ function DataDirRow({ appDataDir, electron }: { appDataDir: string; electron: El
         <IconButton
           className="h-6 w-6 text-ink-4 hover:text-ink"
           label={electron.available ? '打开目录' : '复制到剪贴板'}
-          onClick={openDir}
+          onClick={() => void openDir()}
           variant="ghost"
         >
           <ExternalLink className="h-3 w-3" strokeWidth={1.5} />

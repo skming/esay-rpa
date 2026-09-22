@@ -1,4 +1,4 @@
-import { Bell, Eye, EyeOff, Loader2 } from 'lucide-react';
+import { Bell, Eye, EyeOff, Loader2, Send } from 'lucide-react';
 import type { ReactElement } from 'react';
 import { useCallback, useEffect, useState } from 'react';
 import { backend, type NotificationConfig } from '../../../lib/backendClient';
@@ -7,7 +7,7 @@ import { cn } from '../../../lib/utils';
 import { Button } from '../../ui/button';
 import { Collapsible } from '../../ui/collapsible';
 import { Switch } from '../../ui/switch';
-import { SettingsContent } from './SettingsContent';
+import { SettingsContent, SettingsLoadError } from './SettingsContent';
 
 const fieldClass = 'h-8 w-full rounded-md border border-rule-2 bg-surface px-2.5 text-[11px] text-ink-2 outline-none transition placeholder:text-ink-3 focus-visible:border-accent-line focus-visible:ring-2 focus-visible:ring-accent-soft';
 const monoFieldClass = cn(fieldClass, 'font-mono');
@@ -15,7 +15,9 @@ const monoFieldClass = cn(fieldClass, 'font-mono');
 export function NotificationConfigPanel({ electron }: { electron: ElectronBridgeState }): ReactElement {
   const [config, setConfig] = useState<NotificationConfig | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
   const [enabled, setEnabled] = useState(false);
   const [webhookUrl, setWebhookUrl] = useState('');
   const [secretDraft, setSecretDraft] = useState<string | null>(null);
@@ -29,8 +31,9 @@ export function NotificationConfigPanel({ electron }: { electron: ElectronBridge
       setEnabled(cfg.dingtalk_enabled);
       setWebhookUrl(cfg.dingtalk_webhook_url);
       setSecretDraft(null);
-    } catch {
-      // 配置读取失败不阻断设置页渲染，用户仍可通过保存操作重试。
+      setLoadError(null);
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : '通知配置读取失败');
     } finally {
       setLoading(false);
     }
@@ -54,15 +57,34 @@ export function NotificationConfigPanel({ electron }: { electron: ElectronBridge
       setConfig(updated);
       setSecretDraft(null);
       electron.pushToast('success', '通知配置已保存');
-    } catch {
-      // 保存失败时保留草稿，用户可直接重试
-      electron.pushToast('error', '通知配置保存失败，请检查后端服务');
+    } catch (error) {
+      electron.pushToast('error', error instanceof Error ? error.message : '通知配置保存失败');
     } finally {
       setSaving(false);
     }
   };
 
+  const handleTest = async (): Promise<void> => {
+    setTesting(true);
+    try {
+      await backend.testNotification({
+        dingtalk_webhook_url: webhookUrl.trim(),
+        dingtalk_secret: secretDraft ?? config?.dingtalk_secret ?? '',
+      });
+      electron.pushToast('success', '测试通知已发送');
+    } catch (error) {
+      electron.pushToast('error', error instanceof Error ? error.message : '测试通知发送失败');
+    } finally {
+      setTesting(false);
+    }
+  };
+
   const secretValue = secretDraft ?? config?.dingtalk_secret ?? '';
+  const hasChanges = config !== null && (
+    enabled !== config.dingtalk_enabled
+    || webhookUrl !== config.dingtalk_webhook_url
+    || secretDraft !== null
+  );
 
   return (
     <SettingsContent
@@ -71,6 +93,16 @@ export function NotificationConfigPanel({ electron }: { electron: ElectronBridge
       title="通知渠道"
     >
       <div className="grid w-full max-w-300 gap-4">
+        {loadError !== null && (
+          <SettingsLoadError
+            message={loadError}
+            onRetry={() => {
+              setLoading(true);
+              setLoadError(null);
+              void load();
+            }}
+          />
+        )}
         <Collapsible
           badge={<NotificationStatusBadge configured={enabled && webhookUrl.trim() !== ''} />}
           defaultOpen
@@ -85,7 +117,7 @@ export function NotificationConfigPanel({ electron }: { electron: ElectronBridge
               <p className="text-[11px] leading-snug text-ink-3">
                 配置钉钉机器人 Webhook，在钉钉群 → 群设置 → 智能群助手 → 添加机器人 中获取。
               </p>
-              <Switch checked={enabled} className="shrink-0" onCheckedChange={setEnabled} />
+              <Switch aria-label="启用钉钉通知" checked={enabled} className="shrink-0" onCheckedChange={setEnabled} />
             </div>
 
             <div className="grid gap-1.5">
@@ -131,8 +163,17 @@ export function NotificationConfigPanel({ electron }: { electron: ElectronBridge
 
       <div className="flex items-center justify-end gap-3 pt-3">
         <Button
+          className="h-8 rounded-md px-3 text-[11px]"
+          disabled={testing || loading || webhookUrl.trim() === ''}
+          onClick={() => void handleTest()}
+          variant="secondary"
+        >
+          {testing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
+          {testing ? '发送中…' : '发送测试'}
+        </Button>
+        <Button
           className="h-8 rounded-md px-4 text-[11px]"
-          disabled={saving || loading}
+          disabled={saving || loading || !hasChanges}
           onClick={() => void handleSave()}
           variant="subtle"
         >
