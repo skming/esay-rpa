@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { createElement } from 'react';
-import { toolDisplayStatus, toolResultStatus } from './toolResult';
+import { redactToolPayload, toolDisplayStatus, toolResultStatus, toolResultSummary } from './toolResult';
 import { ToolCallCard } from './ToolCallCard';
 
 describe('工具证据状态', () => {
@@ -20,7 +20,7 @@ describe('工具证据状态', () => {
     expect(toolDisplayStatus({ id: 'a', tool: 'run_flow', args: '{}', status: 'done', result: { error: 'timeout' } }, false)).toBe('error');
     expect(toolDisplayStatus({ id: 'a', tool: 'run_flow', args: '{}', status: 'running' }, false)).toBe('stopped');
   });
-  it('展开直接显示详情，不增加二次折叠或收起按钮', () => {
+  it('展开先显示结构化证据，原始数据保持二次折叠', () => {
     const html = renderToStaticMarkup(createElement(ToolCallCard, { expanded: true, toolCall: {
       id: 'a', tool: 'run_flow', args: '{}', status: 'done', result: {
         status: 'blocking_lint_findings', message: '请修复行选择器',
@@ -29,11 +29,39 @@ describe('工具证据状态', () => {
     } }));
     expect(html).toContain('已阻断');
     expect(html).toContain('选择器指向表格容器');
-    expect(html).toContain('结果');
-    expect(html).not.toContain('原始调用数据');
-    expect(html).not.toContain('<details');
+    expect(html).toContain('原始数据');
+    expect(html).toContain('<details');
     expect(html).not.toContain('收起');
   });
+});
+
+it('用实际工具结果生成紧凑证据摘要', () => {
+  expect(toolResultSummary({ id: '1', tool: 'run_flow', args: '{}', status: 'done', result: {
+    status: 'success', acceptance_audit: { passed: true },
+  } })).toBe('运行成功 · 验收通过');
+  expect(toolResultSummary({ id: '2', tool: 'update_flow', args: '{}', status: 'done', result: {
+    status: 'applied', revision: 8, changed_nodes: [{ id: 'n1' }, { id: 'n2' }],
+  } })).toBe('r8 · 2 个节点变更');
+  expect(toolResultSummary({ id: '3', tool: 'get_run_output', args: '{}', status: 'done', result: {
+    status: 'success', variables: {}, artifacts: [],
+  } })).toBe('无输出数据');
+  expect(toolResultSummary({ id: '4', tool: 'inspect_page', args: '{}', status: 'done', result: {
+    page_outcome: 'target_content_ready',
+    inputs: [{ actions: ['fill:v1:input'] }],
+    buttons: [{ actions: ['click:v1:button'] }],
+    page_actions: ['scroll:v1:page:down'],
+  } })).toBe('目标内容已就绪 · 3 个可操作目标');
+});
+
+it('原始工具数据隐藏凭据和运行变量值', () => {
+  expect(redactToolPayload({
+    password: 'secret', nested: { accessToken: 'token' }, variables: { page: 1, account: 'alice' }, visible: 'ok',
+    input_variables: [{ name: 'login', category: 'credential', value: 'alice' }],
+  }, '', true)).toEqual({
+    password: '••••', nested: { accessToken: '••••' }, variables: { page: '••••', account: '••••' }, visible: 'ok',
+    input_variables: [{ name: 'login', category: 'credential', value: '••••' }],
+  });
+  expect(redactToolPayload({ variables: { rows: [{ id: 1 }] } })).toEqual({ variables: { rows: [{ id: 1 }] } });
 });
 
 

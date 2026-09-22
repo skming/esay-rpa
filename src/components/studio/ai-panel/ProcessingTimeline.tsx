@@ -9,7 +9,7 @@ import { Marker, MarkerContent, MarkerIcon } from '../../ui/marker';
 import type { AiUsage, ToolCallState } from './aiPanelTypes';
 import { ToolCallCard } from './ToolCallCard';
 
-/** 把一轮对话的工具调用折叠成一条「处理中/已处理/需要确认」时间线。 */
+/** 把一轮工具调用折叠成一条活动摘要，异常与证据按需展开。 */
 function formatProcessingTime(ms: number): string {
   if (ms < 1000) return `${ms}ms`;
   if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)}s`;
@@ -18,7 +18,12 @@ function formatProcessingTime(ms: number): string {
   return `${minutes}m ${seconds}s`;
 }
 
-function buildProcessingSummary(toolCalls: ToolCallState[], processingMs?: number, streamingPending?: boolean): {
+function buildProcessingSummary(
+  toolCalls: ToolCallState[],
+  processingMs?: number,
+  streamingPending?: boolean,
+  activeLabel?: string,
+): {
   label: string;
   badge: string;
   tone: 'running' | 'error' | 'blocked' | 'done' | 'stopped';
@@ -31,36 +36,36 @@ function buildProcessingSummary(toolCalls: ToolCallState[], processingMs?: numbe
 
   if (streamingPending || runningCount > 0) {
     return {
-      label: `处理中${processingMs !== undefined ? ` ${formatProcessingTime(processingMs)}` : ''}`,
-      badge: `${doneCount}/${toolCalls.length} 步`,
+      label: activeLabel || '正在处理',
+      badge: `${doneCount}/${toolCalls.length}${processingMs !== undefined ? ` · ${formatProcessingTime(processingMs)}` : ''}`,
       tone: 'running',
     };
   }
   if (errorCount > 0) {
     return {
-      label: `已处理${processingMs !== undefined ? ` ${formatProcessingTime(processingMs)}` : ''}`,
-      badge: `${errorCount} 个异常`,
+      label: '操作记录',
+      badge: `${errorCount} 项异常${processingMs !== undefined ? ` · ${formatProcessingTime(processingMs)}` : ''}`,
       tone: 'error',
     };
   }
   // 编排守卫拦截：既不是失败也不该走绿色"已处理"，否则用户扫一眼摘要会以为全部顺利完成
   if (blockedCount > 0) {
     return {
-      label: `需要处理${processingMs !== undefined ? ` ${formatProcessingTime(processingMs)}` : ''}`,
-      badge: `${blockedCount} 步已阻断`,
+      label: '操作记录',
+      badge: `${blockedCount} 项阻断${processingMs !== undefined ? ` · ${formatProcessingTime(processingMs)}` : ''}`,
       tone: 'blocked',
     };
   }
   if (stoppedCount > 0) {
     return {
-      label: `已停止${processingMs !== undefined ? ` ${formatProcessingTime(processingMs)}` : ''}`,
-      badge: `${stoppedCount} 步未完成`,
+      label: '操作记录',
+      badge: `${stoppedCount} 项中断${processingMs !== undefined ? ` · ${formatProcessingTime(processingMs)}` : ''}`,
       tone: 'stopped',
     };
   }
   return {
-    label: `已处理${processingMs !== undefined ? ` ${formatProcessingTime(processingMs)}` : ''}`,
-    badge: `${toolCalls.length} 步`,
+    label: '操作记录',
+    badge: `${toolCalls.length} 次${processingMs !== undefined ? ` · ${formatProcessingTime(processingMs)}` : ''}`,
     tone: 'done',
   };
 }
@@ -98,15 +103,17 @@ export function ProcessingTimeline({
   streamingPending,
   usage,
   onFocusNode,
+  activeLabel,
 }: {
   toolCalls: ToolCallState[];
   processingMs?: number;
   streamingPending?: boolean;
   usage?: AiUsage;
   onFocusNode?: (nodeId: string) => void;
+  activeLabel?: string;
 }): ReactElement {
   const calls = toolCalls.map((call) => ({ ...call, status: toolDisplayStatus(call, Boolean(streamingPending)) }));
-  const summary = buildProcessingSummary(calls, processingMs, streamingPending);
+  const summary = buildProcessingSummary(calls, processingMs, streamingPending, activeLabel);
   // 手风琴：同时只展开一条。展开体是 JSON 代码块，两三条一起展开就把后面的步骤和最终回答推出几屏，
   // 要逐条收回来才能继续读——换成开新的自动关旧的，展开/收起都只需要一次点击。
   const [openId, setOpenId] = useState<string | null>(null);

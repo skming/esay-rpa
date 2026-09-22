@@ -1,4 +1,4 @@
-import { toolDisplayStatus } from './toolResult';
+import { redactToolPayload, toolDisplayStatus, toolResultSummary } from './toolResult';
 import { CheckCircle2, ChevronRight, CircleAlert, CircleSlash, Loader2, ShieldAlert } from 'lucide-react';
 import type { ReactElement } from 'react';
 import { useState } from 'react';
@@ -109,6 +109,7 @@ export function ToolCallCard({
     .map(readObject).filter((item): item is Record<string, unknown> => Boolean(item));
   const node = getPrimaryNodeRef(toolCall);
   const statusLabel = { running: '执行中', done: '已返回', error: '异常', blocked: '已阻断', stopped: '已中断' }[status];
+  const summary = toolResultSummary({ ...toolCall, status });
   const parsedArgs = parseArgs(toolCall.args);
   const hasArgs = Object.keys(parsedArgs).length > 0;
   // guard 拦截（如失败预算耗尽）不是成功也不是报错，需单独展示，否则会被误读为已完成
@@ -149,6 +150,15 @@ export function ToolCallCard({
           {label}
         </span>
 
+        {summary && (
+          <span className={cn(
+            'max-w-[48%] truncate text-[10px] font-normal',
+            status === 'error' ? 'text-red-600' : status === 'blocked' ? 'text-amber-700' : 'text-slate-500'
+          )} title={summary}>
+            {summary}
+          </span>
+        )}
+
         <span className="sr-only">{statusLabel}</span>
 
         <ChevronRight
@@ -180,17 +190,24 @@ export function ToolCallCard({
               ))}
             </ul>
           )}
-          {hasArgs && (
-            <div className="px-2.5 pt-2">
-              <p className="mb-1 text-[9.5px] font-semibold uppercase tracking-wide text-slate-500">参数</p>
-              <CodeBlock code={JSON.stringify(parsedArgs, null, 2)} language="json" maxHeight={128} variant="light" />
-            </div>
-          )}
-          {toolCall.result !== undefined && (
-            <div className="px-2.5 py-2">
-              <p className="mb-1 text-[9.5px] font-semibold uppercase tracking-wide text-slate-500">结果</p>
-              <CodeBlock code={JSON.stringify(toolCall.result, null, 2)} language="json" maxHeight={192} variant="light" />
-            </div>
+          {(hasArgs || toolCall.result !== undefined) && (
+            <details className="group/raw px-2.5 py-2">
+              <summary className="cursor-pointer select-none text-[10px] text-slate-500 hover:text-slate-700">
+                原始数据
+              </summary>
+              {hasArgs && (
+                <div className="pt-2">
+                  <p className="mb-1 text-[9.5px] font-medium text-slate-500">参数</p>
+                  <CodeBlock code={JSON.stringify(redactToolPayload(parsedArgs, '', true), null, 2)} language="json" maxHeight={128} variant="light" />
+                </div>
+              )}
+              {toolCall.result !== undefined && (
+                <div className="pt-2">
+                  <p className="mb-1 text-[9.5px] font-medium text-slate-500">结果</p>
+                  <CodeBlock code={JSON.stringify(redactToolPayload(toolCall.result), null, 2)} language="json" maxHeight={192} variant="light" />
+                </div>
+              )}
+            </details>
           )}
 
         </div>

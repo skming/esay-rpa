@@ -174,7 +174,8 @@ export const MessageBubble = memo(function MessageBubble({
           )}
 
         {/* 工具执行期间唯一的活体信号：run_flow 要跑几分钟，没有这行面板看起来就是卡死的 */}
-        {streamingPending && !isUser && !message.content && message.statusText !== undefined && (
+        {streamingPending && !isUser && !message.content && message.statusText !== undefined
+          && (!message.toolCalls || message.toolCalls.length === 0) && (
           <Marker className="mt-1 px-0.5 py-1 text-accent">
             <MarkerIcon>
               <Loader2 className="animate-spin" strokeWidth={1.8} />
@@ -192,6 +193,7 @@ export const MessageBubble = memo(function MessageBubble({
         {!isUser && message.toolCalls && message.toolCalls.length > 0 && (
           <div className="mt-1 w-full">
             <ProcessingTimeline
+              activeLabel={message.statusText}
               onFocusNode={onFocusNode}
               processingMs={message.processingMs}
               streamingPending={streamingPending}
