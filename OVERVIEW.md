@@ -136,6 +136,8 @@ Easy RPA 是一款运行在本地的桌面端 RPA（机器人流程自动化）�
 | 产出格式     | 标准库格式（`.csv/.json/.md/.txt/.html/.xml/.zip`）随便写；第三方库按环境实际探测（`find_spec`），当前 `.xlsx` 可用（openpyxl），`.pdf/.docx/.pptx` 缺库不可用。缺库时不允许自己拼字节流——那样照样跑成 `success`，坏在用户打开文件那一刻，所以 lint 以 `unavailable_artifact_format`（error）在运行前拦下，出路是换格式或让用户装库。往 `pyproject` 加一个库，节点说明与放行范围同时生效，无需改代码 |
 | 语义加工     | **没有**会调模型的节点，脚本只能做规则处理（原文摘录、按句截取、词频统计、正则抽取）。声称「总结/摘要/改写/翻译」会被 `claimed_semantic_capability_unavailable`（error）拦下，出路是告诉用户平台只能给规则产物、并把节点与文档里的说法改成实际做的事 |
 
+适用流程可导出为独立 Scrapling Python 脚本；不支持的节点会拒绝生成，凭据通过环境变量提供。
+
 ### 3.7 文件操作（9 种）
 
 `file.read` / `file.write` / `file.copy` / `file.move` / `file.delete` / `file.list` / `file.compress` / `file.rename` / `file.watch`
@@ -169,6 +171,9 @@ Easy RPA 是一款运行在本地的桌面端 RPA（机器人流程自动化）�
 - **失败现场取证**：浏览器节点最终失败时自动截取当时页面（JPEG）并连同页面 URL 存为运行产物，供事后排查和 RPA 助手诊断使用。
 - **子流程**：`control.subprocess` 节点可调用其他已发布（`active`）状态的流程，支持传参和获取返回值。
 - **超时**：`run_flow` API 最长等待 90 秒返回结果；单个节点超时由 `timeoutMs` 字段控制。
+
+- **浏览器执行方式**：流程可使用独立 Playwright 浏览器或已连接的 Chrome 扩展。
+- **本机设置**：支持配置 AI 模型、浏览器扩展和钉钉通知，敏感配置以掩码展示。
 
 ---
 

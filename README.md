@@ -66,7 +66,7 @@ lsof -nP -iTCP:8765 -sTCP:LISTEN
 | Playwright | 默认后台自动化、定时任务、无人值守流程 | 使用 Easy RPA 管理的浏览器 Profile，稳定可复现 |
 | Chrome 扩展 | 复用用户真实 Chrome 登录态、企业 SSO、人机协同 | 需要扩展在线，复用真实浏览器会话，不建议作为无人值守主路径 |
 
-扩展开发与调试见 [extension/README.md](extension/README.md)。
+流程可在顶部运行菜单切换为当前 Chrome；扩展说明见 [extension/README.md](extension/README.md)。
 
 ## 常用命令
 
