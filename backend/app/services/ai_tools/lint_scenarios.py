@@ -17,7 +17,10 @@ from app.services.ai_tools.script_capabilities import (
     unsupported_formats,
 )
 from app.services.ai_tools.selectors import _is_broad_table_row_selector, _is_table_container_selector
-from app.services.ai_tools.variables import _SCRIPT_CHANNEL_NODE_TYPES, _find_script_http_fetch_marker
+from app.services.ai_tools.variables import (
+    _SCRIPT_CHANNEL_NODE_TYPES,
+    _find_script_http_fetch_marker,
+)
 
 def _lint_flow_semantic_quality(nodes: list[Any]) -> list[dict[str, Any]]:
     """Detect semantic smells that make generated flows hard to repair."""
@@ -864,21 +867,6 @@ def _lint_script_environment_risks(nodes: list[dict[str, Any]]) -> list[dict[str
         code = str(node.get("code") or "")
         if not code:
             continue
-        uses_runtime_snapshot = any(marker in code for marker in (
-            "RPA_VARIABLES_JSON", "RPA_VARIABLES_FILE", "_vars",
-        ))
-        if uses_runtime_snapshot and not isinstance(node.get("inputVariables"), list):
-            findings.append({
-                "severity": "error",
-                "node_id": str(node.get("id", "?")),
-                "node_title": str(node.get("title") or node.get("id", "?")),
-                "issue": "script_inputs_not_declared",
-                "message": (
-                    "脚本读取运行时变量快照，却没有声明 inputVariables。"
-                    "执行器只会向脚本注入显式声明的变量和内置变量，隐式读取会得到空值。"
-                ),
-                "fix": "列出脚本真实读取的变量名到 inputVariables；不读取业务变量时显式填写空数组。",
-            })
         lowered = code.lower()
         if not any(token in lowered for token in browser_globals):
             continue

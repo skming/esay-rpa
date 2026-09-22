@@ -55,4 +55,21 @@ def test_sensitive_values_never_receive_a_content_digest() -> None:
 
     assert evidence.inputs[0].digest is None
     assert evidence.inputs[0].comparable is False
+
+
+def test_script_inputs_are_inferred_from_runtime_snapshot_reads() -> None:
+    variables = RuntimeVariableStore.from_initial({"rows": [{"id": 1}]})
+    node = {
+        "id": "export",
+        "type": "script.python",
+        "code": "rows = _vars.get('rows', [])\nprint(len(rows))",
+    }
+
+    evidence = build_node_execution_evidence(
+        node,
+        variables.raw_values(),
+        variables,
+    )
+
+    assert [item.name for item in evidence.inputs] == ["rows"]
     assert evidence.unchanged_pairs == []

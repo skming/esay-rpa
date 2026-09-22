@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 from app.models.schemas import FlowRunRequest, FlowSnapshot, RunMode, RunTaskRequest, TaskSnapshot
 from app.services.flow_definition import FlowDefinitionSelector
 from app.services.execution_evidence import definition_digest
+from app.services.runtime_variables import protected_variable_names
 from app.services.acceptance_contract import (
     contract_validation_errors,
     definition_variable_names,
@@ -78,11 +79,7 @@ class FlowRunService:
             flowRevision=flow.revision,
             definitionDigest=definition_digest(flow.definition),
             acceptanceContract=flow.acceptance_contract,
-            sensitiveVariables=[
-                variable.get("name") if isinstance(variable, dict) else variable.name
-                for variable in flow.input_variables
-                if (variable.get("sensitive", False) if isinstance(variable, dict) else variable.sensitive)
-            ],
+            sensitiveVariables=protected_variable_names(flow.input_variables),
             mode=run_request.mode if run_request is not None else mode,
             # RunTaskRequest 要求 targetUrl/selector 非空，但非 browser.fetch 流程根本用不到它们；
             # 这里填占位默认值，若存在 browser.fetch 节点会在下方被 build_request_for_fetch_node 覆盖。

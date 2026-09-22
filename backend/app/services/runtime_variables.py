@@ -10,6 +10,23 @@ _VARIABLE_PATTERN = re.compile(r"\$\{var\.([A-Za-z_][A-Za-z0-9_.-]{0,119})\}")
 _MAX_TEMPLATE_RESOLUTION_DEPTH = 5  # 防止循环/过深嵌套的模板引用
 
 
+def protected_variable_names(variables: list[object]) -> list[str]:
+    """返回运行时不得默认暴露给脚本的变量名。"""
+    protected: list[str] = []
+    for variable in variables:
+        if isinstance(variable, dict):
+            name = variable.get("name")
+            sensitive = variable.get("sensitive") is True
+            credential = variable.get("category") == "credential"
+        else:
+            name = getattr(variable, "name", None)
+            sensitive = getattr(variable, "sensitive", False) is True
+            credential = getattr(variable, "category", None) == "credential"
+        if isinstance(name, str) and name and (sensitive or credential):
+            protected.append(name)
+    return protected
+
+
 @dataclass
 class RuntimeVariableStore:
     """In-memory key-value store for runtime variables during a single task execution."""

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shlex
 import shutil
@@ -37,6 +38,58 @@ async def test_python_script_runner_writes_output_variables(tmp_path) -> None:
     assert saved == ["script_stdout", "script_exit_code", "script_stderr"]
     assert variables.get("script_exit_code") == 0
     assert "A001" in str(variables.get("script_stdout"))
+
+
+async def test_script_runner_injects_runtime_variables_without_duplicate_declarations(tmp_path) -> None:
+    script = tmp_path / "read_rows.py"
+    script.write_text(
+        "import json, os\n"
+        "values = json.loads(os.environ['RPA_VARIABLES_JSON'])\n"
+        "print(json.dumps(values, ensure_ascii=False))\n",
+        encoding="utf-8",
+    )
+    variables = RuntimeVariableStore.from_initial({
+        "all_contract_data": [{"id": "C-1"}],
+        "table_headers": ["id"],
+    })
+
+    result = await ScriptActionRunner(tmp_path).run(
+        {"type": "script.python", "path": "read_rows.py"},
+        variables,
+        timeout_ms=5_000,
+    )
+
+    assert json.loads(result.stdout) == {
+        "all_contract_data": [{"id": "C-1"}],
+        "table_headers": ["id"],
+    }
+
+
+async def test_script_runner_requires_explicit_declaration_for_sensitive_variables(tmp_path) -> None:
+    script = tmp_path / "read_secret.py"
+    script.write_text(
+        "import json, os\nprint(json.dumps(json.loads(os.environ['RPA_VARIABLES_JSON']), sort_keys=True))\n",
+        encoding="utf-8",
+    )
+    variables = RuntimeVariableStore.from_initial(
+        {"rows": [1], "api_token": "secret"},
+        sensitive_names={"api_token"},
+    )
+    runner = ScriptActionRunner(tmp_path)
+
+    ordinary = await runner.run(
+        {"type": "script.python", "path": "read_secret.py"},
+        variables,
+        timeout_ms=5_000,
+    )
+    authorized = await runner.run(
+        {"type": "script.python", "path": "read_secret.py", "inputVariables": ["api_token"]},
+        variables,
+        timeout_ms=5_000,
+    )
+
+    assert json.loads(ordinary.stdout) == {"rows": [1]}
+    assert json.loads(authorized.stdout) == {"api_token": "secret", "rows": [1]}
 
 
 async def test_python_script_runner_accepts_response_variable_alias(tmp_path) -> None:

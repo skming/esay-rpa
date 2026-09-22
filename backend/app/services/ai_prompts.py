@@ -226,7 +226,7 @@ _SEC['step2_mapping'] = """### 第二步：节点映射
 
 **优先使用原生节点**（`browser.extract`、`http.request`、`excel.addrow`、`file.write` 等），只在原生节点无法覆盖某步骤时，才用 `script.python` 补充。
 
-所有 `script.python` / `script.javascript` / `script.shell` 节点必须用 `inputVariables` 精确声明读取的业务变量；不读取业务变量时显式写空数组。运行器只向脚本暴露这些变量与 `output_dir`、`run_timestamp` 等系统变量。
+`script.python` / `script.javascript` / `script.shell` 运行时会自动获得当前已产生的普通流程变量。读取 `sensitive:true` 或 `category:"credential"` 的密码、账号、Token 等受保护变量时，必须在节点 `inputVariables` 中显式声明变量名。
 
 """
 

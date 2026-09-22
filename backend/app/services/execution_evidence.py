@@ -8,6 +8,10 @@ from app.models.schemas import NodeExecutionEvidence, VariableEvidence
 from app.services.runtime_variables import RuntimeVariableStore, infer_variable_type
 
 _VAR_REF_RE = re.compile(r"\$\{var\.([^}]+)\}")
+_SCRIPT_VAR_ACCESS_RE = re.compile(
+    r"\b(?:_vars|_v)\.get\(\s*['\"]([A-Za-z_][A-Za-z0-9_.-]*)['\"]|"
+    r"\b(?:_vars|_v)\s*\[\s*['\"]([A-Za-z_][A-Za-z0-9_.-]*)['\"]\s*\]"
+)
 _MAX_COMPARABLE_BYTES = 2 * 1024 * 1024
 _INPUT_NAME_FIELDS = (
     "inputVariable",
@@ -60,6 +64,10 @@ def collect_node_input_names(node: dict[str, object]) -> list[str]:
                 walk(nested)
 
     walk(node)
+    if node.get("type") in {"script.python", "script.javascript", "script.shell"}:
+        code = str(node.get("code") or node.get("command") or "")
+        for match in _SCRIPT_VAR_ACCESS_RE.finditer(code):
+            names.add(match.group(1) or match.group(2))
     return sorted(names)
 
 

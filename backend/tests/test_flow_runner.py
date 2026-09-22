@@ -7,7 +7,15 @@ from pathlib import Path
 
 import pytest
 
-from app.models.schemas import FlowRunRequest, FlowSnapshot, RunTaskRequest, RuntimeProgress, ScrapeResult, TaskSnapshot
+from app.models.schemas import (
+    FlowRunRequest,
+    FlowSnapshot,
+    RunTaskRequest,
+    RuntimeProgress,
+    RuntimeVariableSnapshot,
+    ScrapeResult,
+    TaskSnapshot,
+)
 from app.services.flow_control import evaluate_condition
 from app.services.ai_tools.catalog import NODE_TYPE_CATALOG
 from app.services.flow_definition import FlowDefinitionSelector, is_executable_node
@@ -125,6 +133,27 @@ def test_flow_template_action_types_are_backend_executable() -> None:
     unsupported = sorted(action_type for action_type in template_action_types if not is_executable_node({"type": action_type}))
 
     assert unsupported == []
+
+
+def test_flow_runner_protects_credential_category_without_sensitive_flag() -> None:
+    flow = build_flow().model_copy(update={
+        "input_variables": [
+            RuntimeVariableSnapshot(
+                name="username",
+                type="String",
+                value="alice",
+                category="credential",
+                sensitive=False,
+            ),
+        ],
+    })
+
+    request = FlowRunService(RecordingTaskManager())._build_task_request(
+        flow,
+        mode="run",
+    )
+
+    assert request.sensitive_variables == ["username"]
 
 
 def test_every_node_type_offered_to_the_model_is_actually_runnable() -> None:

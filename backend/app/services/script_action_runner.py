@@ -22,7 +22,6 @@ _SCRIPT_ACTION_TYPES = {"script.python", "script.javascript", "script.shell", "s
 _MAX_STDIO_BYTES = 512_000  # 单路输出上限，防止失控脚本把日志/内存打爆
 _MAX_ENV_BYTES = 64_000  # 多数系统 env 总量上限留出安全余量，超出则改用紧凑/省略副本
 _MAX_ENV_VALUE_BYTES = 8_000  # 单个变量塞进紧凑 JSON 副本前的上限，超出的改走 RPA_VARIABLES_FILE
-_RUNTIME_BUILTINS = frozenset({"run_timestamp", "flow_slug", "output_dir", "output_prefix"})
 
 # 注入到内联 Python 脚本开头，确保 _vars 读取未截断的文件快照而非可能被截断的
 # env var 副本；sentinel 防止重复注入。
@@ -243,12 +242,22 @@ def _build_command(action_type: str, script_path: Path) -> list[str]:
 def _declared_script_variables(node: FlowNode) -> set[str]:
     declared = node.get("inputVariables")
     if not isinstance(declared, list):
-        return set(_RUNTIME_BUILTINS)
+        return set()
     return {
         str(name).strip()
         for name in declared
         if isinstance(name, str) and name.strip()
-    } | set(_RUNTIME_BUILTINS)
+    }
+
+
+def _script_visible_variables(node: FlowNode, variables: RuntimeVariableStore) -> set[str]:
+    """普通运行时变量自动可见；敏感变量必须由脚本节点显式声明。"""
+    declared = _declared_script_variables(node)
+    return {
+        name
+        for name in variables.raw_values()
+        if not variables.is_sensitive(name) or name in declared
+    }
 
 
 def _build_variables_payload(variables: RuntimeVariableStore, allowed_names: set[str]) -> str:
@@ -268,14 +277,15 @@ def _build_script_env(
     """构造脚本子进程环境。
 
     打包态后端会通过 PYTHONPATH 暴露随包 site-packages；脚本节点必须继承它，
-    否则 `script.python` 子进程会找不到 openpyxl 等内置依赖。完整变量快照始终
-    写入 RPA_VARIABLES_FILE，确保脚本读到未截断的数据；env var 仅作紧凑副本。
+    否则 `script.python` 子进程会找不到 openpyxl 等内置依赖。普通运行时变量自动
+    注入；敏感变量仅在 inputVariables 显式声明后注入。完整快照写入
+    RPA_VARIABLES_FILE，env var 仅作紧凑副本。
     """
     env = dict(os.environ)
     env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin" if restrict_path else os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
     env["HOME"] = str(Path.home())
 
-    allowed_names = _declared_script_variables(node)
+    allowed_names = _script_visible_variables(node, variables)
     full_payload = _build_variables_payload(variables, allowed_names)
     variables_file = _write_variables_payload_file(full_payload)
     env["RPA_VARIABLES_FILE"] = str(variables_file)

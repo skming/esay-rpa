@@ -1743,6 +1743,7 @@ async def test_task_manager_runs_python_script_node_and_writes_variables(tmp_pat
     variables = {variable.name: variable for variable in current.variables}
     assert variables["script_exit_code"].value == "0"
     assert "cleaned=" in variables["script_stdout"].value
+    assert '"order_id":"A001"' in variables["script_stdout"].value
     logs = await manager.get_logs(snapshot.task_id)
     assert logs is not None
     assert any(log.node_id == "clean" and "脚本节点完成" in log.message for log in logs)
