@@ -228,7 +228,10 @@ async def health() -> HealthResponse:
 
 @app.post("/api/code/generate", response_model=GeneratedScript)
 async def generate_code(request: CodeGenerateRequest) -> GeneratedScript:
-    return code_generator.generate(request)
+    try:
+        return code_generator.generate(request)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.post("/api/site/analyze", response_model=SiteAnalysisResult)

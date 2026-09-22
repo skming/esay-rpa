@@ -7,8 +7,8 @@ from app.services.code_generator import ScraplingCodeGenerator
 from app.services.flow_control import evaluate_condition
 from app.services.runtime_variables import RuntimeVariableStore
 
-# 导出脚本不会被真的跑起来（那需要联网抓页面），但条件求值、变量渲染这些纯函数必须
-# 能单独执行来验证语义。exec 整个脚本即可：scrapling 已是后端依赖，import 不会失败。
+# 用 exec 加载生成脚本后替换网络抓取函数，验证脚本自身的控制流和数据输出。
+# scrapling 已是后端依赖，import 不会失败。
 def _exec_script(content: str) -> dict:
     namespace: dict = {}
     exec(compile(content, "<generated>", "exec"), namespace)
@@ -53,20 +53,75 @@ def test_generate_full_flow_scrapling_script_is_valid_python() -> None:
     assert 'page = fetch_page(render_template("${var.base_url}", variables), "static")' in script.content
 
 
-def test_generate_flow_script_preserves_unsupported_browser_actions_as_comments() -> None:
+def test_generate_flow_script_rejects_unsupported_browser_actions() -> None:
+    with pytest.raises(ValueError, match=r"点击登录（browser\.click）"):
+        _generate(
+            "login-flow",
+            {
+                "nodes": [
+                    {"id": "start", "type": "start", "title": "开始"},
+                    {"id": "click", "type": "browser.click", "title": "点击登录", "selector": "#login"},
+                ],
+                "edges": [{"source": "start", "target": "click"}],
+            },
+        )
+
+
+def test_disabled_unsupported_node_does_not_block_or_execute() -> None:
     script = _generate(
-        "login-flow",
+        "disabled-action",
         {
             "nodes": [
-                {"id": "start", "type": "start", "title": "开始"},
-                {"id": "click", "type": "browser.click", "title": "点击登录", "selector": "#login"},
+                {"id": "start", "type": "start"},
+                {"id": "click", "type": "browser.click", "title": "停用点击", "disabled": True},
+                {"id": "end", "type": "end"},
             ],
-            "edges": [{"source": "start", "target": "click"}],
+            "edges": [
+                {"source": "start", "target": "click"},
+                {"source": "click", "target": "end"},
+            ],
         },
     )
 
-    compile(script.content, script.filename, "exec")
-    assert "Scrapling 是采集引擎，不执行真实点击/输入" in script.content
+    assert "已禁用，跳过" in script.content
+
+
+def test_generated_pure_scraping_flow_runs_as_a_standalone_function() -> None:
+    script = _generate(
+        "quotes",
+        {
+            "nodes": [
+                {"id": "start", "type": "start"},
+                {"id": "open", "type": "browser.open", "targetUrl": "https://example.test"},
+                {"id": "extract", "type": "browser.extract", "selector": ".quote", "outputVariable": "quotes"},
+                {"id": "end", "type": "end"},
+            ],
+            "edges": [
+                {"source": "start", "target": "open"},
+                {"source": "open", "target": "extract"},
+                {"source": "extract", "target": "end"},
+            ],
+        },
+    )
+    namespace = _exec_script(script.content)
+
+    class Element:
+        def get_all_text(self, *, strip: bool) -> str:
+            assert strip is True
+            return "captured"
+
+    class Page:
+        def css(self, selector: str) -> list[Element]:
+            assert selector == ".quote"
+            return [Element()]
+
+    namespace["fetch_page"] = lambda _url, _fetcher="static": Page()
+
+    result = namespace["run"]()
+
+    assert result["variables"]["quotes"] == ["captured"]
+    assert result["outputs"]["extract"] == ["captured"]
+    assert script.dependencies == ["scrapling[all]>=0.4.10"]
 
 
 def test_credential_values_never_reach_the_exported_script() -> None:

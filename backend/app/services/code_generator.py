@@ -17,6 +17,19 @@ _INDENT = "    "
 # 凭据不写进脚本，改由环境变量注入。前缀是为了在用户的 shell 里与其它变量区分开。
 _CREDENTIAL_ENV_PREFIX = "RPA_"
 _SENSITIVE_CATEGORIES = {"credential", "secret"}
+_SUPPORTED_NODE_TYPES = {
+    "start",
+    "end",
+    "browser.open",
+    "browser.tab.open",
+    "browser.fetch",
+    "browser.extract",
+    "ui.extract",
+    "browser.paginateNext",
+    "control.delay",
+    "variable.set",
+    "file.write",
+}
 
 
 class ScraplingCodeGenerator:
@@ -25,13 +38,39 @@ class ScraplingCodeGenerator:
     def generate(self, request: CodeGenerateRequest) -> GeneratedScript:
         flow_name = request.flow_name.strip()
         filename = f"{self._slugify(flow_name)}.py"
+        self._validate_supported_nodes(request.flow_definition)
         content = "\n".join(self._build_flow_script_lines(request))
 
         return GeneratedScript(
             filename=filename,
-            dependencies=["scrapling[all]>=0.3.0"],
+            dependencies=["scrapling[all]>=0.4.10"],
             content=content,
         )
+
+    def _validate_supported_nodes(self, flow: dict[str, object] | None) -> None:
+        if flow is None:
+            raise ValueError("flowDefinition 不能为空")
+        raw_nodes = flow.get("nodes")
+        nodes = [node for node in raw_nodes if isinstance(node, dict)] if isinstance(raw_nodes, list) else []
+        unsupported: list[str] = []
+        for node in nodes:
+            if node.get("disabled") is True:
+                continue
+            node_type = str(node.get("type") or "").strip()
+            if (
+                node_type in _SUPPORTED_NODE_TYPES
+                or is_condition_node(node)
+                or is_loop_node(node)
+                or is_repeat_until_node(node)
+            ):
+                continue
+            title = str(node.get("title") or node.get("id") or "未命名节点")
+            unsupported.append(f"{title}（{node_type or '缺少类型'}）")
+        if unsupported:
+            raise ValueError(
+                "无法生成可独立运行的 Scrapling 脚本，以下节点需要浏览器交互或尚未支持："
+                + "、".join(unsupported)
+            )
 
     def _build_flow_script_lines(self, request: CodeGenerateRequest) -> list[str]:
         flow = request.flow_definition
@@ -53,8 +92,8 @@ class ScraplingCodeGenerator:
             "",
             "",
             f"FLOW_NAME = {json.dumps(request.flow_name, ensure_ascii=False)}",
-            f"VARIABLES: dict[str, Any] = {json.dumps(variables, ensure_ascii=False, indent=2)}",
-            f"CREDENTIAL_ENV: dict[str, str] = {json.dumps(credentials, ensure_ascii=False, indent=2)}",
+            f"VARIABLES: dict[str, Any] = {self._json_load_expr(variables)}",
+            f"CREDENTIAL_ENV: dict[str, str] = {self._json_load_expr(credentials)}",
             "",
             "",
         ]
@@ -124,6 +163,12 @@ class ScraplingCodeGenerator:
             if node is None:
                 break
             active = active | {current}
+
+            if node.get("disabled") is True:
+                lines.extend(self._node_lines(node, depth))
+                outgoing = graph["adjacency"].get(current, [])
+                current = str(outgoing[0].get("target")) if outgoing else None
+                continue
 
             if is_condition_node(node):
                 lines.extend(self._emit_condition(graph, node, depth=depth, active=active))
@@ -575,14 +620,7 @@ class ScraplingCodeGenerator:
             )
             return lines
 
-        if node_type.startswith("browser.") or node_type.startswith("ui."):
-            lines.append(f"{pad}# Scrapling 是采集引擎，不执行真实点击/输入；此交互节点已保留为注释。")
-            lines.append(f"{pad}pass")
-            return lines
-
-        lines.append(f"{pad}# 当前节点类型暂未映射到 Scrapling 脚本，已保留为流程注释。")
-        lines.append(f"{pad}pass")
-        return lines
+        raise ValueError(f"Scrapling 脚本不支持节点 {title}（{node_type or '缺少类型'}）")
 
     def _pagination_lines(self, node: dict[str, Any], depth: int) -> list[str]:
         """点击式翻页在 Scrapling 里没有对应能力，只能拒绝。
@@ -605,7 +643,7 @@ class ScraplingCodeGenerator:
         max_pages = self._read_int(node, "maxIterations", default=20)
         selector = self._node_string_expr(node.get("targetSelector") or node.get("selector"))
         mode = str(node.get("extractMode") or "text")
-        payload = json.dumps(self._output_node_payload(node), ensure_ascii=False)
+        payload = self._json_load_expr(self._output_node_payload(node))
         stop = start_page + page_step * max_pages
         return [
             f"{pad}collected: list[str] = []",
@@ -629,11 +667,11 @@ class ScraplingCodeGenerator:
         attribute = node.get("attribute")
         return [
             f"{pad}values = extract_values(page, render_template({selector}, variables), "
-            f"{json.dumps(mode)}, {json.dumps(attribute)})",
-            f"{pad}if not values and not {json.dumps(bool(node.get('continueOnError')))}:",
+            f"{json.dumps(mode)}, {attribute!r})",
+            f"{pad}if not values and not {bool(node.get('continueOnError'))!r}:",
             f"{pad}{_INDENT}raise RuntimeError("
             f"{json.dumps('未找到目标元素: ' + str(node.get('selector') or ''), ensure_ascii=False)})",
-            f"{pad}node = {json.dumps(self._output_node_payload(node), ensure_ascii=False)}",
+            f"{pad}node = {self._json_load_expr(self._output_node_payload(node))}",
             f"{pad}save_output(variables, node, values, {json.dumps(mode)})",
             f"{pad}outputs[str(node.get('id') or node.get('title') or 'extract')] = values",
         ]
@@ -739,6 +777,10 @@ class ScraplingCodeGenerator:
 
     def _node_string_expr(self, value: object) -> str:
         return json.dumps("" if value is None else str(value), ensure_ascii=False)
+
+    def _json_load_expr(self, value: object) -> str:
+        serialized = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        return f"json.loads({serialized!r})"
 
     def _slugify(self, value: str) -> str:
         # 只保留 ASCII 会让所有中文流程名塌成同一个兜底名，导出第二个流程直接覆盖第一个。
