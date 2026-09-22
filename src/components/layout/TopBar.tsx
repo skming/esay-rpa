@@ -2,14 +2,17 @@ import {
   Archive, BookOpen, Check, ChevronDown, ChevronRight,
   Download, FolderTree, Hash, History, Loader2, Pencil,
   CirclePause, Play, Save, Square, Trash2, Variable, Workflow, XCircle,
-  CheckCircle2, Bug,
+  CheckCircle2, Bug, Puzzle, Settings2,
 } from 'lucide-react';
 import type { KeyboardEvent, ReactElement } from 'react';
 import { useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 
+import { ROUTE_PATHS } from '../../app/routeConfig';
 import { Button } from '../ui/button';
 import { Badge } from '../ui/badge';
 import { cn } from '../../lib/utils';
+import { backend } from '../../lib/backendClient';
 import type { ElectronBridgeState } from '../../hooks/useElectronBridge';
 import type { FlowDraftAutosaveState } from '../../hooks/useFlowDraftAutosave';
 import { useFlowVariableStore } from '../../stores/useFlowVariableStore';
@@ -38,8 +41,10 @@ export function TopBar({
   selectedNodeTitle: string;
 }): ReactElement {
   const [runConfigOpen, setRunConfigOpen] = useState(false);
+  const [extensionAvailability, setExtensionAvailability] = useState<'checking' | 'ready' | 'disabled' | 'disconnected' | 'error'>('checking');
   const [versionHistoryOpen, setVersionHistoryOpen] = useState(false);
   const [flowVariablesOpen, setFlowVariablesOpen] = useState(false);
+  const navigate = useNavigate();
 
   const inputVariables = useFlowVariableStore((s) => s.inputVariables);
   const addInputVariable = useFlowVariableStore((s) => s.addInputVariable);
@@ -51,6 +56,38 @@ export function TopBar({
   const activeFlowId = electron.currentFlow?.flowId;
   const activeFlowVersion = electron.currentFlow?.version ?? '草稿';
   const activeFlowStatus = electron.currentFlow?.status ?? 'draft';
+  const defaultBrowserExecutor = electron.currentFlow?.defaultBrowserExecutor ?? 'playwright';
+
+  const refreshExtensionAvailability = async (): Promise<void> => {
+    setExtensionAvailability('checking');
+    try {
+      const status = await backend.getExtensionStatus();
+      setExtensionAvailability(
+        status.enabled === false ? 'disabled' : status.canExecute ? 'ready' : 'disconnected'
+      );
+    } catch {
+      setExtensionAvailability('error');
+    }
+  };
+
+  const handlePrimaryRun = async (): Promise<void> => {
+    if (defaultBrowserExecutor !== 'extension') {
+      await electron.startRun('run');
+      return;
+    }
+    try {
+      const status = await backend.getExtensionStatus();
+      if (status.enabled === false || !status.canExecute) {
+        electron.pushToast('info', status.enabled === false ? '浏览器扩展执行器已关闭' : '浏览器扩展尚未连接');
+        navigate(ROUTE_PATHS.settings, { state: { settingsSection: 'extension' } });
+        return;
+      }
+    } catch (error) {
+      electron.pushToast('error', error instanceof Error ? error.message : '无法读取浏览器扩展状态');
+      return;
+    }
+    await electron.startRun('run');
+  };
 
   if (!visible) return <></>;
 
@@ -129,29 +166,62 @@ export function TopBar({
           <div className="flex overflow-hidden rounded-lg shadow-sm">
             <Button
               className="h-7 rounded-r-none shadow-none"
-              onClick={() => void electron.startRun('run')}
+              onClick={() => void handlePrimaryRun()}
               variant="primary"
             >
-              <Play className="h-3.5 w-3.5 fill-current" strokeWidth={1.5} />
-              运行
+              {defaultBrowserExecutor === 'extension'
+                ? <Puzzle className="h-3.5 w-3.5" strokeWidth={1.5} />
+                : <Play className="h-3.5 w-3.5 fill-current" strokeWidth={1.5} />}
+              {defaultBrowserExecutor === 'extension' ? 'Chrome 运行' : '运行'}
             </Button>
-            <Button
-              aria-label="打开运行配置"
-              className="h-7 w-7 rounded-l-none border-l border-white/20 px-0 shadow-none"
-              onClick={() => setRunConfigOpen(true)}
-              variant="primary"
-            >
-              <ChevronDown className="h-3.5 w-3.5" strokeWidth={1.5} />
-            </Button>
+            <DropdownMenu onOpenChange={(open) => { if (open) void refreshExtensionAvailability(); }}>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  aria-label="选择运行方式"
+                  className="h-7 w-7 rounded-l-none border-l border-white/20 px-0 shadow-none"
+                  variant="primary"
+                >
+                  <ChevronDown className="h-3.5 w-3.5" strokeWidth={1.5} />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-60">
+                <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-slate-500">流程默认运行方式</div>
+                <DropdownMenuItem onSelect={() => void electron.setDefaultBrowserExecutor('playwright')}>
+                  <Play className="mr-2 h-3.5 w-3.5 text-slate-400" strokeWidth={1.5} />
+                  <span className="flex-1">独立浏览器</span>
+                  {defaultBrowserExecutor === 'playwright' && <Check className="h-3.5 w-3.5 text-emerald-600" />}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  disabled={extensionAvailability !== 'ready'}
+                  onSelect={() => void electron.setDefaultBrowserExecutor('extension')}
+                >
+                  <Puzzle className="mr-2 h-3.5 w-3.5 text-slate-400" strokeWidth={1.5} />
+                  <span className="flex-1">当前 Chrome</span>
+                  {defaultBrowserExecutor === 'extension' && extensionAvailability === 'ready'
+                    ? <Check className="h-3.5 w-3.5 text-emerald-600" />
+                    : <span className="text-[10px] text-slate-400">{extensionAvailabilityLabel(extensionAvailability)}</span>}
+                </DropdownMenuItem>
+                {extensionAvailability !== 'ready' && extensionAvailability !== 'checking' && (
+                  <DropdownMenuItem onSelect={() => navigate(ROUTE_PATHS.settings, { state: { settingsSection: 'extension' } })}>
+                    <Puzzle className="mr-2 h-3.5 w-3.5 text-blue-500" strokeWidth={1.5} />
+                    连接浏览器扩展…
+                  </DropdownMenuItem>
+                )}
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onSelect={() => setRunConfigOpen(true)}>
+                  <Settings2 className="mr-2 h-3.5 w-3.5 text-slate-400" strokeWidth={1.5} />
+                  本次运行配置…
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         )}
       </div>
 
       <RunConfigDialog
-        defaultBrowserExecutor={electron.currentFlow?.defaultBrowserExecutor}
+        defaultBrowserExecutor={defaultBrowserExecutor}
         inputVariables={electron.inputVariables}
         onOpenChange={setRunConfigOpen}
-        onSetDefaultBrowserExecutor={(browserExecutor) => void electron.setDefaultBrowserExecutor(browserExecutor)}
         onStart={(options) => void electron.startRun(options)}
         open={runConfigOpen}
         running={running}
@@ -179,6 +249,14 @@ export function TopBar({
       />
     </header>
   );
+}
+
+function extensionAvailabilityLabel(status: 'checking' | 'ready' | 'disabled' | 'disconnected' | 'error'): string {
+  if (status === 'checking') return '检查中';
+  if (status === 'disabled') return '已关闭';
+  if (status === 'disconnected') return '未连接';
+  if (status === 'error') return '不可用';
+  return '已连接';
 }
 
 function FlowNameEditor({ name, onRename }: { name: string; onRename: (name: string) => void }): ReactElement {
