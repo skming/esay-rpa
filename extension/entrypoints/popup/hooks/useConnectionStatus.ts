@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react';
-import { POLL_INTERVAL_MS, type ConnectionStatus } from '../lib/connection';
+import { POLL_INTERVAL_MS, type ConnectionState, type ConnectionStatus } from '../lib/connection';
 
-export function useConnectionStatus(): ConnectionStatus | null {
-  const [status, setStatus] = useState<ConnectionStatus | null>(null);
+export function useConnectionStatus(): ConnectionState {
+  const [state, setState] = useState<ConnectionState>({ phase: 'checking', status: null });
 
   useEffect(() => {
     let cancelled = false;
@@ -11,11 +11,11 @@ export function useConnectionStatus(): ConnectionStatus | null {
       try {
         const response = (await browser.runtime.sendMessage({ type: 'getConnectionStatus' })) as ConnectionStatus;
         if (!cancelled) {
-          setStatus(response);
+          setState({ phase: 'ready', status: response });
         }
       } catch {
         if (!cancelled) {
-          setStatus(null);
+          setState({ phase: 'error', status: null });
         }
       }
     };
@@ -28,5 +28,5 @@ export function useConnectionStatus(): ConnectionStatus | null {
     };
   }, []);
 
-  return status;
+  return state;
 }

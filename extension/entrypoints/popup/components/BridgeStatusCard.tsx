@@ -1,24 +1,38 @@
-export function BridgeStatusCard({ connected }: { connected: boolean }) {
+import type { ConnectionPhase } from '../lib/connection';
+
+type StatusTone = 'success' | 'waiting' | 'neutral' | 'error';
+
+const toneClasses: Record<StatusTone, { card: string; dot: string }> = {
+  success: { card: 'border-emerald-200 bg-emerald-50/70', dot: 'bg-emerald-500' },
+  waiting: { card: 'border-amber-200 bg-amber-50/70', dot: 'bg-amber-500' },
+  neutral: { card: 'border-rule-2 bg-paper-sunk/70', dot: 'bg-ink-4' },
+  error: { card: 'border-red-200 bg-red-50/70', dot: 'bg-red-500' },
+};
+
+function statusContent(phase: ConnectionPhase, connected: boolean): { description: string; title: string; tone: StatusTone } {
+  if (phase === 'checking') {
+    return { title: '正在检查连接', description: '正在唤醒浏览器扩展…', tone: 'neutral' };
+  }
+  if (phase === 'error') {
+    return { title: '扩展后台未响应', description: '请在扩展管理页重新加载 Easy RPA。', tone: 'error' };
+  }
+  if (connected) {
+    return { title: '已连接', description: '可以使用当前 Chrome 运行流程。', tone: 'success' };
+  }
+  return { title: '正在连接客户端', description: '打开 Easy RPA 后会自动恢复连接。', tone: 'waiting' };
+}
+
+export function BridgeStatusCard({ connected, phase }: { connected: boolean; phase: ConnectionPhase }) {
+  const content = statusContent(phase, connected);
+  const tone = toneClasses[content.tone];
+
   return (
-    <section className="rounded-lg border border-rule-2 bg-paper-sunk/70 p-3">
-      <div className="relative flex items-center gap-2">
-        <span
-          className={[
-            'relative h-2 w-2 shrink-0 rounded-full',
-            connected
-              ? 'bg-live shadow-running after:absolute after:-inset-1.25 after:rounded-full after:border-[1.5px] after:border-live after:animate-[bridge-live-ping_1.9s_cubic-bezier(0.16,1,0.3,1)_infinite] motion-reduce:after:animate-none'
-              : 'bg-ink-4',
-          ].join(' ')}
-        />
-        <span className="text-sm font-medium text-ink-2">
-          {connected ? '已连接到 Easy RPA' : '未连接'}
-        </span>
+    <section aria-live="polite" className={`rounded-lg border p-3.5 ${tone.card}`}>
+      <div className="flex items-center gap-2.5">
+        <span className={`h-2 w-2 shrink-0 rounded-full ${tone.dot}`} />
+        <span className="text-[13px] font-semibold text-ink-2">{content.title}</span>
       </div>
-      <p className="relative mt-1.5 text-xs leading-relaxed text-ink-3">
-        {connected
-          ? '浏览器插件已进入可执行状态，运行流程时可直接接管当前网页。'
-          : '请确认 Easy RPA 应用已启动，启动后会自动连接，无需重装插件。'}
-      </p>
+      <p className="mt-1.5 pl-4.5 text-[11px] leading-5 text-ink-3">{content.description}</p>
     </section>
   );
 }
