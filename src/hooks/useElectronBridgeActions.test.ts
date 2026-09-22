@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { initialEdges, initialNodes } from '../data/studioData';
 import { fetchFlowSnapshot } from '../lib/backendClient';
 import { buildFlowDefinition, restoreFlowCanvas } from '../lib/flowDefinition';
-import type { BridgeResult, FlowSnapshot } from '../types/electron';
+import type { BridgeResult, FlowSnapshot, FlowVersionSnapshot } from '../types/electron';
 import type { RuntimeVariable } from '../types/rpa';
 import { useElectronBridgeActions, type ElectronBridgeActions } from './useElectronBridgeActions';
 
@@ -27,7 +27,10 @@ const savedFlow: FlowSnapshot = {
   version: 'v1.0.0',
 };
 
-function renderActions(callBridge: Parameters<typeof useElectronBridgeActions>[0]['callBridge'] = async () => null) {
+function renderActions(
+  callBridge: Parameters<typeof useElectronBridgeActions>[0]['callBridge'] = async () => null,
+  currentFlow: FlowSnapshot | null = null,
+) {
   let variables = draftVariables;
   const params: Parameters<typeof useElectronBridgeActions>[0] = {
     activeFlowNameRef: { current: '' },
@@ -35,7 +38,7 @@ function renderActions(callBridge: Parameters<typeof useElectronBridgeActions>[0
     activeRunFlowId: null,
     callBridge,
     clearLastRunOverrides: vi.fn(),
-    currentFlow: null,
+    currentFlow,
     flowCanvas: { nodes: initialNodes, edges: initialEdges },
     flows: [],
     pushToast: vi.fn(() => 1),
@@ -129,6 +132,32 @@ describe('流程恢复的输入变量归属', () => {
     expect(params.setFlowNodes).not.toHaveBeenCalled();
     expect(params.resetRunView).not.toHaveBeenCalled();
     expect(readVariables()).toEqual(draftVariables);
+  });
+
+  it('恢复快照时同时恢复定义、变量和验收契约', async () => {
+    const updateFlow = vi.fn(async () => ({ ok: true as const, data: { ...savedFlow, revision: 3 } }));
+    const snapshot: FlowVersionSnapshot = {
+      acceptanceContract: {
+        requirements: [{ id: 'required', description: '必须有结果', sourceKind: 'user' }],
+        deliverables: [{ id: 'rows', kind: 'table', requirementIds: ['required'], variable: 'rows' }],
+      },
+      definition: { nodes: [{ id: 'old' }], edges: [] },
+      inputVariables: savedVariables,
+      revision: 1,
+      savedAt: '2026-09-04T00:00:00.000Z',
+      version: 'v1.0.0',
+    };
+    const { actions } = renderActions(async (action) => {
+      const result = await action({ updateFlow } as unknown as import('../types/electron').RpaBridge);
+      return result.ok ? result.data ?? null : null;
+    }, savedFlow);
+
+    expect(await actions.rollbackFlowSnapshot(snapshot)).toBe(true);
+    expect(updateFlow).toHaveBeenCalledWith(savedFlow.flowId, expect.objectContaining({
+      acceptanceContract: snapshot.acceptanceContract,
+      definition: snapshot.definition,
+      inputVariables: snapshot.inputVariables,
+    }));
   });
 });
 

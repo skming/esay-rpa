@@ -128,4 +128,26 @@ describe('flowDiff', () => {
     expect(edgeItem?.title).toBe('判断是否登录 → 打开工作台');
     expect(edgeItem?.subtitle).toBe('分支：true');
   });
+
+  it('变量和验收契约变化进入差异，敏感变量不显示原值', () => {
+    const before = buildFlow('base', { edges: [], nodes: [] });
+    before.inputVariables = [{ category: 'credential', name: 'password', sensitive: true, scope: '全局', type: 'String', value: 'old-secret' }];
+    before.acceptanceContract = { requirements: [], deliverables: [] };
+    const after = buildFlow('target', { edges: [], nodes: [] });
+    after.inputVariables = [
+      { category: 'credential', name: 'password', sensitive: true, scope: '全局', type: 'String', value: 'new-secret' },
+      { category: 'flow', name: 'rows', sensitive: false, scope: '全局', type: 'List', value: '[]' },
+    ];
+    after.acceptanceContract = {
+      requirements: [{ id: 'required', description: '必须输出结果', sourceKind: 'user' }],
+      deliverables: [],
+    };
+
+    const diff = diffFlowSnapshots(before, after);
+
+    expect(diff.configChanged).toBe(2);
+    expect(diff.items.map((item) => item.scope)).toEqual(expect.arrayContaining(['variable', 'contract']));
+    expect(JSON.stringify(diff.items)).not.toContain('old-secret');
+    expect(JSON.stringify(diff.items)).not.toContain('new-secret');
+  });
 });

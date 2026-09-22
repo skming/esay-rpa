@@ -81,7 +81,7 @@ export function TopBar({
           onExport={electron.exportFlow}
           onLoadFlows={electron.loadFlows}
           onOpenPicker={electron.openFlow}
-          onOpenVersionHistory={() => { setVersionHistoryOpen(true); void electron.loadFlows(); }}
+          onOpenVersionHistory={() => setVersionHistoryOpen(true)}
           onSave={electron.saveFlow}
           version={activeFlowVersion}
         />
@@ -172,8 +172,9 @@ export function TopBar({
       />
       <VersionHistoryDialog
         currentFlow={electron.currentFlow}
+        onLoadSnapshots={electron.loadFlowVersions}
         onOpenChange={setVersionHistoryOpen}
-        onRestoreSnapshot={(savedAt) => electron.rollbackFlowById(savedAt).then(() => setVersionHistoryOpen(false))}
+        onRestoreSnapshot={electron.rollbackFlowSnapshot}
         open={versionHistoryOpen}
       />
     </header>

@@ -15,13 +15,12 @@ type DiffFilter = FlowDiffType | 'all';
 export function VersionDiffView({
   baseFlow,
   onBack,
-  onRollback,
+  onRequestRollback,
   targetSnapshot
 }: {
   baseFlow: FlowSnapshot | null;
   onBack: () => void;
-  /** 按快照的 savedAt（唯一）标识回退目标，而不是 version（多条快照常共享同一个 version 字符串）。*/
-  onRollback: (savedAt: string) => Promise<void>;
+  onRequestRollback: (snapshot: FlowVersionSnapshot) => void;
   targetSnapshot: FlowVersionSnapshot | null;
 }): ReactElement {
   const [filter, setFilter] = useState<DiffFilter>('all');
@@ -46,9 +45,9 @@ export function VersionDiffView({
             {baseFlow !== null && targetSnapshot !== null ? (
               <span className="inline-flex items-center gap-1.5">
                 自
-                <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] text-slate-600">{targetSnapshot.version}</span>
+                <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] text-slate-600">r{targetSnapshot.revision ?? '—'}</span>
                 <MoveRight className="h-3 w-3 text-slate-400" strokeWidth={1.5} />
-                <span className="rounded bg-blue-50 px-1.5 py-0.5 font-mono text-[10px] text-blue-700">{baseFlow.version}</span>
+                <span className="rounded bg-blue-50 px-1.5 py-0.5 font-mono text-[10px] text-blue-700">r{baseFlow.revision ?? 1}</span>
                 以来的改动
               </span>
             ) : (
@@ -66,7 +65,7 @@ export function VersionDiffView({
             <VersionDiffMetrics diff={diff} filter={filter} onFilterChange={setFilter} />
             <div className="max-h-90 overflow-auto rounded-xl border border-slate-200 bg-slate-50 p-2">
               {diff.items.length === 0 ? (
-                <div className="rounded-lg bg-white px-4 py-8 text-center text-[12px] text-slate-500 shadow-xs">两个版本的节点与连线定义一致。</div>
+                <div className="rounded-lg bg-white px-4 py-8 text-center text-[12px] text-slate-500 shadow-xs">两个版本的流程配置一致。</div>
               ) : visibleItems.length === 0 ? (
                 <div className="rounded-lg bg-white px-4 py-8 text-center text-[12px] text-slate-500 shadow-xs">当前筛选下没有条目。</div>
               ) : (
@@ -89,7 +88,7 @@ export function VersionDiffView({
           disabled={baseFlow === null || targetSnapshot === null}
           onClick={() => {
             if (targetSnapshot !== null) {
-              void onRollback(targetSnapshot.savedAt).then(onBack);
+              onRequestRollback(targetSnapshot);
             }
           }}
           variant="primary"
@@ -104,7 +103,7 @@ export function VersionDiffView({
 
 function VersionDiffMetrics({ diff, filter, onFilterChange }: { diff: FlowDiffSummary; filter: DiffFilter; onFilterChange: (filter: DiffFilter) => void }): ReactElement {
   const added = diff.nodeAdded + diff.edgeAdded;
-  const changed = diff.nodeChanged + diff.edgeChanged;
+  const changed = diff.nodeChanged + diff.edgeChanged + diff.configChanged;
   const removed = diff.nodeRemoved + diff.edgeRemoved;
 
   return (
@@ -123,6 +122,8 @@ function VersionDiffMetrics({ diff, filter, onFilterChange }: { diff: FlowDiffSu
         <span>
           连线 <DiffCount type="added" value={diff.edgeAdded} /> <DiffCount type="changed" value={diff.edgeChanged} /> <DiffCount type="removed" value={diff.edgeRemoved} />
         </span>
+        <span className="text-slate-300">|</span>
+        <span>变量/契约 <DiffCount type="changed" value={diff.configChanged} /></span>
         {diff.layoutOnly > 0 && (
           <>
             <span className="text-slate-300">|</span>
@@ -168,7 +169,7 @@ function VersionDiffRow({ item }: { item: FlowDiffItem }): ReactElement {
       <div className="min-w-0">
         <div className="flex flex-wrap items-center gap-1.5">
           <Badge variant={DIFF_BADGE_VARIANT[item.type]}>
-            {item.scope === 'node' ? '节点' : '连线'}
+            {SCOPE_LABEL[item.scope]}
             {DIFF_TYPE_LABEL[item.type]}
           </Badge>
           <span className="min-w-0 break-all text-[12px] font-semibold text-slate-700">{item.title}</span>
@@ -246,6 +247,13 @@ const DIFF_TYPE_LABEL: Record<FlowDiffType, string> = {
   added: '新增',
   changed: '变更',
   removed: '移除'
+};
+
+const SCOPE_LABEL: Record<FlowDiffItem['scope'], string> = {
+  contract: '契约',
+  edge: '连线',
+  node: '节点',
+  variable: '变量',
 };
 
 const DIFF_SIGN: Record<FlowDiffType, string> = {

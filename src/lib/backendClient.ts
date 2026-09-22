@@ -12,6 +12,7 @@ import type {
   DebugControlCommand,
   FlowSavePayload,
   FlowSnapshot,
+  FlowVersionSnapshot,
   FlowStatus,
   FlowUpdatePayload,
   GeneratedScriptResult,
@@ -114,6 +115,14 @@ export class BackendClient {
     return await this.request<FlowSnapshot>(`/api/flows/${encodeURIComponent(flowId)}`, {
       method: 'GET',
       timeoutMs: 3000
+    });
+  }
+
+  async listFlowVersions(flowId: string): Promise<FlowVersionSnapshot[]> {
+    assertId(flowId, 'flowId');
+    return await this.request<FlowVersionSnapshot[]>(`/api/flows/${encodeURIComponent(flowId)}/versions`, {
+      method: 'GET',
+      timeoutMs: 5000
     });
   }
 

@@ -4,6 +4,7 @@ import type {
   ArtifactSnapshot,
   BackendServiceStatus,
   FlowSnapshot,
+  FlowVersionSnapshot,
   GeneratedScriptResult,
   PickerOpenPayload,
   PickerRequest,
@@ -70,7 +71,8 @@ export type ElectronBridgeState = {
   openFlowById: (flowId: string) => Promise<void>;
   silentlyRestoreCurrentFlow: (flowId: string, options?: { restoreCanvas?: boolean }) => Promise<void>;
   applyAiFlowUpdate: (flowId: string) => Promise<void>;
-  rollbackFlowById: (flowId: string) => Promise<void>;
+  loadFlowVersions: () => Promise<FlowVersionSnapshot[]>;
+  rollbackFlowSnapshot: (snapshot: FlowVersionSnapshot) => Promise<boolean>;
   exportFlow: () => Promise<void>;
   exportFlowById: (flowId: string) => Promise<void>;
   saveFlow: () => Promise<void>;

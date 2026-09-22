@@ -20,6 +20,7 @@ import type {
   ArtifactSnapshot,
   BridgeResult,
   FlowSnapshot,
+  FlowVersionSnapshot,
   GeneratedScriptResult,
   PickerOpenPayload,
   PickerRequest,
@@ -86,7 +87,8 @@ export type ElectronBridgeActions = {
   silentlyRestoreCurrentFlow: (flowId: string, options?: { restoreCanvas?: boolean }) => Promise<void>;
   /** AI 更新流程后的轻量画布刷新：不清运行日志/草稿，不弹 toast */
   applyAiFlowUpdate: (flowId: string) => Promise<void>;
-  rollbackFlowById: (flowId: string) => Promise<void>;
+  loadFlowVersions: () => Promise<FlowVersionSnapshot[]>;
+  rollbackFlowSnapshot: (snapshot: FlowVersionSnapshot) => Promise<boolean>;
   saveFlow: () => Promise<void>;
   exportFlow: () => Promise<void>;
   exportFlowById: (flowId: string) => Promise<void>;
@@ -347,21 +349,19 @@ export function useElectronBridgeActions({
         setFlows(upsertFlow(flow));
         applyFlowDefinitionToCanvas(flow.definition, setFlowNodes, setFlowEdges);
       },
-      rollbackFlowById: async (savedAt: string) => {
-        if (currentFlow === null) return;
-        // 按 savedAt 查找而非 version：AI/工具编辑从不改 version，同流程快照几乎共享同一个值，
-        // 用它查找永远命中数组里第一个同 version 的快照，回退到错误版本
-        const snapshot = currentFlow.snapshots.find((s) => s.savedAt === savedAt)
-          ?? currentFlow.snapshots[0];
-        if (snapshot === undefined) {
-          pushToast('error', '未找到可回退的版本快照');
-          return;
-        }
+      loadFlowVersions: async () => {
+        if (currentFlow === null) return [];
+        return await backend.listFlowVersions(currentFlow.flowId);
+      },
+      rollbackFlowSnapshot: async (snapshot: FlowVersionSnapshot) => {
+        if (currentFlow === null) return false;
         const updated = await callBridge((api) => api.updateFlow(currentFlow.flowId, {
+          acceptanceContract: snapshot.acceptanceContract,
+          description: snapshot.description ?? undefined,
           definition: snapshot.definition,
           inputVariables: snapshot.inputVariables,
         }));
-        if (updated === null) return;
+        if (updated === null) return false;
         clearDraftStorage();
         resetRunView();
         setCurrentFlow(updated);
@@ -369,7 +369,8 @@ export function useElectronBridgeActions({
         setFlows((prev) => [updated, ...prev.filter((f) => f.flowId !== updated.flowId)]);
         applyFlowDefinitionToCanvas(updated.definition, setFlowNodes, setFlowEdges);
         setInputVariables(updated.inputVariables);
-        pushToast('success', `已回退为 ${snapshot.version}`);
+        pushToast('success', `已恢复 revision ${snapshot.revision ?? snapshot.version}，并保存为新版本`);
+        return true;
       },
       loadFlows: async (options?: BridgeCallOptions) => {
         const flows = await callBridge((api) => api.listFlows(), undefined, options);

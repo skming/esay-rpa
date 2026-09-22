@@ -1,5 +1,5 @@
 export type FlowDiffType = 'added' | 'changed' | 'removed';
-export type FlowDiffScope = 'edge' | 'node';
+export type FlowDiffScope = 'contract' | 'edge' | 'node' | 'variable';
 
 export type FlowDiffField = {
   key: string;
@@ -30,6 +30,7 @@ export type FlowDiffSummary = {
   edgeAdded: number;
   edgeChanged: number;
   edgeRemoved: number;
+  configChanged: number;
   /** 只挪了位置、定义没变的节点数——不计入变更，但要让用户知道差异不是零。 */
   layoutOnly: number;
   items: FlowDiffItem[];
@@ -44,15 +45,22 @@ type ComparableItem = {
   signature: string;
 };
 
-type DefinitionHolder = { version: string; definition: Record<string, unknown> };
+type DefinitionHolder = {
+  acceptanceContract?: unknown;
+  definition: Record<string, unknown>;
+  inputVariables?: unknown[];
+  version: string;
+};
 
 /** 运行态与布局，不属于流程定义；不剔除的话每次保存都会把全部节点报成「变更」。 */
 const VOLATILE_FIELDS = new Set(['exportedAt', 'updatedAt', 'position', 'status', 'x', 'y', 'width', 'height', 'measured']);
 
 /** 新增/移除条目的标题行已经展示了这些字段，再列一遍是重复。 */
 const SUMMARY_SKIP_FIELDS: Record<FlowDiffScope, Set<string>> = {
+  contract: new Set(),
   edge: new Set(['id', 'label', 'source', 'target']),
-  node: new Set(['id', 'title', 'type', 'kind', 'description'])
+  node: new Set(['id', 'title', 'type', 'kind', 'description']),
+  variable: new Set(),
 };
 
 const FIELD_LABELS: Record<string, string> = {
@@ -117,17 +125,43 @@ export function diffFlowSnapshots(before: DefinitionHolder, after: DefinitionHol
 
   const nodeItems = diffComparableItems(beforeNodes, afterNodes, 'node');
   const edgeItems = diffComparableItems(readEdges(before.definition, nodeTitles), readEdges(after.definition, nodeTitles), 'edge');
+  const configItems = [
+    buildConfigDiff('variable', '输入变量', sanitizeVariables(before.inputVariables), sanitizeVariables(after.inputVariables)),
+    buildConfigDiff('contract', '验收契约', before.acceptanceContract, after.acceptanceContract),
+  ].filter((item): item is FlowDiffItem => item !== null);
 
   return {
+    configChanged: configItems.length,
     edgeAdded: countByType(edgeItems, 'added'),
     edgeChanged: countByType(edgeItems, 'changed'),
     edgeRemoved: countByType(edgeItems, 'removed'),
-    items: [...sortByType(nodeItems), ...sortByType(edgeItems)],
+    items: [...configItems, ...sortByType(nodeItems), ...sortByType(edgeItems)],
     layoutOnly: countLayoutOnlyMoves(before.definition, after.definition),
     nodeAdded: countByType(nodeItems, 'added'),
     nodeChanged: countByType(nodeItems, 'changed'),
     nodeRemoved: countByType(nodeItems, 'removed')
   };
+}
+
+function buildConfigDiff(scope: 'contract' | 'variable', title: string, before: unknown, after: unknown): FlowDiffItem | null {
+  if (stableStringify(before) === stableStringify(after)) return null;
+  return {
+    entityId: scope === 'variable' ? 'inputVariables' : 'acceptanceContract',
+    fields: compareFields({ value: before }, { value: after }),
+    id: `${scope}-changed`,
+    scope,
+    title,
+    type: 'changed',
+  };
+}
+
+function sanitizeVariables(variables: unknown[] | undefined): unknown[] {
+  if (!Array.isArray(variables)) return [];
+  return variables.map((variable) => {
+    if (variable === null || typeof variable !== 'object' || Array.isArray(variable)) return variable;
+    const item = variable as Record<string, unknown>;
+    return item.sensitive === true || item.category === 'credential' ? { ...item, value: '••••' } : item;
+  });
 }
 
 function diffComparableItems(beforeItems: ComparableItem[], afterItems: ComparableItem[], scope: FlowDiffScope): FlowDiffItem[] {
