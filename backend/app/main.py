@@ -73,6 +73,7 @@ from app.models.schemas import (
     FlowSnapshot,
     FlowStatusPatchRequest,
     FlowUpdateRequest,
+    FlowVersionSnapshot,
     GeneratedScript,
     HealthResponse,
     QueueStats,
@@ -256,7 +257,10 @@ async def list_flows() -> list[FlowSnapshot]:
     except Exception:
         logging.getLogger(__name__).warning("30天成功率计算失败", exc_info=True)
         rates = {}
-    return [flow.model_copy(update={"success_rate_30d": rates.get(flow.flow_id)}) for flow in flows]
+    return [
+        flow.model_copy(update={"success_rate_30d": rates.get(flow.flow_id), "snapshots": []})
+        for flow in flows
+    ]
 
 
 @app.get("/api/flows/{flow_id}", response_model=FlowSnapshot)
@@ -264,7 +268,15 @@ async def get_flow(flow_id: str) -> FlowSnapshot:
     snapshot = await flow_service.get_flow(flow_id)
     if snapshot is None:
         raise HTTPException(status_code=404, detail="Flow not found")
-    return snapshot
+    return snapshot.model_copy(update={"snapshots": []})
+
+
+@app.get("/api/flows/{flow_id}/versions", response_model=list[FlowVersionSnapshot])
+async def list_flow_versions(flow_id: str) -> list[FlowVersionSnapshot]:
+    snapshots = await flow_service.list_versions(flow_id)
+    if snapshots is None:
+        raise HTTPException(status_code=404, detail="Flow not found")
+    return snapshots
 
 
 @app.patch("/api/flows/{flow_id}", response_model=FlowSnapshot)
@@ -272,7 +284,7 @@ async def update_flow(flow_id: str, request: FlowUpdateRequest) -> FlowSnapshot:
     snapshot = await flow_service.update_flow(flow_id, request)
     if snapshot is None:
         raise HTTPException(status_code=404, detail="Flow not found")
-    return snapshot
+    return snapshot.model_copy(update={"snapshots": []})
 
 
 @app.post("/api/flows/{flow_id}/duplicate", response_model=FlowSnapshot)
@@ -280,7 +292,7 @@ async def duplicate_flow(flow_id: str) -> FlowSnapshot:
     snapshot = await flow_service.duplicate_flow(flow_id)
     if snapshot is None:
         raise HTTPException(status_code=404, detail="Flow not found")
-    return snapshot
+    return snapshot.model_copy(update={"snapshots": []})
 
 
 @app.patch("/api/flows/{flow_id}/move", response_model=FlowSnapshot)
@@ -288,7 +300,7 @@ async def move_flow(flow_id: str, request: FlowMoveRequest) -> FlowSnapshot:
     snapshot = await flow_service.move_flow(flow_id, request.folder_path)
     if snapshot is None:
         raise HTTPException(status_code=404, detail="Flow not found")
-    return snapshot
+    return snapshot.model_copy(update={"snapshots": []})
 
 
 @app.patch("/api/flows/{flow_id}/status", response_model=FlowSnapshot)
@@ -296,7 +308,7 @@ async def set_flow_status(flow_id: str, request: FlowStatusPatchRequest) -> Flow
     snapshot = await flow_service.set_flow_status(flow_id, request.status)
     if snapshot is None:
         raise HTTPException(status_code=404, detail="Flow not found")
-    return snapshot
+    return snapshot.model_copy(update={"snapshots": []})
 
 
 @app.post("/api/flows/{flow_id}/archive", response_model=FlowSnapshot)
@@ -304,7 +316,7 @@ async def archive_flow(flow_id: str) -> FlowSnapshot:
     snapshot = await flow_service.archive_flow(flow_id)
     if snapshot is None:
         raise HTTPException(status_code=404, detail="Flow not found")
-    return snapshot
+    return snapshot.model_copy(update={"snapshots": []})
 
 
 @app.post("/api/flows/{flow_id}/run", response_model=TaskSnapshot)

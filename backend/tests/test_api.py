@@ -138,6 +138,22 @@ async def test_flow_crud_endpoints() -> None:
         assert update_response.json()["version"] == "v1.1.0"
         assert update_response.json()["status"] == "active"
 
+        revision_response = await client.patch(
+            f"/api/flows/{flow_id}",
+            json={"definition": {"nodes": [{"id": "start", "type": "start"}, {"id": "end", "type": "end"}], "edges": []}},
+        )
+        assert revision_response.status_code == 200
+        assert revision_response.json()["revision"] == 2
+        assert revision_response.json()["snapshots"] == []
+
+        list_response = await client.get("/api/flows")
+        assert all(item["snapshots"] == [] for item in list_response.json())
+        flow_response = await client.get(f"/api/flows/{flow_id}")
+        assert flow_response.json()["snapshots"] == []
+        versions_response = await client.get(f"/api/flows/{flow_id}/versions")
+        assert versions_response.status_code == 200
+        assert [item["revision"] for item in versions_response.json()] == [1]
+
         archive_response = await client.post(f"/api/flows/{flow_id}/archive")
         assert archive_response.status_code == 200
         assert archive_response.json()["status"] == "archived"

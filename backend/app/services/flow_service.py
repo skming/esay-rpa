@@ -66,6 +66,10 @@ class FlowService:
     async def get_flow(self, flow_id: str) -> FlowSnapshot | None:
         return await self._store.get(flow_id)
 
+    async def list_versions(self, flow_id: str) -> list[FlowVersionSnapshot] | None:
+        flow = await self._store.get(flow_id)
+        return None if flow is None else flow.snapshots
+
     async def update_flow(self, flow_id: str, request: FlowUpdateRequest) -> FlowSnapshot | None:
         current = await self._store.get(flow_id)
         if current is None:
