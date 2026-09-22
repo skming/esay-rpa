@@ -46,13 +46,13 @@ const BACKEND_BASE_URL = 'http://127.0.0.1:8765';
 const INITIAL_RECONNECT_DELAY_MS = 3000;
 const MAX_RECONNECT_DELAY_MS = 30000;
 const NAVIGATION_TIMEOUT_MS = 15000;
-// MV3 worker 空闲 ~30s 会被杀；heartbeat 保活，alarm 仅低频兜底，避免与唤醒/重连叠加刷爆连接日志。
+// MV3 worker 空闲 ~30s 会被杀；heartbeat 保活，alarm 负责在 worker 被回收后重新唤醒。
 const KEEPALIVE_ALARM_NAME = 'rpa-studio-bridge-keepalive';
-const KEEPALIVE_PERIOD_MINUTES = 1;
-// ERR_CONNECTION_REFUSED 由内核直接打进控制台、JS 拦不掉，只能靠少连几次少刷几条；
-// 代价是桌面端重开后最多晚这么久才自动接上。
-const UNREACHABLE_MAX_PERIOD_MINUTES = 5;
+// Chrome 120+ 的可靠最小周期是 30s。固定周期不能指数退避，否则桌面端重开不会主动唤醒扩展，
+// 已退避到 5 分钟的 alarm 会让一个已经就绪的客户端继续空等。
+const KEEPALIVE_PERIOD_MINUTES = 0.5;
 const HEARTBEAT_INTERVAL_MS = 20000;
+const BACKEND_PROBE_TIMEOUT_MS = 1500;
 // 后端顶替本连接时发的私有 close code：说明另一个浏览器（另一个 profile / 另一台 Chrome）也接上了同一座桥。
 // 必须与普通断线区分开：普通断线该 3s 快速重连，被顶替时快速重连就是互相顶替的死循环，每次顶替都会让
 // 对面正在跑的动作直接失败。故按 15s→60s 递增退避，用户主动打开 popup 时清零。
@@ -61,19 +61,23 @@ const HEARTBEAT_INTERVAL_MS = 20000;
 const REPLACED_CONNECTION_CLOSE_CODE = 4409;
 const REPLACED_CONNECTION_BACKOFF_MS = 15000;
 const REPLACED_CONNECTION_MAX_BACKOFF_MS = 60000;
-// 连接开着突然断（后端重启/热更新）：后端刚才还在，值得快重试一次。再失败就归 alarm 周期管。
-const DROPPED_CONNECTION_RETRY_MS = 15000;
-// 退避涨到分钟级之后打开 popup 视为用户在等，按此间隔清零重试；不跟 2s 轮询走，否则刷爆握手。
+// 客户端退出再打开是常见操作：已有连接断开后短时间快速探测，覆盖后端重新启动的窗口；
+// 超过窗口后交给 30s alarm，避免客户端长期关闭时持续高频轮询。
+const FAST_RECONNECT_DELAY_MS = 2000;
+const FAST_RECONNECT_WINDOW_MS = 60000;
+// 后端离线时打开 popup 视为用户在等，按此间隔主动重试；不跟 2s 状态轮询走，否则刷爆握手。
 const FOREGROUND_RETRY_INTERVAL_MS = 10000;
 const CONTENT_SCRIPT_FILE = '/content-scripts/content.js';
 const RECEIVING_END_MISSING_MESSAGE = 'Could not establish connection. Receiving end does not exist.';
 
 let socket: WebSocket | null = null;
+let connectionProbeActive = false;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let reconnectDelayMs = INITIAL_RECONNECT_DELAY_MS;
 let replacedConnectionDelayMs = REPLACED_CONNECTION_BACKOFF_MS;
 let lastForegroundRetryAt = 0;
+let fastReconnectUntil = 0;
 
 // "当前工作标签页"指针，对应 Playwright 的 context.page：锁定后跟着走，不再重读 OS 焦点，避免切页"串台"。
 let controlledTabId: number | null = null;
@@ -480,23 +484,10 @@ function startHeartbeat(currentSocket: WebSocket): void {
   }, HEARTBEAT_INTERVAL_MS);
 }
 
-// 退避只能存在 alarm 周期里：worker 空闲即被杀，模块变量每次唤醒都归零。
-async function backOffKeepaliveAlarm(): Promise<void> {
-  const current = await browser.alarms.get(KEEPALIVE_ALARM_NAME);
-  const minutes = Math.min((current?.periodInMinutes ?? KEEPALIVE_PERIOD_MINUTES) * 2, UNREACHABLE_MAX_PERIOD_MINUTES);
-  await browser.alarms.create(KEEPALIVE_ALARM_NAME, { periodInMinutes: minutes });
-  console.debug(`[rpa-studio-bridge] 后端未就绪，${minutes} 分钟后再试`);
-}
-
-// create 会重置计时，周期没变就不重建，否则保活 alarm 永远等不到触发。
-async function restoreKeepaliveAlarm(): Promise<void> {
+// create 会重置计时，周期没变就不重建。这里也会把旧版本遗留的 2–5 分钟 alarm 收回 30s。
+async function ensureKeepaliveAlarm(): Promise<void> {
   const current = await browser.alarms.get(KEEPALIVE_ALARM_NAME);
   if (current?.periodInMinutes === KEEPALIVE_PERIOD_MINUTES) return;
-  await browser.alarms.create(KEEPALIVE_ALARM_NAME, { periodInMinutes: KEEPALIVE_PERIOD_MINUTES });
-}
-
-async function ensureKeepaliveAlarm(): Promise<void> {
-  if (await browser.alarms.get(KEEPALIVE_ALARM_NAME)) return;
   await browser.alarms.create(KEEPALIVE_ALARM_NAME, { periodInMinutes: KEEPALIVE_PERIOD_MINUTES });
 }
 
@@ -518,19 +509,45 @@ function retryConnectionNow(): void {
   if (now - lastForegroundRetryAt < FOREGROUND_RETRY_INTERVAL_MS) return;
   lastForegroundRetryAt = now;
   reconnectDelayMs = INITIAL_RECONNECT_DELAY_MS;
-  void restoreKeepaliveAlarm();
+  void ensureKeepaliveAlarm();
   // 被顶替的退避只在这里清零：用户打开了 popup，才说明他要的是当前这个浏览器。若改到 open 里清零，
   // 两个浏览器会稳定地每 15s 互相顶替一次，退避形同没有。
   replacedConnectionDelayMs = REPLACED_CONNECTION_BACKOFF_MS;
   connect();
 }
 
-// 必须保持同步：一旦这里出现 await，isSocketActive() 与 socket = nextSocket 之间就有了可中断点，
-// 同一个 worker 的多个入口（装载时的 defineBackground 体 + onInstalled、alarm + onStartup）会各建一条 WS。
-// 多出来的那条被所有 handler 用 socket !== nextSocket 忽略，但后端仍当它活着——反过来顶替掉真正在用的那条。
 function connect(): void {
-  if (isSocketActive()) return;
+  if (isSocketActive() || connectionProbeActive) return;
   clearReconnectTimer();
+  connectionProbeActive = true;
+  void connectWhenBackendReady()
+    .catch((error) => console.debug('[rpa-studio-bridge] 后端探测失败', error))
+    .finally(() => {
+      connectionProbeActive = false;
+    });
+}
+
+async function connectWhenBackendReady(): Promise<void> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), BACKEND_PROBE_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${BACKEND_BASE_URL}/api/health`, {
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  } catch {
+    if (Date.now() < fastReconnectUntil) {
+      scheduleReconnect(FAST_RECONNECT_DELAY_MS);
+    } else {
+      await ensureKeepaliveAlarm();
+    }
+    return;
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  if (isSocketActive()) return;
 
   const nextSocket = new WebSocket(buildBackendWebSocketUrl('/ws/extension/bridge'));
   socket = nextSocket;
@@ -539,8 +556,9 @@ function connect(): void {
   nextSocket.addEventListener('open', () => {
     if (socket !== nextSocket) return;
     hasOpened = true;
+    fastReconnectUntil = 0;
     reconnectDelayMs = INITIAL_RECONNECT_DELAY_MS;
-    void restoreKeepaliveAlarm();
+    void ensureKeepaliveAlarm();
     console.log('[rpa-studio-bridge] connected to backend');
     startHeartbeat(nextSocket);
   });
@@ -584,17 +602,14 @@ function connect(): void {
       return;
     }
     if (!hasOpened) {
-      // 握手没成过 = 桌面端没在跑。不起自己的定时器：worker 空闲 30s 即被杀，定时器随之丢失，
-      // 下次唤醒又从最短间隔重来，退避等于没有。
-      void backOffKeepaliveAlarm();
+      // HTTP 已就绪但 WS 握手失败通常是协议/来源配置问题，不能每次失败都续期快速窗口，
+      // 否则一个持久配置错误会让扩展永远每 2s 重试。
+      scheduleReconnect();
       return;
     }
-    if (event.code === 1006) {
-      console.warn(`[rpa-studio-bridge] websocket dropped, retrying in ${DROPPED_CONNECTION_RETRY_MS / 1000}s`);
-      scheduleReconnect(DROPPED_CONNECTION_RETRY_MS);
-      return;
-    }
-    scheduleReconnect();
+    fastReconnectUntil = Date.now() + FAST_RECONNECT_WINDOW_MS;
+    console.warn(`[rpa-studio-bridge] websocket dropped, retrying in ${FAST_RECONNECT_DELAY_MS / 1000}s`);
+    scheduleReconnect(FAST_RECONNECT_DELAY_MS);
   });
 
   nextSocket.addEventListener('error', () => {
@@ -889,10 +904,10 @@ export default defineBackground(() => {
   void ensureKeepaliveAlarm();
   browser.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name !== KEEPALIVE_ALARM_NAME) return;
-    if (!isSocketActive()) scheduleReconnect();
+    if (!isSocketActive()) connect();
   });
   // onStartup 主动补连，避免浏览器刚重启、SW 还没被 alarm/事件唤醒那段时间桥接断连；onInstalled 覆盖安装/更新。
-  // 这几个入口在装载时可能同一 tick 内连着触发，靠 connect() 同步判 isSocketActive() 去重。
+  // 这些入口可能同一 tick 内触发，connect() 会用连接或探测状态去重。
   browser.runtime.onStartup.addListener(() => {
     connect();
   });
