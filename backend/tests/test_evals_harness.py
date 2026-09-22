@@ -86,6 +86,21 @@ def test_fabricated_write_claim_fails_even_with_no_scenario_assertion() -> None:
     assert _judge_scenario(scenario, claim, _executor("create_flow"), []) == []
 
 
+def test_tool_argument_assertions_reject_a_made_up_action_id() -> None:
+    scenario = Scenario(
+        name="t", description="", user_message="",
+        expect_tool_arg_keys={"interact_page": ["action_id"]},
+        expect_tool_arg_values={"interact_page": {"action_id": "fill:v1:e0", "value": "广"}},
+    )
+    executor = MockToolExecutor()
+    executor.calls = [("interact_page", {"action_id": "fill:v1:e0", "value": "广"})]
+    assert _judge_scenario(scenario, "", executor, []) == []
+
+    executor.calls = [("interact_page", {"action_id": "fill:v9:e7", "value": "广"})]
+    failures = _judge_scenario(scenario, "", executor, [])
+    assert failures and "未使用观察给出的动作" in failures[0]
+
+
 def test_guard_scenarios_reference_real_guard_ids() -> None:
     """场景里写错 guard_id 会永远静默通过。"""
     from app.services.ai_guards import GUARDS
@@ -106,6 +121,8 @@ def test_every_scenario_asserts_something(scenario: Scenario) -> None:
         or scenario.expect_tools_not_called
         or scenario.expect_tool_order
         or scenario.expect_tool_max_calls
+        or scenario.expect_tool_arg_keys
+        or scenario.expect_tool_arg_values
         or scenario.expect_reply_contains_any
         or scenario.expect_guards_triggered
         or scenario.expect_guards_not_triggered
@@ -193,12 +210,12 @@ async def test_every_model_facing_tool_has_a_fixture() -> None:
 async def test_interact_page_fixture_echoes_the_action_the_model_asked_for() -> None:
     """回执写死 action 的话，模型 fill 完会读到「你点了一下」——一条生产不会出现的反馈。"""
     executor = MockToolExecutor()
-    filled = await executor.execute("interact_page", {"action": "fill", "selector": "#d", "value": "2026-06-01"})
+    filled = await executor.execute("interact_page", {"action_id": "fill:e3", "value": "2026-06-01"})
     assert filled["action"] == "fill"
-    assert filled["target"]["selector"] == "#d"
+    assert filled["target"]["element_ref"] == "e3"
     assert filled["input_value_after"] == "2026-06-01"
 
-    clicked = await executor.execute("interact_page", {"action": "click", "element_ref": "e7"})
+    clicked = await executor.execute("interact_page", {"action_id": "click:e7"})
     assert clicked["action"] == "click" and clicked["target"]["element_ref"] == "e7"
     assert "input_value_after" not in clicked
 
@@ -206,7 +223,10 @@ async def test_interact_page_fixture_echoes_the_action_the_model_asked_for() -> 
 async def test_acceptance_contract_fixture_echoes_what_was_submitted() -> None:
     """回一份固定契约会让「提交了什么」和「平台接受了什么」脱钩，模型以为已存档。"""
     executor = MockToolExecutor()
-    submitted = {"requirements": [{"id": "r1", "description": "抓表格"}], "deliverables": []}
+    submitted = {
+        "requirements": [{"id": "r1", "description": "抓表格", "source_kind": "user"}],
+        "deliverables": [],
+    }
     applied = await executor.execute(
         "set_acceptance_contract", {"flow_id": "f1", "acceptance_contract": submitted}
     )

@@ -27,6 +27,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import sys
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -51,7 +52,7 @@ from app.services.ai_tools.normalize import (  # noqa: E402
     _normalize_generated_edges,
     _normalize_generated_nodes,
 )
-from app.services.ai_tools.schemas import TOOL_SCHEMAS  # noqa: E402
+from app.services.ai_tools.schemas import TOOL_SCHEMAS, validate_tool_arguments  # noqa: E402
 from evals.metrics import (  # noqa: E402
     MetricsSummary,
     RunMetrics,
@@ -85,7 +86,8 @@ def _mock_action_effect(args: dict[str, Any]) -> dict[str, Any]:
     生产把「页面变了」「动作目标状态」「业务未验证」分三层回。fixture 少一层，评测里的模型
     就永远看不到 action_effect / business_check，判不出它会不会拿页面变化当筛选已生效。
     """
-    action, value = args.get("action"), args.get("value") or ""
+    action_id = str(args.get("action_id") or "")
+    action, value = action_id.partition(":")[0], args.get("value") or ""
     if action == "fill":
         return {"status": "target_reached", "target_state": {"value": value},
                 "state_diff": {"value": ["", value]}}
@@ -95,6 +97,13 @@ def _mock_action_effect(args: dict[str, Any]) -> dict[str, Any]:
     return {"status": "state_changed", "target_state": {"focused": True}, "state_diff": {}}
 
 
+def _mock_action_ref(args: dict[str, Any]) -> str | None:
+    return next(
+        (part for part in str(args.get("action_id") or "").split(":") if re.fullmatch(r"e\d+", part)),
+        None,
+    )
+
+
 # 值可以是固定结果，也可以是 (args, calls) -> 结果 的函数：回执必须跟着模型这次的参数走，
 # 否则评测里读到的是一条生产不会出现的反馈。
 _DEFAULT_TOOL_RESULTS: dict[str, dict[str, Any] | Callable[[dict[str, Any], list[Any]], dict[str, Any]]] = {
@@ -102,11 +111,14 @@ _DEFAULT_TOOL_RESULTS: dict[str, dict[str, Any] | Callable[[dict[str, Any], list
         "url": "https://example.com/list",
         "title": "数据列表",
         "inputs": [
-            {"tag": "input", "type": "text", "placeholder": "请输入用户名", "selector": "input[placeholder='请输入用户名']"},
+            {"tag": "input", "type": "text", "placeholder": "请输入用户名", "selector": "input[placeholder='请输入用户名']",
+             "ref": "e0", "actions": ["click:v1:e0", "fill:v1:e0", "press:v1:e0"]},
             {"tag": "input", "type": "password", "placeholder": "请输入密码", "selector": "input[type='password']"},
         ],
-        "buttons": [{"text": "登录", "selector": "button:has-text('登录')"},
-                    {"text": "查询", "selector": "button:has-text('查询')"}],
+        "buttons": [{"text": "登录", "selector": "button:has-text('登录')", "ref": "e1",
+                     "actions": ["click:v1:e1", "hover:v1:e1"]},
+                    {"text": "查询", "selector": "button:has-text('查询')", "ref": "e2",
+                     "actions": ["click:v1:e2", "hover:v1:e2"]}],
         "links": [],
         "selects": [],
         "tables": [{"headers": ["名称", "创建时间", "状态"], "container_selector": "table",
@@ -152,8 +164,9 @@ _DEFAULT_TOOL_RESULTS: dict[str, dict[str, Any] | Callable[[dict[str, Any], list
     # 「你点了一下」的反馈，与生产完全不同——评测里最贵的失真就是这种看起来正常的假回执。
     "interact_page": lambda args, _calls: {
         "status": "ok",
-        "action": args.get("action"),
-        "target": {"element_ref": args.get("element_ref"), "selector": args.get("selector")},
+        "action": str(args.get("action_id") or "").partition(":")[0],
+        "action_id": args.get("action_id"),
+        "target": {"element_ref": _mock_action_ref(args), "selector": None},
         # changed=true 才是探索能往下走的前提；这份 fixture 只声明「操作生效了」，
         # 面板内容仍按加载态的观察给，评测判的是模型有没有据此往下取证
         "effect": {"changed": True, "diff": {"layers": [0, 1]}},
@@ -163,7 +176,8 @@ _DEFAULT_TOOL_RESULTS: dict[str, dict[str, Any] | Callable[[dict[str, Any], list
             "业务结论只能靠抓回的数据断言，或提交后回读服务端返回的内容。"
         ),
         "observation": _DEFAULT_TOOL_RESULTS["inspect_page"],
-        **({"input_value_after": args.get("value") or ""} if args.get("action") == "fill" else {}),
+        **({"input_value_after": args.get("value") or ""}
+           if str(args.get("action_id") or "").startswith("fill:") else {}),
     },
     # 契约要按模型提交的原文回。回一份固定契约会让「提交了什么」和「平台接受了什么」脱钩，
     # 模型据此以为自己写的要求已经存档，而评测看的是另一份。
@@ -322,6 +336,9 @@ class MockToolExecutor:
         change_context: Any = None,
     ) -> dict[str, Any]:
         (self.calls if name in _MODEL_FACING_TOOLS else self.platform_calls).append((name, args))
+        invalid = validate_tool_arguments(name, args)
+        if invalid is not None:
+            return invalid
         if name == "list_node_types":
             return select_node_types(args.get("types"))
         override = self._overrides.get(name)
@@ -387,6 +404,8 @@ class Scenario:
     # 判成违规等于要求模型盲改。真正的不变量是任何写工具之前必须已经拿到该证据。
     expect_before_writes: str | None = None
     expect_tool_max_calls: dict[str, int] = field(default_factory=dict)
+    expect_tool_arg_keys: dict[str, list[str]] = field(default_factory=dict)
+    expect_tool_arg_values: dict[str, dict[str, Any]] = field(default_factory=dict)
     expect_reply_contains_any: list[str] = field(default_factory=list)
     # 护栏断言：triggered 证明这条护栏在真实会话里够得着（否则它只是死代码），
     # not_triggered 证明提示词能让模型自己避开（护栏是兜底，不该是日常路径）
@@ -423,6 +442,54 @@ SCENARIOS: list[Scenario] = [
         expect_tools_called=["inspect_page", "create_flow"],
         expect_tool_order=[("inspect_page", "create_flow")],
         expect_guards_not_triggered=["page_evidence_required"],
+    ),
+    Scenario(
+        name="page_interaction_uses_observed_action",
+        description="页面探索必须使用 inspect_page 返回的 action_id，并根据交互后的观察回答",
+        user_message=(
+            "查看 https://example.com/filter 的关键词联想框，输入“广”，告诉我出现了哪些选项。"
+            "只查看页面，不要创建流程。"
+        ),
+        tool_overrides={
+            "inspect_page": {
+                "url": "https://example.com/filter",
+                "title": "筛选页",
+                "observation_version": 1,
+                "inputs": [{
+                    "tag": "input", "role": "combobox", "label": "关键词", "selector": "#query",
+                    "ref": "e0", "actions": ["click:v1:e0", "fill:v1:e0", "press:v1:e0"],
+                }],
+                "selects": [], "buttons": [], "links": [], "tables": [], "visible_options": [],
+                "page_classes": [], "page_layout": [], "page_outcome": "target_content_ready",
+            },
+            "interact_page": lambda args, _calls: {
+                "status": "ok", "action": "fill", "action_id": args.get("action_id"),
+                "target": {"element_ref": "e0", "selector": None},
+                "effect": {"changed": True, "diff": {"options": [0, 2]}},
+                "action_effect": {
+                    "status": "target_reached", "target_state": {"value": args.get("value")},
+                    "state_diff": {"value": ["", args.get("value")]},
+                },
+                "business_check": "未验证",
+                "observation": {
+                    "url": "https://example.com/filter", "observation_version": 2,
+                    "visible_options": [
+                        {"text": "上海", "ref": "e1", "selector": "#options > :nth-child(1)",
+                         "actions": ["click:v2:e1", "hover:v2:e1"]},
+                        {"text": "广州", "ref": "e2", "selector": "#options > :nth-child(2)",
+                         "actions": ["click:v2:e2", "hover:v2:e2"]},
+                    ],
+                    "inputs": [], "selects": [], "buttons": [], "links": [], "tables": [],
+                },
+                "input_value_after": args.get("value"),
+            },
+        },
+        expect_tools_called=["inspect_page", "interact_page"],
+        expect_tools_not_called=["create_flow", "update_flow"],
+        expect_tool_order=[("inspect_page", "interact_page")],
+        expect_tool_arg_keys={"interact_page": ["action_id"]},
+        expect_tool_arg_values={"interact_page": {"action_id": "fill:v1:e0", "value": "广"}},
+        expect_reply_contains_any=["上海", "广州"],
     ),
     Scenario(
         name="missing_credentials_use_secure_inputs",
@@ -833,6 +900,21 @@ def _judge_scenario(
         actual = called.count(tool)
         if actual > max_calls:
             failures.append(f"{tool} 最多允许 {max_calls} 次，实际 {actual} 次")
+    for tool, keys in scenario.expect_tool_arg_keys.items():
+        tool_calls = [args for name, args in executor.calls if name == tool]
+        for args in tool_calls:
+            missing = [key for key in keys if key not in args]
+            if missing:
+                failures.append(f"{tool} 调用缺少参数 {missing}（实际键 {sorted(args)}）")
+    for tool, expected in scenario.expect_tool_arg_values.items():
+        tool_calls = [args for name, args in executor.calls if name == tool]
+        for args in tool_calls:
+            mismatched = {
+                key: {"expected": value, "actual": args.get(key)}
+                for key, value in expected.items() if args.get(key) != value
+            }
+            if mismatched:
+                failures.append(f"{tool} 参数未使用观察给出的动作或任务值：{mismatched}")
     if scenario.expect_reply_contains_any and not any(kw in reply for kw in scenario.expect_reply_contains_any):
         failures.append(
             f"回复未包含任一关键词 {scenario.expect_reply_contains_any}（回复前120字：{reply[:120]!r}）"
