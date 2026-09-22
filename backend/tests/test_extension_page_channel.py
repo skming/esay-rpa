@@ -83,77 +83,33 @@ async def test_observe_bumps_version_and_stamps_it_on_the_result() -> None:
     assert ch.last_url == "https://a/2"
 
 
-async def test_ref_from_an_earlier_observation_is_refused_without_touching_the_page() -> None:
-    bridge = FakeBridge(responses={"page.observe": [{}, {}]})
+async def test_action_resolution_uses_the_current_observation_version() -> None:
+    bridge = FakeBridge(responses={
+        "page.observe": [{}],
+        "page.resolveAction": [{"status": "ok", "ref": "e3", "operation": "click"}],
+    })
     _, ch = await open_with(bridge)
     await ch.observe(None)
-    await ch.observe(None)
 
-    ref, error = await ch.resolve_target("e3", None, 1)
+    result = await ch.resolve_action("click:e3")
 
-    assert ref is None
-    assert error == {
-        "status": "stale_element_ref",
-        "error": "元素引用属于第 1 次观察，当前会话是第 2 次，元素可能已经换了位置",
-        "required_action": "call_inspect_page_again",
+    assert result["status"] == "ok"
+    assert bridge.page_calls()[-1] == {
+        "type": "page.resolveAction", "actionId": "click:e3", "observationVersion": 1,
+        "explorationTabId": 7, "documentId": "doc-1",
     }
-    # 过期编号不许发到页面：发过去内容脚本自己也会拒，但那多一次往返，且真按 selector
-    # 兜底解析就会点到同位置的另一个元素
-    assert [c["type"] for c in bridge.page_calls()] == ["page.observe", "page.observe"]
 
 
-async def test_content_script_ref_failure_becomes_stale_ref_not_a_crash() -> None:
-    """导航后内容脚本重建、ref 表消失，报的是 RuntimeError；对模型只有一个结论：重新观察。"""
-    bridge = FakeBridge(
-        responses={
-            "page.observe": [{}],
-            "page.resolveTarget": [RuntimeError("ref 已失效或不存在: e2，请重新 query/find 生成快照")],
-        }
-    )
+@pytest.mark.parametrize("status", ["stale_action", "target_not_actionable", "target_occluded"])
+async def test_action_resolution_preserves_page_validation_status(status: str) -> None:
+    bridge = FakeBridge(responses={
+        "page.observe": [{}],
+        "page.resolveAction": [{"status": status, "error": "fixture"}],
+    })
     _, ch = await open_with(bridge)
     await ch.observe(None)
 
-    ref, error = await ch.resolve_target("e2", None, 1)
-
-    assert ref is None
-    assert error is not None and error["status"] == "stale_element_ref"
-    assert error["required_action"] == "call_inspect_page_again"
-
-
-async def test_selector_hitting_several_elements_is_refused_instead_of_taking_the_first() -> None:
-    bridge = FakeBridge(responses={"page.observe": [{}], "page.resolveTarget": [{"matches": 3}]})
-    _, ch = await open_with(bridge)
-    await ch.observe(None)
-
-    ref, error = await ch.resolve_target(None, "button:has-text('查询')", None)
-
-    assert ref is None
-    assert error is not None and error["status"] == "ambiguous_selector"
-    assert error["matches"] == 3
-    assert error["required_action"] == "narrow_selector_or_use_element_ref"
-
-
-async def test_selector_hitting_nothing_is_element_not_found() -> None:
-    bridge = FakeBridge(responses={"page.observe": [{}], "page.resolveTarget": [{"matches": 0}]})
-    _, ch = await open_with(bridge)
-    await ch.observe(None)
-
-    ref, error = await ch.resolve_target(None, "#nope", None)
-
-    assert ref is None
-    assert error is not None and error["status"] == "element_not_found"
-
-
-async def test_unique_selector_returns_a_temp_ref_so_the_action_hits_what_was_checked() -> None:
-    bridge = FakeBridge(
-        responses={"page.observe": [{}], "page.resolveTarget": [{"matches": 1, "element_ref": "t1"}]}
-    )
-    _, ch = await open_with(bridge)
-    await ch.observe(None)
-
-    ref, error = await ch.resolve_target(None, "#start", None)
-
-    assert (ref, error) == ("t1", None)
+    assert await ch.resolve_action("click:e3") == {"status": status, "error": "fixture"}
 
 
 @pytest.mark.parametrize(
@@ -391,14 +347,14 @@ async def test_real_tool_dispatch_reuses_extension_and_reports_action_effect(mon
         pytest.fail("extension observation opened Playwright")
     monkeypatch.setattr(RpaToolExecutor, "_inspect_page_via_browser", wrong_channel)
     bridge = FakeBridge({"page.observe": [{"url": "https://logged-in.test/"}, {"url": "https://logged-in.test/"}],
-                         "page.resolveTarget": [{"matches": 1}],
+                         "page.resolveAction": [{"status": "ok", "ref": "e0", "operation": "fill"}],
                          "page.targetState": [{"tag": "input", "value": "old"}, {"tag": "input", "value": "new"}],
                          "page.effectSignature": [{"url": "https://logged-in.test/"}, {"url": "https://logged-in.test/"}]})
     executor, _ = tool_executor(bridge)
     observed = await executor.execute("inspect_page", {"browser_executor": "extension"})
     assert observed["inspection_source"] == "extension"
     assert observed["session"]["tab_id"] == 7
-    acted = await executor.execute("interact_page", {"action": "fill", "element_ref": "e0", "value": "new", "observation_version": 1, "wait_ms": 0})
+    acted = await executor.execute("interact_page", {"action_id": "fill:e0", "value": "new"})
     assert acted["action_effect"]["status"] == "target_reached"
     assert acted["input_value_after"] == "new"
     assert acted["observation"]["observation_version"] == 2
@@ -411,7 +367,7 @@ async def test_extension_disabled_mid_session_prevents_interaction() -> None:
     await executor.execute("inspect_page", {"browser_executor": "extension"})
     manager.is_extension_enabled = lambda: False
     before = len(bridge.calls)
-    result = await executor.execute("interact_page", {"action": "click", "element_ref": "e0"})
+    result = await executor.execute("interact_page", {"action_id": "click:e0"})
     assert result["status"] == "blocked_extension_disabled"
     assert len(bridge.calls) == before
 
@@ -471,13 +427,12 @@ async def test_inspect_requests_page_html_but_interact_does_not() -> None:
     bridge = FakeBridge({
         "page.observe": [{"url": "https://example.com/list", "tables": [{}]},
                           {"url": "https://example.com/list", "tables": [{}]}],
-        "page.resolveTarget": [{"matches": 1, "element_ref": "t1"}],
+        "page.resolveAction": [{"status": "ok", "ref": "t1", "operation": "click"}],
     })
     executor, _ = tool_executor(bridge)
 
     await executor.execute("inspect_page", {"browser_executor": "extension", "url": "https://example.com/list"})
-    await executor.execute("interact_page", {"action": "click", "selector": "#go",
-                                             "observation_version": 1})
+    await executor.execute("interact_page", {"action_id": "click:t1"})
 
     observes = [c for c in bridge.calls if c["type"] == "page.observe"]
     assert [c.get("includeHtml") for c in observes] == [True, False]
@@ -592,7 +547,7 @@ async def test_extension_interaction_timeout_still_returns_observation(monkeypat
     from app.services.ai_tools.executor import RpaToolExecutor
 
     bridge = FakeBridge({
-        "page.resolveTarget": [{"matches": 1, "element_ref": "e1"}],
+        "page.resolveAction": [{"status": "ok", "ref": "e1", "operation": "click"}],
         "page.waitFor": [{"status": "timed_out"}],
         "page.observe": [{"url": "https://example.test", "inputs": [], "buttons": []}],
     })
@@ -600,7 +555,7 @@ async def test_extension_interaction_timeout_still_returns_observation(monkeypat
     monkeypatch.setattr(channel_mod, "get_channel", lambda: channel)
     monkeypatch.setattr(RpaToolExecutor, "_extension_access_error", lambda self: None)
     executor = RpaToolExecutor(flow_service=None, task_manager=None)
-    result = await executor._interact_page_via_extension("click", None, "#button", None, None, None, "#panel", 0)
+    result = await executor._interact_page_via_extension("click:e1", None, None, "#panel")
     assert result["status"] == "ok"
     assert result["wait_result"]["status"] == "timed_out"
     assert result["observation"]["inspection_source"] == "extension"

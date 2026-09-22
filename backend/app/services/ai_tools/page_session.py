@@ -239,6 +239,33 @@ class PageSession:
             raise StaleRefError(f"元素引用 {ref} 在页面上已经不存在，请重新观察")
         return element
 
+    async def resolve_action(self, action_id: str) -> tuple[dict[str, Any], Any | None]:
+        """校验动作仍属于当前观察且目标语义未变化，并返回同一个 DOM 节点句柄。"""
+        self._require_open()
+        self.touch()
+        target = await self.target()
+        try:
+            result = await target.evaluate(
+                "(id) => { const reg = window.__rpaProbe;"
+                " return reg && typeof reg.resolveAction === 'function'"
+                " ? reg.resolveAction(id) : {status:'stale_action',error:'当前页面没有动作观察记录'}; }",
+                action_id,
+            )
+        except Exception:
+            return {"status": "stale_action", "error": "页面在动作校验前已经变化"}, None
+        if not isinstance(result, dict) or result.get("status") != "ok":
+            return result if isinstance(result, dict) else {
+                "status": "stale_action", "error": "动作校验没有返回有效结果"
+            }, None
+        element_ref = result.get("ref")
+        if element_ref is None:
+            return result, None
+        try:
+            element = await self.element_for_ref(str(element_ref), self.version)
+        except StaleRefError as exc:
+            return {"status": "stale_action", "error": str(exc)}, None
+        return result, element
+
 
 def _is_closed(page: Any) -> bool:
     checker = getattr(page, "is_closed", None)

@@ -23,7 +23,7 @@ export const PAGE_PROBE = (args) => {
     // ── 一次观察 = 一个 ref 注册表 ────────────────────────────────
     // 整表替换而不是追加：上一次观察的 ref 编号在新版本里必须失效，
     // 否则模型会拿旧编号操作重渲染后的元素，点到的是同位置的另一行数据。
-    const reg = { version: version, els: [] };
+    const reg = { version: version, els: [], actions: new Map() };
     window.__rpaProbe = reg;
     function ref(el) { reg.els.push(el); return 'e' + (reg.els.length - 1); }
 
@@ -94,6 +94,78 @@ export const PAGE_PROBE = (args) => {
         return el.disabled === true || el.getAttribute('aria-disabled') === 'true';
     }
 
+    function actionSignature(el) {
+        const scope = el.closest('form, dialog, [role=dialog], article, li, tr, [role=row]') || el.parentElement;
+        const scopeText = scope && !scope.matches('input, textarea, select')
+            ? renderedText(scope).slice(0, 160) : '';
+        return JSON.stringify({
+            tag: el.tagName,
+            role: el.getAttribute('role') || implicitRole(el),
+            name: accName(el) || labelFor(el) || renderedText(el),
+            value: el.type === 'password' ? null : ('value' in el ? String(el.value || '') : null),
+            checked: typeof el.checked === 'boolean' ? el.checked : null,
+            selected_index: typeof el.selectedIndex === 'number' ? el.selectedIndex : null,
+            disabled: isDisabled(el),
+            readonly: el.readOnly === true || el.getAttribute('aria-readonly') === 'true',
+            href: el.getAttribute('href'),
+            scope: scope ? [scope.tagName, scope.id || null, scope.getAttribute('role'), scopeText] : null,
+        });
+    }
+
+    function registerAction(el, elementRef, operation, suffix, boundValue) {
+        const actionId = operation + ':v' + version + ':' + elementRef
+            + (suffix === null ? '' : ':' + suffix);
+        reg.actions.set(actionId, {
+            element: el,
+            ref: elementRef,
+            operation: operation,
+            bound_value: boundValue,
+            signature: actionSignature(el),
+        });
+        return actionId;
+    }
+
+    reg.resolveAction = (actionId) => {
+        const action = reg.actions.get(actionId);
+        if (!action) return { status: 'stale_action', error: '动作不属于当前观察' };
+        const el = action.element;
+        if (!el || !el.isConnected || actionSignature(el) !== action.signature) {
+            return { status: 'stale_action', error: '目标元素在观察后发生了变化' };
+        }
+        if (!isVisible(el) || isDisabled(el)) {
+            return { status: 'target_not_actionable', error: '目标元素当前不可操作' };
+        }
+        if (action.operation !== 'scroll') {
+            const rect = el.getBoundingClientRect();
+            const x = rect.x + rect.width / 2;
+            const y = rect.y + rect.height / 2;
+            // 视口外不是遮挡：Playwright 会自动滚入视口，扩展按 DOM 直接派发事件。只有中心点
+            // 已在视口内时 elementFromPoint 才能给出「被另一层盖住」的有效证据。
+            if (document.visibilityState === 'visible' && document.hasFocus()
+                && x >= 0 && x <= window.innerWidth && y >= 0 && y <= window.innerHeight) {
+                const root = el.getRootNode();
+                const hit = typeof root.elementFromPoint === 'function'
+                    ? root.elementFromPoint(x, y) : document.elementFromPoint(x, y);
+                // 扩展在自动化期间主动盖住页面，防止用户同时点击。它不阻止内容脚本/CDP 动作，
+                // 因而不是业务页面对目标的遮挡证据。
+                const ownBlocker = hit && hit.id === 'rpa-studio-page-blocker';
+                if (!ownBlocker && (!hit || (hit !== el && !el.contains(hit)))) {
+                    return {
+                        status: 'target_occluded', error: '目标元素被其他元素遮挡',
+                        occluding: hit ? {
+                            tag: hit.tagName.toLowerCase(), id: hit.id || null,
+                            role: hit.getAttribute('role'), text: renderedText(hit),
+                        } : null,
+                    };
+                }
+            }
+        }
+        return {
+            status: 'ok', ref: action.ref, operation: action.operation,
+            bound_value: action.bound_value,
+        };
+    };
+
     // 字段缺省即默认值：visible=true / disabled=false / matches=1。
     // 60 个元素每个都带三个默认字段，光默认值就能占掉上千 token。
     function base(el) {
@@ -106,6 +178,11 @@ export const PAGE_PROBE = (args) => {
         if (isDisabled(el)) out.disabled = true;
         if (inShadow.has(el)) out.shadow = true;
         return out;
+    }
+
+    function attachActions(out, el, operations) {
+        if (!isVisible(el) || isDisabled(el)) return;
+        out.actions = operations.map(operation => registerAction(el, out.ref, operation, null, null));
     }
 
     // 表单字段的标签：只用 HTML 语义，不猜类名。
@@ -240,6 +317,15 @@ export const PAGE_PROBE = (args) => {
         out.value = el.type === 'password' ? null : ((el.value || '').slice(0, 40) || null);
         out.ancestors = componentAncestors(el);   // 仅服务端做组件识别用，返回给模型前会被移除
         out.containers = containerChain(el);      // 同上，仅服务端做日期控件实例分组
+        const inputType = String(el.type || 'text').toLowerCase();
+        if (inputType === 'password' || inputType === 'file'
+            || inputType === 'submit' || inputType === 'button' || inputType === 'reset') {
+            // password/file 不由助手直接填写；按钮类 input 会在 buttons 中注册一次，避免重复动作。
+        } else if (inputType === 'checkbox' || inputType === 'radio' || el.readOnly) {
+            attachActions(out, el, ['click']);
+        } else {
+            attachActions(out, el, ['click', 'fill', 'press']);
+        }
         return out;
     }).sort((a, b) => (a.placeholder || a.name || a.id ? 0 : 1) - (b.placeholder || b.name || b.id ? 0 : 1))
       .slice(0, MAX);
@@ -250,6 +336,14 @@ export const PAGE_PROBE = (args) => {
         out.id = el.id || null;
         out.label = labelFor(el);
         out.options = [...el.options].map(o => o.text.trim()).filter(Boolean).slice(0, 20);
+        attachActions(out, el, ['click', 'press']);
+        out.option_actions = [...el.options].slice(0, 20).map((option, index) => ({
+            label: option.text.trim(),
+            value: option.value,
+            disabled: option.disabled || option.closest('optgroup[disabled]') !== null,
+            action_id: option.disabled || option.closest('optgroup[disabled]') !== null
+                ? null : registerAction(el, out.ref, 'select_option', index, option.value),
+        }));
         out.ancestors = componentAncestors(el);
         return out;
     });
@@ -270,6 +364,7 @@ export const PAGE_PROBE = (args) => {
         const out = base(el);
         out.text = text(el);
         out.type = el.type || null;
+        attachActions(out, el, ['click', 'hover']);
         // 分页页码、tab 的「当前选中」只写在 class 上（active / current / selected）：
         // 不给出来，模型无法判断这次点击有没有真的换页
         out.cls = String(el.className || '').slice(0, 60) || null;
@@ -289,6 +384,7 @@ export const PAGE_PROBE = (args) => {
         out.text = text(item.el);
         out.href = item.el.href || null;
         out.cls = String(item.el.className || '').slice(0, 60);
+        attachActions(out, item.el, ['click', 'hover']);
         if (item.group_size > 1) out.same_text_count = item.group_size;
         return out;
     });
@@ -427,9 +523,30 @@ export const PAGE_PROBE = (args) => {
     for (const cell of layerCells) {
         if (!optionEls.includes(cell)) optionEls.push(cell);
     }
-    const visibleOptions = optionEls
-        .slice(0, 40)
-        .map(el => ({ text: text(el), ref: ref(el), selector: bestSelector(el).selector }));
+    const visibleOptions = optionEls.slice(0, 40).map(el => {
+        const out = { text: text(el), ref: ref(el), selector: bestSelector(el).selector };
+        attachActions(out, el, ['click', 'hover']);
+        return out;
+    });
+
+    // 页面内滚动容器必须作为动作显式暴露。只给整页滚动会让虚拟列表、抽屉和固定高度表格
+    // 永远无法触发懒加载；让模型自行猜 selector 又会重新引入「定位与动作分离」的问题。
+    const scrollables = queryAll(ROOTS, '*').filter(el => {
+        if (!isVisible(el) || el.scrollHeight <= el.clientHeight + 2) return false;
+        const overflowY = getComputedStyle(el).overflowY;
+        return overflowY === 'auto' || overflowY === 'scroll';
+    }).slice(0, 20).map(el => {
+        const out = base(el);
+        out.scroll = {
+            top: Math.round(el.scrollTop),
+            max: Math.max(0, Math.round(el.scrollHeight - el.clientHeight)),
+        };
+        out.actions = [registerAction(el, out.ref, 'scroll', 'down', '800')];
+        if (el.scrollTop > 0) {
+            out.actions.push(registerAction(el, out.ref, 'scroll', 'up', '-800'));
+        }
+        return out;
+    });
 
     // ── 页面全部 class 名 ─────────────────────────────────────────
     // 组件库指纹常常出现在 DOM 靠后的位置（筛选区、下拉浮层），按文档序截断会把它们整段丢掉，
@@ -504,6 +621,27 @@ export const PAGE_PROBE = (args) => {
         return { html: clone.outerHTML };
     }
 
+    const pageActions = [];
+    const scrollRoot = document.scrollingElement || document.documentElement;
+    if (scrollRoot && scrollRoot.scrollHeight > scrollRoot.clientHeight + 2) {
+        if (scrollRoot.scrollTop + scrollRoot.clientHeight < scrollRoot.scrollHeight - 2) {
+            const actionId = 'scroll:v' + version + ':page:down';
+            reg.actions.set(actionId, {
+                element: scrollRoot, ref: null, operation: 'scroll', bound_value: '800',
+                signature: actionSignature(scrollRoot),
+            });
+            pageActions.push(actionId);
+        }
+        if (scrollRoot.scrollTop > 0) {
+            const actionId = 'scroll:v' + version + ':page:up';
+            reg.actions.set(actionId, {
+                element: scrollRoot, ref: null, operation: 'scroll', bound_value: '-800',
+                signature: actionSignature(scrollRoot),
+            });
+            pageActions.push(actionId);
+        }
+    }
+
     const result = {
         url: window.location.href,
         title: document.title,
@@ -515,9 +653,11 @@ export const PAGE_PROBE = (args) => {
         tables,
         open_layers: openLayers,
         visible_options: visibleOptions,
+        scrollables,
         page_classes: pageCls,
         all_classes: allCls,   // 仅供服务端做组件识别/加载态判断，返回给模型前会被移除
         page_layout: pageLayout,
+        page_actions: pageActions,
     };
     if (includeHtml) {
         const captured = capturePageHtml();

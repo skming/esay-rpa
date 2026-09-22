@@ -24,6 +24,14 @@ from app.services.extension_executor import ExtensionExecutor
 PRICING_TABLE = (Path(__file__).parent / "pages/table_blank_header_col.html").read_text(encoding="utf-8")
 
 
+def _item(result, key, selector):
+    return next(item for item in result.get(key) or [] if item.get("selector") == selector)
+
+
+def _action(item, operation):
+    return next(value for value in item.get("actions") or [] if value.startswith(f"{operation}:"))
+
+
 class SocketAdapter:
     def __init__(self, socket):
         self.socket = socket
@@ -114,47 +122,62 @@ async def test_extension_observe_act_and_document_boundaries(tmp_path, monkeypat
                 assert first.get("date_controls"), first
                 recipe = first["date_controls"][0]["interaction_recipe"]
                 assert recipe["trigger"] == "#start" and recipe["end_input"] == "#end"
-                ref = next(item["ref"] for item in first["inputs"] if item["selector"] == "#start")
                 assert any(item["selector"] == "#shadow-button" for item in first["buttons"])
-                duplicate = await executor.execute("interact_page", {"action": "click", "selector": ".duplicate", "wait_ms": 0})
-                assert duplicate["status"] == "ambiguous_selector", duplicate
+                duplicates = [item for item in first["buttons"] if item.get("text") == "查询"]
+                assert len(duplicates) == 2
+                assert len({_action(item, "click") for item in duplicates}) == 2
                 second_page = await context.new_page()
                 await second_page.goto("https://fixture.test/other")
-                filled = await executor.execute("interact_page", {"action": "fill", "element_ref": ref, "observation_version": first["observation_version"], "value": "2026-01-01", "wait_ms": 0})
+                fill_action = _action(_item(first, "inputs", "#start"), "fill")
+                filled = await executor.execute(
+                    "interact_page", {"action_id": fill_action, "value": "2026-01-01"}
+                )
+                assert "error" not in filled, filled
                 assert filled["action_effect"]["status"] == "target_reached", filled
                 assert await page.input_value("#start") == "2026-01-01"
                 assert await second_page.input_value("#start") == ""
-                stale = await executor.execute("interact_page", {"action": "click", "element_ref": ref, "observation_version": first["observation_version"], "wait_ms": 0})
-                assert stale["status"] == "stale_element_ref", stale
-                opened = await executor.execute("interact_page", {"action": "click", "selector": "#open", "wait_selector": "#layer"})
+                stale = await executor.execute("interact_page", {"action_id": fill_action, "value": "ignored"})
+                assert stale["status"] == "stale_action", stale
+                open_action = _action(_item(filled["observation"], "buttons", "#open"), "click")
+                opened = await executor.execute(
+                    "interact_page", {"action_id": open_action, "wait_selector": "#layer"}
+                )
                 assert "error" not in opened, opened
                 assert opened["observation"]["open_layers"]
                 assert await page.locator("#layer").is_visible()
-                picked = await executor.execute("interact_page", {"action": "click", "selector": "#day", "wait_ms": 0})
+                day_action = _action(_item(opened["observation"], "buttons", "#day"), "click")
+                picked = await executor.execute("interact_page", {"action_id": day_action})
                 assert "error" not in picked, picked
                 assert await page.input_value("#start") == "2026-01-02"
-                readonly = await executor.execute("interact_page", {"action": "fill", "selector": "#readonly", "value": "bad", "wait_ms": 0})
-                assert "只读" in readonly["error"]
-                password = await executor.execute("interact_page", {"action": "fill", "selector": "#password", "value": "bad", "wait_ms": 0})
-                assert "凭据" in password["error"]
+                assert not any(
+                    action.startswith("fill:")
+                    for action in _item(picked["observation"], "inputs", "#readonly").get("actions") or []
+                )
+                password = _item(picked["observation"], "inputs", "#password")
+                assert not any(action.startswith("fill:") for action in password.get("actions") or [])
                 assert "fixture-secret" not in json.dumps(password)
-                scroll = await executor.execute("interact_page", {"action": "scroll", "selector": "#scroll", "value": "100", "wait_ms": 0})
+                scroll_action = _action(_item(picked["observation"], "scrollables", "#scroll"), "scroll")
+                scroll = await executor.execute("interact_page", {"action_id": scroll_action})
                 assert scroll["action_effect"]["status"] == "target_reached", scroll
-                assert await page.locator("#scroll").evaluate("el => el.scrollTop") == 100
+                assert await page.locator("#scroll").evaluate("el => el.scrollTop") > 0
                 await page.bring_to_front()
                 shot = await executor.execute("inspect_screenshot", {})
                 assert shot["image_base64"], shot
                 ch = extension_page_channel.get_channel()
                 doc = ch.document_id
+                reload_action = _action(_item(scroll["observation"], "buttons", "#open"), "click")
                 await page.reload()
-                rejected = await executor.execute("interact_page", {"action": "click", "element_ref": "e0", "observation_version": ch.version, "wait_ms": 0})
-                assert rejected["status"] == "stale_element_ref", rejected
+                rejected = await executor.execute("interact_page", {"action_id": reload_action})
+                assert rejected["status"] in {"stale_action", "extension_interaction_failed"}, rejected
                 current = await executor.execute("inspect_page", {})
                 assert current["document_id"] != doc
                 ambiguous = await executor.execute("inspect_page", {"scope_selector": ".duplicate"})
                 assert ambiguous["required_action"] == "narrow_scope_selector", ambiguous
+                close_action = _action(_item(current, "inputs", "#start"), "fill")
                 await page.close()
-                missing = await executor.execute("interact_page", {"action": "fill", "selector": "#start", "value": "wrong", "wait_ms": 0})
+                missing = await executor.execute(
+                    "interact_page", {"action_id": close_action, "value": "wrong"}
+                )
                 assert "error" in missing
                 assert await second_page.input_value("#start") == ""
             finally:

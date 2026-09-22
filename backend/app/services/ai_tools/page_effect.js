@@ -50,3 +50,52 @@ export const TARGET_STATE = (el) => {
   st.text = ((t.innerText || '').trim()).slice(0, 80);
   return st;
 };
+
+export const SETTLE_AFTER_ACTION = async (args) => {
+  const started = performance.now();
+  const frame = () => new Promise((resolve) => requestAnimationFrame(resolve));
+  const frames = async () => {
+    await frame();
+    await frame();
+  };
+  const elapsed = () => Math.round(performance.now() - started);
+  const action = args && args.action;
+  const ref = args && args.ref;
+  const reg = window.__rpaProbe;
+  const index = typeof ref === 'string' && /^e\d+$/.test(ref) ? Number(ref.slice(1)) : -1;
+  const el = reg && index >= 0 ? reg.els[index] : null;
+
+  // 文本输入触发的联想列表通常在一次或多次异步渲染后出现。只有带 combobox 语义的输入框
+  // 才等候选项，普通输入只等两帧，避免每个动作都付固定延迟。
+  const controlsPopup = action === 'fill' && el && (
+    el.getAttribute('role') === 'combobox'
+    || el.hasAttribute('aria-controls')
+    || el.hasAttribute('aria-owns')
+    || el.getAttribute('aria-autocomplete') !== null
+  );
+  if (controlsPopup) {
+    const ids = [el.getAttribute('aria-controls'), el.getAttribute('aria-owns')]
+      .filter(Boolean).flatMap((value) => value.split(/\s+/));
+    const hasVisibleOption = () => {
+      const roots = ids.map((id) => document.getElementById(id)).filter(Boolean);
+      const candidates = roots.length
+        ? roots.flatMap((root) => Array.from(root.querySelectorAll('[role=option]')))
+        : Array.from(document.querySelectorAll('[role=option]'));
+      return candidates.some((option) => {
+        const style = getComputedStyle(option);
+        const rect = option.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden'
+          && Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
+      });
+    };
+    const deadline = performance.now() + 800;
+    do {
+      if (hasVisibleOption()) return { reason: 'options_visible', elapsed_ms: elapsed() };
+      await frame();
+    } while (performance.now() < deadline);
+    return { reason: 'frames', elapsed_ms: elapsed() };
+  }
+
+  await frames();
+  return { reason: 'frames', elapsed_ms: elapsed() };
+};

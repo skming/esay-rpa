@@ -4087,7 +4087,7 @@ async def test_execute_rejects_invalid_arguments_before_side_effects() -> None:
         ("run_flow", {}, "required"),
         ("run_flow", {"flow_id": 7}, "type"),
         ("run_flow", {"flow_id": "f", "progress_sink": {}}, "additionalProperties"),
-        ("interact_page", {"action": "not-an-action"}, "enum"),
+        ("interact_page", {"action": "not-an-action"}, "additionalProperties"),
         ("list_node_types", {"types": []}, "minItems"),
         ("update_flow", {"flow_id": "f", "update_nodes": [{"id": "n", "patch": "secret-value"}]}, "type"),
         ("inspect_page", [], "type"),

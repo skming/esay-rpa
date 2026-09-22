@@ -35,7 +35,8 @@ export interface ContentAction {
   | 'page.pickerCancel'
   | 'page.effectSignature'
   | 'page.targetState'
-  | 'page.resolveTarget'
+  | 'page.resolveAction'
+  | 'page.settle'
   | 'scrollIntoView'
   | 'resolveRect'
   | 'highlight'
@@ -85,6 +86,10 @@ export interface ContentAction {
    * 少了这个校验，上一次观察的 ref 会指向重渲染后同一位置的另一行数据。
    */
   observationVersion?: number;
+  /** page.resolveAction：本次观察返回的受约束动作标识。 */
+  actionId?: string;
+  /** page.settle：刚完成的受约束动作类型。 */
+  actionName?: string;
   /** page.observe 使用：额外带回整页 HTML，供后端建精简正文快照。 */
   includeHtml?: boolean;
   documentId?: string;

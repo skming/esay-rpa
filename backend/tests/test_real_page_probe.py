@@ -52,6 +52,18 @@ def _by_selector(items: list[dict[str, Any]], selector: str) -> dict[str, Any] |
     return next((i for i in items if i.get("selector") == selector), None)
 
 
+def _action(item: dict[str, Any], operation: str) -> str:
+    prefix = f"{operation}:"
+    return next(action for action in item.get("actions") or [] if action.startswith(prefix))
+
+
+def _option_action(item: dict[str, Any], value: str) -> str:
+    return next(
+        option["action_id"] for option in item.get("option_actions") or []
+        if option.get("value") == value
+    )
+
+
 def _active_page(result: dict[str, Any]) -> str | None:
     """当前页码：页码控件的「选中」只写在 class 上，没有任何 ARIA 语义。"""
     for item in result.get("buttons") or []:
@@ -80,26 +92,21 @@ async def test_native_date_page_gives_a_range_recipe_and_flags_duplicate_buttons
     assert len(searches) == 3, result.get("buttons")
     assert all(b.get("same_text_count") == 3 for b in searches), searches
     assert len({b["selector"] for b in searches}) == 3, searches
+    assert all(f":v{result['observation_version']}:" in _action(b, "click") for b in searches)
     row_scoped = [b for b in searches if "tbody" in b["selector"]]
     assert len(row_scoped) == 2 and all("tr:nth-of-type" in b["selector"] for b in row_scoped), row_scoped
 
 
-async def test_duplicate_button_selector_is_refused_instead_of_hitting_the_first(
+async def test_duplicate_buttons_get_distinct_observed_actions(
     executor: RpaToolExecutor,
 ) -> None:
-    await _observe(executor, "native_date.html")
-    refused = await executor._interact_page(action="click", selector=".btn-link")
-    assert refused["status"] == "ambiguous_selector"
-    assert refused["matches"] == 4  # 两行 × 查询/编辑
-    assert refused["required_action"] == "narrow_selector_or_use_element_ref"
+    observed = await _observe(executor, "native_date.html")
+    searches = [button for button in observed["buttons"] if button.get("text") == "查询"]
+    action_ids = [_action(button, "click") for button in searches]
+    assert len(action_ids) == len(set(action_ids)) == 3
 
-    # 只收窄到「第二行的 .btn-link」仍是两个（查询 + 编辑），差一点也算歧义
-    still = await executor._interact_page(action="click", selector="#order-table tbody tr:nth-child(2) .btn-link")
-    assert still["status"] == "ambiguous_selector" and still["matches"] == 2
-
-    ok = await executor._interact_page(
-        action="click", selector="#order-table tbody tr:nth-child(2) .btn-link:nth-of-type(1)"
-    )
+    row_search = next(button for button in searches if "tr:nth-of-type(2)" in button["selector"])
+    ok = await executor._interact_page(action_id=_action(row_search, "click"))
     assert ok["status"] == "ok"
 
 
@@ -111,12 +118,64 @@ async def test_element_ui_panel_only_exists_after_the_click_in_the_same_session(
     first = await _observe(executor, "element_ui_range.html")
     assert not any(".el-picker-panel" in str(b.get("selector")) for b in first.get("buttons") or [])
 
-    opened = await executor._interact_page(action="click", selector="#range-editor", wait_selector=".el-picker-panel")
+    # 触发器容器不是可访问性控件；点击内部真实输入会冒泡到同一个监听器，动作仍来自观察结果。
+    trigger = next(item for item in first["inputs"] if item.get("placeholder") == "开始日期")
+    opened = await executor._interact_page(
+        action_id=_action(trigger, "click"), wait_selector=".el-picker-panel"
+    )
     assert opened["status"] == "ok"
     assert opened["effect"]["changed"] is True, opened
     classes = opened["observation"].get("page_classes") or []
     assert "el-picker-panel" in classes, "点开后的观察里没有面板，说明观察没有落在同一次交互后的页面上"
     assert "warning" not in opened
+
+
+async def test_async_combobox_waits_for_observed_options_without_a_fixed_delay(
+    executor: RpaToolExecutor,
+) -> None:
+    first = await _observe(executor, "async_combobox.html")
+    query = _by_selector(first["inputs"], "#query")
+    assert query is not None
+
+    filled = await executor._interact_page(
+        action_id=_action(query, "fill"), value="广"
+    )
+
+    assert {item["text"] for item in filled["observation"]["visible_options"]} == {"上海", "广州"}
+
+
+async def test_observed_action_is_rejected_after_semantic_change_or_occlusion(
+    executor: RpaToolExecutor,
+) -> None:
+    first = await _observe(executor, "interaction_effects.html")
+    dead = _by_selector(first["buttons"], "#dead-btn")
+    assert dead is not None
+    action_id = _action(dead, "click")
+    session = page_session.get_session()
+    assert session is not None
+    page = await session.page()
+    await page.evaluate("() => { document.querySelector('#dead-btn').textContent = '语义已变'; }")
+
+    stale = await executor._interact_page(action_id=action_id)
+    assert stale["status"] == "stale_action", stale
+
+    second = await executor._inspect_page_via_browser()
+    changed = _by_selector(second["buttons"], "#dead-btn")
+    assert changed is not None
+    await page.evaluate("""() => {
+      const button = document.querySelector('#dead-btn');
+      const rect = button.getBoundingClientRect();
+      const cover = document.createElement('div');
+      cover.id = 'cover';
+      Object.assign(cover.style, {
+        position: 'fixed', left: `${rect.left}px`, top: `${rect.top}px`,
+        width: `${rect.width}px`, height: `${rect.height}px`, zIndex: '99999',
+      });
+      document.body.appendChild(cover);
+    }""")
+
+    occluded = await executor._interact_page(action_id=_action(changed, "click"))
+    assert occluded["status"] == "target_occluded", occluded
 
 
 async def test_two_range_pickers_on_a_real_page_resolve_inside_their_own_container(
@@ -164,7 +223,11 @@ async def test_readonly_calendar_recipe_marks_typing_unusable_and_the_panel_open
     assert generic, result.get("date_controls")
     assert generic[0]["interaction_recipe"].get("readonly_trigger") is True
 
-    opened = await executor._interact_page(action="click", selector="#pick-date", wait_selector=".cal-title")
+    trigger = _by_selector(result["inputs"], "#pick-date")
+    assert trigger is not None
+    opened = await executor._interact_page(
+        action_id=_action(trigger, "click"), wait_selector=".cal-title"
+    )
     assert opened["status"] == "ok" and opened["effect"]["changed"] is True
     assert "layers" in opened["effect"]["diff"], opened["effect"]
     observation = opened["observation"]
@@ -223,10 +286,14 @@ async def test_virtual_list_grows_on_scroll_and_stops_without_a_hardcoded_count(
     assert any(t.get("container_selector") == "#rows" for t in first.get("tables") or [])
 
     effects: list[dict[str, Any]] = []
+    observation = first
     for _ in range(5):
-        stepped = await executor._interact_page(action="scroll", selector="#scroller", wait_ms=300)
+        scroller = _by_selector(observation.get("scrollables") or [], "#scroller")
+        assert scroller is not None, observation.get("scrollables")
+        stepped = await executor._interact_page(action_id=_action(scroller, "scroll"))
         assert stepped["status"] == "ok", stepped
         effects.append(stepped["effect"])
+        observation = stepped["observation"]
         if not stepped["effect"]["changed"]:
             break
 
@@ -248,14 +315,16 @@ async def test_pagination_turns_the_page_and_reports_it_as_an_observable_change(
     pager = [b for b in result.get("buttons") or [] if "page-num" in str(b.get("cls") or "")]
     assert len(pager) == 3 and len({b["selector"] for b in pager}) == 3, pager
 
-    stepped = await executor._interact_page(action="click", selector=".next-page", wait_ms=300)
+    next_button = next(button for button in result["buttons"] if button.get("text") == "下一页")
+    stepped = await executor._interact_page(action_id=_action(next_button, "click"))
     assert stepped["status"] == "ok" and stepped["effect"]["changed"] is True
     assert stepped["effect"]["diff"].get("visible_text") == "changed", stepped["effect"]
     assert _active_page(stepped["observation"]) == "2"
     assert "warning" not in stepped, stepped.get("warning")
 
     # 直接点页码同样要认得出来：它连 activeElement 都不改，只有文字指纹能证明换了页
-    jumped = await executor._interact_page(action="click", selector=".page-num:nth-of-type(3)", wait_ms=300)
+    third = next(button for button in stepped["observation"]["buttons"] if button.get("text") == "3")
+    jumped = await executor._interact_page(action_id=_action(third, "click"))
     assert jumped["effect"]["diff"].get("visible_text") == "changed", jumped["effect"]
     assert _active_page(jumped["observation"]) == "3"
     # 末页才置灰：disabled 只是结果，判终止的依据是页码不再变
@@ -362,14 +431,18 @@ async def test_focused_fill_lands_even_though_the_page_fingerprint_stays_put(
     只看指纹就会把它报成「没生效，换目标」。这条判据只能在真实浏览器上验证——
     「填第二次时焦点不再变化」是浏览器的行为，假对象里的 active 是我自己写的返回值。
     """
-    await _observe(executor, "interaction_effects.html")
+    observation = await _observe(executor, "interaction_effects.html")
 
-    first = await executor._interact_page(action="fill", selector="#keyword", value="订单", wait_ms=200)
+    keyword = _by_selector(observation["inputs"], "#keyword")
+    assert keyword is not None
+    first = await executor._interact_page(action_id=_action(keyword, "fill"), value="订单")
     assert first["status"] == "ok", first
     assert first["action_effect"]["status"] == "target_reached", first
     assert first["input_value_after"] == "订单"
 
-    again = await executor._interact_page(action="fill", selector="#keyword", value="发票", wait_ms=200)
+    keyword = _by_selector(first["observation"]["inputs"], "#keyword")
+    assert keyword is not None
+    again = await executor._interact_page(action_id=_action(keyword, "fill"), value="发票")
     assert again["status"] == "ok", again
     assert again["effect"]["changed"] is False, again  # 焦点已在框里，DOM 没动，指纹无从变化
     assert again["action_effect"]["status"] == "target_reached", again
@@ -377,7 +450,9 @@ async def test_focused_fill_lands_even_though_the_page_fingerprint_stays_put(
     # 值写进去了也只到这一层：业务后置条件（筛选真的生效）仍未验证
     assert "business_check" in again
 
-    same = await executor._interact_page(action="fill", selector="#keyword", value="发票", wait_ms=200)
+    keyword = _by_selector(again["observation"]["inputs"], "#keyword")
+    assert keyword is not None
+    same = await executor._interact_page(action_id=_action(keyword, "fill"), value="发票")
     assert same["action_effect"]["status"] == "already_in_target_state", same
     assert "warning" not in same, same
 
@@ -386,16 +461,22 @@ async def test_native_select_switch_and_repeat_are_told_apart(
     executor: RpaToolExecutor,
 ) -> None:
     """原生 select 换选项不新增任何 DOM。重复设成同一项是幂等，不能被要求盲目换目标。"""
-    await _observe(executor, "interaction_effects.html")
+    observation = await _observe(executor, "interaction_effects.html")
 
-    await executor._interact_page(action="select_option", selector="#city", value="上海", wait_ms=200)
-    switched = await executor._interact_page(action="select_option", selector="#city", value="广州", wait_ms=200)
+    city = _by_selector(observation["selects"], "#city")
+    assert city is not None
+    selected = await executor._interact_page(action_id=_option_action(city, "上海"))
+    city = _by_selector(selected["observation"]["selects"], "#city")
+    assert city is not None
+    switched = await executor._interact_page(action_id=_option_action(city, "广州"))
     assert switched["status"] == "ok", switched
     assert switched["effect"]["changed"] is False, switched
     assert switched["action_effect"]["status"] == "target_reached", switched
     assert switched["action_effect"]["target_state"]["selected"] == ["广州"], switched
 
-    repeated = await executor._interact_page(action="select_option", selector="#city", value="广州", wait_ms=200)
+    city = _by_selector(switched["observation"]["selects"], "#city")
+    assert city is not None
+    repeated = await executor._interact_page(action_id=_option_action(city, "广州"))
     assert repeated["action_effect"]["status"] == "already_in_target_state", repeated
     assert "warning" not in repeated, repeated
 
@@ -408,20 +489,28 @@ async def test_pure_scroll_is_reached_then_idempotent_at_the_bottom(
     虚拟列表那条测的是「滚动能不能触发加载」；这条测的是「加载不了的时候能不能说清
     是滚到底了，还是选择器指错了容器」——两者的处置完全不同。
     """
-    await _observe(executor, "interaction_effects.html")
+    observation = await _observe(executor, "interaction_effects.html")
 
-    moved = await executor._interact_page(action="scroll", selector="#static-scroller", wait_ms=200)
+    scroller = _by_selector(observation["scrollables"], "#static-scroller")
+    assert scroller is not None
+    moved = await executor._interact_page(action_id=_action(scroller, "scroll"))
     assert moved["status"] == "ok", moved
     assert moved["effect"]["changed"] is False, moved
     assert moved["action_effect"]["status"] == "target_reached", moved
 
-    at_end = await executor._interact_page(action="scroll", selector="#static-scroller", wait_ms=200)
+    at_end = moved
+    for _ in range(4):
+        scroller = _by_selector(at_end["observation"]["scrollables"], "#static-scroller")
+        assert scroller is not None
+        at_end = await executor._interact_page(action_id=_action(scroller, "scroll"))
+        if at_end["action_effect"]["status"] == "already_in_target_state":
+            break
     assert at_end["action_effect"]["status"] == "already_in_target_state", at_end
     assert "换翻页方式" in at_end["action_effect"]["note"], at_end
     assert "warning" not in at_end, at_end  # 滚到底不是失败，不能报警告让模型去换目标
 
 
-async def test_a_dead_button_and_an_inert_label_are_reported_differently(
+async def test_a_dead_button_is_reported_and_an_inert_label_has_no_action(
     executor: RpaToolExecutor,
 ) -> None:
     """点没绑事件的按钮 = 只拿到了焦点；点不可聚焦的文本 = 什么证据都没有。
@@ -429,16 +518,18 @@ async def test_a_dead_button_and_an_inert_label_are_reported_differently(
     两者都不能报成「状态已变化」：按钮会让整页指纹的 active 变，靠指纹判决时它正好会被判成
     面板已打开，模型接着照这个建流程。
     """
-    await _observe(executor, "interaction_effects.html")
+    observation = await _observe(executor, "interaction_effects.html")
 
-    dead = await executor._interact_page(action="click", selector="#dead-btn", wait_ms=200)
+    button = _by_selector(observation["buttons"], "#dead-btn")
+    assert button is not None
+    dead = await executor._interact_page(action_id=_action(button, "click"))
     assert dead["status"] == "ok", dead
     assert dead["action_effect"]["status"] == "focus_only", dead
     assert "warning" in dead and "business_check" not in dead, dead
-
-    inert = await executor._interact_page(action="click", selector="#inert-label", wait_ms=200)
-    assert inert["action_effect"]["status"] == "no_observable_change", inert
-    assert "不等于失败" in inert["warning"], inert
+    all_observed = sum((dead["observation"].get(key) or [] for key in (
+        "inputs", "selects", "buttons", "links", "visible_options", "scrollables"
+    )), [])
+    assert not any(item.get("selector") == "#inert-label" and item.get("actions") for item in all_observed)
 
 
 @pytest.mark.parametrize(("name", "expected"), [

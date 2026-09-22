@@ -4,7 +4,6 @@
 """
 from __future__ import annotations
 
-import asyncio
 import base64
 import copy
 import hashlib
@@ -55,10 +54,8 @@ from app.services.ai_tools.normalize import (
 from app.services.ai_tools.page_observation import (
     annotate_observation,
     build_interaction_result,
-    ambiguous_selector_error,
-    element_not_found_error,
-    stale_ref_error,
     EFFECT_SIGNATURE_JS,
+    SETTLE_AFTER_ACTION_JS,
     TARGET_STATE_JS,
     describe_action_effect as _describe_action_effect,
     describe_effect as _describe_effect,
@@ -70,11 +67,28 @@ import app.services.ai_tools.page_session as _page_session
 from app.services.ai_tools.static_page_probe import inspect_static_page, snapshot_from_html
 from app.services.ai_tools.static_page_content import clear_static_snapshot, read_static_snapshot
 from app.services.ai_tools.variables import _RUNTIME_BUILTINS, _collect_defined_vars, _validate_variable_refs
+from app.services.runtime_variables import protected_variable_names
 
 if TYPE_CHECKING:
     from app.services.flow_service import FlowService
     from app.services.scheduler_service import ScheduleService
     from app.services.task_manager import TaskManager
+
+
+_OBSERVED_PAGE_ACTIONS = frozenset({"click", "fill", "select_option", "press", "hover", "scroll"})
+
+
+def _observed_action_error(resolved: dict[str, Any]) -> dict[str, Any] | None:
+    if resolved.get("status") == "ok":
+        return None
+    error: dict[str, Any] = {
+        "status": resolved.get("status", "stale_action"),
+        "error": resolved.get("error", "动作不属于当前观察"),
+        "required_action": "call_inspect_page_again",
+    }
+    if resolved.get("occluding") is not None:
+        error["occluding"] = resolved["occluding"]
+    return error
 
 
 def _merge_page_content(observation: dict[str, Any], scope_selector: str | None) -> None:
@@ -911,7 +925,6 @@ class RpaToolExecutor:
             flow.definition, add_nodes, update_nodes, add_edges,
             remove_set, final_remove_edge_ids, new_node_ids,
         )
-
         # 只在流程仍是占位名时接受 AI 给出的标题，已经有正式名称就不允许覆盖，
         # 避免模型在无关的结构性修改里顺手把用户自己起的名字改掉。
         requested_name = name.strip() if isinstance(name, str) and name.strip() else None
@@ -1610,7 +1623,7 @@ class RpaToolExecutor:
             flow_definition=flow.definition,
             flow_revision=flow.revision,
             acceptance_contract=flow.acceptance_contract,
-            sensitive_variables=[iv.name for iv in flow.input_variables if iv.sensitive],
+            sensitive_variables=protected_variable_names(flow.input_variables),
             variables={k: str(v) for k, v in merged_variables.items()},
             browser_executor=browser_executor,
         )
@@ -2388,9 +2401,8 @@ class RpaToolExecutor:
             return {"status": "extension_observation_failed", "error": str(exc)}
 
     async def _interact_page_via_extension(
-        self, action: str, element_ref: str | None, selector: str | None, value: str | None,
-        observation_version: int | None, scope_selector: str | None,
-        wait_selector: str | None, wait_ms: int | None,
+        self, action_id: str, value: str | None, scope_selector: str | None,
+        wait_selector: str | None,
     ) -> dict[str, Any]:
         blocked = self._extension_access_error()
         if blocked is not None:
@@ -2400,19 +2412,30 @@ class RpaToolExecutor:
                 channel = _extension_page.get_channel()
                 if channel is None:
                     return {"error": "扩展探索会话已结束，请重新 inspect_page(browser_executor='extension')"}
-                ref = None
-                if action != "scroll" or element_ref or selector:
-                    ref, error = await channel.resolve_target(element_ref, selector, observation_version)
-                    if error is not None:
-                        return error
+                resolved = await channel.resolve_action(action_id)
+                error = _observed_action_error(resolved)
+                if error is not None:
+                    return error
+                action = str(resolved.get("operation") or "")
+                if action not in _OBSERVED_PAGE_ACTIONS:
+                    return {
+                        "status": "stale_action",
+                        "error": "观察动作包含不受支持的操作，请重新观察",
+                        "required_action": "call_inspect_page_again",
+                    }
+                ref = resolved.get("ref")
+                ref = str(ref) if ref is not None else None
+                action_value = resolved.get("bound_value")
+                if action_value is None:
+                    action_value = value
                 before = await channel.effect_signature()
                 state_before = await channel.target_state(ref, None)
-                await channel.apply_action(action, ref, None, value)
+                await channel.apply_action(action, ref, None, action_value)
                 wait_result = None
                 if wait_selector:
                     wait_result = await _observe_wait(channel.wait_for(wait_selector), wait_selector)
                 else:
-                    await asyncio.sleep(min(max(wait_ms if wait_ms is not None else 600, 0), 5000) / 1000)
+                    await channel.settle(action, ref)
                 state_after = await channel.target_state(ref, None)
                 # 点击可能导航；先重新观察文档，再取整页变化，旧目标回读不得落到新文档。
                 observation = await channel.observe(scope_selector)
@@ -2421,10 +2444,14 @@ class RpaToolExecutor:
                 observation["inspection_source"] = "extension"
                 observation["capabilities"] = channel.capability_report()
                 effect = _describe_effect(before, after)
-                action_effect = _describe_action_effect(action, value, state_before, state_after, page_diff=effect.get("diff"))
-                return build_interaction_result(
-                    action, element_ref, selector, action_effect, effect, observation, wait_result,
+                action_effect = _describe_action_effect(
+                    action, action_value, state_before, state_after, page_diff=effect.get("diff")
                 )
+                result = build_interaction_result(
+                    action, ref, None, action_effect, effect, observation, wait_result,
+                )
+                result["action_id"] = action_id
+                return result
         except Exception as exc:
             return {"status": "extension_interaction_failed", "error": str(exc), "required_action": "call_inspect_page_again"}
 
@@ -2683,39 +2710,12 @@ class RpaToolExecutor:
             if current is not None:
                 current.touch()
 
-    async def _resolve_interaction_target(
-        self,
-        session: Any,
-        element_ref: str | None,
-        selector: str | None,
-        observation_version: int | None,
-    ) -> tuple[Any, dict[str, Any] | None]:
-        """返回 (元素句柄, 错误)。定位不唯一时交出错误而不是取第一个。"""
-        target = await session.target()
-        if element_ref:
-            try:
-                return await session.element_for_ref(element_ref, observation_version), None
-            except _page_session.StaleRefError as exc:
-                return None, stale_ref_error(str(exc))
-        if not selector:
-            return None, {"error": "必须提供 element_ref 或 selector"}
-        found = await target.query_selector_all(selector)
-        if not found:
-            return None, element_not_found_error(selector)
-        if len(found) > 1:
-            return None, ambiguous_selector_error(selector, len(found))
-        return found[0], None
-
     async def _interact_page(
         self,
-        action: str,
-        element_ref: str | None = None,
-        selector: str | None = None,
+        action_id: str,
         value: str | None = None,
-        observation_version: int | None = None,
         scope_selector: str | None = None,
         wait_selector: str | None = None,
-        wait_ms: int | None = None,
     ) -> dict[str, Any]:
         """在探索会话的当前页面上操作一次，并把操作前后的变化和新的观察一起返回。
 
@@ -2724,8 +2724,9 @@ class RpaToolExecutor:
         """
         clear_static_snapshot()
         if _extension_page.get_channel() is not None or _extension_page.foreign_channel() is not None:
-            return await self._interact_page_via_extension(action, element_ref, selector, value,
-                                                         observation_version, scope_selector, wait_selector, wait_ms)
+            return await self._interact_page_via_extension(
+                action_id, value, scope_selector, wait_selector
+            )
         session = _page_session.get_session()
         if session is None:
             foreign = _foreign_session_block("interact_page")
@@ -2735,28 +2736,33 @@ class RpaToolExecutor:
                 "error": "当前没有正在探索的页面，先调用 inspect_page(url=...) 打开。",
                 "required_action": "call_inspect_page_with_url",
             }
-        supported = ("click", "fill", "select_option", "press", "hover", "scroll")
-        if action not in supported:
-            return {"error": f"不支持的 action：{action}，可用：{', '.join(supported)}"}
-
         try:
             async with _page_session.guard:
                 page = await session.page()
                 target = await session.target()
                 before = await self._page_effect_signature(target)
-                element: Any = None
-                if action != "scroll" or element_ref or selector:
-                    element, err = await self._resolve_interaction_target(
-                        session, element_ref, selector, observation_version
-                    )
-                    if err is not None:
-                        return err
+                resolved, element = await session.resolve_action(action_id)
+                error = _observed_action_error(resolved)
+                if error is not None:
+                    return error
+                action = str(resolved.get("operation") or "")
+                if action not in _OBSERVED_PAGE_ACTIONS:
+                    return {
+                        "status": "stale_action",
+                        "error": "观察动作包含不受支持的操作，请重新观察",
+                        "required_action": "call_inspect_page_again",
+                    }
+                element_ref = resolved.get("ref")
+                element_ref = str(element_ref) if element_ref is not None else None
+                action_value = resolved.get("bound_value")
+                if action_value is None:
+                    action_value = value
 
                 # 目标状态要在动作之前读：动作之后再读就分不出「本来就是这个值」和「这次填进去的」，
                 # 幂等动作会被报成成功，而已经聚焦的输入框填失败会被报成「页面没变化」。
                 state_before = await self._target_state(element if element is not None else page)
 
-                acted = await self._apply_page_action(page, element, action, value)
+                acted = await self._apply_page_action(page, element, action, action_value)
                 if isinstance(acted, dict):
                     return acted
                 wait_result = None
@@ -2766,7 +2772,9 @@ class RpaToolExecutor:
                         target.wait_for_selector(wait_selector, timeout=10_000), wait_selector,
                     )
                 else:
-                    await page.wait_for_timeout(min(max(int(wait_ms if wait_ms is not None else 600), 0), 5_000))
+                    await self._settle_after_action(
+                        await session.target(), action, element_ref,
+                    )
 
                 state_after = await self._target_state(element if element is not None else page)
 
@@ -2776,12 +2784,14 @@ class RpaToolExecutor:
 
                 effect = _describe_effect(before, after)
                 action_effect = _describe_action_effect(
-                    action, value, state_before, state_after,
+                    action, action_value, state_before, state_after,
                     page_diff=effect.get("diff"),
                 )
-                return build_interaction_result(
-                    action, element_ref, selector, action_effect, effect, observation, wait_result,
+                result = build_interaction_result(
+                    action, element_ref, None, action_effect, effect, observation, wait_result,
                 )
+                result["action_id"] = action_id
+                return result
         except _page_session.SessionExpiredError as exc:
             return {"error": str(exc), "required_action": "call_inspect_page_with_url"}
         except Exception as exc:
@@ -2806,6 +2816,18 @@ class RpaToolExecutor:
         except Exception:
             return {}
 
+    async def _settle_after_action(
+        self, target: Any, action: str, element_ref: str | None,
+    ) -> dict[str, Any]:
+        """等页面完成最小必要渲染；导航会销毁旧文档，此时直接交给后续观察。"""
+        try:
+            value = await target.evaluate(
+                SETTLE_AFTER_ACTION_JS, {"action": action, "ref": element_ref}
+            )
+            return value if isinstance(value, dict) else {"reason": "unknown"}
+        except Exception:
+            return {"reason": "document_changed"}
+
     async def _apply_page_action(
         self,
         page: Any,
@@ -2815,8 +2837,10 @@ class RpaToolExecutor:
     ) -> dict[str, Any] | None:
         """执行一次操作。失败返回错误字典，成功返回 None。"""
         needs_value = {"fill", "select_option", "press"}
-        if action in needs_value and (value is None or value == ""):
+        if action in needs_value and value is None:
             return {"error": f"{action} 需要 value 参数"}
+        if action == "press" and value == "":
+            return {"error": "press 需要非空 value 参数"}
         try:
             if action == "click":
                 await element.click(timeout=8_000)

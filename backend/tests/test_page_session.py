@@ -20,7 +20,7 @@ from app.services import browser_profile_lock
 from app.services.ai_orchestrator import AiOrchestrator
 from app.services.ai_tools import page_session
 from app.services.ai_tools.executor import RpaToolExecutor
-from app.services.ai_tools.page_observation import EFFECT_SIGNATURE_JS, TARGET_STATE_JS
+from app.services.ai_tools.page_observation import EFFECT_SIGNATURE_JS, SETTLE_AFTER_ACTION_JS, TARGET_STATE_JS
 
 PROFILE = "/tmp/easy-rpa-test-profile"
 
@@ -66,6 +66,10 @@ class FakePage:
         self.probe_version: int | None = None
         self.frame: "FakePage | None" = None
         self._effect_calls = 0
+        self.settle_calls = 0
+        self.action_status: dict[str, Any] = {
+            "status": "ok", "ref": "e0", "operation": "click", "bound_value": None,
+        }
 
     def is_closed(self) -> bool:
         return False
@@ -90,6 +94,11 @@ class FakePage:
         if script == TARGET_STATE_JS:
             # 整页滚动没有元素可回读，执行器把同一段脚本发给 page
             return {"tag": "body", "focused": False, "scroll": {"top": 0, "left": 0, "max": 0}}
+        if script == SETTLE_AFTER_ACTION_JS:
+            self.settle_calls += 1
+            return {"reason": "frames", "elapsed_ms": 32}
+        if "resolveAction" in script:
+            return self.action_status
         if arg is None:
             return self.probe_version  # 只读版本号那次调用不带参数
         version = arg.get("version")
@@ -216,23 +225,26 @@ def _executor() -> RpaToolExecutor:
     return RpaToolExecutor(flow_service=None, task_manager=None)  # type: ignore[arg-type]
 
 
+def _activate(page: FakePage) -> None:
+    page.probe_version = 0
+    page_session._current = _make_session(page)
+
+
 async def test_interact_page_without_a_session_asks_for_a_url() -> None:
     """没有会话时不能自己开一个：模型以为在操作刚看过的页面，实际是一张空白新页。"""
-    result = await _executor().execute("interact_page", {"action": "click", "selector": "#q"})
+    result = await _executor().execute("interact_page", {"action_id": "click:e0"})
     assert result["required_action"] == "call_inspect_page_with_url"
 
 
-async def test_interact_page_refuses_an_ambiguous_selector() -> None:
-    """同一页面上「查询」按钮往往有两三个。取第一个在探索阶段看着能过，
-    写进流程后点的是另一行的按钮，运行结果还是绿的。"""
-    page = FakePage(matches=3)
-    page_session._current = _make_session(page)
+async def test_interact_page_refuses_an_action_not_in_the_current_observation() -> None:
+    page = FakePage()
+    page.action_status = {"status": "stale_action", "error": "动作不属于当前观察"}
+    _activate(page)
 
-    result = await _executor().execute("interact_page", {"action": "click", "selector": "button.query"})
+    result = await _executor().execute("interact_page", {"action_id": "click:e99"})
 
-    assert result["status"] == "ambiguous_selector"
-    assert result["matches"] == 3
-    assert result["required_action"] == "narrow_selector_or_use_element_ref"
+    assert result["status"] == "stale_action"
+    assert result["required_action"] == "call_inspect_page_again"
     assert page.clicks == 0  # 拒绝就必须真的没点
 
 
@@ -242,9 +254,10 @@ async def test_interact_page_flags_an_action_that_changed_nothing() -> None:
     这里的结论只能是「没观察到变化」，不能是「操作失败，换目标」：变化也可能落在观测不到的
     地方。两者的处置不同——后者会让模型丢掉一次其实成功了的操作。
     """
-    page_session._current = _make_session(FakePage(effect_changes=False))
+    page = FakePage(effect_changes=False)
+    _activate(page)
 
-    result = await _executor().execute("interact_page", {"action": "click", "selector": "#trigger"})
+    result = await _executor().execute("interact_page", {"action_id": "click:e0"})
 
     assert result["status"] == "ok"
     assert result["effect"]["changed"] is False
@@ -256,9 +269,9 @@ async def test_interact_page_flags_an_action_that_changed_nothing() -> None:
 async def test_interact_page_reobserves_after_a_real_change() -> None:
     """交互后自动重新观察：下拉面板、日历格这些 DOM 只在操作之后才存在。"""
     page = FakePage(effect_changes=True)
-    page_session._current = _make_session(page)
+    _activate(page)
 
-    result = await _executor().execute("interact_page", {"action": "click", "selector": "#trigger"})
+    result = await _executor().execute("interact_page", {"action_id": "click:e0"})
 
     assert result["effect"]["changed"] is True
     assert result["action_effect"]["status"] == "state_changed"
@@ -373,7 +386,7 @@ async def test_the_three_page_tools_report_busy_instead_of_taking_over() -> None
         executor = _executor()
         calls = (
             ("inspect_page", {}),
-            ("interact_page", {"action": "click", "selector": "#q"}),
+                ("interact_page", {"action_id": "click:e0"}),
             ("inspect_screenshot", {}),
         )
         for name, args in calls:
@@ -514,8 +527,9 @@ async def test_interaction_wait_timeout_returns_observation_in_the_selected_fram
     session = _make_session(page)
     page_session._current = session
     await session.switch_frame("iframe")
+    page.frame.probe_version = session.version
     result = await _executor().execute("interact_page", {
-        "action": "click", "selector": "#trigger", "wait_selector": "#panel",
+        "action_id": "click:e0", "wait_selector": "#panel",
     })
     assert calls == ["#panel"]
     assert result["status"] == "ok"
@@ -531,15 +545,15 @@ async def test_interaction_wait_does_not_swallow_invalid_selector() -> None:
         raise ValueError("invalid selector fixture")
 
     page.wait_for_selector = invalid
-    page_session._current = _make_session(page)
+    _activate(page)
     result = await _executor().execute("interact_page", {
-        "action": "click", "selector": "#trigger", "wait_selector": "[",
+        "action_id": "click:e0", "wait_selector": "[",
     })
     assert "invalid selector fixture" in result["error"]
     assert result.get("status") != "ok"
 
 
-async def test_interaction_explicit_zero_wait_is_preserved() -> None:
+async def test_interaction_uses_shared_adaptive_settle_without_fixed_wait() -> None:
     page = FakePage()
     waits = []
 
@@ -547,9 +561,11 @@ async def test_interaction_explicit_zero_wait_is_preserved() -> None:
         waits.append(ms)
 
     page.wait_for_timeout = record
-    page_session._current = _make_session(page)
-    await _executor().execute("interact_page", {"action": "click", "selector": "#trigger", "wait_ms": 0})
-    assert waits == [0]
+    _activate(page)
+    result = await _executor().execute("interact_page", {"action_id": "click:e0"})
+    assert waits == []
+    assert result["status"] == "ok"
+    assert page.settle_calls == 1
 
 
 @pytest.mark.parametrize("reply,status", [(None, "satisfied"), ({"status": "timed_out"}, "timed_out"),

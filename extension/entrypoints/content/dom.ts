@@ -9,7 +9,6 @@ const INTERACTIVE_SELECTOR =
 
 let snapshotRefs = new Map<string, Element>();
 let refCounter = 0;
-let targetCounter = 0;
 // 当前 ref 表来自哪一次 page.observe。query/find 的快照没有版本，记 null。
 // 没有这个编号，模型可以拿上一次观察的 ref 去操作重渲染后的 DOM：编号还在、指向的
 // 已经是同一位置的另一行数据，动作成功、数据全错。
@@ -18,7 +17,6 @@ let refsObservationVersion: number | null = null;
 function resetSnapshot(): void {
   snapshotRefs = new Map();
   refCounter = 0;
-  targetCounter = 0;
   refsObservationVersion = null;
 }
 
@@ -437,18 +435,17 @@ export function observePage(args: { scope?: string | null; version?: number; inc
   return result;
 }
 
-/**
- * 给一次动作的目标元素发个临时编号。
- *
- * 定位和动作之间页面可能重渲染，只传 selector 就会「校验的是这一个、动作打在另一个」；
- * Playwright 那条通道持的是 element handle，这里的编号是同一件事。
- * 它挂在当前观察的 ref 表上，下一次观察连表一起换掉，所以不会被跨观察复用。
- */
-export function registerActionTarget(el: Element): string {
-  targetCounter += 1;
-  const ref = `t${targetCounter}`;
-  snapshotRefs.set(ref, el);
-  return ref;
+export function resolveObservedAction(actionId: string, observationVersion: number): Record<string, unknown> {
+  const registry = (window as unknown as {
+    __rpaProbe?: {
+      version: number;
+      resolveAction?: (id: string) => Record<string, unknown>;
+    };
+  }).__rpaProbe;
+  if (registry === undefined || registry.version !== observationVersion || registry.resolveAction === undefined) {
+    return { status: 'stale_action', error: '动作不属于当前观察' };
+  }
+  return registry.resolveAction(actionId);
 }
 
 function scoreCandidate(query: string, summary: DomElementSummary): number {

@@ -81,7 +81,8 @@ def finalize_observation(result: dict[str, Any]) -> bool:
 OBSERVATION_NOTE = (
     "selector 字段为推荐选择器，可直接用于 browser.click / browser.fill 等节点。"
     ":has-text() 为 Playwright 伪选择器，合法可用。"
-    "ref 字段只在本次观察内有效，只能给 interact_page 用；"
+    "actions/option_actions/page_actions 中的 action_id 只在本次观察内有效，只能给 interact_page 用；"
+    "ref 是取证编号，不能直接用于 interact_page；"
     "存进流程的节点必须写 selector，ref 换一次观察就失效。"
     "matches>1 说明该 selector 命中多个元素，必须先用 container 收窄再写进流程。"
     "tables[].headers 取自表头行（空列位置保留 ''），与 sample_rows 逐列对应；"
@@ -259,31 +260,6 @@ def annotate_observation(result: dict[str, Any], requested_url: str | None = Non
     return False
 
 
-# 定位失败的三种结论：措辞和 required_action 由这里单点给出，两条通道共用。
-# 各写一份的话，同一个「命中多个元素」在扩展通道上会变成另一句话，模型的应对也跟着变。
-def stale_ref_error(detail: str) -> dict[str, Any]:
-    return {"status": "stale_element_ref", "error": detail, "required_action": "call_inspect_page_again"}
-
-
-def element_not_found_error(selector: str) -> dict[str, Any]:
-    return {
-        "status": "element_not_found",
-        "error": f"selector {selector} 在当前页面（或 iframe）上没有命中元素",
-        "required_action": "call_inspect_page_again",
-    }
-
-
-def ambiguous_selector_error(selector: str, matches: int) -> dict[str, Any]:
-    # 同一个页面上「查询」按钮往两三处都有。默认取第一个，在探索阶段看着能过，
-    # 写进流程后点的是另一行的按钮——错的元素比找不到元素难查得多。
-    return {
-        "status": "ambiguous_selector",
-        "matches": matches,
-        "error": f"selector {selector} 命中 {matches} 个元素，无法确定操作哪一个",
-        "required_action": "narrow_selector_or_use_element_ref",
-    }
-
-
 def build_date_controls(inputs: list[dict], all_classes: list[str]) -> list[dict[str, Any]]:
     """识别页面上的组件库控件实例，并对没有被任何实例认领的日期输入框给出通用配方。"""
     from app.services.skills.generic import build_generic_date_controls
@@ -310,6 +286,7 @@ def build_date_controls(inputs: list[dict], all_classes: list[str]) -> list[dict
 # 操作前后的页面指纹：只取几个能反映「面板开了、页面换了、内容变了」的量，
 # 比完整探测便宜得多，可以每次操作都取两次。
 EFFECT_SIGNATURE_JS = _shared_script("EFFECT_SIGNATURE")
+SETTLE_AFTER_ACTION_JS = _shared_script("SETTLE_AFTER_ACTION")
 
 _EFFECT_KEYS = ("url", "elements", "options", "layers", "active")
 

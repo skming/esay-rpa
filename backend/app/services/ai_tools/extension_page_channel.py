@@ -7,11 +7,6 @@ import time
 from typing import Any
 
 import app.services.ai_tools.page_session as _page_session
-from app.services.ai_tools.page_observation import (
-    ambiguous_selector_error,
-    element_not_found_error,
-    stale_ref_error,
-)
 
 CHANNEL_OWNER = "AI 助手 · 扩展探索会话"
 _ACTION_TIMEOUT_SECONDS = 15.0
@@ -141,34 +136,26 @@ class ExtensionPageChannel:
             return {}
         return result if isinstance(result, dict) else {}
 
-    async def resolve_target(
-        self, element_ref: str | None, selector: str | None, observation_version: int | None
-    ) -> tuple[str | None, dict[str, Any] | None]:
-        """以临时 ref 固定目标，防止校验后重新解析 selector 命中另一元素。"""
+    async def resolve_action(self, action_id: str) -> dict[str, Any]:
+        result = await self._send({
+            "type": "page.resolveAction",
+            "actionId": action_id,
+            "observationVersion": self.version,
+        })
+        if not isinstance(result, dict):
+            return {"status": "stale_action", "error": "动作校验没有返回有效结果"}
+        return result
+
+    async def settle(self, action: str, element_ref: str | None) -> dict[str, Any]:
+        payload: dict[str, Any] = {"type": "page.settle", "actionName": action}
         if element_ref is not None:
-            want = self.version if observation_version is None else int(observation_version)
-            if want != self.version:
-                return None, stale_ref_error(
-                    f"元素引用属于第 {want} 次观察，当前会话是第 {self.version} 次，元素可能已经换了位置"
-                )
-            try:
-                await self._send(
-                    {"type": "page.resolveTarget", "ref": element_ref, "observationVersion": want}
-                )
-            except RuntimeError as exc:
-                # 导航或重渲染会使旧 ref 失效。
-                return None, stale_ref_error(str(exc))
-            return element_ref, None
-        if not selector:
-            return None, {"error": "必须提供 element_ref 或 selector"}
-        result = await self._send({"type": "page.resolveTarget", "selector": selector})
-        matches = int((result or {}).get("matches") or 0)
-        if matches == 0:
-            return None, element_not_found_error(selector)
-        if matches > 1:
-            return None, ambiguous_selector_error(selector, matches)
-        resolved = (result or {}).get("element_ref")
-        return (str(resolved) if resolved else None), None
+            payload["ref"] = element_ref
+            payload["observationVersion"] = self.version
+        try:
+            result = await self._send(payload)
+        except RuntimeError:
+            return {"reason": "document_changed"}
+        return result if isinstance(result, dict) else {"reason": "unknown"}
 
     async def apply_action(
         self, action: str, element_ref: str | None, selector: str | None, value: str | None

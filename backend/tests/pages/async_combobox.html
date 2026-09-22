@@ -1,0 +1,17 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>异步联想框</title>
+<style>#options[hidden] { display: none } #options { position: absolute; background: white }</style>
+<label for="query">关键词</label>
+<input id="query" role="combobox" aria-controls="options" aria-expanded="false">
+<div id="options" role="listbox" hidden>
+  <div role="option">上海</div>
+  <div role="option">广州</div>
+</div>
+<script>
+  const input = document.querySelector('#query');
+  input.addEventListener('input', () => setTimeout(() => {
+    document.querySelector('#options').hidden = false;
+    input.setAttribute('aria-expanded', 'true');
+  }, 80));
+</script>

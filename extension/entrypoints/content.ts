@@ -9,12 +9,12 @@ import {
   observePage,
   probeSelectorVisible,
   querySelectorAllDeep,
-  registerActionTarget,
   resolveElement,
+  resolveObservedAction,
   tryResolveElement,
 } from './content/dom';
 // 取证脚本与 Playwright 通道同一个文件，不是各自一份：见该文件头部注释。
-import { EFFECT_SIGNATURE, TARGET_STATE } from '../../backend/app/services/ai_tools/page_effect.js';
+import { EFFECT_SIGNATURE, SETTLE_AFTER_ACTION, TARGET_STATE } from '../../backend/app/services/ai_tools/page_effect.js';
 import { dispatchExtract, dispatchExtractAll } from './content/extract';
 import { markAutomationActivity, moveCursorTo, pulseClickAt, highlightElement, setPageBlocked } from './content/automationVisual';
 import { hideTakeoverBanner, showTakeoverBanner } from './content/takeoverBanner';
@@ -400,18 +400,15 @@ async function handleAction(action: ContentAction): Promise<unknown> {
       const el = action.ref === undefined && action.selector === undefined ? null : tryResolveElement(action);
       return TARGET_STATE(el);
     }
-    case 'page.resolveTarget': {
-      // 只报事实（命中几个、编号是什么），措辞和 required_action 由后端统一给：
-      // 两条通道各写一份错误文案，模型看到的失败原因就会因通道而异。
-      if (action.ref !== undefined) {
-        resolveElement(action);
-        return { matches: 1, element_ref: action.ref };
+    case 'page.resolveAction': {
+      if (action.actionId === undefined || action.observationVersion === undefined) {
+        throw new Error('page.resolveAction 需要 actionId 和 observationVersion');
       }
-      if (action.selector === undefined) throw new Error('page.resolveTarget 需要 ref 或 selector');
-      const found = querySelectorAllDeep(action.selector);
-      const only = found.length === 1 ? found[0] : undefined;
-      if (only === undefined) return { matches: found.length };
-      return { matches: 1, element_ref: registerActionTarget(only) };
+      return resolveObservedAction(action.actionId, action.observationVersion);
+    }
+    case 'page.settle': {
+      if (action.actionName === undefined) throw new Error('page.settle 需要 actionName');
+      return SETTLE_AFTER_ACTION({ action: action.actionName, ref: action.ref });
     }
     case 'takeover.show': {
       if (action.message === undefined || action.taskId === undefined) throw new Error('takeover.show 需要 message 和 taskId');

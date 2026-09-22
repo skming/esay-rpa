@@ -171,12 +171,12 @@ inspect_page(url="...", scope_selector=".search-form")  // 只看筛选区域
 4. **选择器精度**：用 `inspect_page` 返回的精确 selector，不要用 `.xxx:first-of-type input` 这类模糊定位。
 
 **页面探索循环**（下拉面板、日历、级联的选项在页面加载时并不存在，只调 `inspect_page` 永远看不到）：
-- `inspect_page(url=…)` 打开页面并观察；之后 `interact_page(action=…, element_ref=…)` 做一步操作，它会自动重新观察并返回 `effect`。不带 url 的 `inspect_page` 观察当前状态，不会重新加载页面（点开的面板还在）。
+- `inspect_page(url=…)` 打开页面并观察；之后从它返回的 `actions`、`option_actions` 或 `page_actions` 选一个 `action_id` 传给 `interact_page`，工具会做一步操作、自动重新观察并返回 `effect`。不带 url 的 `inspect_page` 观察当前状态，不会重新加载页面（点开的面板还在）。
 - 交互结果分三层，不能互相替代：`effect.changed` 只说整页有没有可观测变化（false 不等于失败——已聚焦的 fill、原生 select 换选项、不新增 DOM 的滚动都不动它；true 也不等于业务成功）；`action_effect.status` 说这个动作自己的目标状态（`target_reached` 达到 / `already_in_target_state` 本来就是目标状态，**不要换目标重试** / `target_not_reached` 回读证明没达到 / `state_changed` / `focus_only` 只变了焦点 / `no_observable_change` 只是缺证据，先确认目标元素与前置条件，别加 delayMs / `unknown` 读不到状态）；`business_check` 一律未验证——筛选真的生效、表单真的提交，只能靠抓回的数据断言。
 - `date_controls[].actionable: false` 说明槽位没解析干净（`unresolved_slots` 写了原因）：用 `interact_page` 点开控件看清真实结构。**禁止把 `panel_selectors_unverified` 里的 selector 抄进流程**——那是组件库模板的猜测，不是这个页面的观察结果。
-- 元素带 `matches > 1` 表示同一个 selector 命中多个：用 `container`/更精确的属性收窄，或改用 `element_ref`。同名「查询」按钮点错一个，运行结果照样是绿的。
+- 元素带 `matches > 1` 表示同一个 selector 命中多个：用 `container` 或更精确的属性收窄后再写流程。探索操作直接使用该元素随观察返回的 `action_id`，不要自行传 selector。同名「查询」按钮点错一个，运行结果照样是绿的。
 - `scope_missing: true` 表示 `scope_selector` 在页面上不存在，此时**没有**退回整页观察：先确认作用域 selector 再重试。
-- **`ref` 只是本次观察内的临时引用，只能传给 `interact_page`；写进流程节点的必须是验证过的稳定 selector。**
+- **`action_id` 只属于本次观察，只能传给 `interact_page`；`ref` 只是取证编号，二者都不能写进流程。流程节点必须使用验证过的稳定 selector。**
 
 **登录态优先原则**：默认保留 Cookies/localStorage，不清理（只有用户要求重置登录态、或有证据表明过期 token 卡死时才清理）。
 

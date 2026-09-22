@@ -555,8 +555,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "在 inspect_page 打开的同一个页面上做一次操作，然后自动重新观察并返回变化。"
                 "用它确认「点开日期面板后面板里有什么」「选完城市后区县选项变了没有」这类"
                 "只在交互之后才存在的事实——这些 DOM 在页面加载时不存在，光调 inspect_page 永远看不到。\n"
-                "目标优先用 element_ref（inspect_page 返回的 ref），它避开了同名按钮的歧义；"
-                "ref 只在返回它的那次观察内有效，页面变过就要重新 inspect_page。\n"
+                "必须使用 inspect_page 返回的 actions/option_actions/page_actions 中的 action_id；"
+                "动作只在返回它的那次观察内有效，页面或目标语义变化后必须重新 inspect_page。\n"
                 "返回分三层，不能互相替代：\n"
                 "- effect.changed：整页有没有可观测变化。false 不代表失败（已聚焦的 fill、原生 select "
                 "换选项、不新增 DOM 的滚动都不动它），true 也不代表业务成功。\n"
@@ -574,26 +574,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
-                    "action": {
+                    "action_id": {
                         "type": "string",
-                        "enum": ["click", "fill", "select_option", "press", "hover", "scroll"],
-                        "description": "press 时 value 是键名（如 Enter）；scroll 不需要目标，滚动整页",
-                    },
-                    "element_ref": {
-                        "type": "string",
-                        "description": "inspect_page 返回的元素 ref（如 e12），优先用它",
-                    },
-                    "selector": {
-                        "type": "string",
-                        "description": "没有 ref 时用 CSS 选择器；命中多个会被拒绝，需要收窄",
+                        "minLength": 1,
+                        "description": "inspect_page 当前观察返回的动作标识，如 click:v3:e12 或 select_option:v3:e7:2",
                     },
                     "value": {
                         "type": "string",
-                        "description": "fill 的文本、select_option 的选项 value、press 的键名",
-                    },
-                    "observation_version": {
-                        "type": "integer",
-                        "description": "element_ref 来自哪次观察（inspect_page 返回的 observation_version）",
+                        "description": "fill 的文本或 press 的键名；select_option 的值已绑定在 action_id 中",
                     },
                     "scope_selector": {
                         "type": "string",
@@ -601,14 +589,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                     "wait_selector": {
                         "type": "string",
-                        "description": "操作后等待该选择器出现再观察，比等固定时间可靠（如 .ant-picker-dropdown）",
-                    },
-                    "wait_ms": {
-                        "type": "integer",
-                        "description": "没有可等的选择器时才用，默认 600ms",
+                        "description": "操作后等待该选择器出现再观察（如 .ant-picker-dropdown）；不传时工具按动作语义等待最小必要渲染",
                     },
                 },
-                "required": ["action"],
+                "required": ["action_id"],
             },
         },
     },
