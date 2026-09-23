@@ -43,9 +43,8 @@ async def test_python_script_runner_writes_output_variables(tmp_path) -> None:
 async def test_script_runner_injects_runtime_variables_without_duplicate_declarations(tmp_path) -> None:
     script = tmp_path / "read_rows.py"
     script.write_text(
-        "import json, os\n"
-        "values = json.loads(os.environ['RPA_VARIABLES_JSON'])\n"
-        "print(json.dumps(values, ensure_ascii=False))\n",
+        "import json\n"
+        "print(json.dumps(_vars, ensure_ascii=False))\n",
         encoding="utf-8",
     )
     variables = RuntimeVariableStore.from_initial({
@@ -68,7 +67,7 @@ async def test_script_runner_injects_runtime_variables_without_duplicate_declara
 async def test_script_runner_requires_explicit_declaration_for_sensitive_variables(tmp_path) -> None:
     script = tmp_path / "read_secret.py"
     script.write_text(
-        "import json, os\nprint(json.dumps(json.loads(os.environ['RPA_VARIABLES_JSON']), sort_keys=True))\n",
+        "import json\nprint(json.dumps(_vars, sort_keys=True))\n",
         encoding="utf-8",
     )
     variables = RuntimeVariableStore.from_initial(
@@ -129,17 +128,30 @@ async def test_python_script_runner_preserves_pythonpath(tmp_path, monkeypatch) 
     assert result.stdout == "from-pythonpath"
 
 
-async def test_python_script_runner_writes_large_variables_to_file(tmp_path) -> None:
-    script = tmp_path / "read_large_variables.py"
-    script.write_text(
-        "import json, os\n"
-        "payload_path = os.environ.get('RPA_VARIABLES_FILE')\n"
-        "assert payload_path, 'RPA_VARIABLES_FILE missing'\n"
-        "with open(payload_path, encoding='utf-8') as f:\n"
-        "    data = json.load(f)\n"
-        "print(len(data['large_payload']))\n",
+async def test_python_path_script_preserves_file_and_sibling_imports(tmp_path) -> None:
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "helper.py").write_text("VALUE = 'from-sibling'\n", encoding="utf-8")
+    (scripts / "main.py").write_text(
+        "from pathlib import Path\n"
+        "import helper\n"
+        "print(f'{Path(__file__).name}:{helper.VALUE}:{_vars[\"run_id\"]}')\n",
         encoding="utf-8",
     )
+
+    result = await ScriptActionRunner(tmp_path).run(
+        {"type": "script.python", "path": "scripts/main.py"},
+        RuntimeVariableStore.from_initial({"run_id": "R-1"}),
+        timeout_ms=5_000,
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == "main.py:from-sibling:R-1"
+
+
+async def test_python_script_runner_writes_large_variables_to_file(tmp_path) -> None:
+    script = tmp_path / "read_large_variables.py"
+    script.write_text("print(len(_vars['large_payload']))\n", encoding="utf-8")
     variables = RuntimeVariableStore.from_initial({"large_payload": "x" * 80_000})
     runner = ScriptActionRunner(tmp_path)
 
@@ -151,6 +163,19 @@ async def test_python_script_runner_writes_large_variables_to_file(tmp_path) -> 
 
     assert result.exit_code == 0
     assert result.stdout == "80000"
+
+
+async def test_inline_python_script_receives_injected_variables(tmp_path) -> None:
+    variables = RuntimeVariableStore.from_initial({"rows": [{"id": 1}]})
+
+    result = await ScriptActionRunner(tmp_path).run(
+        {"type": "script.python", "code": "print(_vars['rows'][0]['id'])"},
+        variables,
+        timeout_ms=5_000,
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == "1"
 
 
 def _script_node(tmp_path, action_type: str, python_code: str, javascript_code: str) -> dict[str, str]:

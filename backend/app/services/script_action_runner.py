@@ -23,26 +23,16 @@ _MAX_STDIO_BYTES = 512_000  # 单路输出上限，防止失控脚本把日志/�
 _MAX_ENV_BYTES = 64_000  # 多数系统 env 总量上限留出安全余量，超出则改用紧凑/省略副本
 _MAX_ENV_VALUE_BYTES = 8_000  # 单个变量塞进紧凑 JSON 副本前的上限，超出的改走 RPA_VARIABLES_FILE
 
-# 注入到内联 Python 脚本开头，确保 _vars 读取未截断的文件快照而非可能被截断的
-# env var 副本；sentinel 防止重复注入。
-_PY_PREAMBLE_SENTINEL = "# __rpa_vars_injected__"
-_PY_PREAMBLE = """\
-# __rpa_vars_injected__
-import json as __j, os as __o
+# 用 runpy 执行真实脚本路径，既保留 __file__ / 相邻模块导入语义，又让 code 与 path
+# 两种模式都从未截断的文件快照获得同一份 _vars。
+_PYTHON_RUNNER = """\
+import json as __j, os as __o, runpy as __r, sys as __s
+__p = __s.argv[1]
 __rf = __o.environ.get('RPA_VARIABLES_FILE', '')
-_vars = __j.load(open(__rf, encoding='utf-8')) if __rf and __o.path.exists(__rf) else __j.loads(__o.environ.get('RPA_VARIABLES_JSON', '{}'))
-del __j, __o, __rf
+__v = __j.load(open(__rf, encoding='utf-8')) if __rf and __o.path.exists(__rf) else __j.loads(__o.environ.get('RPA_VARIABLES_JSON', '{}'))
+__s.path.insert(0, __o.path.dirname(__p))
+__r.run_path(__p, run_name='__main__', init_globals={'_vars': __v})
 """
-
-# AI/UI 生成的旧版加载样板，须清除，否则会用可能截断的数据覆盖注入的 _vars。
-_PY_STALE_LOADERS = [
-    "_vars = json.loads(os.environ.get('RPA_VARIABLES_JSON', '{}'))",
-    (
-        "_rf = os.environ.get('RPA_VARIABLES_FILE', '')\n"
-        "_vars = json.load(open(_rf, encoding='utf-8')) if _rf and os.path.exists(_rf) "
-        "else json.loads(os.environ.get('RPA_VARIABLES_JSON', '{}'))"
-    ),
-]
 
 
 @dataclass(frozen=True)
@@ -182,8 +172,6 @@ class ScriptActionRunner:
         rendered_code = variables.resolve_text(raw_code)
         action_type = node.get("type", "script.python")
         ext = ".py" if "python" in str(action_type) else ".js"
-        if ext == ".py":
-            rendered_code = _inject_py_preamble(rendered_code)
         code_hash = hashlib.md5(rendered_code.encode()).hexdigest()[:8]
         # 内联脚本是临时缓存而非用户产出，放专用缓存目录（不进用户工作区）并定期清理。
         tmp_dir = storage.temp_scripts_dir()
@@ -191,14 +179,6 @@ class ScriptActionRunner:
         tmp_file = tmp_dir / f"inline_{code_hash}{ext}"
         tmp_file.write_text(rendered_code, encoding="utf-8")
         return tmp_file
-
-
-def _inject_py_preamble(code: str) -> str:
-    if _PY_PREAMBLE_SENTINEL in code:
-        return code
-    for stale in _PY_STALE_LOADERS:
-        code = code.replace(stale, "")
-    return _PY_PREAMBLE + code
 
 
 def is_script_action_node(node: FlowNode) -> bool:
@@ -228,7 +208,7 @@ def _build_command(action_type: str, script_path: Path) -> list[str]:
     if action_type == "script.python":
         if script_path.suffix.lower() != ".py":
             raise ValueError("Python 脚本节点仅允许执行 .py 文件")
-        return [sys.executable, str(script_path)]
+        return [sys.executable, "-c", _PYTHON_RUNNER, str(script_path)]
     if action_type == "script.javascript":
         if script_path.suffix.lower() not in {".js", ".mjs"}:
             raise ValueError("JavaScript 脚本节点仅允许执行 .js/.mjs 文件")
