@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Protocol
 
-from sqlalchemy import BigInteger, Index, Integer, String, Text, case, delete, func, inspect, select, text
+from sqlalchemy import BigInteger, Index, Integer, String, Text, case, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -111,9 +111,7 @@ class TaskRow(Base):
     variables_payload: Mapped[list] = mapped_column(_json_type(), nullable=False, default=list)
     execution_evidence_payload: Mapped[list] = mapped_column(_json_type(), nullable=False, default=list)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    input_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
-    human_takeover_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    human_takeover_resume_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    confirmation_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
@@ -168,7 +166,6 @@ class SqlAlchemyTaskStore:
     async def create_schema(self) -> None:
         async with self._engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all, tables=[TaskRow.__table__, TaskLogRow.__table__, TaskVariableRow.__table__, ArtifactRow.__table__])
-            await connection.run_sync(_ensure_task_columns)
             for index in TaskRow.__table__.indexes:
                 await connection.run_sync(lambda conn, index=index: index.create(conn, checkfirst=True))
 
@@ -281,9 +278,7 @@ class SqlAlchemyTaskStore:
             evidence.model_dump(mode="json", by_alias=True) for evidence in task.execution_evidence
         ]
         row.error_message = task.error
-        row.input_prompt = task.input_prompt
-        row.human_takeover_message = task.human_takeover_message
-        row.human_takeover_resume_mode = task.human_takeover_resume_mode
+        row.confirmation_message = task.confirmation_message
         row.created_at = task.created_at
         if task.status == "running" and row.started_at is None:
             row.started_at = task.updated_at
@@ -317,9 +312,7 @@ class SqlAlchemyTaskStore:
             ],
             run_config=_run_config_from_payload(row.request_payload),
             error=row.error_message,
-            input_prompt=getattr(row, "input_prompt", None),
-            human_takeover_message=getattr(row, "human_takeover_message", None),
-            human_takeover_resume_mode=getattr(row, "human_takeover_resume_mode", None),
+            confirmation_message=row.confirmation_message,
         )
 
     @staticmethod
@@ -358,25 +351,6 @@ class SqlAlchemyTaskStore:
             created_at=artifact.created_at,
         )
 
-
-def _ensure_task_columns(connection) -> None:
-    """补充后续迁移新增的列，不丢已有数据（简易 ALTER TABLE，非正式 migration 框架）。"""
-    log_columns = {column["name"] for column in inspect(connection).get_columns(TaskLogRow.__tablename__)}
-    if "node_id" not in log_columns:
-        connection.execute(text("ALTER TABLE rpa_task_logs ADD COLUMN node_id VARCHAR(120)"))
-    task_columns = {column["name"] for column in inspect(connection).get_columns(TaskRow.__tablename__)}
-    if "variables_payload" not in task_columns:
-        connection.execute(text("ALTER TABLE rpa_tasks ADD COLUMN variables_payload JSON DEFAULT '[]' NOT NULL"))
-    if "execution_evidence_payload" not in task_columns:
-        connection.execute(text("ALTER TABLE rpa_tasks ADD COLUMN execution_evidence_payload JSON DEFAULT '[]' NOT NULL"))
-    if "schedule_id" not in task_columns:
-        connection.execute(text("ALTER TABLE rpa_tasks ADD COLUMN schedule_id VARCHAR(36)"))
-    if "input_prompt" not in task_columns:
-        connection.execute(text("ALTER TABLE rpa_tasks ADD COLUMN input_prompt TEXT"))
-    if "human_takeover_message" not in task_columns:
-        connection.execute(text("ALTER TABLE rpa_tasks ADD COLUMN human_takeover_message TEXT"))
-    if "human_takeover_resume_mode" not in task_columns:
-        connection.execute(text("ALTER TABLE rpa_tasks ADD COLUMN human_takeover_resume_mode VARCHAR(32)"))
 
 
 def _normalize_limit(limit: int) -> int:

@@ -256,7 +256,7 @@ function formatLastRun(status: string | null): string {
     running: '运行中',
     stopped: '已停止',
     queued: '排队中',
-    paused_for_human: '等待操作',
+    awaiting_confirmation: '等待操作',
   };
   return status !== null ? (map[status] ?? '--') : '--';
 }

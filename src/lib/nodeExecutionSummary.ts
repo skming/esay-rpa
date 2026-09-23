@@ -118,11 +118,6 @@ export function buildNodeExecutionSummary(node: Node<RpaNodeData>): NodeExecutio
     addRow('description', actionType === 'control.break' ? '中断说明' : '控制说明', node.data.description);
   }
 
-  if (actionType === 'control.human_takeover') {
-    addRow('humanTakeoverMessage', '提示信息', action.humanTakeoverMessage);
-    addRow('humanTakeoverResumeMode', '恢复方式', action.humanTakeoverResumeMode === 'current_node' ? '重试当前节点' : '继续下一节点');
-  }
-
   if (actionType === 'variable.set') {
     addRow('variableName', '变量名', action.variableName);
     addRow('value', '变量值', action.value ?? action.defaultValue);
@@ -133,13 +128,6 @@ export function buildNodeExecutionSummary(node: Node<RpaNodeData>): NodeExecutio
   if (actionType === 'variable.get') {
     addRow('variableName', '读取变量', action.variableName);
     addRow('responseVariable', '输出变量', action.responseVariable ?? action.outputVariable);
-  }
-
-  if (actionType === 'variable.input') {
-    addRow('message', '弹窗提示', action.message);
-    addRow('defaultValue', '默认值', action.defaultValue);
-    addRow('variableName', '保存变量', action.variableName);
-    addRow('scope', '变量作用域', action.scope);
   }
 
   if (actionType === 'variable.log') {

@@ -29,12 +29,6 @@ class DingTalkNotifier:
     def __init__(self, config_service: NotificationConfigService | None = None) -> None:
         self._config_service = config_service or NotificationConfigService()
 
-    async def notify_human_takeover(self, *, flow_name: str, node_title: str, message: str, task_id: str) -> None:
-        title = f"「{flow_name}」需要人工接管"
-        body = message.split("\n⏱")[0]  # 去掉内部编码的超时毫秒数
-        text = f"#### {title}\n- 节点：{node_title}\n- 说明：{body}\n- 任务 ID：{task_id}"
-        await self.send(text)
-
     async def send(self, markdown_text: str) -> None:
         config = self._config_service.load()
         if not config.get("dingtalk_enabled"):

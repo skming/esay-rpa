@@ -100,7 +100,7 @@
 
   /* 语义化层级标度 —— 数值只在此处定义一次。
      select 必须高于 modal：下拉在对话框内打开时要盖住对话框本身。
-     banner 是最高层：人工接管横幅必须压过任何弹层，否则用户看不到该处理什么。 */
+     banner 是最高层：敏感操作确认必须压过任何弹层，否则用户看不到该确认什么。 */
   --z-sticky: 10;
   --z-raised: 20;
   --z-dropdown: 50;
@@ -611,4 +611,3 @@ select {
     transition-duration: 0.001ms !important;
   }
 }
-

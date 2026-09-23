@@ -44,9 +44,6 @@ const IPC_CHANNELS = Object.freeze({
     debug: 'run:debug',
     event: 'run:event'
   }),
-  input: Object.freeze({
-    provide: 'input:provide'
-  }),
   runs: Object.freeze({
     list: 'runs:list'
   }),

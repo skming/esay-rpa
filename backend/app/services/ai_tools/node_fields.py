@@ -18,7 +18,7 @@ KNOWN_NODE_FIELDS = frozenset({
     "dismissedCountVariable", "distance", "durationMs", "endpoint", "errorVariable",
     "exitCodeVariable", "expression", "extractMode", "extractSelector", "fallbackSelectors",
     "fetcher", "filePath", "fillMode", "firstValueVariable", "flowId", "force", "headers",
-    "humanTakeoverMessage", "humanTakeoverResumeMode", "id", "includeInResult", "index",
+    "id", "includeInResult", "index",
     "indexVariable", "inputValue", "inputVariable", "inputVariables", "itemSelector",
     "itemVariable", "items", "itemsVariable", "jsonVariable", "key", "kind", "label", "left",
     "leftVariable", "level", "limit", "listVariable", "loadedCountVariable", "logLevel",

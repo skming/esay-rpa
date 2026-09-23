@@ -3,7 +3,7 @@ import type { ScheduleSnapshot, TaskSnapshot } from '../types/electron';
 export type OperationalAttentionItem = {
   detail: string;
   id: string;
-  kind: 'human' | 'run-error' | 'schedule-error';
+  kind: 'confirmation' | 'run-error' | 'schedule-error';
   run?: TaskSnapshot;
   schedule?: ScheduleSnapshot;
   title: string;
@@ -24,12 +24,12 @@ export function buildOperationalHealthSnapshot(
   schedules: ScheduleSnapshot[],
 ): OperationalHealthSnapshot {
   const latestRuns = selectLatestRunPerFlow(runs);
-  const humanItems = latestRuns
-    .filter((run) => run.status === 'paused_for_human')
+  const confirmationItems = latestRuns
+    .filter((run) => run.status === 'awaiting_confirmation')
     .map((run): OperationalAttentionItem => ({
-      detail: run.inputPrompt?.trim() || '流程正在等待人工操作后继续',
-      id: `human:${run.taskId}`,
-      kind: 'human',
+      detail: run.confirmationMessage?.trim() || '流程正在等待敏感操作确认',
+      id: `confirmation:${run.taskId}`,
+      kind: 'confirmation',
       run,
       title: run.flowName,
       updatedAt: run.updatedAt,
@@ -58,7 +58,7 @@ export function buildOperationalHealthSnapshot(
   const terminalRuns = runs.filter((run) => run.status === 'success' || run.status === 'error');
   return {
     attention: [
-      ...sortNewest(humanItems),
+      ...sortNewest(confirmationItems),
       ...sortNewest(failedRunItems),
       ...sortNewest(scheduleItems),
     ],

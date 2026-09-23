@@ -22,7 +22,7 @@ def test_second_owner_is_told_who_holds_the_profile(tmp_path) -> None:
     assert excinfo.value.holder == "抓取帖子 · 运行 t_1"
     # 报错必须点名占用方并给出去哪操作，否则用户只能靠猜关窗口
     assert "抓取帖子 · 运行 t_1" in str(excinfo.value)
-    assert "已完成，继续" in str(excinfo.value)
+    assert "确认并继续" in str(excinfo.value)
 
 
 def test_same_owner_can_reacquire(tmp_path) -> None:

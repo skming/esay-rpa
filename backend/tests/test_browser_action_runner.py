@@ -622,7 +622,7 @@ async def test_detect_blocking_overlay_recognizes_captcha_by_keyword() -> None:
 
 async def test_detect_blocking_overlay_ignores_low_confidence_fullscreen_fallback() -> None:
     """兜底扫描命中大面积定位容器，但没有厂商特征也没有关键词命中时，很可能只是
-    页面自身的布局容器（如 SPA 应用外壳）而不是真的阻断浮层——不应据此转人工。"""
+    页面自身的布局容器（如 SPA 应用外壳）而不是真的阻断浮层——不应据此报告阻断。"""
     page = FakeOverlayEvaluatePage(
         {
             "reason": "fullscreen_overlay",
@@ -643,7 +643,7 @@ async def test_detect_blocking_overlay_ignores_low_confidence_fullscreen_fallbac
 
 async def test_detect_blocking_overlay_keeps_low_confidence_target_obscured() -> None:
     """target_obscured 信号本身已经证明目标元素被遮挡，即使标签退化为"未知弹层"
-    也仍应转人工，不受兜底扫描的置信度收紧影响。"""
+    也仍应识别为阻断，不受兜底扫描的置信度收紧影响。"""
     page = FakeOverlayEvaluatePage(
         {
             "reason": "target_obscured",
@@ -683,8 +683,6 @@ async def test_detect_blocking_overlay_falls_through_to_the_challenge_interstiti
     assert overlay is not None
     assert overlay.reason == "challenge_interstitial"
     assert overlay.label == "人机验证拦截页"
-    # 无头下加 human_takeover 节点依然过不去，出路是换有头/插件执行器
-    assert "插件执行器" in overlay.headless_advice
 
 
 async def test_detect_blocking_overlay_reports_nothing_when_neither_probe_hits() -> None:

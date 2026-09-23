@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
-from sqlalchemy import String, Text, delete, inspect, select, text
+from sqlalchemy import String, Text, delete, select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -75,7 +75,6 @@ class SqlAlchemyFlowStore:
     async def create_schema(self) -> None:
         async with self._engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all, tables=[FlowRow.__table__])
-            await connection.run_sync(_ensure_flow_columns)
 
     async def close(self) -> None:
         await self._engine.dispose()
@@ -144,24 +143,3 @@ class SqlAlchemyFlowStore:
             updatedAt=row.updated_at,
             snapshots=[FlowVersionSnapshot.model_validate(s) for s in (getattr(row, "snapshots", None) or [])],
         )
-
-
-def _ensure_flow_columns(connection) -> None:
-    """无 Alembic 的轻量手动迁移：老库缺列时逐个 ADD COLUMN 补齐，新增字段需同步在此追加分支。"""
-    columns = {col["name"] for col in inspect(connection).get_columns(FlowRow.__tablename__)}
-    if "input_variables" not in columns:
-        connection.execute(text("ALTER TABLE rpa_flows ADD COLUMN input_variables TEXT NOT NULL DEFAULT '[]'"))
-    if "acceptance_contract" not in columns:
-        connection.execute(text("ALTER TABLE rpa_flows ADD COLUMN acceptance_contract TEXT NOT NULL DEFAULT '{}'"))
-    if "revision" not in columns:
-        connection.execute(text("ALTER TABLE rpa_flows ADD COLUMN revision INTEGER NOT NULL DEFAULT 1"))
-    if "folder_path" not in columns:
-        connection.execute(text("ALTER TABLE rpa_flows ADD COLUMN folder_path VARCHAR(500) NOT NULL DEFAULT '默认目录'"))
-    if "default_browser_executor" not in columns:
-        connection.execute(text("ALTER TABLE rpa_flows ADD COLUMN default_browser_executor VARCHAR(24) NOT NULL DEFAULT 'playwright'"))
-    if "last_run_status" not in columns:
-        connection.execute(text("ALTER TABLE rpa_flows ADD COLUMN last_run_status VARCHAR(24)"))
-    if "last_run_at" not in columns:
-        connection.execute(text("ALTER TABLE rpa_flows ADD COLUMN last_run_at TIMESTAMP WITH TIME ZONE"))
-    if "snapshots" not in columns:
-        connection.execute(text("ALTER TABLE rpa_flows ADD COLUMN snapshots TEXT NOT NULL DEFAULT '[]'"))

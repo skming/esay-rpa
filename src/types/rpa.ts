@@ -23,8 +23,8 @@ export const DEFAULT_ACTION_TYPE_BY_KIND: Record<NodeKind, string> = {
 export type PanelTab = 'config' | 'io' | 'advanced';
 export type BottomTab = 'logs' | 'variables' | 'breakpoints' | 'errors' | 'artifacts';
 export type CanvasToolMode = 'select' | 'pan';
-export type RuntimeStatus = 'ready' | 'running' | 'success' | 'stopped' | 'error' | 'paused_for_human';
-// 'input' 表示运行器正等待用户输入
+export type RuntimeStatus = 'ready' | 'running' | 'success' | 'stopped' | 'error' | 'awaiting_confirmation';
+// 'input' 表示运行器正等待敏感操作确认
 export type RunLogLevel = 'info' | 'success' | 'running' | 'warn' | 'error' | 'input';
 // 'stealthy' 使用带反反爬措施的无头浏览器
 export type FetcherType = 'static' | 'dynamic' | 'stealthy';
@@ -125,8 +125,6 @@ export type RpaNodeAction = {
   errorVariable?: string;
   flowId?: string;
   command?: string;
-  humanTakeoverMessage?: string;
-  humanTakeoverResumeMode?: 'next_node' | 'current_node';
   /** 换行分隔的备选 selector，运行时主 selector 未命中会自动逐个尝试。 */
   fallbackSelectors?: string;
   /** 元素可见文字锚点，运行时兜底按文字定位（抗页面改版）。 */
@@ -202,8 +200,6 @@ export type RpaNodeConfigDraft = {
   title: string;
   variableName: string;
   variableScope: VariableScope;
-  humanTakeoverMessage: string;
-  humanTakeoverResumeMode: 'next_node' | 'current_node';
   fallbackSelectors: string;
   anchorText: string;
   outputSchema: string;

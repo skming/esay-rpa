@@ -27,7 +27,7 @@ function renderHandler() {
     callBridge: async (action) => (await action(api)).data ?? null,
     pushToast: vi.fn(), onArtifactsReady: vi.fn(), setActiveRunId: vi.fn(), setActiveRunFlowId: vi.fn(),
     setLastRunId: vi.fn(), setArtifactContent: vi.fn(), setArtifacts: vi.fn(), setFlows: vi.fn(),
-    setGeneratedScript: vi.fn(), setInputPrompt: vi.fn(), setHumanTakeoverMessage: vi.fn(), setPausedPageUrl: vi.fn(),
+    setGeneratedScript: vi.fn(), setConfirmationMessage: vi.fn(),
     setLogs: vi.fn(), setNodeStates: vi.fn(), setProgress: vi.fn(), setRuntimeStatus: vi.fn(), setVariables: vi.fn(),
   };
   let handle!: (event: RunEvent) => void;
@@ -70,6 +70,17 @@ describe('运行事件归属', () => {
     params.activeRunIdRef.current = 'new-run';
     handle({ type: 'variable:set', payload: { runId: 'old-run', name: 'old', scope: '全局', type: 'String', value: 'old' } });
     expect(params.setVariables).not.toHaveBeenCalled();
+  });
+
+  it('敏感操作确认出现和清除时同步运行状态', () => {
+    const { handle, params } = renderHandler();
+    handle({ type: 'run:confirmation', payload: { runId: 'old-run', message: '确认提交' } });
+    expect(params.setConfirmationMessage).toHaveBeenLastCalledWith('确认提交');
+    expect(params.setRuntimeStatus).toHaveBeenLastCalledWith('awaiting_confirmation');
+
+    handle({ type: 'run:confirmation', payload: { runId: 'old-run', message: null } });
+    expect(params.setConfirmationMessage).toHaveBeenLastCalledWith(null);
+    expect(params.setRuntimeStatus).toHaveBeenLastCalledWith('running');
   });
 
   it.each(['new-run', null])('任务切换或清空后丢弃旧请求结果：%s', async (runId) => {

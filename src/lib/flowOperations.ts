@@ -556,14 +556,6 @@ function getDefaultAction(payload: ComponentDragPayload): RpaNodeData['action'] 
       timeoutMs: 300_000
     };
   }
-  if (payload.nodeType === 'control' && payload.label === '人工接管') {
-    return {
-      type: 'control.human_takeover',
-      humanTakeoverMessage: '',
-      humanTakeoverResumeMode: 'next_node' as const,
-      timeoutMs: 0
-    };
-  }
   if (payload.nodeType === 'control') {
     return {
       type: 'control.noop',
@@ -607,7 +599,6 @@ function getUiDescription(label: string): string {
 function getVariableDescription(label: string): string {
   if (label === '赋值变量') return 'result_status = done';
   if (label === '获取变量') return 'result_status → status_value';
-  if (label === '输入弹窗') return '请输入参数 → user_input';
   if (label === '输出日志') return 'info · ${var.result_status}';
   if (label === '消息通知') return '企业微信 · 流程完成';
   if (label === '剪贴板') return '${var.result_status} → clipboard_text';
@@ -630,16 +621,6 @@ function getDefaultVariableAction(label: string): RpaNodeData['action'] {
       type: 'variable.get',
       variableName: 'result_status',
       outputVariable: 'status_value',
-      timeoutMs: 30_000
-    };
-  }
-  if (label === '输入弹窗') {
-    return {
-      type: 'variable.input',
-      variableName: 'user_input',
-      message: '请输入运行参数',
-      defaultValue: '',
-      scope: '全局',
       timeoutMs: 30_000
     };
   }

@@ -68,9 +68,7 @@ export function useElectronBridge({
   const [canvasFitVersion, setCanvasFitVersion] = useState(0);
   const [nodeStates, setNodeStates] = useState<Record<string, NodeRuntimeState>>({});
   const [progress, setProgress] = useState<RuntimeProgress>(initialProgress);
-  const [inputPrompt, setInputPrompt] = useState<string | null>(null);
-  const [humanTakeoverMessage, setHumanTakeoverMessage] = useState<string | null>(null);
-  const [pausedPageUrl, setPausedPageUrl] = useState<string | null>(null);
+  const [confirmationMessage, setConfirmationMessage] = useState<string | null>(null);
   const [queueStats, setQueueStats] = useState<QueueStats | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus>('ready');
   const [runs, setRuns] = useState<TaskSnapshot[]>([]);
@@ -200,9 +198,7 @@ export function useElectronBridge({
     setArtifactContent(null);
     setArtifacts([]);
     setGeneratedScript(null);
-    setInputPrompt(null);
-    setHumanTakeoverMessage(null);
-    setPausedPageUrl(null);
+    setConfirmationMessage(null);
     setLogs([]);
     setNodeStates({});
     setProgress(initialProgress);
@@ -227,9 +223,7 @@ export function useElectronBridge({
     setArtifacts,
     setFlows,
     setGeneratedScript,
-    setInputPrompt,
-    setHumanTakeoverMessage,
-    setPausedPageUrl,
+    setConfirmationMessage,
     setLogs,
     setNodeStates,
     setProgress,
@@ -271,8 +265,7 @@ export function useElectronBridge({
     setSiteAnalysis,
     setVariables,
     setLogs,
-    setInputPrompt,
-    setHumanTakeoverMessage,
+    setConfirmationMessage,
     setActivePickerRequest: updateActivePickerRequest,
     setCanvasFitVersion
   });
@@ -366,9 +359,7 @@ export function useElectronBridge({
       pickerResult,
       activePickerRequest,
       pickerActive: activePickerRequest !== null,
-      inputPrompt,
-      humanTakeoverMessage,
-      pausedPageUrl,
+      confirmationMessage,
       activeRunFlowId,
       lastRunId,
       logs,
@@ -427,13 +418,11 @@ export function useElectronBridge({
       flows,
       currentFlow,
       siteAnalysis,
-      inputPrompt,
       activeRunFlowId,
       pickerResult,
       lastRunId,
       activePickerRequest,
-      humanTakeoverMessage,
-      pausedPageUrl,
+      confirmationMessage,
       logs,
       canvasFitVersion,
       nodeStates,

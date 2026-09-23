@@ -39,7 +39,7 @@ type BrowserBridgeOptions = {
 
 type ActiveBrowserRun = {
   artifactIds: Set<string>;
-  lastInputPrompt: string | null;
+  lastConfirmationMessage: string | null;
   lastLogIds: Set<string>;
   pollTimer: number | null;
   runId: string;
@@ -86,7 +86,7 @@ export function createBrowserBridge({ backendClient = new BackendClient() }: Bro
     const runId = task.taskId;
     activeRun = {
       artifactIds: new Set<string>(),
-      lastInputPrompt: null,
+      lastConfirmationMessage: null,
       lastLogIds: new Set<string>(),
       pollTimer: null,
       runId,
@@ -127,17 +127,17 @@ export function createBrowserBridge({ backendClient = new BackendClient() }: Bro
         logs.forEach((log) => emitBackendLog(currentRun, emitRunEvent, log));
       }
 
-      // 轮询兜底：补上可能因 WS 未连接/日志漏收而错过的 input 提示
-      if (snapshot.inputPrompt != null && snapshot.inputPrompt !== currentRun.lastInputPrompt) {
-        currentRun.lastInputPrompt = snapshot.inputPrompt;
-        const syntheticId = `${runId}:poll-input`;
+      // 轮询兜底：补上可能因 WS 未连接/日志漏收而错过的敏感操作确认。
+      if (snapshot.confirmationMessage != null && snapshot.confirmationMessage !== currentRun.lastConfirmationMessage) {
+        currentRun.lastConfirmationMessage = snapshot.confirmationMessage;
+        const syntheticId = `${runId}:poll-confirmation`;
         if (!currentRun.lastLogIds.has(syntheticId)) {
           currentRun.lastLogIds.add(syntheticId);
           emitRunEvent({
             payload: {
               id: syntheticId,
               level: 'input',
-              message: snapshot.inputPrompt,
+              message: snapshot.confirmationMessage,
               nodeId: 'n1',
               runId,
               time: formatLogTime(new Date())
@@ -145,8 +145,10 @@ export function createBrowserBridge({ backendClient = new BackendClient() }: Bro
             type: 'log:append'
           });
         }
-      } else if (snapshot.inputPrompt == null) {
-        currentRun.lastInputPrompt = null;
+      } else if (snapshot.confirmationMessage == null && currentRun.lastConfirmationMessage !== null) {
+        // 确认被解决/超时清空后派发清除，否则桌面确认浮层会一直挂到 run:finish。
+        currentRun.lastConfirmationMessage = null;
+        emitRunEvent({ payload: { message: null, runId }, type: 'run:confirmation' });
       }
 
       const status = normalizeRuntimeStatus(snapshot.status);
@@ -649,17 +651,9 @@ export function createBrowserBridge({ backendClient = new BackendClient() }: Bro
       finishBackendRun(activeRunId, 'stopped', '流程已停止');
       return success({ runId: activeRunId, status: 'stopped', stopped: true });
     },
-    provideInput: async (runId: string, value: string): Promise<BridgeResult<void>> => {
+    resumeConfirmation: async (runId: string): Promise<BridgeResult<void>> => {
       try {
-        await backendClient.provideInput(runId, value);
-        return success(undefined);
-      } catch (error) {
-        return failure(error);
-      }
-    },
-    resumeHumanTakeover: async (runId: string, resumeMode: string): Promise<BridgeResult<void>> => {
-      try {
-        await backendClient.resumeHumanTakeover(runId, resumeMode);
+        await backendClient.resumeConfirmation(runId);
         return success(undefined);
       } catch (error) {
         return failure(error);
@@ -708,10 +702,10 @@ function emitBackendLog(activeRun: ActiveBrowserRun, emitRunEvent: (event: RunEv
 
   activeRun.lastLogIds.add(log.id);
   const level = normalizeLogLevel(log.level);
-  // 标记 prompt 已处理，避免 pollBackendTask 的轮询兜底重复生成
+  // 标记确认消息已处理，避免 pollBackendTask 的轮询兜底重复生成。
   if (level === 'input') {
-    activeRun.lastInputPrompt = log.detail ?? log.message;
-    activeRun.lastLogIds.add(`${activeRun.runId}:poll-input`);
+    activeRun.lastConfirmationMessage = log.detail ?? log.message;
+    activeRun.lastLogIds.add(`${activeRun.runId}:poll-confirmation`);
   }
   emitRunEvent({
     payload: {

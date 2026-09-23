@@ -196,8 +196,7 @@ export const componentGroups: ComponentGroup[] = [
       { label: '等待延时' },
       { label: '子流程' },
       { label: '异常处理' },
-      { label: '重试机制' },
-      { label: '人工接管' }
+      { label: '重试机制' }
     ]
   },
   {
@@ -207,7 +206,6 @@ export const componentGroups: ComponentGroup[] = [
     items: [
       { label: '赋值变量' },
       { label: '获取变量' },
-      { label: '输入弹窗' },
       { label: '输出日志', popular: true },
       { label: '消息通知' },
       { label: '剪贴板' }

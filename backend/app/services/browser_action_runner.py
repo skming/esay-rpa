@@ -72,7 +72,7 @@ class BrowserActionContext:
     page: object
     # browser 是否为 launch_persistent_context 创建的持久化 BrowserContext。
     persistent: bool = field(default=False)
-    # 无头模式下窗口不可见，无法人工接管。
+    # 记录上下文是否无头，供执行诊断使用。
     headless: bool = field(default=True)
     # 持久化 profile 的目录与登记的占用方；关闭上下文时按这两个字段销号
     profile_dir: str | None = field(default=None)
@@ -162,8 +162,8 @@ async def open_stealth_session(profile_dir: str, *, headless: bool) -> object:
     我们自己露了马脚」那一类失败，与指纹伪造是两回事。
 
     不开 solve_cloudflare：它只在 session.fetch() 内部跑，对这里 new_page() 出来的页面
-    不生效，配上就是挂一个握不到的杠杆。拦截页仍由 detect_blocking_interstitial 判、
-    由人工接管兜底。
+    不生效，配上就是挂一个握不到的杠杆。拦截页仍由 detect_blocking_interstitial 判，
+    并作为明确失败证据返回。
     """
     from scrapling.fetchers import AsyncStealthySession
 
@@ -1278,7 +1278,7 @@ def _apply_output_schema(rows: list[object], node: FlowNode) -> tuple[list[objec
 
 
 # 阻断型浮层运行时检测
-# 只识别，不破解/不自动关闭：命中后由 task_manager 转入人工接管等待。
+# 只识别，不破解验证码：命中后由 task_manager 返回明确失败证据。
 # 不穷举第三方验证码厂商 class 名单，而是识别通用信号：①目标元素被遮挡
 # （elementFromPoint 命中的不是目标本身）②无明确目标时兜底扫描大面积高层浮层；
 # 已知验证码厂商特征仍保留作为高置信度快速命中。
@@ -1537,14 +1537,10 @@ _INTERSTITIAL_PROBE_SCRIPT = """
 
 @dataclass(frozen=True)
 class OverlayInfo:
-    """检测到的阻断型浮层：label 用于日志/横幅展示，summary 供 AI 弹层分析使用。"""
+    """检测到的阻断型浮层。"""
 
     label: str
     reason: str
-    summary: dict[str, object]
-    # 无头运行时给出的补救方向。拦截页和普通验证码的出路不同：前者要换有头/插件执行器
-    # 让人过一次，加 human_takeover 节点在无头下依然过不去。
-    headless_advice: str = "请在流程中加入 control.human_takeover 节点后重跑"
 
 
 async def detect_blocking_interstitial(page: object) -> OverlayInfo | None:
@@ -1558,11 +1554,6 @@ async def detect_blocking_interstitial(page: object) -> OverlayInfo | None:
     return OverlayInfo(
         label="人机验证拦截页",
         reason="challenge_interstitial",
-        summary=result,
-        headless_advice=(
-            "请改用有头模式或插件执行器运行，人工完成一次验证；"
-            "登录态与验证 cookie 会留在持久化 profile 里，后续运行通常无需再验"
-        ),
     )
 
 
@@ -1586,13 +1577,13 @@ async def detect_blocking_overlay(page: object, target_selector: str | None = No
     )
     if reason == "fullscreen_overlay" and label == "未知弹层":
         # 兜底扫描命中大面积容器但无厂商特征/关键词匹配，很可能是页面自身布局容器
-        # 而非真阻断浮层，置信度不足以转人工。
+        # 而非真阻断浮层，置信度不足以报告为阻断。
         return await detect_blocking_interstitial(page)
-    return OverlayInfo(label=label, reason=reason, summary=result)
+    return OverlayInfo(label=label, reason=reason)
 
 
 # 仅广告弹窗关闭/跳过、cookie同意/隐私条款确认这两类误点无不可逆后果；验证码
-# （可能触发风控）和未知弹层（可能是"确认下单"等）永远不自动点击，只转人工。
+# （可能触发风控）和未知弹层（可能是"确认下单"等）永远不自动点击。
 _SAFE_AUTO_DISMISS_LABELS = {"疑似广告弹窗", "隐私/条款提示"}
 
 
@@ -1610,7 +1601,7 @@ async def try_auto_dismiss_overlay(
     allow_consent: bool = True,
 ) -> DismissOutcome | None:
     """尝试点击浮层内的"关闭/跳过"按钮，仅广告/隐私条款提示两类安全类别可用。
-    返回 None 表示未处理，调用方应转人工接管；浮层是否真消失需另行调用 detect_blocking_overlay 复检。
+    返回 None 表示未处理；浮层是否真消失需另行调用 detect_blocking_overlay 复检。
     """
     if overlay.label not in _SAFE_AUTO_DISMISS_LABELS:
         return None

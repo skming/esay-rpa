@@ -859,7 +859,7 @@ async function injectContentScript(tab: Browser.tabs.Tab): Promise<{ ok: boolean
   }
 }
 
-// 接管 Banner 点「完成」后 content script 发来（页面主动事件、无 requestId，走不了 WS 协议），直接调后端 REST resume。
+// 确认横幅点「确认并继续」后由 content script 发来（页面主动事件、无 requestId，走不了 WS 协议），直接调后端 REST resume。
 browser.runtime.onMessage.addListener((message) => {
   if (typeof message !== 'object' || message === null) return undefined;
 
@@ -872,14 +872,14 @@ browser.runtime.onMessage.addListener((message) => {
   if ((message as { source?: string }).source === 'rpa-studio-bridge-event') {
     const event = message as { type?: string; taskId?: string };
     // resume 的真实结果要回给 Banner：它据此决定收不收横幅，丢掉结果横幅就会在没恢复成功时也消失。
-    if (event.type === 'takeoverResume' && typeof event.taskId === 'string') {
-      return resumeHumanTakeover(event.taskId);
+    if (event.type === 'confirmationResume' && typeof event.taskId === 'string') {
+      return resumeConfirmation(event.taskId);
     }
   }
   return undefined;
 });
 
-async function resumeHumanTakeover(taskId: string): Promise<boolean> {
+async function resumeConfirmation(taskId: string): Promise<boolean> {
   try {
     const response = await fetch(`${BACKEND_BASE_URL}/api/tasks/${taskId}/resume`, {
       method: 'POST',
@@ -888,12 +888,12 @@ async function resumeHumanTakeover(taskId: string): Promise<boolean> {
     });
     // fetch 只有网络层出错才 reject：任务已结束/不存在返回的是 4xx，不看 ok 就会把「后端拒绝了」当成恢复成功。
     if (!response.ok) {
-      console.error(`[rpa-studio-bridge] 恢复人工接管失败：HTTP ${response.status}`);
+      console.error(`[rpa-studio-bridge] 恢复敏感操作确认失败：HTTP ${response.status}`);
       return false;
     }
     return true;
   } catch (error) {
-    console.error('[rpa-studio-bridge] 恢复人工接管失败', error);
+    console.error('[rpa-studio-bridge] 恢复敏感操作确认失败', error);
     return false;
   }
 }

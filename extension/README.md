@@ -1,6 +1,6 @@
 # Easy RPA Chrome Extension
 
-Chrome 扩展让 Easy RPA 可以操作用户真实浏览器标签页，复用当前 Chrome 登录态。它是 Playwright 后台执行器的补充，适合企业 SSO、验证码前后的人机协同和必须在真实浏览器中完成的页面操作。
+Chrome 扩展让 Easy RPA 可以操作用户真实浏览器标签页，复用当前 Chrome 登录态。它适合企业 SSO、需要先由用户完成验证的站点，以及必须在真实浏览器中完成的页面操作。
 
 ## 客户端安装与使用
 
@@ -43,7 +43,7 @@ curl http://127.0.0.1:8765/api/extension/status
 - 浏览器动作：`browser.open`、`click`、`fill`、`extract`、`hover`、`select`、`press`、`scroll`
 - 标签页：`browser.tab.open`、`browser.tab.switch`、`browser.tab.close`
 - 截图：`browser.screenshot`
-- 可视化：目标元素高亮、人工接管 Banner
+- 可视化：目标元素高亮、敏感操作确认 Banner
 - 可信输入：动作带 `trusted: true` 时通过 Chrome Debugger/CDP 执行点击或输入
 
 ## 手工测试
@@ -79,4 +79,4 @@ curl -X POST http://127.0.0.1:8765/api/extension/execute \
 - 流程运行的受控标签页与助手探索会话分别管理。
 - 跨域 iframe 不能由 content script 直接读取。
 - CDP 可信输入会短暂显示 Chrome 调试提示。
-- 破坏性动作应配合人工确认和审计日志使用。
+- 破坏性动作应启用敏感操作确认并保留审计日志。

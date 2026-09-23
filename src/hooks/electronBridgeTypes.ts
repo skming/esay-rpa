@@ -47,9 +47,7 @@ export type ElectronBridgeState = {
   pickerResult: PickerResult | null;
   activePickerRequest: PickerRequest | null;
   pickerActive: boolean;
-  inputPrompt: string | null;
-  humanTakeoverMessage: string | null;
-  pausedPageUrl: string | null;
+  confirmationMessage: string | null;
   activeRunFlowId: string | null;
   lastRunId: string | null;
   logs: RunLogEntry[];
@@ -92,8 +90,7 @@ export type ElectronBridgeState = {
   closePicker: (requestId: string) => Promise<void>;
   startRun: (options?: RunMode | StartRunOptions) => Promise<void>;
   stopRun: () => Promise<void>;
-  provideInput: (value: string) => Promise<void>;
-  resumeHumanTakeover: (resumeMode: string) => Promise<void>;
+  resumeConfirmation: () => Promise<void>;
   debugControl: (command: DebugControlCommand) => void;
   generateScraplingScript: () => Promise<void>;
   exportScraplingScript: (content: string, filename: string) => Promise<void>;

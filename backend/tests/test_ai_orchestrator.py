@@ -414,8 +414,7 @@ def test_waiting_for_the_user_does_not_burn_the_repair_budget() -> None:
     """停下来等人不是一次失败的修复，记进预算等于罚用户操作慢。"""
     state = _ready()
     for _ in range(VERIFY_ATTEMPT_BUDGET + 2):
-        _orchestrator_guard_after_tool("run_flow", {"status": "paused_for_human"}, state)
-        _orchestrator_guard_after_tool("run_flow", {"status": "waiting_for_user_input"}, state)
+        _orchestrator_guard_after_tool("run_flow", {"status": "awaiting_confirmation"}, state)
     assert state.attempt_budget["spent"] == 0
     assert _orchestrator_guard_before_tool("run_flow", {}, state) is None
 

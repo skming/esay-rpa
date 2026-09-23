@@ -135,13 +135,13 @@ function ensurePageBlocker(): HTMLDivElement {
   return el;
 }
 
-function isTakeoverBannerTarget(target: EventTarget | null): boolean {
-  return target instanceof Element && target.closest(`#${CSS.escape('rpa-studio-takeover-banner')}`) !== null;
+function isConfirmationBannerTarget(target: EventTarget | null): boolean {
+  return target instanceof Element && target.closest(`#${CSS.escape('rpa-studio-confirmation-banner')}`) !== null;
 }
 
 function preventTrustedUserEvent(event: Event): void {
   // 自动化事件 isTrusted=false 放行；用户真实输入 isTrusted=true 在运行态阻断，避免和流程抢页面状态。
-  if (!pageBlocked || !event.isTrusted || isTakeoverBannerTarget(event.target)) return;
+  if (!pageBlocked || !event.isTrusted || isConfirmationBannerTarget(event.target)) return;
   event.preventDefault();
   event.stopImmediatePropagation();
 }
@@ -154,7 +154,7 @@ function ensureBlockListeners(): void {
   }
 }
 
-// 运行中禁止用户操作页面本体，仅在人工接管横幅出现时放开。
+// 运行中禁止用户操作页面本体，仅在敏感操作确认横幅出现时放开。
 export function setPageBlocked(blocked: boolean): void {
   ensureAutomationStyle();
   ensureBlockListeners();

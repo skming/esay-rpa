@@ -371,8 +371,8 @@ def _check_challenge_page_lock(tool_name: str, args: dict[str, Any], state: Guar
         message=(
             f"{locked.get('label') or '人机验证拦截页'}：{locked_url or '目标站点'} 返回的是验证墙，不是真实页面。"
             "这不是流程或 selector 的缺陷，改流程、换 selector、重试探测都会撞上同一堵墙；"
-            "加 control.human_takeover 节点在无头模式下同样过不去，因为那时没有人在场操作。"
-            "请如实告诉用户：需要用有头模式或插件执行器打开一次并人工完成验证，"
+            "运行中交互节点无法解决无头模式下的验证墙。"
+            "请如实告诉用户：需要用插件执行器打开目标标签页，由用户完成验证，"
             "验证 cookie 会留在持久化 profile 里，之后再继续。"
         ),
         challenge_page_lock=locked,

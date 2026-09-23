@@ -56,8 +56,6 @@ export function createNodeConfigDraft(data: RpaNodeData): RpaNodeConfigDraft {
     title: data.title,
     variableName: action.variableName ?? action.inputVariable ?? action.outputVariable ?? '',
     variableScope: action.scope ?? '全局',
-    humanTakeoverMessage: action.humanTakeoverMessage ?? '',
-    humanTakeoverResumeMode: action.humanTakeoverResumeMode ?? 'next_node',
     fallbackSelectors: action.fallbackSelectors ?? '',
     anchorText: action.anchorText ?? '',
     outputSchema: action.outputSchema ?? '',
@@ -144,9 +142,9 @@ export function applyNodeConfigDraft(data: RpaNodeData, draft: RpaNodeConfigDraf
       method: is('http.request') ? draft.method : previous?.method,
       message: isKind('variable.') || is('script.websocket') ? text(draft.message) : previous?.message,
       channel: is('variable.notify') ? text(draft.channel) : previous?.channel,
-      defaultValue: is('variable.input') ? draft.defaultValue : previous?.defaultValue,
+      defaultValue: previous?.defaultValue,
       logLevel: is('variable.log') ? draft.logLevel : previous?.logLevel,
-      scope: is('variable.set', 'variable.input') ? draft.variableScope : previous?.scope,
+      scope: is('variable.set') ? draft.variableScope : previous?.scope,
       variableName: isKind('variable.') ? text(draft.variableName) : previous?.variableName,
       value: is('variable.set') ? draft.defaultValue : previous?.value,
       column: isKind('excel.') ? text(draft.column) : previous?.column,
@@ -184,8 +182,6 @@ export function applyNodeConfigDraft(data: RpaNodeData, draft: RpaNodeConfigDraf
       type: actionType ?? `${data.kind}.custom`,
       url: is('http.request', 'script.websocket') ? text(draft.targetUrl) : previous?.url,
       statusVariable: text(draft.statusVariable),
-      humanTakeoverMessage: is('control.human_takeover') ? text(draft.humanTakeoverMessage) : previous?.humanTakeoverMessage,
-      humanTakeoverResumeMode: is('control.human_takeover') ? draft.humanTakeoverResumeMode : previous?.humanTakeoverResumeMode,
       // ensureLogin 把登录状态写进 firstValueVariable，用的是同一个「状态变量」输入框
       firstValueVariable: is('browser.ensureLogin')
         ? text(draft.statusVariable)

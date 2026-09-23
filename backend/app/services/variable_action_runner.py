@@ -10,7 +10,6 @@ type FlowNode = dict[str, object]
 _VARIABLE_ACTION_TYPES = {
     "variable.set",
     "variable.get",
-    "variable.input",
     "variable.log",
     "variable.notify",
     "variable.clipboard",
@@ -49,11 +48,6 @@ class VariableActionRunner:
             value = variables.get(name)
             return VariableActionResult(action_type=action_type, detail=name, values=[value])
 
-        if action_type == "variable.input":
-            message = _read_optional_template_text(node, variables, "message") or _read_optional_template_text(node, variables, "description") or "输入弹窗"
-            value = _read_template_value(node, variables, keys=("defaultValue", "value", "inputValue"), default="")
-            return VariableActionResult(action_type=action_type, detail=message, values=[value])
-
         if action_type == "variable.log":
             message = _read_message(node, variables)
             level = _read_log_level(node)
@@ -80,12 +74,6 @@ def apply_variable_result_variables(node: FlowNode, result: VariableActionResult
 
     if result.action_type == "variable.set":
         _append_saved_name(saved_names, read_variable_name(node))
-
-    if result.action_type == "variable.input":
-        variable_name = _read_optional_string(node, "variableName") or _read_optional_string(node, "name")
-        if variable_name is not None and result.values:
-            variables.set(variable_name, result.values[0], scope=read_variable_scope(node, default="全局"))
-            _append_saved_name(saved_names, variable_name)
 
     output_variable = _read_optional_string(node, "outputVariable") or _read_optional_string(node, "resultVariable") or _read_optional_string(node, "responseVariable")
     if output_variable is not None:

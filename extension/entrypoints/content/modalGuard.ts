@@ -1,9 +1,9 @@
 // 营销/入驻类全屏弹框会挡住待操作元素，这里保守识别 + 关闭：只处理「fixed/absolute + 高 z-index + 覆盖视口 85%+」
 // 的遮罩，避免误伤侧栏/吸顶导航；优先点关闭按钮、找不到退化为 Escape；每个遮罩只试一次（WeakSet）。
-import { BREATHING_ID, CURSOR_ID, STATUS_ID, TAKEOVER_BANNER_ID } from './automationStyle';
+import { BREATHING_ID, CURSOR_ID, STATUS_ID, CONFIRMATION_BANNER_ID } from './automationStyle';
 import { isVisible } from './dom';
 
-const AUTOMATION_IDS = new Set([CURSOR_ID, BREATHING_ID, STATUS_ID, TAKEOVER_BANNER_ID]);
+const AUTOMATION_IDS = new Set([CURSOR_ID, BREATHING_ID, STATUS_ID, CONFIRMATION_BANNER_ID]);
 
 const CLOSE_SELECTOR = ['[aria-label="close" i]', '[aria-label*="close" i]', '[aria-label*="关闭"]', '[class*="close" i]'].join(
   ','

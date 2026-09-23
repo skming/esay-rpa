@@ -17,7 +17,7 @@ import {
 import { EFFECT_SIGNATURE, SETTLE_AFTER_ACTION, TARGET_STATE } from '../../backend/app/services/ai_tools/page_effect.js';
 import { dispatchExtract, dispatchExtractAll } from './content/extract';
 import { markAutomationActivity, moveCursorTo, pulseClickAt, highlightElement, setPageBlocked } from './content/automationVisual';
-import { hideTakeoverBanner, showTakeoverBanner } from './content/takeoverBanner';
+import { hideConfirmationBanner, showConfirmationBanner } from './content/confirmationBanner';
 import { dismissBlockingOverlays } from './content/modalGuard';
 // Shared browser code is plain ESM so Playwright can inject the same source without a build step.
 // @ts-expect-error The runtime contract is narrowed by PickerEvent and the callback below.
@@ -249,7 +249,7 @@ async function handleAction(action: ContentAction): Promise<unknown> {
   if (!exploring && OVERLAY_DISMISSING_ACTIONS.has(action.type)) {
     dismissBlockingOverlays();
   }
-  if (!exploring && action.type !== 'takeover.show' && action.type !== 'takeover.hide' && action.type !== 'automation.pageBlock') {
+  if (!exploring && action.type !== 'confirmation.show' && action.type !== 'confirmation.hide' && action.type !== 'automation.pageBlock') {
     setPageBlocked(true);
   }
   switch (action.type) {
@@ -410,14 +410,14 @@ async function handleAction(action: ContentAction): Promise<unknown> {
       if (action.actionName === undefined) throw new Error('page.settle 需要 actionName');
       return SETTLE_AFTER_ACTION({ action: action.actionName, ref: action.ref });
     }
-    case 'takeover.show': {
-      if (action.message === undefined || action.taskId === undefined) throw new Error('takeover.show 需要 message 和 taskId');
-      showTakeoverBanner(action.message, action.taskId);
+    case 'confirmation.show': {
+      if (action.message === undefined || action.taskId === undefined) throw new Error('confirmation.show 需要 message 和 taskId');
+      showConfirmationBanner(action.message, action.taskId);
       setPageBlocked(false);
       return { ok: true };
     }
-    case 'takeover.hide': {
-      hideTakeoverBanner();
+    case 'confirmation.hide': {
+      hideConfirmationBanner();
       setPageBlocked(false);
       return { ok: true };
     }

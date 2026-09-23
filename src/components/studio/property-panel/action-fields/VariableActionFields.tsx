@@ -24,17 +24,6 @@ export function VariableActionFields({ draft, electron, node, onDraftPatch }: Ac
     );
   }
 
-  if (actionType === 'variable.input') {
-    return (
-      <>
-        <Field label="弹窗提示" onChange={(e) => onDraftPatch('message', e.target.value)} placeholder="请输入提示文字" value={draft.message} />
-        <VariablePickerField label="默认值" onChange={(value) => onDraftPatch('defaultValue', value)} value={draft.defaultValue} variables={availableVariables} />
-        <VariableNameField label="保存到变量" mode="target" onChange={(value) => onDraftPatch('variableName', value)} placeholder="user_input" value={draft.variableName} variables={availableVariables} />
-        <ScopeSelect draft={draft} onDraftPatch={onDraftPatch} />
-      </>
-    );
-  }
-
   if (actionType === 'variable.log') {
     return (
       <>

@@ -275,16 +275,9 @@ function registerIpcHandlers({
       return failure(error);
     }
   });
-  handle(IPC_CHANNELS.input.provide, async (_event, runId, value) => {
+  handle(IPC_CHANNELS.run.resume, async (_event, runId) => {
     try {
-      return success(await backendClient.provideInput(runId, value));
-    } catch (error) {
-      return failure(error);
-    }
-  });
-  handle(IPC_CHANNELS.run.resume, async (_event, runId, resumeMode) => {
-    try {
-      return success(await backendClient.resumeHumanTakeover(runId, resumeMode));
+      return success(await backendClient.resumeConfirmation(runId));
     } catch (error) {
       return failure(error);
     }

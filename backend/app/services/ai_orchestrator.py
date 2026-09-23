@@ -310,20 +310,12 @@ def _demo_date_controls() -> list[dict[str, Any]]:
 
 
 def _build_few_shot_messages() -> list[dict[str, Any]]:
-    """真实验证过的一次会话作为 few-shot：登录检测→日期选择→多选→表格提取→校验。
+    """真实验证过的一次会话作为 few-shot：已登录页面取证→日期选择→多选→表格提取→校验。
 
     站点域名与凭据一律用 mock：这段每轮都随请求发给模型厂商。
     """
     _nodes: list[dict[str, Any]] = [
         {"id": "start",   "type": "start",             "title": "开始",               "kind": "control", "status": "pending", "position": {"x": 100, "y": 100}},
-        {"id": "n1",      "type": "browser.ensureLogin", "title": "探测登录态",       "kind": "browser", "status": "pending", "position": {"x": 100, "y": 200},  "targetUrl": "https://erp.demo-rpa.test/", "selector": ".side-bar-container, nav", "targetSelector": "input[type='password']", "firstValueVariable": "login_status", "delayMs": 3000, "description": "持久 Cookie 有效则跳过登录 → login_status"},
-        {"id": "n5",      "type": "control.condition", "title": "判断是否需要登录",   "kind": "control", "status": "pending", "position": {"x": 100, "y": 600},  "inputValue": "login_status == 'login_required'", "description": "login_required → 走登录分支"},
-        {"id": "n6",      "type": "browser.fill",      "title": "填写账号",           "kind": "browser", "status": "pending", "position": {"x": 320, "y": 700},  "selector": "input[placeholder='请输入用户名']", "inputValue": "${var.username}", "delayMs": 800, "description": "填入 ${var.username}"},
-        {"id": "n7",      "type": "browser.fill",      "title": "填写密码",           "kind": "browser", "status": "pending", "position": {"x": 320, "y": 800},  "selector": "input[placeholder='请输入密码']", "inputValue": "${var.password}", "delayMs": 500, "description": "填入 ${var.password}"},
-        {"id": "n8_input", "type": "variable.input",    "title": "输入验证码",         "kind": "variable", "status": "pending", "position": {"x": 680, "y": 850},  "message": "请查看浏览器中的图形验证码并输入", "variableName": "captcha", "description": "运行时收集当次验证码 → captcha"},
-        {"id": "n8_fill", "type": "browser.fill",      "title": "填写验证码",         "kind": "browser", "status": "pending", "position": {"x": 320, "y": 900},  "selector": "input[placeholder='请输入验证码']", "inputValue": "${var.captcha}", "delayMs": 500, "description": "填入 ${var.captcha}"},
-        {"id": "n9",      "type": "browser.click",     "title": "点击登录按钮",       "kind": "browser", "status": "pending", "position": {"x": 320, "y": 1000}, "selector": "button:has-text('登录')", "delayMs": 2000, "description": "提交登录表单"},
-        {"id": "n10",     "type": "browser.wait",      "title": "等待登录后导航栏",   "kind": "browser", "status": "pending", "position": {"x": 320, "y": 1100}, "selector": ".side-bar-container, nav", "timeoutMs": 15000, "description": "等应用壳出现，确认登录成功"},
         {"id": "n12",     "type": "browser.open",      "title": "打开项目列表页",     "kind": "browser", "status": "pending", "position": {"x": 100, "y": 1200}, "targetUrl": "https://erp.demo-rpa.test/#/project/list", "delayMs": 3000, "description": "合流后导航到目标数据页"},
         {"id": "n13",     "type": "browser.wait",      "title": "等待表格加载",       "kind": "browser", "status": "pending", "position": {"x": 100, "y": 1300}, "selector": "table, .el-table__body", "timeoutMs": 15000, "description": "等表格渲染完成"},
         {"id": "n14",     "type": "browser.fill",      "title": "填写开始日期",       "kind": "browser", "status": "pending", "position": {"x": 100, "y": 1400}, "selector": "input[placeholder='开始日期']", "inputValue": "${var.date_start}", "fillMode": "type", "timeoutMs": 15000, "delayMs": 500, "description": "键入开始日期；键盘输入才会触发组件的 change 提交，且与运行当天无关"},
@@ -343,16 +335,7 @@ def _build_few_shot_messages() -> list[dict[str, Any]]:
         {"id": "end",     "type": "end",               "title": "结束",               "kind": "control", "status": "pending", "position": {"x": 100, "y": 2800}},
     ]
     _edges: list[dict[str, Any]] = [
-        {"id": "e_start_n1",  "source": "start",   "target": "n1"},
-        {"id": "e_n1_n5",     "source": "n1",      "target": "n5"},
-        {"id": "e_n5_n6",     "source": "n5",      "target": "n6",      "label": "true"},
-        {"id": "e_n5_n12",    "source": "n5",      "target": "n12",     "label": "false"},
-        {"id": "e_n6_n7",     "source": "n6",      "target": "n7"},
-        {"id": "e_n7_n8input", "source": "n7",      "target": "n8_input"},
-        {"id": "e_n8input_n8fill", "source": "n8_input", "target": "n8_fill"},
-        {"id": "e_n8fill_n9", "source": "n8_fill", "target": "n9"},
-        {"id": "e_n9_n10",    "source": "n9",      "target": "n10"},
-        {"id": "e_n10_n12",   "source": "n10",     "target": "n12"},
+        {"id": "e_start_n12", "source": "start",   "target": "n12"},
         {"id": "e_n12_n13",   "source": "n12",     "target": "n13"},
         {"id": "e_n13_n14",   "source": "n13",     "target": "n14"},
         {"id": "e_n14_n15",   "source": "n14",     "target": "n15"},
@@ -371,27 +354,11 @@ def _build_few_shot_messages() -> list[dict[str, Any]]:
         {"id": "e_n24_end",   "source": "n24",     "target": "end"},
     ]
     _ivs: list[dict[str, Any]] = [
-        {"name": "username", "type": "String", "value": "", "category": "credential"},
-        {"name": "password", "type": "String", "value": "", "category": "credential", "sensitive": True},
         {"name": "date_start", "type": "String", "value": "2026-06-01", "category": "flow"},
         {"name": "date_end",   "type": "String", "value": "2026-06-24", "category": "flow"},
     ]
     # 两份 inspect 结果的字段严格对齐 PAGE_PROBE_JS 的真实返回，示例编造字段会让模型
     # 去读运行时根本不存在的 key（曾编造 page_title / login_form / sample_row_count）
-    _inspect_login = json.dumps({
-        "requested_url": "https://erp.demo-rpa.test/",
-        "url": "https://erp.demo-rpa.test/#/login",
-        "title": "示例项目管理系统",
-        "inputs": [
-            {"tag": "input", "type": "text",     "name": "username", "id": None, "placeholder": "请输入用户名", "label": "用户名", "selector": "input[placeholder='请输入用户名']"},
-            {"tag": "input", "type": "password", "name": "password", "id": None, "placeholder": "请输入密码",   "label": "密码",   "selector": "input[placeholder='请输入密码']"},
-            {"tag": "input", "type": "text",     "name": "captcha",  "id": None, "placeholder": "请输入验证码", "label": "验证码", "selector": "input[placeholder='请输入验证码']"},
-        ],
-        "selects": [],
-        "buttons": [{"text": "登 录", "type": "submit", "selector": "button:has-text('登录')"}],
-        "tables": [],
-        "page_classes": ["el-form", "el-input", "el-button", "login-container", "login-form-panel"],
-    }, ensure_ascii=False)
     _inspect_list = json.dumps({
         "requested_url": "https://erp.demo-rpa.test/#/project/list",
         "url": "https://erp.demo-rpa.test/#/project/list",
@@ -463,8 +430,6 @@ def _build_few_shot_messages() -> list[dict[str, Any]]:
     return [
         {"role": "user", "content": "帮我抓取 https://erp.demo-rpa.test/ 项目列表。筛选创建时间 2026-06-01 至 2026-06-24，项目进度为「项目通过/待尽调」。需要账号密码登录，运行时还有图形验证码。"},
         # 每个要交互的页面都单独探一次：登录页给出表单 selector，数据页给出 row_selector 与日期控件配方
-        {"role": "assistant", "content": None, "tool_calls": [{"id": "fs_t1", "type": "function", "function": {"name": "inspect_page", "arguments": json.dumps({"url": "https://erp.demo-rpa.test/", "wait_selector": "input[type='password'], nav"})}}]},
-        {"role": "tool", "tool_call_id": "fs_t1", "content": _inspect_login},
         {"role": "assistant", "content": None, "tool_calls": [{"id": "fs_t2", "type": "function", "function": {"name": "inspect_page", "arguments": json.dumps({"url": "https://erp.demo-rpa.test/#/project/list", "wait_selector": "table, .el-table"})}}]},
         {"role": "tool", "tool_call_id": "fs_t2", "content": _inspect_list},
         # 示例站点恰好是 Element UI，下面的 el- selector 全部来自这次 inspect_page 的 page_classes。
@@ -1974,7 +1939,7 @@ def _tool_call_succeeded(result: Any) -> bool:
 # run_flow 停在这些状态是「轮到用户了」，不是流程没修好。
 # stopped 一并算进来：run_flow 是阻塞轮询的，轮询期间任务变成 stopped 只可能是用户
 # 自己按了停止——把它记成一次失败的修复，等于用户每中止一次就替模型花掉三分之一额度。
-_RUN_WAITING_STATUSES = frozenset({"paused_for_human", "waiting_for_user_input", "stopped"})
+_RUN_WAITING_STATUSES = frozenset({"awaiting_confirmation", "stopped"})
 
 # 执行器在起跑前就拒掉的返回：流程一行都没跑。收敛额度定价的是「真跑过一次」的代价，
 # 这些一次都不该按运行计价——`blocked_by_failure_budget` 尤其是自我加固：熔断锁自己的
@@ -2640,7 +2605,7 @@ def _after_run_flow(result: dict[str, Any], state: GuardState) -> None:
         state.run_succeeded = True
     elif status not in _RUN_WAITING_STATUSES:
         # 停下来等人不是一次失败的修复：流程没跑完是因为轮到用户了，
-        # 记进熔断计数会让「等一次人工接管」白白吃掉三分之一的修复预算
+        # awaiting_confirmation 是等待敏感操作确认，不属于运行失败
         never_started = status in _RUN_NOT_STARTED_STATUSES or invalid_arguments
         _count_repair_cycle(
             state,

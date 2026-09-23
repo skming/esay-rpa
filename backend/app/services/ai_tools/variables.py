@@ -99,8 +99,7 @@ def _collect_defined_vars(nodes: list[Any], input_variable_names: list[str]) -> 
             val = node.get(field)
             if isinstance(val, str) and val.strip():
                 defined.add(val.strip())
-        # variable.set and variable.input both define variableName
-        if node.get("type") in ("variable.set", "variable.input"):
+        if node.get("type") == "variable.set":
             vname = node.get("variableName")
             if isinstance(vname, str) and vname.strip():
                 defined.add(vname.strip())

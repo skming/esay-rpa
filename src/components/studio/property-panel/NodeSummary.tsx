@@ -58,7 +58,6 @@ const ACTION_TYPE_LABELS: Record<string, string> = {
   'control.noop': '空节点',
   'variable.set': '设置变量',
   'variable.get': '读取变量',
-  'variable.input': '用户输入',
   'variable.log': '输出日志',
   'variable.notify': '发送通知',
   'variable.clipboard': '剪贴板',

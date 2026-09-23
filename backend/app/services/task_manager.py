@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import re
 import time
 from collections.abc import Callable
@@ -15,7 +14,7 @@ from app.services.artifact_store import ArtifactStore, LocalArtifactStore
 from app.services.acceptance_audit import freeze_contract_inputs
 from app.services.browser_action_runner import BrowserActionContext, BrowserActionResult, BrowserActionRunner, OverlayInfo, apply_browser_result_variables, detect_blocking_overlay, is_browser_action_node, try_auto_dismiss_overlay
 from app.services.browser_executor import BrowserExecutor
-from app.services.control_action_runner import BreakLoopSignal, ControlActionRunner, apply_control_result_variables, is_control_action_node, is_human_takeover_node, is_subprocess_node
+from app.services.control_action_runner import BreakLoopSignal, ControlActionRunner, apply_control_result_variables, is_control_action_node, is_subprocess_node
 from app.services.extension_bridge_service import ExtensionBridgeService
 from app.services.extension_executor import ExtensionExecutor
 from app.services.execution_evidence import build_node_execution_evidence, definition_digest
@@ -41,11 +40,6 @@ from app.services.script_action_runner import ScriptActionRunner, apply_script_r
 from app.services.task_store import InMemoryTaskStore, TaskStore
 from app.services.task_queue import InMemoryTaskQueue, TaskQueue, TaskRunner
 from app.services.variable_action_runner import VariableActionRunner, apply_variable_result_variables, is_variable_action_node
-
-
-# AI 弹层分析置信度低于此阈值时，不用其结论覆盖启发式文案（宁可用不太具体的
-# 兜底描述，也不要展示一个模型自己都不确定的猜测）。
-_OVERLAY_ANALYSIS_CONFIDENCE_THRESHOLD = 0.5
 
 
 def _timestamp_sort_key(value: datetime) -> float:
@@ -94,12 +88,11 @@ class TaskRecord:
     debug_step_once: bool = False
     debug_resume_until_breakpoint: bool = False
     paused_node_id: str | None = None
-    input_waiter: asyncio.Event = field(default_factory=asyncio.Event)
-    input_prompt: str | None = None
-    input_value: str = ""
-    human_takeover_waiter: asyncio.Event = field(default_factory=asyncio.Event)
-    human_takeover_message: str | None = None
-    human_takeover_resume_mode: str = "next_node"
+    confirmation_waiter: asyncio.Event = field(default_factory=asyncio.Event)
+    confirmation_message: str | None = None
+    # 超时到 CancelledError 落终态之间 status 仍是 awaiting_confirmation，单凭它 resume 会误翻回
+    # running；改用这个同步置位/清位的标志作为 resume 的真正闸门。
+    confirmation_active: bool = False
     # 惰性填充（见 _has_breakpoint），避免每次 debug step 都重建节点映射
     breakpoint_ids: frozenset[str] | None = field(default=None, init=False, repr=False, compare=False)
 
@@ -150,17 +143,8 @@ class TaskManager:
         self._tasks: dict[str, TaskRecord] = {}
         self._lock = asyncio.Lock()
         self._queue = queue_factory(self._run_record) if queue_factory is not None else InMemoryTaskQueue(self._run_record, concurrency=concurrency)
-        self._notifier: object | None = None
-        self._overlay_analyzer: object | None = None
         self._extension_executor: ExtensionExecutor | None = None
         self._is_extension_enabled: Callable[[], bool] | None = None
-        self._background_tasks: set[asyncio.Task] = set()
-
-    def set_notifier(self, notifier: object) -> None:
-        self._notifier = notifier
-
-    def set_overlay_analyzer(self, analyzer: object) -> None:
-        self._overlay_analyzer = analyzer
 
     def set_extension_bridge(self, bridge: ExtensionBridgeService, *, is_extension_enabled: Callable[[], bool]) -> None:
         """is_extension_enabled 是必传关键字参数：留默认值就等于默认放行，那样设置里关掉插件后，
@@ -194,27 +178,6 @@ class TaskManager:
                 raise ConnectionError("插件执行器已在设置中关闭：请先在「设置 · 浏览器插件」里开启后再运行")
             return self._extension_executor
         return self._browser_action_runner
-
-    def _spawn_background(self, coro: object) -> asyncio.Task:
-        """asyncio 只持有 create_task() 结果的弱引用，没有强引用会在任务跑完前被 GC，
-        故存入注册表直到完成。"""
-        task = asyncio.create_task(coro)
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
-        return task
-
-    def _notify_human_takeover(self, record: TaskRecord, *, node_title: str, message: str) -> None:
-        # fire-and-forget：通知失败不应阻塞或中断流程执行
-        if self._notifier is None:
-            return
-        self._spawn_background(
-            self._notifier.notify_human_takeover(
-                flow_name=record.snapshot.flow_name,
-                node_title=node_title,
-                message=message,
-                task_id=record.snapshot.task_id,
-            )
-        )
 
     def start_workers(self) -> None:
         self._queue.start()
@@ -336,21 +299,13 @@ class TaskManager:
             started=snapshot.started,
         )
 
-    async def provide_input(self, task_id: str, value: str) -> TaskSnapshot | None:
+    async def resume_confirmation(self, task_id: str) -> TaskSnapshot | None:
         record = self._tasks.get(task_id)
-        if record is None or record.input_prompt is None:
+        if record is None or not record.confirmation_active or record.snapshot.status != "awaiting_confirmation":
             return None
-        record.input_value = value
-        record.input_waiter.set()
-        return record.snapshot
-
-    async def resume_human_takeover(self, task_id: str, resume_mode: str = "next_node") -> TaskSnapshot | None:
-        record = self._tasks.get(task_id)
-        if record is None or record.snapshot.status != "paused_for_human":
-            return None
-        record.human_takeover_resume_mode = resume_mode
-        record.human_takeover_waiter.set()
-        await self._update_snapshot(record, status="running", human_takeover_message=None, human_takeover_resume_mode=None)
+        record.confirmation_active = False
+        record.confirmation_waiter.set()
+        await self._update_snapshot(record, status="running", confirmation_message=None)
         return record.snapshot
 
     async def stop_task(self, task_id: str) -> TaskSnapshot | None:
@@ -358,8 +313,8 @@ class TaskManager:
         if record is None:
             return None
         record.canceled = True
-        record.input_waiter.set()  # unblock any waiting input node
-        record.human_takeover_waiter.set()  # unblock any waiting human takeover node
+        record.confirmation_active = False
+        record.confirmation_waiter.set()
         record.debug_waiter.set()
         canceled_running_task = self._queue.cancel(task_id)
         await self._append_log(record, "warn", "用户请求停止任务", None, node_id="end")
@@ -488,9 +443,7 @@ class TaskManager:
         artifacts: list[ArtifactSnapshot] | None = None,
         variables: list[RuntimeVariableSnapshot] | None = None,
         error: str | None = None,
-        input_prompt: str | None = _SENTINEL,
-        human_takeover_message: str | None = _SENTINEL,
-        human_takeover_resume_mode: str | None = _SENTINEL,
+        confirmation_message: str | None = _SENTINEL,
     ) -> None:
         update: dict[str, object] = {
             "status": status or record.snapshot.status,
@@ -501,12 +454,8 @@ class TaskManager:
             "error": error,
             "updated_at": datetime.now(UTC),
         }
-        if input_prompt is not _SENTINEL:
-            update["input_prompt"] = input_prompt
-        if human_takeover_message is not _SENTINEL:
-            update["human_takeover_message"] = human_takeover_message
-        if human_takeover_resume_mode is not _SENTINEL:
-            update["human_takeover_resume_mode"] = human_takeover_resume_mode
+        if confirmation_message is not _SENTINEL:
+            update["confirmation_message"] = confirmation_message
         record.snapshot = record.snapshot.model_copy(update=update)
         await self._task_store.save_task(record.snapshot, record.request)
 
@@ -865,8 +814,7 @@ class TaskManager:
             state.executable_steps += 1
             await self._update_step_progress(record, state.started, current_step=state.executable_steps, total_steps=state.total_steps)
             if state.browser_context is None:
-                needs_headed = any(is_human_takeover_node(n) for n in record.executable_nodes)
-                state.browser_context = await self._resolve_browser_executor(record).create_context(headless=not needs_headed, owner=_profile_owner_label(record))
+                state.browser_context = await self._resolve_browser_executor(record).create_context(headless=True, owner=_profile_owner_label(record))
             browser_result = await self._run_browser_action_node(record, node, state.browser_context, node_id=record.active_node_id, node_title=node_title)
             if browser_result is not None and _is_collectable_result_node(node):
                 state.results.append(browser_result)
@@ -876,12 +824,6 @@ class TaskManager:
             state.executable_steps += 1
             await self._update_step_progress(record, state.started, current_step=state.executable_steps, total_steps=state.total_steps)
             await self._run_subprocess_node(record, state, node, node_id=record.active_node_id, node_title=node_title)
-        elif is_human_takeover_node(node):
-            node_title = _read_node_title(node, fallback=f"人工接管 {state.executable_steps + 1}")
-            await self._pause_for_debug_if_needed(record, node_id=record.active_node_id, node_title=node_title)
-            state.executable_steps += 1
-            await self._update_step_progress(record, state.started, current_step=state.executable_steps, total_steps=state.total_steps)
-            await self._run_human_takeover_node(record, node, state, node_id=record.active_node_id, node_title=node_title)
         elif is_control_action_node(node):
             node_title = _read_node_title(node, fallback=f"控制动作 {state.executable_steps + 1}")
             await self._pause_for_debug_if_needed(record, node_id=record.active_node_id, node_title=node_title)
@@ -940,134 +882,61 @@ class TaskManager:
         await self._update_snapshot(record)
         return next_edges
 
-    async def _run_human_takeover_node(
-        self,
-        record: TaskRecord,
-        node: dict[str, object],
-        state: FlowRunState,
-        *,
-        node_id: str,
-        node_title: str,
-    ) -> object:
-        """暂停流程，等待用户完成手动操作后继续。"""
-        from app.services.control_action_runner import ControlActionResult
-        body = str(node.get("message") or node.get("humanTakeoverMessage") or node.get("description") or "")
-        timeout_ms = int(node.get("timeoutMs") or 600_000)
-
-        # Banner parseMessage expects: "{title}\n{body}\n⏱{timeoutMs}"
-        if body:
-            banner_message = f"{node_title}\n{body}\n⏱{timeout_ms}"
-        else:
-            banner_message = f"{node_title}\n⏱{timeout_ms}"
-
-        browser_url = _get_browser_url(state)
-        log_detail = f"{banner_message}\n{browser_url}" if browser_url else banner_message
-        # 插件执行器的 context 是 ExtensionExecutionContext，没有 .page；用 getattr 兜底，
-        # 否则人工接管节点在扩展执行器下会以 'object has no attribute page' 崩掉整个任务。
-        page = getattr(state.browser_context, "page", None)
-        completed = await self._wait_for_human(
-            record,
-            message=banner_message,
-            timeout_seconds=timeout_ms / 1000,
-            node_id=node_id,
-            node_title=node_title,
-            log_title=f"等待人工接管 · {node_title}",
-            log_detail=log_detail,
-            bring_to_front_page=page,
-            on_pause=lambda: self._notify_human_takeover(record, node_title=node_title, message=banner_message),
-        )
-        if not completed:
-            # 超时未完成人工操作不是流程缺陷，按"任务已停止"收尾而非报错，
-            # 避免触发失败自愈诊断和误导性的错误统计。
-            await self._append_log(
-                record,
-                "warn",
-                f"人工接管超时（{timeout_ms // 1000}s），任务已停止 · {node_title}",
-                "超时未完成人工操作。可在节点上调大 timeoutMs 后重新运行。",
-                node_id=node_id,
-            )
-            raise asyncio.CancelledError
-
-        resume_mode = record.human_takeover_resume_mode
-        await self._append_log(record, "success", f"人工接管完成 · {node_title}", f"恢复模式: {resume_mode}", node_id=node_id)
-        return ControlActionResult(action_type="control.human_takeover", detail=resume_mode, values=[resume_mode])
-
-    async def _extension_show_takeover_banner(self, record: TaskRecord, message: str) -> None:
-        """插件执行器下，人工接管提示要出现在用户正盯着的真实浏览器标签页里，
-        而不是只出现在 Easy RPA 应用窗口——用户此时很可能根本没在看应用窗口。"""
+    async def _extension_show_confirmation_banner(self, record: TaskRecord, message: str) -> None:
+        """把敏感操作确认同时显示在扩展连接的真实浏览器标签页。"""
         if record.request.browser_executor != "extension" or self._extension_executor is None:
             return
         try:
-            await self._extension_executor.show_takeover_banner(record.snapshot.task_id, message)
+            await self._extension_executor.show_confirmation_banner(record.snapshot.task_id, message)
         except Exception:
             pass
 
-    async def _extension_hide_takeover_banner(self, record: TaskRecord) -> None:
+    async def _extension_hide_confirmation_banner(self, record: TaskRecord) -> None:
         if record.request.browser_executor != "extension" or self._extension_executor is None:
             return
         try:
-            await self._extension_executor.hide_takeover_banner()
+            await self._extension_executor.hide_confirmation_banner()
         except Exception:
             pass
 
-    async def _wait_for_human(
+    async def _wait_for_confirmation(
         self,
         record: TaskRecord,
         *,
         message: str,
         timeout_seconds: float,
         node_id: str,
-        node_title: str,
         log_title: str,
-        log_detail: str | None = None,
-        bring_to_front_page: object | None = None,
-        on_pause: Callable[[], None] | None = None,
     ) -> bool:
-        """所有人工接管的共用等待通道：显式节点、敏感操作确认、验证码兜底都走这里。
-
-        返回 True 表示用户完成并 resume；False 表示超时。用户中途 stop_task() 时抛
-        CancelledError。三条路径此前各写一份，兜底路径漏掉了插件端横幅——统一后
-        extension 执行器下任意暂停都会在用户真实盯着的标签页里弹出横幅。
-
-        stop_task() 先 set() waiter 再 task.cancel()：waiter 对应的 future 已 done，
-        协程在 wait_for 恢复时直接收 CancelledError，会跳过后续清理。用 try/finally
-        保证插件横幅在完成、超时、被取消三种退出下都恰好隐藏一次。
-        """
-        record.human_takeover_message = message
+        """等待扩展执行器的敏感操作确认。"""
+        record.confirmation_message = message
         # 重建 Event 而非 clear()：复用可能已被上次 stop/resume set() 过的实例会导致 wait() 不挂起
-        record.human_takeover_waiter = asyncio.Event()
-        await self._update_snapshot(
-            record, status="paused_for_human", human_takeover_message=message, human_takeover_resume_mode=None
-        )
-        await self._append_log(record, "input", log_title, log_detail if log_detail is not None else message, node_id=node_id)
-        if on_pause is not None:
-            on_pause()
-        if bring_to_front_page is not None:
-            try:
-                await bring_to_front_page.bring_to_front()  # type: ignore[attr-defined]
-            except Exception:
-                pass
-        await self._extension_show_takeover_banner(record, message)
+        record.confirmation_waiter = asyncio.Event()
+        record.confirmation_active = True
+        await self._update_snapshot(record, status="awaiting_confirmation", confirmation_message=message)
+        await self._append_log(record, "input", log_title, message, node_id=node_id)
+        await self._extension_show_confirmation_banner(record, message)
         try:
             try:
-                await asyncio.wait_for(record.human_takeover_waiter.wait(), timeout=timeout_seconds)
+                await asyncio.wait_for(record.confirmation_waiter.wait(), timeout=timeout_seconds)
             except asyncio.TimeoutError:
-                record.human_takeover_message = None
-                await self._update_snapshot(record, human_takeover_message=None)
+                # 清位必须先于下面的 await：否则该窗口里 resume 仍能把超时取消中的任务翻回 running。
+                record.confirmation_active = False
+                record.confirmation_message = None
+                await self._update_snapshot(record, confirmation_message=None)
                 return False
+            record.confirmation_active = False
             if record.canceled:
                 raise asyncio.CancelledError
-            record.human_takeover_message = None
+            record.confirmation_message = None
             return True
         finally:
-            await self._extension_hide_takeover_banner(record)
+            await self._extension_hide_confirmation_banner(record)
 
     async def _maybe_confirm_sensitive_action(
         self, record: TaskRecord, node: dict[str, object], *, node_id: str, node_title: str
     ) -> None:
-        """插件执行器操作的是用户真实登录态的浏览器（可能是转账、发起支付等敏感页面）。
-        节点上显式打了 requireConfirmation 标记的，执行前先暂停等人工点"确认"——
-        复用人工接管的等待/Banner 机制，不重复造一套新的暂停通道。"""
+        """扩展执行器执行显式标记的敏感操作前，暂停等待用户确认。"""
         if record.request.browser_executor != "extension" or self._extension_executor is None:
             return
         if node.get("requireConfirmation") is not True:
@@ -1076,19 +945,18 @@ class TaskManager:
         confirm_timeout_seconds = 120  # 2 分钟：给用户看清敏感操作详情再点确认的合理时长
         detail = _read_node_browser_detail(node) or ""
         message = f"{node_title}\n即将执行敏感操作：{node.get('type')} {detail}\n请确认后继续\n⏱{confirm_timeout_seconds * 1000}"
-        completed = await self._wait_for_human(
+        completed = await self._wait_for_confirmation(
             record,
             message=message,
             timeout_seconds=confirm_timeout_seconds,
             node_id=node_id,
-            node_title=node_title,
             log_title=f"等待人工确认 · {node_title}",
         )
         if not completed:
             await self._append_log(record, "warn", f"人工确认超时，节点已中止 · {node_title}", None, node_id=node_id)
             raise asyncio.CancelledError
 
-        await self._update_snapshot(record, status="running", human_takeover_message=None)
+        await self._update_snapshot(record, status="running", confirmation_message=None)
         await self._append_log(record, "success", f"人工已确认 · {node_title}", None, node_id=node_id)
 
     async def _pause_for_debug_if_needed(self, record: TaskRecord, *, node_id: str, node_title: str) -> None:
@@ -1260,7 +1128,6 @@ class TaskManager:
         self,
         record: TaskRecord,
         node: dict[str, object],
-        state: FlowRunState | None = None,
         *,
         node_id: str,
         node_title: str,
@@ -1276,11 +1143,11 @@ class TaskManager:
                 await self._append_log(record, "warn", f"重试变量 / 消息 · {node_title}", detail, node_id=node_id)
             else:
                 await self._append_log(record, "running", f"执行变量 / 消息 · {node_title}", detail, node_id=node_id)
-            action_type = str(resolved_node.get("type", ""))
-            if action_type == "variable.input":
-                variable_result = await self._run_user_input_node(record, resolved_node, state, node_id=node_id, node_title=node_title)
-            else:
-                variable_result = await self._variable_action_runner.run(resolved_node, record.variables, timeout_ms=_read_node_timeout(resolved_node, default=record.request.timeout_ms))
+            variable_result = await self._variable_action_runner.run(
+                resolved_node,
+                record.variables,
+                timeout_ms=_read_node_timeout(resolved_node, default=record.request.timeout_ms),
+            )
             message = _build_variable_result_message(variable_result.action_type, node_title)
             await self._append_log(record, variable_result.log_level, message, variable_result.detail, node_id=node_id)
             saved_names = apply_variable_result_variables(node, variable_result, record.variables)
@@ -1290,48 +1157,6 @@ class TaskManager:
             return variable_result.to_scrape_result()
 
         return await self._run_with_retry(record, node, node_id=node_id, node_title=node_title, label="变量 / 消息", execute=_execute)
-
-    async def _run_user_input_node(
-        self,
-        record: TaskRecord,
-        node: dict[str, object],
-        state: FlowRunState | None,
-        *,
-        node_id: str,
-        node_title: str,
-    ):
-        from app.services.variable_action_runner import VariableActionResult
-        prompt = str(node.get("message") or node.get("description") or node_title or "请输入")
-        has_default = any(
-            key in node and str(node.get(key) if node.get(key) is not None else "").strip()
-            for key in ("defaultValue", "value", "inputValue")
-        )
-        default_value = str(node.get("defaultValue") or node.get("value") or node.get("inputValue") or "")
-        timeout_ms = _read_node_timeout(node, default=300_000)  # default 5 min
-
-        if has_default:
-            await self._append_log(record, "info", f"使用默认输入 · {node_title}", prompt, node_id=node_id)
-            return VariableActionResult(action_type="variable.input", detail=prompt, values=[default_value])
-
-        record.input_prompt = prompt
-        record.input_value = default_value
-        record.input_waiter.clear()
-        await self._update_snapshot(record, input_prompt=prompt)
-        browser_url = _get_browser_url(state)
-        detail = f"{prompt}\n{browser_url}" if browser_url else prompt
-        await self._append_log(record, "input", f"等待用户输入 · {node_title}", detail, node_id=node_id)
-
-        try:
-            await asyncio.wait_for(record.input_waiter.wait(), timeout=timeout_ms / 1000)
-        except asyncio.TimeoutError:
-            record.input_prompt = None
-            await self._update_snapshot(record, input_prompt=None)
-            raise RuntimeError(f"等待用户输入超时（{timeout_ms // 1000}s）: {prompt}")
-
-        value = record.input_value
-        record.input_prompt = None
-        await self._update_snapshot(record, input_prompt=None)
-        return VariableActionResult(action_type="variable.input", detail=prompt, values=[value])
 
     async def _run_http_node(
         self,
@@ -1372,6 +1197,12 @@ class TaskManager:
     ) -> ScrapeResult | None:
         attempt_count = 0
 
+        # 只确认一次：契约是"确认后执行一次、不重试当前节点"。留在 _execute 里会随重试和
+        # 浮层自动关闭后的重跑反复弹窗，无人值守下再等一轮超时直接取消任务。
+        await self._maybe_confirm_sensitive_action(
+            record, _resolve_node_variables(node, record.variables), node_id=node_id, node_title=node_title
+        )
+
         async def _execute():
             nonlocal attempt_count
             attempt_count += 1
@@ -1380,7 +1211,6 @@ class TaskManager:
                 await self._append_log(record, "warn", f"重试浏览器动作 · {node_title}", _read_node_browser_detail(resolved_node), node_id=node_id)
             else:
                 await self._append_log(record, "running", f"执行浏览器动作 · {node_title}", _read_node_browser_detail(resolved_node), node_id=node_id)
-            await self._maybe_confirm_sensitive_action(record, resolved_node, node_id=node_id, node_title=node_title)
             browser_result = await self._resolve_browser_executor(record).run(resolved_node, record.variables, context, timeout_ms=_read_node_timeout(resolved_node, default=record.request.timeout_ms))
             await self._append_log(record, "success", f"浏览器动作完成 · {node_title}", browser_result.detail, node_id=node_id)
             saved_names = apply_browser_result_variables(node, browser_result, record.variables)
@@ -1396,7 +1226,7 @@ class TaskManager:
             raise
         except Exception as exc:
             if await self._handle_browser_node_failure(record, context, exc, node=node, node_id=node_id, node_title=node_title):
-                # 人工处理完阻断浮层后重试本节点一次。
+                # 安全类别浮层自动关闭并复检消失后重试本节点一次。
                 return await self._run_with_retry(record, node, node_id=node_id, node_title=node_title, label="浏览器动作", execute=_execute)
             raise
 
@@ -1410,12 +1240,7 @@ class TaskManager:
         node_id: str,
         node_title: str,
     ) -> bool:
-        """浏览器节点最终失败时的现场处理。
-
-        广告/隐私条款提示这类安全类别会先尝试自动关闭；验证码/未知弹层永远跳过自动关闭，
-        直接转人工。返回 True 表示浮层已被自动关闭或人工已处理，调用方应重试该节点；
-        返回 False 表示应继续抛出原始异常（此时已尽力留存失败现场证据）。
-        """
+        """浏览器节点最终失败时检测阻断浮层并留存现场。"""
         if record.canceled:
             return False
 
@@ -1431,13 +1256,10 @@ class TaskManager:
         if overlay is not None:
             if await self._try_auto_dismiss_overlay(record, context, overlay, target_selector, node_id=node_id, node_title=node_title):
                 return True
-            if context.headless:
-                # 无头模式用户看不到浏览器，无法人工处理——补充错误上下文后按失败处理。
-                _append_exc_context(exc, f"[检测到{overlay.label}，但当前为无头运行无法人工处理。{overlay.headless_advice}]")
-            else:
-                if await self._pause_for_runtime_overlay(record, context, overlay, node_id=node_id, node_title=node_title):
-                    return True
-                _append_exc_context(exc, f"[检测到{overlay.label}，等待人工处理超时]")
+            _append_exc_context(
+                exc,
+                f"[检测到{overlay.label}，运行时无法可靠接管。请先在扩展连接的浏览器标签页完成验证或登录，再重新运行。]",
+            )
 
         await self._capture_failure_evidence(record, context, exc, node_id=node_id, node_title=node_title)
         return False
@@ -1471,111 +1293,11 @@ class TaskManager:
         except Exception:
             still_present = overlay
         if still_present is not None:
-            await self._append_log(record, "warn", f"自动关闭{overlay.label}未生效，转入人工处理 · {node_title}", None, node_id=node_id)
+            await self._append_log(record, "warn", f"自动关闭{overlay.label}未生效 · {node_title}", None, node_id=node_id)
             return False
 
         await self._append_log(record, "success", f"{overlay.label}已自动关闭，重试节点 · {node_title}", None, node_id=node_id)
         return True
-
-    async def _pause_for_runtime_overlay(
-        self,
-        record: TaskRecord,
-        context: BrowserActionContext,
-        overlay: OverlayInfo,
-        *,
-        node_id: str,
-        node_title: str,
-    ) -> bool:
-        """运行时检测到阻断型浮层（验证码/广告/弹层等）：即使流程里没有 human_takeover 节点也转入人工等待。"""
-        timeout_ms = 600_000
-        banner_message = (
-            f"检测到{overlay.label}\n"
-            f"页面出现{overlay.label}，自动化无法通过。请在浏览器窗口中手动处理。\n"
-            f"⏱{timeout_ms}"
-        )
-        completed = await self._wait_for_human(
-            record,
-            message=banner_message,
-            timeout_seconds=timeout_ms / 1000,
-            node_id=node_id,
-            node_title=node_title,
-            log_title=f"检测到{overlay.label}，等待人工完成 · {node_title}",
-            bring_to_front_page=context.page,
-            on_pause=lambda: self._enrich_overlay_and_notify(
-                record, context, overlay, node_id=node_id, node_title=node_title, timeout_ms=timeout_ms, fallback_message=banner_message
-            ),
-        )
-        # 超时和完成都回到 running：兜底暂停不终止任务，交由调用方决定重试/继续
-        await self._update_snapshot(record, status="running", human_takeover_message=None)
-        if not completed:
-            return False
-        await self._append_log(record, "success", f"人工验证完成，重试节点 · {node_title}", None, node_id=node_id)
-        return True
-
-    def _enrich_overlay_and_notify(
-        self,
-        record: TaskRecord,
-        context: BrowserActionContext,
-        overlay: OverlayInfo,
-        *,
-        node_id: str,
-        node_title: str,
-        timeout_ms: int,
-        fallback_message: str,
-    ) -> None:
-        """Fire-and-forget：先用 AI 分析弹层具体原因，再发通知；分析失败/超时则直接用启发式文案发通知。"""
-        self._spawn_background(
-            self._run_overlay_enrichment(
-                record, context, overlay, node_id=node_id, node_title=node_title, timeout_ms=timeout_ms, fallback_message=fallback_message
-            )
-        )
-
-    async def _run_overlay_enrichment(
-        self,
-        record: TaskRecord,
-        context: BrowserActionContext,
-        overlay: OverlayInfo,
-        *,
-        node_id: str,
-        node_title: str,
-        timeout_ms: int,
-        fallback_message: str,
-    ) -> None:
-        analysis = None
-        screenshot_b64: str | None = None
-        try:
-            content = await context.page.screenshot(type="jpeg", quality=60, full_page=False)
-            screenshot_b64 = base64.b64encode(content).decode("ascii")
-        except Exception:
-            pass
-
-        if self._overlay_analyzer is not None:
-            try:
-                analysis = await self._overlay_analyzer.analyze(overlay.summary, screenshot_b64=screenshot_b64)
-            except Exception:
-                analysis = None
-
-        message = fallback_message
-        # 只有人工还没恢复、消息还没被其它状态变化覆盖时，才回填 AI 增强内容；
-        # 置信度过低的猜测不如启发式文案可靠，直接丢弃。
-        if (
-            analysis is not None
-            and analysis.confidence >= _OVERLAY_ANALYSIS_CONFIDENCE_THRESHOLD
-            and record.human_takeover_message == fallback_message
-        ):
-            hint_line = f"建议：{analysis.human_action_hint}\n" if analysis.human_action_hint else ""
-            enriched_message = (
-                f"检测到{overlay.label}\n"
-                f"{analysis.reason or ('页面出现' + overlay.label + '，自动化无法通过。')}\n"
-                f"{hint_line}"
-                f"⏱{timeout_ms}"
-            )
-            record.human_takeover_message = enriched_message
-            await self._update_snapshot(record, human_takeover_message=enriched_message)
-            await self._append_log(record, "input", f"AI 分析弹层原因 · {node_title}", enriched_message, node_id=node_id)
-            message = enriched_message
-
-        self._notify_human_takeover(record, node_title=node_title, message=message)
 
     async def _capture_failure_evidence(
         self,
@@ -2115,7 +1837,6 @@ def _build_variable_result_message(action_type: str, node_title: str) -> str:
     labels = {
         "variable.set": "变量已更新",
         "variable.get": "变量已读取",
-        "variable.input": "输入弹窗已记录",
         "variable.log": "流程日志",
         "variable.notify": "消息通知已记录",
         "variable.clipboard": "剪贴板已更新",

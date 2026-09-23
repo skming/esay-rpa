@@ -246,8 +246,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "启动流程并最多等待 90 秒，返回 task_id、flow_revision、progress 和 status。"
                 "status=success 时同时返回 acceptance_audit——平台按流程冻结的验收契约算出的结论，"
                 "passed=true 才算交付达标，passed=false 按 repair_plan 修流程后重跑；"
-                "error 后诊断；paused_for_human / waiting_for_user_input"
-                "表示原任务仍在等待用户，禁止重新运行；timeout 可查询状态。extension 未连接时"
+                "error 后诊断；awaiting_confirmation 表示原任务正在等待敏感操作确认，禁止重新运行；"
+                "timeout 表示任务仍在后台运行。extension 未连接时"
                 "返回 extension_not_connected，被设置关闭时返回 extension_disabled，两者都不会回退到 Playwright。"
             ),
             "parameters": {
@@ -293,9 +293,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "description": (
                 "停止一个正在运行或暂停等待中的任务。适用场景："
                 "① 用户明确要求停止/取消当前运行；"
-                "② run_flow 超时且流程含 variable.input / control.human_takeover，"
-                "用户表示不想继续等待——先 stop_run 清理后台任务，再修复流程，"
-                "避免旧任务一直占着浏览器等输入。"
+                "② 任务仍处于 awaiting_confirmation，用户表示不想继续等待——"
+                "先 stop_run 清理后台任务，避免它继续占用浏览器。"
                 "禁止用它掩盖失败：任务已经 error/success 结束时调用无效果。"
             ),
             "parameters": {
@@ -328,8 +327,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "'每小时执行一次'等诉求时使用。cron_expression 为 5 段标准 Cron"
                 "（分 时 日 月 周，如 '0 9 * * *' 表示每天 09:00）。"
                 "创建前必须确认流程存在且可运行（凭据类 input_variables 的 value 不能为空——"
-                "定时任务无人值守，无法运行时补输入）；含 variable.input / control.human_takeover "
-                "的流程不适合定时执行，必须先提醒用户。"
+                "定时任务无人值守，无法运行时补输入）；依赖运行中人工操作的流程不能创建定时任务。"
             ),
             "parameters": {
                 "type": "object",

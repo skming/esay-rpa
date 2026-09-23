@@ -275,6 +275,7 @@ export type RunEvent =
   | { type: 'log:append'; payload: RunLogEntry & { runId: string } }
   | { type: 'variable:set'; payload: RuntimeVariable & { runId: string } }
   | { type: 'artifacts:update'; payload: { runId: string; artifacts: ArtifactSnapshot[] } }
+  | { type: 'run:confirmation'; payload: { runId: string; message: string | null } }
   | { type: 'run:finish'; payload: { runId: string; status: RuntimeStatus; finishedAt: string; message: string } };
 
 export type GenerateScriptPayload = {
@@ -486,7 +487,7 @@ export type TaskSnapshot = {
   taskId: string;
   flowId?: string | null;
   flowName: string;
-  status: 'queued' | 'running' | 'success' | 'stopped' | 'error' | 'paused_for_human';
+  status: 'queued' | 'running' | 'success' | 'stopped' | 'error' | 'awaiting_confirmation';
   mode: RunMode;
   runConfig: {
     scope: RunScope;
@@ -527,7 +528,7 @@ export type TaskSnapshot = {
   }>;
   artifacts?: ArtifactSnapshot[];
   error?: string | null;
-  inputPrompt?: string | null;
+  confirmationMessage?: string | null;
 };
 
 export type BackendTaskLogEntry = {
@@ -549,8 +550,7 @@ export type RpaBridge = {
   exportLogs: (payload: ExportLogsPayload) => Promise<BridgeResult<FlowFileResult>>;
   startRun: (payload: RunStartPayload) => Promise<BridgeResult<RunStartResult>>;
   stopRun: (runId?: string) => Promise<BridgeResult<RunStopResult>>;
-  provideInput: (runId: string, value: string) => Promise<BridgeResult<void>>;
-  resumeHumanTakeover: (runId: string, resumeMode: string) => Promise<BridgeResult<void>>;
+  resumeConfirmation: (runId: string) => Promise<BridgeResult<void>>;
   debugRun: (runId: string, command: DebugControlCommand) => Promise<BridgeResult<RunDebugResult>>;
   listRuns: (options?: { flowId?: string; limit?: number }) => Promise<BridgeResult<TaskSnapshot[]>>;
   listFlowRuns: (flowId: string, options?: { limit?: number }) => Promise<BridgeResult<TaskSnapshot[]>>;

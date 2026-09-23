@@ -190,12 +190,12 @@ class ExtensionExecutor:
         with audit_scope(run_label=self._lease_owner, node_id=None):
             return await self._bridge.execute(action, timeout=timeout)
 
-    async def show_takeover_banner(self, task_id: str, message: str) -> None:
+    async def show_confirmation_banner(self, task_id: str, message: str) -> None:
         """在真实浏览器标签页（而非 Easy RPA 应用窗口）顶部插入提示条，因为插件执行器运行时用户看的是前者。"""
-        await self._bridge.execute({"type": "takeover.show", "message": message, "taskId": task_id}, timeout=5.0)
+        await self._bridge.execute({"type": "confirmation.show", "message": message, "taskId": task_id}, timeout=5.0)
 
-    async def hide_takeover_banner(self) -> None:
-        await self._bridge.execute({"type": "takeover.hide"}, timeout=5.0)
+    async def hide_confirmation_banner(self) -> None:
+        await self._bridge.execute({"type": "confirmation.hide"}, timeout=5.0)
 
     async def _highlight_best_effort(self, selector: str) -> None:
         """纯视觉反馈，失败或超时不应影响实际动作。"""

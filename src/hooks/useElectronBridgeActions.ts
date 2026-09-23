@@ -72,8 +72,7 @@ type UseElectronBridgeActionsParams = {
   setSiteAnalysis: Dispatch<SetStateAction<SiteAnalysisResult | null>>;
   setVariables: Dispatch<SetStateAction<RuntimeVariable[]>>;
   setLogs: Dispatch<SetStateAction<RunLogEntry[]>>;
-  setInputPrompt: Dispatch<SetStateAction<string | null>>;
-  setHumanTakeoverMessage: Dispatch<SetStateAction<string | null>>;
+  setConfirmationMessage: Dispatch<SetStateAction<string | null>>;
   setActivePickerRequest: Dispatch<SetStateAction<PickerRequest | null>>;
   setCanvasFitVersion: Dispatch<SetStateAction<number>>;
 };
@@ -108,8 +107,7 @@ export type ElectronBridgeActions = {
   closePicker: (requestId: string) => Promise<void>;
   startRun: (options?: RunMode | StartRunOptions) => Promise<void>;
   stopRun: () => Promise<void>;
-  provideInput: (value: string) => Promise<void>;
-  resumeHumanTakeover: (resumeMode: string) => Promise<void>;
+  resumeConfirmation: () => Promise<void>;
   generateScraplingScript: () => Promise<void>;
   exportScraplingScript: (content: string, filename: string) => Promise<void>;
   analyzeCurrentSite: () => Promise<void>;
@@ -196,8 +194,7 @@ export function useElectronBridgeActions({
   setSiteAnalysis,
   setVariables,
   setLogs,
-  setInputPrompt,
-  setHumanTakeoverMessage,
+  setConfirmationMessage,
   setActivePickerRequest,
   setCanvasFitVersion
 }: UseElectronBridgeActionsParams): ElectronBridgeActions {
@@ -692,15 +689,10 @@ export function useElectronBridgeActions({
           }
         }
       },
-      provideInput: async (value: string) => {
+      resumeConfirmation: async () => {
         if (activeRunId === null) return;
-        const result = await callBridge((api) => api.provideInput(activeRunId, value));
-        if (result !== null) setInputPrompt(null);
-      },
-      resumeHumanTakeover: async (resumeMode: string) => {
-        if (activeRunId === null) return;
-        const result = await callBridge((api) => api.resumeHumanTakeover(activeRunId, resumeMode));
-        if (result !== null) setHumanTakeoverMessage(null);
+        const result = await callBridge((api) => api.resumeConfirmation(activeRunId));
+        if (result !== null) setConfirmationMessage(null);
       },
       generateScraplingScript: async () => {
         const flowDefinition = buildFlowDefinition(flowCanvas.nodes, flowCanvas.edges, inputVariables, currentFlow?.name ?? '未命名流程');
@@ -968,8 +960,7 @@ export function useElectronBridgeActions({
       setSchedules,
       setSelectedNodeId,
       setSiteAnalysis,
-      setInputPrompt,
-      setHumanTakeoverMessage,
+      setConfirmationMessage,
       setVariables
     ]
   );

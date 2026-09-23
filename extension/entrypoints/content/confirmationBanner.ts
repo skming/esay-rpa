@@ -1,12 +1,12 @@
-import { AUTOMATION_Z_INDEX, TAKEOVER_BANNER_ID } from './automationStyle';
+import { AUTOMATION_Z_INDEX, CONFIRMATION_BANNER_ID } from './automationStyle';
 
-let currentTakeoverTaskId: string | null = null;
+let currentConfirmationTaskId: string | null = null;
 
-export function hideTakeoverBanner(): void {
-  const banner = document.getElementById(TAKEOVER_BANNER_ID);
-  currentTakeoverTaskId = null;
+export function hideConfirmationBanner(): void {
+  const banner = document.getElementById(CONFIRMATION_BANNER_ID);
+  currentConfirmationTaskId = null;
   if (banner === null) return;
-  banner.style.animation = 'rpa-studio-takeover-out 160ms ease-in forwards';
+  banner.style.animation = 'rpa-studio-confirmation-out 160ms ease-in forwards';
   // reduced-motion 下 animation 被强制 none、animationend 不触发，用定时器兜底移除，避免横幅卡死在页面。
   let removed = false;
   const remove = () => {
@@ -18,11 +18,17 @@ export function hideTakeoverBanner(): void {
   setTimeout(remove, 200);
 }
 
-export function showTakeoverBanner(message: string, taskId: string): void {
-  hideTakeoverBanner();
-  currentTakeoverTaskId = taskId;
+// 后端消息带 ⏱<ms> 计时哨兵、用 \n 分段（见 SensitiveActionConfirmation.parseMessage）；
+// 剥掉哨兵并把换行并成分隔，否则原始标记会直接漏进页面横幅。
+function formatConfirmationText(raw: string): string {
+  return raw.replace(/⏱️?\d+/g, '').replace(/\s*\n+\s*/g, ' · ').trim();
+}
+
+export function showConfirmationBanner(message: string, taskId: string): void {
+  hideConfirmationBanner();
+  currentConfirmationTaskId = taskId;
   const banner = document.createElement('div');
-  banner.id = TAKEOVER_BANNER_ID;
+  banner.id = CONFIRMATION_BANNER_ID;
   banner.setAttribute('role', 'status');
   banner.setAttribute('aria-live', 'polite');
   banner.style.cssText =
@@ -32,23 +38,23 @@ export function showTakeoverBanner(message: string, taskId: string): void {
     'border:1px solid rgba(217,119,6,0.34);background:rgba(255,251,235,0.96);color:#451a03;' +
     'font:13px/1.4 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;' +
     'box-shadow:0 8px 24px rgba(15,23,42,0.14),0 1px 2px rgba(15,23,42,0.08);backdrop-filter:blur(10px);' +
-    'animation:rpa-studio-takeover-in 200ms ease-out;';
+    'animation:rpa-studio-confirmation-in 200ms ease-out;';
   const content = document.createElement('span');
   content.style.cssText = 'display:flex;align-items:flex-start;min-width:0;gap:8px;';
   const indicator = document.createElement('span');
-  indicator.className = 'rpa-studio-takeover-indicator';
+  indicator.className = 'rpa-studio-confirmation-indicator';
   indicator.style.cssText =
     'display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;width:20px;height:20px;border-radius:6px;margin-top:1px;' +
-    'background:#f59e0b;color:#1c1917;font-size:12px;font-weight:700;animation:rpa-studio-takeover-pulse 2s ease-out infinite;';
+    'background:#f59e0b;color:#1c1917;font-size:12px;font-weight:700;animation:rpa-studio-confirmation-pulse 2s ease-out infinite;';
   indicator.textContent = '!';
   const text = document.createElement('span');
   text.style.cssText =
     'min-width:0;overflow:hidden;text-overflow:ellipsis;word-break:break-word;' +
     'display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;';
-  text.textContent = `Easy RPA 等待人工操作：${message}`;
+  text.textContent = `Easy RPA 等待敏感操作确认：${formatConfirmationText(message)}`;
   content.append(indicator, text);
   const button = document.createElement('button');
-  button.textContent = '完成，继续执行';
+  button.textContent = '确认并继续';
   button.style.cssText =
     'flex:0 0 auto;height:28px;border:0;border-radius:8px;padding:0 12px;cursor:pointer;' +
     'background:#0f172a;color:#fff;font:600 12px/1 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;' +
@@ -71,18 +77,18 @@ export function showTakeoverBanner(message: string, taskId: string): void {
     // isTrusted 是页面伪造不了的那一位：少了它，人工已确认就成了任意网页能替用户点下的动作，
     // 而它放行的恰恰是流程特意留给人判断的那一步。
     if (!event.isTrusted) return;
-    // 淡出的 160ms 里横幅还在 DOM 里、还能点，而 taskId 已被 hideTakeoverBanner 清空；
+    // 淡出的 160ms 里横幅还在 DOM 里、还能点，而 taskId 已被 hideConfirmationBanner 清空；
     // 背景页只认 string，放过去就是后端收不到 resume、这边横幅却已经收掉。
-    const resumeTaskId = currentTakeoverTaskId;
+    const resumeTaskId = currentConfirmationTaskId;
     if (resumeTaskId === null) return;
     button.disabled = true;
-    // 收横幅必须等后端真的 resume 成功：这是用户恢复 paused_for_human 流程的唯一入口，
+    // 收横幅必须等后端真的 resume 成功：这是用户恢复 awaiting_confirmation 流程的唯一入口，
     // 提前收掉就只剩重开流程一条路。失败时留着横幅并放开按钮，让用户能再点一次。
     browser.runtime
-      .sendMessage({ source: 'rpa-studio-bridge-event', type: 'takeoverResume', taskId: resumeTaskId })
+      .sendMessage({ source: 'rpa-studio-bridge-event', type: 'confirmationResume', taskId: resumeTaskId })
       .catch(() => false)
       .then((resumed) => {
-        if (resumed === true) hideTakeoverBanner();
+        if (resumed === true) hideConfirmationBanner();
         else button.disabled = false;
       });
   });

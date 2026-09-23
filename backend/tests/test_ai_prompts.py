@@ -44,6 +44,32 @@ def test_prompt_uses_secure_credential_and_default_output_policy() -> None:
     assert "问\"保存为 JSON 还是 Excel？\"" not in text
 
 
+def test_prompt_uses_runtime_owned_script_variables_and_capabilities() -> None:
+    assert "自动获得完整的 `_vars` 字典" in SYSTEM_PROMPT
+    assert "不要自行解析 `RPA_VARIABLES_JSON`" in SYSTEM_PROMPT
+    assert "可用内置库" not in SYSTEM_PROMPT
+    assert "需要第三方 Python 包（仅限" not in SYSTEM_PROMPT
+
+
+def test_prompt_keeps_selector_fallbacks_out_of_the_primary_selector() -> None:
+    assert "主 selector 只写一个已验证" in SYSTEM_PROMPT
+    assert "每个 selector 逗号分隔列 3～5 个备选" not in SYSTEM_PROMPT
+    assert "结构性 CSS 只放 `fallbackSelectors`" in SYSTEM_PROMPT
+
+
+def test_prompt_distinguishes_execution_from_acceptance() -> None:
+    assert "执行完成，但验收未通过" in SYSTEM_PROMPT
+    assert "改动后 `run_flow` 成功" not in SYSTEM_PROMPT
+    assert "`acceptance_audit.passed=true` 才能向用户汇报成功" in SYSTEM_PROMPT
+
+
+def test_prompt_rejects_unreliable_mid_run_login_intervention() -> None:
+    assert "运行中等待用户交互不能稳定保证操作发生在原任务浏览器上下文" in SYSTEM_PROMPT
+    assert "先在扩展连接的真实浏览器标签页完成登录" in SYSTEM_PROMPT
+    assert "variable.input" not in SYSTEM_PROMPT
+    assert "control.human_takeover" not in SYSTEM_PROMPT
+
+
 def test_tool_prompts_keep_the_contract_authoritative_and_bounded() -> None:
     functions = {item["function"]["name"]: item["function"] for item in TOOL_SCHEMAS}
     # 模型手上不存在任何「发起审计」的入口：验收结论只能随 run_flow 回来。

@@ -236,8 +236,6 @@ function restoreAction(node: Record<string, unknown>, type: string): RpaNodeActi
     errorVariable: readOptionalString(node.errorVariable),
     flowId: readOptionalString(node.flowId),
     command: readOptionalString(node.command),
-    humanTakeoverMessage: readOptionalString(node.humanTakeoverMessage),
-    humanTakeoverResumeMode: node.humanTakeoverResumeMode === 'current_node' ? 'current_node' : node.humanTakeoverResumeMode === 'next_node' ? 'next_node' : undefined,
     fallbackSelectors: readOptionalString(node.fallbackSelectors),
     anchorText: readOptionalString(node.anchorText),
     outputSchema: readOutputSchema(node.outputSchema)
@@ -393,14 +391,12 @@ function getDefaultTitle(type: string, id: string): string {
   if (type === 'control.noop') return '流程控制';
   if (type === 'variable.set') return '赋值变量';
   if (type === 'variable.get') return '获取变量';
-  if (type === 'variable.input') return '输入弹窗';
   if (type === 'variable.log') return '输出日志';
   if (type === 'variable.notify') return '消息通知';
   if (type === 'variable.clipboard') return '剪贴板';
   if (type === 'control.retry') return '重试机制';
   if (type === 'control.try') return '异常处理';
   if (type === 'control.subprocess') return '子流程';
-  if (type === 'control.human_takeover') return '人工接管';
   if (type === 'script.shell') return '执行 Shell';
   if (type === 'script.websocket') return 'WebSocket';
   if (type === 'excel.save') return '保存工作簿';

@@ -20,6 +20,33 @@ function createNode(id: string, overrides: Partial<RpaNodeData> = {}): Node<RpaN
 }
 
 describe('runValidation', () => {
+  it.each([
+    ['control.human_takeover', '旧交互节点'],
+    ['variable.input', '验证码输入']
+  ] as const)('拦截暂未开放的运行中交互节点 %s', (type, title) => {
+    const nodes: Node<RpaNodeData>[] = [
+      createNode('start'),
+      createNode('interactive', {
+        title,
+        kind: type.startsWith('control.') ? 'control' : 'variable',
+        action: { type }
+      }),
+      createNode('end')
+    ];
+    const edges: Edge[] = [
+      { id: 'e1', source: 'start', target: 'interactive' },
+      { id: 'e2', source: 'interactive', target: 'end' }
+    ];
+
+    const result = validateRunConfiguration(nodes, edges, { scope: 'full' });
+
+    expect(result.primaryIssue).toEqual({
+      nodeId: 'interactive',
+      severity: 'error',
+      message: `节点“${title}”使用了已移除的交互节点；请先在扩展连接的浏览器中完成登录，再删除该节点`
+    });
+  });
+
   it('拦截缺少浏览器采集 URL 的节点', () => {
     const nodes: Node<RpaNodeData>[] = [
       createNode('start'),

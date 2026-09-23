@@ -2,7 +2,7 @@
 export const CURSOR_ID = 'rpa-studio-cursor';
 export const BREATHING_ID = 'rpa-studio-breathing';
 export const STATUS_ID = 'rpa-studio-automation-status';
-export const TAKEOVER_BANNER_ID = 'rpa-studio-takeover-banner';
+export const CONFIRMATION_BANNER_ID = 'rpa-studio-confirmation-banner';
 export const PAGE_BLOCKER_ID = 'rpa-studio-page-blocker';
 export const IDLE_HIDE_MS = 3200;
 
@@ -56,15 +56,15 @@ export function ensureAutomationStyle(): void {
   0%, 100% { box-shadow: 0 0 0 3px rgba(59,130,246,0.14); }
   50% { box-shadow: 0 0 0 5px rgba(59,130,246,0.22); }
 }
-@keyframes rpa-studio-takeover-in {
+@keyframes rpa-studio-confirmation-in {
   0% { opacity: 0; transform: translate3d(-50%, -10px, 0) scale(0.98); }
   100% { opacity: 1; transform: translate3d(-50%, 0, 0) scale(1); }
 }
-@keyframes rpa-studio-takeover-out {
+@keyframes rpa-studio-confirmation-out {
   0% { opacity: 1; transform: translate3d(-50%, 0, 0) scale(1); }
   100% { opacity: 0; transform: translate3d(-50%, -8px, 0) scale(0.98); }
 }
-@keyframes rpa-studio-takeover-pulse {
+@keyframes rpa-studio-confirmation-pulse {
   0%, 100% { box-shadow: 0 0 0 0 rgba(245,158,11,0.38); }
   50% { box-shadow: 0 0 0 5px rgba(245,158,11,0); }
 }
@@ -78,8 +78,8 @@ html.rpa-studio-page-blocked > body {
   #${BREATHING_ID} .rpa-studio-frame,
   #${BREATHING_ID} .rpa-studio-frame-sweep,
   #${STATUS_ID} .rpa-studio-live-dot,
-  #${TAKEOVER_BANNER_ID} { animation: none !important; }
-  #${TAKEOVER_BANNER_ID} .rpa-studio-takeover-indicator {
+  #${CONFIRMATION_BANNER_ID} { animation: none !important; }
+  #${CONFIRMATION_BANNER_ID} .rpa-studio-confirmation-indicator {
     animation: none !important;
   }
   #${STATUS_ID} { transition: opacity 120ms linear !important; }

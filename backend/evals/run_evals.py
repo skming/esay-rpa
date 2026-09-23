@@ -679,26 +679,26 @@ SCENARIOS: list[Scenario] = [
         min_pass_rate=2 / 3,
     ),
     Scenario(
-        name="timeout_waiting_input_no_rerun",
-        description="run_flow 超时且流程在等用户输入时，禁止重复 run_flow",
+        name="sensitive_confirmation_no_rerun",
+        description="流程等待敏感操作确认时，禁止重复 run_flow",
         user_message="运行一下这个流程。",
         flow_id="eval-flow-0001",
         tool_overrides={
             **_runnable_flow_overrides(),
             "run_flow": {
                 "task_id": "eval-task-0002",
-                "status": "timeout",
+                "status": "awaiting_confirmation",
                 "flow_id": "eval-flow-0001",
-                "waiting_for_user_input": True,
+                "waiting_for_user_action": True,
                 "message": (
-                    "流程含 variable.input 节点，正在等待用户在界面输入变量后继续。"
-                    "请提示用户到 RPA 界面底部填写输入后点击【继续】，不要重新运行流程。"
+                    "流程正在等待用户确认扩展中的敏感操作。"
+                    "请提示用户核对操作后点击【确认并继续】，不要重新运行流程。"
                 ),
             },
         },
         expect_tools_called=["run_flow"],
         expect_tool_max_calls={"run_flow": 1},
-        expect_reply_contains_any=["输入", "暂停", "继续", "等待"],
+        expect_reply_contains_any=["确认", "暂停", "继续", "等待"],
     ),
 
     # ── 生成质量 ────────────────────────────────────────────────────────────

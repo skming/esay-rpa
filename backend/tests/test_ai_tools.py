@@ -39,7 +39,7 @@ from app.services.ai_tools.diagnostics import (
 )
 from app.services.ai_tools.schemas import validate_tool_arguments
 from app.services.ai_tools.lint import _lint_flow, is_blocking_finding
-from app.services.ai_tools.catalog import NODE_TYPE_CATALOG, select_node_types
+from app.services.ai_tools.catalog import REMOVED_FLOW_NODE_TYPES, NODE_TYPE_CATALOG, select_node_types
 from app.services.ai_tools.lint_scenarios import (
     _lint_claimed_semantic_capability,
     _lint_script_hardcoded_content,
@@ -105,6 +105,25 @@ def test_lint_flow_reports_visual_overlap_for_crowded_branch_columns() -> None:
     findings = _lint_flow(nodes, edges)
 
     assert any(finding["issue"] == "node_visual_overlap" for finding in findings)
+
+
+@pytest.mark.parametrize("node_type", sorted(REMOVED_FLOW_NODE_TYPES))
+def test_lint_blocks_removed_interactive_nodes(node_type: str) -> None:
+    findings = _lint_flow(
+        [
+            {"id": "start", "type": "start"},
+            {"id": "interactive", "type": node_type, "title": "等待用户"},
+            {"id": "end", "type": "end"},
+        ],
+        [
+            {"source": "start", "target": "interactive"},
+            {"source": "interactive", "target": "end"},
+        ],
+    )
+
+    finding = next(item for item in findings if item["issue"] == "removed_interactive_node")
+    assert finding["severity"] == "error"
+    assert is_blocking_finding(finding)
 
 
 def test_normalize_layout_spreads_columns_and_removes_visual_overlap() -> None:
@@ -193,6 +212,28 @@ async def test_create_flow_rejects_unbound_acceptance_contract_before_persisting
 
     assert unbound["error"] == "acceptance_contract_invalid"
     assert any("unknown" in issue for issue in unbound["contract_errors"])
+
+
+@pytest.mark.parametrize("node_type", sorted(REMOVED_FLOW_NODE_TYPES))
+async def test_create_flow_rejects_removed_interactive_nodes_before_persisting(node_type: str) -> None:
+    executor = RpaToolExecutor(flow_service=SimpleNamespace(), task_manager=SimpleNamespace())  # type: ignore[arg-type]
+
+    result = await executor.execute("create_flow", {
+        "name": "旧交互节点",
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {"id": "removed", "type": node_type},
+            {"id": "end", "type": "end"},
+        ],
+        "edges": [
+            {"source": "start", "target": "removed"},
+            {"source": "removed", "target": "end"},
+        ],
+        "acceptance_contract": _valid_contract("result"),
+    })
+
+    assert result["status"] == "unsupported_interactive_nodes"
+    assert result["nodes"] == [{"id": "removed", "type": node_type}]
 
 
 async def test_create_flow_refuses_to_persist_credential_values() -> None:
@@ -907,11 +948,6 @@ async def test_run_flow_tells_the_model_to_ask_the_user_not_to_invent_credential
     assert ok["status"] != "empty_credential_variables"
 
 
-async def _fake_sleep(_seconds: float) -> None:
-    """轮询等待在测试里没有意义，真睡 90s 会把整个套件拖死。"""
-    return None
-
-
 async def test_run_flow_rejects_call_parameters_smuggled_into_variables() -> None:
     """browser_executor 写进 variables 会被当普通变量吞掉：不报错、不生效、照常跑完。"""
     task_manager = FakeTaskManager(with_failing_tasks=False, extension_connected=True)
@@ -922,61 +958,6 @@ async def test_run_flow_rejects_call_parameters_smuggled_into_variables() -> Non
     assert result["status"] == "misplaced_call_parameters"
     assert result["misplaced_variables"] == ["browser_executor"]
     assert task_manager.started is False
-
-
-class _TakeoverFlowService:
-    """含人工接管节点的流程：运行会停在非终态等人，而不是跑得慢。"""
-
-    def __init__(self, node_type: str) -> None:
-        self._node_type = node_type
-
-    async def get_flow(self, flow_id: str) -> FlowSnapshot:
-        now = datetime.now(UTC)
-        return FlowSnapshot(
-            flowId=flow_id,
-            name="等待用户测试",
-            version="v1.0.0",
-            status="active",
-            inputVariables=[],
-            acceptanceContract=_valid_contract("takeover_result"),
-            definition={
-                "nodes": [
-                    {"id": "start", "type": "start"},
-                    {"id": "n1", "type": self._node_type, "title": "等用户", "outputVariable": "takeover_result"},
-                ],
-                "edges": [{"source": "start", "target": "n1"}],
-            },
-            createdAt=now,
-            updatedAt=now,
-        )
-
-
-async def test_run_flow_reports_paused_for_human_instead_of_timeout(monkeypatch) -> None:
-    """判成 timeout 会让助手重跑，旧任务留在后台继续等——用户面前多一个孤儿任务。"""
-    import asyncio as _asyncio
-
-    monkeypatch.setattr(_asyncio, "sleep", _fake_sleep)
-    task_manager = FakeTaskManager(with_failing_tasks=False, extension_connected=True)
-    executor = RpaToolExecutor(flow_service=_TakeoverFlowService("control.human_takeover"), task_manager=task_manager)  # type: ignore[arg-type]
-
-    result = await executor._run_flow("flow-1")
-
-    assert result["status"] == "paused_for_human"
-    assert result["waiting_for_user_action"] is True
-    assert "不要重新运行流程" in result["message"]
-
-
-async def test_run_flow_reports_waiting_for_user_input_instead_of_timeout(monkeypatch) -> None:
-    import asyncio as _asyncio
-
-    monkeypatch.setattr(_asyncio, "sleep", _fake_sleep)
-    task_manager = FakeTaskManager(with_failing_tasks=False, extension_connected=True)
-    executor = RpaToolExecutor(flow_service=_TakeoverFlowService("variable.input"), task_manager=task_manager)  # type: ignore[arg-type]
-
-    result = await executor._run_flow("flow-1")
-
-    assert result["status"] == "waiting_for_user_input"
-    assert result["waiting_for_user_input"] is True
 
 
 async def test_run_flow_blocks_when_another_run_holds_the_browser_profile() -> None:
@@ -1859,23 +1840,6 @@ class FakeScheduleService:
         )
 
 
-async def test_create_schedule_rejects_flow_with_pause_nodes() -> None:
-    flow = _make_flow_snapshot(
-        nodes=[
-            {"id": "start", "type": "start"},
-            {"id": "n_input", "type": "variable.input", "variableName": "captcha", "title": "输入验证码"},
-        ]
-    )
-    executor = RpaToolExecutor(
-        flow_service=FakeScheduleFlowService(flow),  # type: ignore[arg-type]
-        task_manager=FakeTaskManager(with_failing_tasks=False),  # type: ignore[arg-type]
-        schedule_service=FakeScheduleService(),  # type: ignore[arg-type]
-    )
-    result = await executor.execute("create_schedule", {"flow_id": "flow-sched-1", "cron_expression": "0 9 * * *"})
-    assert "不适合定时无人值守运行" in result["error"]
-    assert result["pause_nodes"][0]["id"] == "n_input"
-
-
 async def test_create_schedule_rejects_missing_input_variable_defaults() -> None:
     flow = _make_flow_snapshot(
         input_variables=[
@@ -1904,6 +1868,45 @@ async def test_create_schedule_uses_flow_default_executor_and_returns_snapshot()
     assert result["schedule_id"] == "sched-1"
     assert schedule_service.created_request.task.browser_executor == "extension"
     assert "warning" in result  # extension 模式必须携带无人值守告警
+
+
+async def test_create_schedule_rejects_extension_flow_with_confirmation() -> None:
+    """扩展执行器 + requireConfirmation 定时无人值守会挂到确认超时，须在建排程时拒绝、不落库。"""
+    flow = _make_flow_snapshot(
+        default_browser_executor="extension",
+        nodes=[
+            {"id": "start", "type": "start"},
+            {"id": "pay", "title": "提交支付", "type": "browser.click", "requireConfirmation": True},
+        ],
+    )
+    schedule_service = FakeScheduleService()
+    executor = RpaToolExecutor(
+        flow_service=FakeScheduleFlowService(flow),  # type: ignore[arg-type]
+        task_manager=FakeTaskManager(with_failing_tasks=False),  # type: ignore[arg-type]
+        schedule_service=schedule_service,  # type: ignore[arg-type]
+    )
+    result = await executor.execute("create_schedule", {"flow_id": "flow-sched-1", "cron_expression": "0 9 * * *"})
+    assert "requireConfirmation" in result["error"]
+    assert result["confirmation_nodes"][0]["id"] == "pay"
+    assert schedule_service.created_request is None
+
+
+async def test_create_schedule_allows_playwright_flow_with_confirmation() -> None:
+    """playwright 下 requireConfirmation 本就不生效，不该误拦。"""
+    flow = _make_flow_snapshot(
+        default_browser_executor="playwright",
+        nodes=[
+            {"id": "start", "type": "start"},
+            {"id": "pay", "title": "提交支付", "type": "browser.click", "requireConfirmation": True},
+        ],
+    )
+    executor = RpaToolExecutor(
+        flow_service=FakeScheduleFlowService(flow),  # type: ignore[arg-type]
+        task_manager=FakeTaskManager(with_failing_tasks=False),  # type: ignore[arg-type]
+        schedule_service=FakeScheduleService(),  # type: ignore[arg-type]
+    )
+    result = await executor.execute("create_schedule", {"flow_id": "flow-sched-1", "cron_expression": "0 9 * * *"})
+    assert result.get("schedule_id") == "sched-1"
 
 
 async def test_create_schedule_rejects_invalid_cron_expression() -> None:
@@ -2183,6 +2186,25 @@ async def test_update_flow_drops_leftover_start_to_end_skeleton_edge() -> None:
     pairs = {(e["source"], e["target"]) for e in edges}
     assert ("start", "end") not in pairs
     assert ("start", "n1") in pairs
+
+
+@pytest.mark.parametrize("node_type", sorted(REMOVED_FLOW_NODE_TYPES))
+async def test_update_flow_rejects_removed_interactive_nodes_before_persisting(node_type: str) -> None:
+    flow_service = FakeRenamableFlowService(initial_name="新建 RPA 流程")
+    executor = RpaToolExecutor(flow_service=flow_service, task_manager=FakeTaskManager())  # type: ignore[arg-type]
+
+    result = await executor.execute("update_flow", {
+        "flow_id": "flow-rename-1",
+        "add_nodes": [{"id": "removed", "type": node_type, "title": "旧交互节点"}],
+        "add_edges": [
+            {"source": "start", "target": "removed"},
+            {"source": "removed", "target": "end"},
+        ],
+        "remove_edge_ids": ["e1"],
+    })
+
+    assert result["status"] == "unsupported_interactive_nodes"
+    assert result["nodes"] == [{"id": "removed", "type": node_type}]
 
 
 async def test_update_flow_keeps_start_to_end_edge_when_it_is_the_only_path() -> None:
@@ -2812,7 +2834,7 @@ def test_user_saying_not_to_run_is_respected():
 
 def test_a_runtime_blocker_prevents_another_nudge():
     state = _ready_state(latest_user_message="验收")
-    _orchestrator_guard_after_tool("run_flow", {"status": "paused_for_human"}, state)
+    _orchestrator_guard_after_tool("run_flow", {"status": "awaiting_confirmation"}, state)
     assert _unmet_verification_request(state) is None
 
 
@@ -3569,6 +3591,10 @@ def test_node_catalog_is_returned_on_demand() -> None:
     index = select_node_types(None)
     assert index["node_types"] == []
     assert index["available_types"] == [entry["type"] for entry in NODE_TYPE_CATALOG]
+
+    removed = select_node_types(sorted(REMOVED_FLOW_NODE_TYPES))
+    assert removed["node_types"] == []
+    assert removed["unknown_types"] == sorted(REMOVED_FLOW_NODE_TYPES)
 
 
 def test_paging_nodes_document_extract_mode() -> None:

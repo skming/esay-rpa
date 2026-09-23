@@ -47,9 +47,6 @@ const IPC_CHANNELS = Object.freeze({
     debug: 'run:debug',
     event: 'run:event'
   }),
-  input: Object.freeze({
-    provide: 'input:provide'
-  }),
   runs: Object.freeze({
     list: 'runs:list'
   }),
@@ -122,8 +119,7 @@ function createRpaBridge(ipcRenderer) {
     exportLogs: (payload) => invoke(IPC_CHANNELS.logs.export, payload),
     startRun: (payload) => invoke(IPC_CHANNELS.run.start, payload),
     stopRun: (runId) => invoke(IPC_CHANNELS.run.stop, runId),
-    provideInput: (runId, value) => invoke(IPC_CHANNELS.input.provide, runId, value),
-    resumeHumanTakeover: (runId, resumeMode) => invoke(IPC_CHANNELS.run.resume, runId, resumeMode),
+    resumeConfirmation: (runId) => invoke(IPC_CHANNELS.run.resume, runId),
     debugRun: (runId, command) => invoke(IPC_CHANNELS.run.debug, runId, command),
     listRuns: (options) => invoke(IPC_CHANNELS.runs.list, options),
     listFlowRuns: (flowId, options) => invoke(IPC_CHANNELS.flows.runs, flowId, options),

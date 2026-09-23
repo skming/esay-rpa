@@ -281,7 +281,7 @@ def _selector_budget_findings(
             "不是 selector 写错，而是页面出现了 DOM 看不见的状态（滑块验证 / 弹窗遮挡 / 页面未跳转）。"
             "请先 inspect_screenshot 查看页面实际状态（或 inspect_page 复核 DOM、"
             "get_run_error 取失败现场截图），确认真实原因后再改；"
-            "若确认是验证码/滑块，改为插入 control.human_takeover 节点而不是修 selector。"
+            "若确认是验证码/滑块，要求用户先在扩展连接的浏览器标签页完成验证并保持登录态，再重新取证。"
         ),
         "node_ids": exhausted,
     }]

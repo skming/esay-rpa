@@ -32,10 +32,10 @@ function buildSchedule(overrides: Partial<ScheduleSnapshot>): ScheduleSnapshot {
 }
 
 describe('buildOperationalHealthSnapshot', () => {
-  it('优先返回等待接管、运行失败与仍启用的调度错误', () => {
+  it('优先返回等待确认、运行失败与仍启用的调度错误', () => {
     const runs = [
       buildRun({ flowName: '失败流程', status: 'error', taskId: 'run-error' }),
-      buildRun({ flowName: '接管流程', status: 'paused_for_human', taskId: 'run-human' }),
+      buildRun({ flowName: '确认流程', status: 'awaiting_confirmation', taskId: 'run-confirmation' }),
       buildRun({ flowName: '成功流程', status: 'success', taskId: 'run-success' }),
     ];
     const schedules = [
@@ -45,7 +45,7 @@ describe('buildOperationalHealthSnapshot', () => {
 
     const snapshot = buildOperationalHealthSnapshot(runs, schedules);
 
-    expect(snapshot.attention.map((item) => item.kind)).toEqual(['human', 'run-error', 'schedule-error']);
+    expect(snapshot.attention.map((item) => item.kind)).toEqual(['confirmation', 'run-error', 'schedule-error']);
     expect(snapshot.recentResult).toEqual({ failed: 1, sampleSize: 2, succeeded: 1 });
   });
 

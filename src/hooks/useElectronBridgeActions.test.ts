@@ -64,8 +64,7 @@ function renderActions(
     setSiteAnalysis: vi.fn(),
     setVariables: vi.fn(),
     setLogs: vi.fn(),
-    setInputPrompt: vi.fn(),
-    setHumanTakeoverMessage: vi.fn(),
+    setConfirmationMessage: vi.fn(),
     setActivePickerRequest: vi.fn(),
     setCanvasFitVersion: vi.fn(),
   };

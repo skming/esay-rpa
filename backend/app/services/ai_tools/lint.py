@@ -7,6 +7,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.services.ai_tools.catalog import REMOVED_FLOW_NODE_TYPES
 from app.services.ai_tools.graph import (
     _collect_ancestor_node_ids,
     _collect_downstream_nodes,
@@ -43,12 +44,6 @@ _RESULT_STEP_NODE_TYPES = frozenset({
     "ui.wait", "ui.extract",
     "file.write", "excel.addrow", "excel.save", "excel.write",
     "script.python", "script.javascript", "script.shell",
-})
-
-# Credential-like variable name keywords
-_CREDENTIAL_KEYWORDS = frozenset({
-    "password", "passwd", "pwd", "username", "account", "user",
-    "login", "secret", "token", "apikey", "api_key",
 })
 
 # warn 级但照样会挡住运行的 issue：它们不会让流程报错，只会让它安静地跑出错数据
@@ -142,7 +137,7 @@ def _lint_flow(
 
         findings.extend(_lint_branch_edges_for_node(out_edges.get(nid, []), nid=nid, ntitle=ntitle, ntype=ntype))
         findings.extend(_lint_output_contract_for_node(node, nid=nid, ntitle=ntitle, ntype=ntype))
-        findings.extend(_lint_credential_input_for_node(node, nid=nid, ntitle=ntitle, ntype=ntype))
+        findings.extend(_lint_unavailable_interactive_node(node, nid=nid, ntitle=ntitle, ntype=ntype))
         findings.extend(_lint_output_target_for_node(node, nid=nid, ntitle=ntitle, ntype=ntype))
         findings.extend(_lint_action_fields_for_node(node, nid=nid, ntitle=ntitle, ntype=ntype))
         findings.extend(_lint_variable_contract_for_node(node, nid=nid, ntitle=ntitle, ntype=ntype))
@@ -257,29 +252,25 @@ def _lint_output_contract_for_node(
     return findings
 
 
-def _lint_credential_input_for_node(
+def _lint_unavailable_interactive_node(
     node: dict[str, Any],
     *,
     nid: str,
     ntitle: str,
     ntype: str,
 ) -> list[dict[str, Any]]:
-    if ntype != "variable.input":
-        return []
-    vname = (node.get("variableName") or "").lower()
-    if not any(kw in vname for kw in _CREDENTIAL_KEYWORDS):
+    if ntype not in REMOVED_FLOW_NODE_TYPES:
         return []
     return [{
         "severity": "error", "node_id": nid, "node_title": ntitle,
-        "issue": "credential_in_variable_input",
+        "issue": "removed_interactive_node",
         "message": (
-            f"节点 `{nid}` 用 variable.input 收集凭据字段 '{node.get('variableName')}'，"
-            "每次运行都会暂停等待手动输入，破坏自动化。"
+            f"节点 `{nid}` 使用了已移除的 `{ntype}`。这类交互无法保证发生在原任务的"
+            "浏览器上下文，因此不能作为可交付流程运行。"
         ),
         "fix": (
-            "删除此节点，改在流程 input_variables 中声明"
-            "（category='credential'，密码加 sensitive=true），"
-            "节点中用 ${var.xxx} 直接引用。"
+            "删除该节点。固定值改为 input_variables；验证码、短信码、TOTP、扫码或授权登录"
+            "必须由用户先在扩展连接的真实浏览器标签页完成，再使用已登录会话运行流程。"
         ),
     }]
 

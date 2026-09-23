@@ -26,7 +26,7 @@ BrowserExecutorKind = Literal["playwright", "extension"]
 DebugControlCommand = Literal["continue", "step-over", "step-into"]
 FetcherType = Literal["static", "dynamic", "stealthy"]
 ExtractMode = Literal["text", "html", "attribute", "count", "table", "similar", "by_text"]
-TaskStatus = Literal["queued", "running", "success", "stopped", "error", "paused_for_human"]
+TaskStatus = Literal["queued", "running", "success", "stopped", "error", "awaiting_confirmation"]
 TaskLogLevel = Literal["info", "success", "running", "warn", "error", "input"]
 ScheduleStatus = Literal["enabled", "disabled"]
 ArtifactType = Literal["script", "screenshot", "report", "dataset", "log"]
@@ -419,10 +419,6 @@ class DebugControlRequest(ApiModel):
     command: DebugControlCommand
 
 
-class UserInputRequest(ApiModel):
-    value: str = Field(default="", max_length=4096)
-
-
 class RunTaskRequest(ApiModel):
     mode: RunMode = "run"
     flow_id: str | None = Field(default=None, max_length=36)
@@ -610,9 +606,7 @@ class TaskSnapshot(ApiModel):
     execution_evidence: list[NodeExecutionEvidence] = Field(default_factory=list)
     run_config: RunConfigSnapshot = Field(default_factory=RunConfigSnapshot)
     error: str | None = None
-    input_prompt: str | None = None
-    human_takeover_message: str | None = None
-    human_takeover_resume_mode: str | None = None   # "next_node" | "current_node"
+    confirmation_message: str | None = None
 
 
 class ScheduleCreateRequest(ApiModel):

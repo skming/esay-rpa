@@ -225,19 +225,9 @@ export class BackendClient {
     });
   }
 
-  async provideInput(taskId: string, value: string): Promise<TaskSnapshot> {
-    assertId(taskId, 'taskId');
-    return await this.request<TaskSnapshot>(`/api/tasks/${encodeURIComponent(taskId)}/input`, {
-      body: { value },
-      method: 'POST',
-      timeoutMs: 5000
-    });
-  }
-
-  async resumeHumanTakeover(taskId: string, resumeMode: string): Promise<TaskSnapshot> {
+  async resumeConfirmation(taskId: string): Promise<TaskSnapshot> {
     assertId(taskId, 'taskId');
     return await this.request<TaskSnapshot>(`/api/tasks/${encodeURIComponent(taskId)}/resume`, {
-      body: { resume_mode: resumeMode },
       method: 'POST',
       timeoutMs: 5000
     });

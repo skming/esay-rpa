@@ -136,17 +136,17 @@ class FakeBrowserActionRunner:
 class FakeExtensionExecutor(FakeBrowserActionRunner):
     def __init__(self, extract_values_by_selector: dict[str, list[str]] | None = None) -> None:
         super().__init__(extract_values_by_selector)
-        # 记录人工接管横幅的显示/隐藏，验证兜底暂停在插件端也会弹横幅。
+        # 记录敏感操作确认横幅的显示/隐藏。
         self.banner_calls: list[tuple[str, object]] = []
 
     @property
     def is_connected(self) -> bool:
         return True
 
-    async def show_takeover_banner(self, task_id: str, message: str) -> None:
+    async def show_confirmation_banner(self, task_id: str, message: str) -> None:
         self.banner_calls.append(("show", message))
 
-    async def hide_takeover_banner(self) -> None:
+    async def hide_confirmation_banner(self) -> None:
         self.banner_calls.append(("hide", None))
 
     async def run(self, node: dict[str, object], variables, context: object, *, timeout_ms: int):
@@ -243,24 +243,6 @@ class OverlayBrowserActionRunner(FakeBrowserActionRunner):
         return BrowserActionResult(action_type=action_type, detail=str(node.get("selector", "")), values=[action_type])
 
 
-class RecordingOverlayNotifier:
-    def __init__(self) -> None:
-        self.calls: list[dict[str, object]] = []
-
-    async def notify_human_takeover(self, *, flow_name: str, node_title: str, message: str, task_id: str) -> None:
-        self.calls.append({"flow_name": flow_name, "node_title": node_title, "message": message, "task_id": task_id})
-
-
-class StubOverlayAnalyzer:
-    def __init__(self, analysis: object) -> None:
-        self._analysis = analysis
-        self.calls: list[dict[str, object]] = []
-
-    async def analyze(self, overlay_summary: dict[str, object], *, screenshot_b64: str | None = None) -> object:
-        self.calls.append({"summary": overlay_summary, "has_screenshot": screenshot_b64 is not None})
-        return self._analysis
-
-
 _OVERLAY_RESULT_SLIDER_CAPTCHA: dict[str, object] = {
     "reason": "target-obscured",
     "vendor": None,
@@ -283,12 +265,10 @@ def _overlay_flow_definition() -> dict[str, object]:
     }
 
 
-async def test_task_manager_pauses_for_runtime_overlay_and_retries_after_resume(tmp_path) -> None:
+async def test_task_manager_reports_runtime_overlay_without_pausing(tmp_path) -> None:
     fake_browser = OverlayBrowserActionRunner(overlay_result=_OVERLAY_RESULT_SLIDER_CAPTCHA, headless=False)
-    notifier = RecordingOverlayNotifier()
     manager = TaskManager(runner=FakeRunner(), broker=LogBroker(), artifact_store=LocalArtifactStore(artifact_root=tmp_path))
     manager._browser_action_runner = fake_browser  # type: ignore[attr-defined]
-    manager.set_notifier(notifier)
 
     snapshot = await manager.start_task(
         RunTaskRequest(
@@ -299,73 +279,132 @@ async def test_task_manager_pauses_for_runtime_overlay_and_retries_after_resume(
         )
     )
 
-    paused = await wait_for_status(manager, snapshot.task_id, {"paused_for_human"})
-    assert paused.human_takeover_message is not None
-    assert "疑似验证码" in paused.human_takeover_message
-    assert fake_browser.page.brought_to_front
-
-    resumed = await manager.resume_human_takeover(snapshot.task_id)
-    assert resumed is not None
-
     done = await wait_for_status(manager, snapshot.task_id, {"success", "error"})
-    assert done.status == "success"
-    assert [action["id"] for action in fake_browser.actions] == ["click", "click"]
-
-    for _ in range(40):
-        if notifier.calls:
-            break
-        await asyncio.sleep(0.01)
-    assert len(notifier.calls) == 1
-    assert "疑似验证码" in str(notifier.calls[0]["message"])
+    assert done.status == "error"
+    assert [action["id"] for action in fake_browser.actions] == ["click"]
+    assert not fake_browser.page.brought_to_front
+    logs = await manager.get_logs(snapshot.task_id)
+    assert logs is not None
+    assert any("运行时无法可靠接管" in (log.detail or "") for log in logs)
 
 
-async def test_task_manager_shows_and_hides_extension_banner_through_human_takeover_node(tmp_path) -> None:
-    """插件执行器下的人工接管：暂停时在用户真实标签页弹横幅，resume 后收起。
-    三条暂停路径统一走 _wait_for_human 后，横幅的显/隐是共用兜底，锁死避免再退化。
-
-    回归点：先跑一个浏览器节点让 state.browser_context 变成插件端 context（无 .page），
-    再进人工接管。修复前该节点会以 'ExtensionExecutionContext' object has no attribute
-    'page' 崩掉整个任务——运行到 n9 直接失败而不是暂停，用户看到的就是"人工接管没生效"。"""
+async def test_task_manager_confirms_sensitive_extension_action(tmp_path) -> None:
     fake_extension = FakeExtensionExecutor()
-    notifier = RecordingOverlayNotifier()
     manager = TaskManager(runner=FakeRunner(), broker=LogBroker(), artifact_store=LocalArtifactStore(artifact_root=tmp_path))
     manager._extension_executor = fake_extension  # type: ignore[assignment]
-    # 绕过 set_extension_bridge 直接注入执行器时必须补上开关闭包：没有闭包按关闭处理（fail-closed），
-    # 否则这条流程会以「插件已在设置中关闭」报错，而不是走到人工接管暂停。
     manager._is_extension_enabled = lambda: True  # type: ignore[assignment]
-    manager.set_notifier(notifier)
 
     snapshot = await manager.start_task(
         RunTaskRequest(
-            flowName="人工接管流程",
+            flowName="敏感操作确认流程",
             targetUrl="https://example.com/fallback",
             selector=".fallback::text",
             browserExecutor="extension",
             flowDefinition={
                 "nodes": [
                     {"id": "start", "type": "start"},
-                    {"id": "open", "title": "打开页面", "type": "browser.open", "targetUrl": "https://example.com/login"},
-                    {"id": "takeover", "title": "请人工核对", "type": "control.human_takeover", "message": "确认后继续"},
+                    {"id": "submit", "title": "提交支付", "type": "browser.click", "selector": "#submit", "requireConfirmation": True},
                 ],
                 "edges": [
-                    {"source": "start", "target": "open"},
-                    {"source": "open", "target": "takeover"},
+                    {"source": "start", "target": "submit"},
                 ],
             },
         )
     )
 
-    paused = await wait_for_status(manager, snapshot.task_id, {"paused_for_human"})
-    assert paused.human_takeover_message is not None
+    paused = await wait_for_status(manager, snapshot.task_id, {"awaiting_confirmation"})
+    assert paused.confirmation_message is not None
     assert fake_extension.banner_calls[0][0] == "show"
-    assert "确认后继续" in str(fake_extension.banner_calls[0][1])
+    assert "即将执行敏感操作" in str(fake_extension.banner_calls[0][1])
 
-    resumed = await manager.resume_human_takeover(snapshot.task_id)
+    resumed = await manager.resume_confirmation(snapshot.task_id)
     assert resumed is not None
 
     done = await wait_for_status(manager, snapshot.task_id, {"success", "error"})
     assert done.status == "success"
+    assert [action["id"] for action in fake_extension.actions] == ["submit"]
     assert fake_extension.banner_calls[-1] == ("hide", None)
+
+
+async def test_task_manager_confirms_sensitive_extension_action_once_across_retries(tmp_path) -> None:
+    """契约是"确认后执行一次"：retry 策略重跑动作时横幅不能再弹第二次。"""
+
+    class FailOnceExtensionExecutor(FakeExtensionExecutor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.run_attempts = 0
+
+        async def run(self, node, variables, context, *, timeout_ms):
+            self.run_attempts += 1
+            if self.run_attempts == 1:
+                raise RuntimeError("首次点击瞬时失败")
+            return await super().run(node, variables, context, timeout_ms=timeout_ms)
+
+    fake_extension = FailOnceExtensionExecutor()
+    manager = TaskManager(runner=FakeRunner(), broker=LogBroker(), artifact_store=LocalArtifactStore(artifact_root=tmp_path))
+    manager._extension_executor = fake_extension  # type: ignore[assignment]
+    manager._is_extension_enabled = lambda: True  # type: ignore[assignment]
+
+    snapshot = await manager.start_task(
+        RunTaskRequest(
+            flowName="敏感操作重试流程",
+            targetUrl="https://example.com/fallback",
+            selector=".fallback::text",
+            browserExecutor="extension",
+            failureStrategy="retry",
+            flowDefinition={
+                "nodes": [
+                    {"id": "start", "type": "start"},
+                    {"id": "submit", "title": "提交支付", "type": "browser.click", "selector": "#submit", "requireConfirmation": True},
+                ],
+                "edges": [{"source": "start", "target": "submit"}],
+            },
+        )
+    )
+
+    await wait_for_status(manager, snapshot.task_id, {"awaiting_confirmation"})
+    resumed = await manager.resume_confirmation(snapshot.task_id)
+    assert resumed is not None
+
+    done = await wait_for_status(manager, snapshot.task_id, {"success", "error"})
+    assert done.status == "success"
+    assert fake_extension.run_attempts == 2  # 重试确实重跑了动作
+    assert [call[0] for call in fake_extension.banner_calls].count("show") == 1
+
+
+async def test_resume_confirmation_is_noop_after_active_cleared(tmp_path) -> None:
+    """超时清位与 resume 抢跑：confirmation_active 清零后 resume 不得把任务翻回 running。"""
+    fake_extension = FakeExtensionExecutor()
+    manager = TaskManager(runner=FakeRunner(), broker=LogBroker(), artifact_store=LocalArtifactStore(artifact_root=tmp_path))
+    manager._extension_executor = fake_extension  # type: ignore[assignment]
+    manager._is_extension_enabled = lambda: True  # type: ignore[assignment]
+
+    snapshot = await manager.start_task(
+        RunTaskRequest(
+            flowName="确认竞态流程",
+            targetUrl="https://example.com/fallback",
+            selector=".fallback::text",
+            browserExecutor="extension",
+            flowDefinition={
+                "nodes": [
+                    {"id": "start", "type": "start"},
+                    {"id": "submit", "title": "提交支付", "type": "browser.click", "selector": "#submit", "requireConfirmation": True},
+                ],
+                "edges": [{"source": "start", "target": "submit"}],
+            },
+        )
+    )
+
+    await wait_for_status(manager, snapshot.task_id, {"awaiting_confirmation"})
+    # 模拟超时分支已清位（发生在其落终态的 await 之前）
+    manager._tasks[snapshot.task_id].confirmation_active = False
+
+    assert await manager.resume_confirmation(snapshot.task_id) is None
+    still = await manager.get_task(snapshot.task_id)
+    assert still is not None and still.status == "awaiting_confirmation"
+
+    await manager.stop_task(snapshot.task_id)  # 收尾：让挂起的确认等待退出，避免事件循环拆除时挂死
+    assert await manager.resume_confirmation(snapshot.task_id) is None
 
 
 async def test_task_manager_propagates_failure_when_no_overlay_detected(tmp_path) -> None:
@@ -388,7 +427,7 @@ async def test_task_manager_propagates_failure_when_no_overlay_detected(tmp_path
     assert not fake_browser.page.brought_to_front
 
 
-async def test_task_manager_skips_pause_and_annotates_error_when_headless(tmp_path) -> None:
+async def test_task_manager_annotates_overlay_error_when_headless(tmp_path) -> None:
     fake_browser = OverlayBrowserActionRunner(overlay_result=_OVERLAY_RESULT_SLIDER_CAPTCHA, headless=True)
     manager = TaskManager(runner=FakeRunner(), broker=LogBroker(), artifact_store=LocalArtifactStore(artifact_root=tmp_path))
     manager._browser_action_runner = fake_browser  # type: ignore[attr-defined]
@@ -404,61 +443,11 @@ async def test_task_manager_skips_pause_and_annotates_error_when_headless(tmp_pa
 
     done = await wait_for_status(manager, snapshot.task_id, {"success", "error"})
     assert done.status == "error"
-    assert done.human_takeover_message is None
+    assert done.confirmation_message is None
     assert not fake_browser.page.brought_to_front
     logs = await manager.get_logs(snapshot.task_id)
     assert logs is not None
-    assert any("无头运行无法人工处理" in (log.detail or "") for log in logs)
-
-
-async def test_task_manager_enriches_overlay_message_with_ai_analysis_before_notifying(tmp_path) -> None:
-    from app.services.overlay_analyzer import OverlayAnalysis
-
-    analysis = OverlayAnalysis(
-        category="captcha_slider",
-        reason="页面弹出滑块验证码，需要人工拖动滑块完成校验。",
-        human_action_hint="拖动滑块到缺口位置",
-        confidence=0.9,
-    )
-    fake_browser = OverlayBrowserActionRunner(overlay_result=_OVERLAY_RESULT_SLIDER_CAPTCHA, headless=False)
-    notifier = RecordingOverlayNotifier()
-    analyzer = StubOverlayAnalyzer(analysis)
-    manager = TaskManager(runner=FakeRunner(), broker=LogBroker(), artifact_store=LocalArtifactStore(artifact_root=tmp_path))
-    manager._browser_action_runner = fake_browser  # type: ignore[attr-defined]
-    manager.set_notifier(notifier)
-    manager.set_overlay_analyzer(analyzer)
-
-    snapshot = await manager.start_task(
-        RunTaskRequest(
-            flowName="AI 增强弹层流程",
-            targetUrl="https://example.com/fallback",
-            selector=".fallback::text",
-            flowDefinition=_overlay_flow_definition(),
-        )
-    )
-
-    await wait_for_status(manager, snapshot.task_id, {"paused_for_human"})
-
-    for _ in range(40):
-        if notifier.calls:
-            break
-        await asyncio.sleep(0.01)
-    assert len(analyzer.calls) == 1
-    assert analyzer.calls[0]["has_screenshot"] is True
-    assert len(notifier.calls) == 1
-    enriched_message = str(notifier.calls[0]["message"])
-    assert "拖动滑块到缺口位置" in enriched_message
-    assert "需要人工拖动滑块完成校验" in enriched_message
-
-    current = await manager.get_task(snapshot.task_id)
-    assert current is not None
-    assert current.human_takeover_message is not None
-    assert "拖动滑块到缺口位置" in current.human_takeover_message
-
-    resumed = await manager.resume_human_takeover(snapshot.task_id)
-    assert resumed is not None
-    done = await wait_for_status(manager, snapshot.task_id, {"success", "error"})
-    assert done.status == "success"
+    assert any("运行时无法可靠接管" in (log.detail or "") for log in logs)
 
 
 _OVERLAY_RESULT_AD_POPUP: dict[str, object] = {
@@ -490,10 +479,8 @@ async def test_task_manager_auto_dismisses_ad_popup_without_pausing(tmp_path) ->
         dismiss_result={"clicked": True, "category": "close", "buttonText": "关闭"},
         headless=False,
     )
-    notifier = RecordingOverlayNotifier()
     manager = TaskManager(runner=FakeRunner(), broker=LogBroker(), artifact_store=LocalArtifactStore(artifact_root=tmp_path))
     manager._browser_action_runner = fake_browser  # type: ignore[attr-defined]
-    manager.set_notifier(notifier)
 
     snapshot = await manager.start_task(
         RunTaskRequest(
@@ -504,11 +491,10 @@ async def test_task_manager_auto_dismisses_ad_popup_without_pausing(tmp_path) ->
         )
     )
 
-    done = await wait_for_status(manager, snapshot.task_id, {"success", "error", "paused_for_human"})
+    done = await wait_for_status(manager, snapshot.task_id, {"success", "error", "awaiting_confirmation"})
     assert done.status == "success"
     assert [action["id"] for action in fake_browser.actions] == ["click", "click"]
     assert not fake_browser.page.brought_to_front
-    assert notifier.calls == []
     dismiss_call = fake_browser.page.dismiss_calls[0]
     assert dismiss_call["allowConsent"] is False
     logs = await manager.get_logs(snapshot.task_id)
@@ -534,22 +520,20 @@ async def test_task_manager_auto_dismisses_privacy_consent_popup(tmp_path) -> No
         )
     )
 
-    done = await wait_for_status(manager, snapshot.task_id, {"success", "error", "paused_for_human"})
+    done = await wait_for_status(manager, snapshot.task_id, {"success", "error", "awaiting_confirmation"})
     assert done.status == "success"
     dismiss_call = fake_browser.page.dismiss_calls[0]
     assert dismiss_call["allowConsent"] is True
 
 
-async def test_task_manager_falls_back_to_human_takeover_when_dismiss_does_not_stick(tmp_path) -> None:
+async def test_task_manager_fails_when_auto_dismiss_does_not_stick(tmp_path) -> None:
     fake_browser = OverlayBrowserActionRunner(
         overlay_result=[_OVERLAY_RESULT_AD_POPUP, _OVERLAY_RESULT_AD_POPUP],
         dismiss_result={"clicked": True, "category": "close", "buttonText": "关闭"},
         headless=False,
     )
-    notifier = RecordingOverlayNotifier()
     manager = TaskManager(runner=FakeRunner(), broker=LogBroker(), artifact_store=LocalArtifactStore(artifact_root=tmp_path))
     manager._browser_action_runner = fake_browser  # type: ignore[attr-defined]
-    manager.set_notifier(notifier)
 
     snapshot = await manager.start_task(
         RunTaskRequest(
@@ -560,14 +544,11 @@ async def test_task_manager_falls_back_to_human_takeover_when_dismiss_does_not_s
         )
     )
 
-    paused = await wait_for_status(manager, snapshot.task_id, {"paused_for_human"})
-    assert paused.human_takeover_message is not None
+    done = await wait_for_status(manager, snapshot.task_id, {"success", "error"})
+    assert done.status == "error"
     logs = await manager.get_logs(snapshot.task_id)
     assert logs is not None
-    assert any("未生效，转入人工处理" in log.message for log in logs)
-
-    resumed = await manager.resume_human_takeover(snapshot.task_id)
-    assert resumed is not None
+    assert any("自动关闭疑似广告弹窗未生效" in log.message for log in logs)
 
 
 async def test_task_manager_never_auto_dismisses_captcha_overlay(tmp_path) -> None:
@@ -584,14 +565,9 @@ async def test_task_manager_never_auto_dismisses_captcha_overlay(tmp_path) -> No
         )
     )
 
-    await wait_for_status(manager, snapshot.task_id, {"paused_for_human"})
+    done = await wait_for_status(manager, snapshot.task_id, {"success", "error"})
+    assert done.status == "error"
     assert fake_browser.page.dismiss_calls == []
-
-    # 暂停期间会挂起一个 600 秒的 asyncio.wait_for；测试结束前必须恢复，否则该等待会
-    # 一直悬着，拖住事件循环在用例收尾时的清理（其它 paused_for_human 用例同样如此）。
-    resumed = await manager.resume_human_takeover(snapshot.task_id)
-    assert resumed is not None
-    await wait_for_status(manager, snapshot.task_id, {"success", "error"})
 
 
 async def test_task_manager_auto_dismisses_ad_popup_even_when_headless(tmp_path) -> None:
@@ -1949,7 +1925,6 @@ async def test_task_manager_runs_variable_message_actions(tmp_path) -> None:
                     {"id": "log", "title": "输出日志", "type": "variable.log", "message": "状态 ${var.status_copy}", "logLevel": "warn"},
                     {"id": "notify", "title": "消息通知", "type": "variable.notify", "channel": "企业微信", "message": "订单 ${var.order_id} 已完成", "outputVariable": "notification_message"},
                     {"id": "clipboard", "title": "剪贴板", "type": "variable.clipboard", "content": "${var.status_copy}", "outputVariable": "clipboard_text"},
-                    {"id": "input", "title": "输入弹窗", "type": "variable.input", "variableName": "manual_note", "message": "请输入备注", "defaultValue": "无需人工处理", "scope": "局部"},
                 ],
                 "edges": [
                     {"source": "start", "target": "set"},
@@ -1957,7 +1932,6 @@ async def test_task_manager_runs_variable_message_actions(tmp_path) -> None:
                     {"source": "get", "target": "log"},
                     {"source": "log", "target": "notify"},
                     {"source": "notify", "target": "clipboard"},
-                    {"source": "clipboard", "target": "input"},
                 ],
             },
         )
@@ -1973,8 +1947,6 @@ async def test_task_manager_runs_variable_message_actions(tmp_path) -> None:
     assert variables["status_copy"].value == "done:A001"
     assert variables["notification_message"].value == "订单 A001 已完成"
     assert variables["clipboard_text"].value == "done:A001"
-    assert variables["manual_note"].value == "无需人工处理"
-    assert variables["manual_note"].scope == "局部"
     logs = await manager.get_logs(snapshot.task_id)
     assert logs is not None
     assert any(log.node_id == "log" and log.level == "warn" and log.detail == "状态 done:A001" for log in logs)

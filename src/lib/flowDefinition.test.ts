@@ -243,8 +243,7 @@ describe('flowDefinition', () => {
     const logNode = createFlowNode({ label: '输出日志', nodeType: 'variable' }, { x: 120, y: 380 }, 3);
     const notifyNode = createFlowNode({ label: '消息通知', nodeType: 'variable' }, { x: 120, y: 480 }, 4);
     const clipboardNode = createFlowNode({ label: '剪贴板', nodeType: 'variable' }, { x: 120, y: 580 }, 5);
-    const inputNode = createFlowNode({ label: '输入弹窗', nodeType: 'variable' }, { x: 120, y: 680 }, 6);
-    const definition = buildFlowDefinition([setNode, getNode, logNode, notifyNode, clipboardNode, inputNode], []);
+    const definition = buildFlowDefinition([setNode, getNode, logNode, notifyNode, clipboardNode], []);
     const restored = restoreFlowCanvas(definition);
 
     expect(definition.nodes).toEqual([
@@ -252,10 +251,9 @@ describe('flowDefinition', () => {
       expect.objectContaining({ type: 'variable.get', variableName: 'result_status', outputVariable: 'status_value' }),
       expect.objectContaining({ type: 'variable.log', message: '处理结果: ${var.result_status}', logLevel: 'info' }),
       expect.objectContaining({ type: 'variable.notify', channel: '企业微信', message: '流程执行完成: ${var.result_status}', outputVariable: 'notification_message' }),
-      expect.objectContaining({ type: 'variable.clipboard', content: '${var.result_status}', outputVariable: 'clipboard_text' }),
-      expect.objectContaining({ type: 'variable.input', variableName: 'user_input', message: '请输入运行参数', defaultValue: '', scope: '全局' })
+      expect.objectContaining({ type: 'variable.clipboard', content: '${var.result_status}', outputVariable: 'clipboard_text' })
     ]);
-    expect(restored?.nodes.map((node) => node.data.action?.type)).toEqual(['variable.set', 'variable.get', 'variable.log', 'variable.notify', 'variable.clipboard', 'variable.input']);
+    expect(restored?.nodes.map((node) => node.data.action?.type)).toEqual(['variable.set', 'variable.get', 'variable.log', 'variable.notify', 'variable.clipboard']);
     expect(restored?.nodes[2]?.data.action).toEqual(expect.objectContaining({ message: '处理结果: ${var.result_status}', logLevel: 'info' }));
     expect(restored?.nodes[3]?.data.action).toEqual(expect.objectContaining({ channel: '企业微信', outputVariable: 'notification_message' }));
   });

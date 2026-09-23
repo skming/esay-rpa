@@ -1,10 +1,8 @@
 import type { ReactElement } from 'react';
 
 import { Field } from '../../../ui/FormControls';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../../../ui/select';
 import { VariableNameField } from '../VariableNameField';
 import { VariablePickerField } from '../VariablePickerField';
-import { LabelLike } from './FieldLayout';
 import type { ActionFieldsProps } from './types';
 import { DEFAULT_ACTION_TYPE_BY_KIND } from '../../../../types/rpa';
 
@@ -61,24 +59,6 @@ export function ControlActionFields({ draft, electron, node, onDraftPatch }: Pic
         <Field label="子流程 ID" mono onChange={(event) => onDraftPatch('flowId', event.target.value)} placeholder="flow-abc123" value={draft.flowId} />
         <VariableNameField label="输出变量" mode="target" onChange={(value) => onDraftPatch('responseVariable', value)} placeholder="subprocess_result" value={draft.responseVariable} variables={availableVariables} />
         <VariableNameField label="状态变量" mode="target" onChange={(value) => onDraftPatch('statusVariable', value)} placeholder="subprocess_status" value={draft.statusVariable} variables={availableVariables} />
-      </>
-    );
-  }
-  if (actionType === 'control.human_takeover') {
-    return (
-      <>
-        <Field label="提示信息" onChange={(event) => onDraftPatch('humanTakeoverMessage', event.target.value)} placeholder="请完成验证后点击继续" value={draft.humanTakeoverMessage} />
-        <LabelLike text="默认恢复方式">
-          <Select onValueChange={(value) => onDraftPatch('humanTakeoverResumeMode', value as 'next_node' | 'current_node')} value={draft.humanTakeoverResumeMode}>
-            <SelectTrigger>
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="next_node">已完成，继续下一节点</SelectItem>
-              <SelectItem value="current_node">重试当前节点</SelectItem>
-            </SelectContent>
-          </Select>
-        </LabelLike>
       </>
     );
   }

@@ -27,11 +27,11 @@ export function RunDetailDialog({
     error: <XCircle className="h-4 w-4 text-red-500" strokeWidth={1.5} />,
     stopped: <XCircle className="h-4 w-4 text-amber-500" strokeWidth={1.5} />,
     queued: <Loader2 className="h-4 w-4 text-slate-400" strokeWidth={1.5} />,
-    paused_for_human: <Loader2 className="h-4 w-4 text-amber-500" strokeWidth={1.5} />,
+    awaiting_confirmation: <Loader2 className="h-4 w-4 text-amber-500" strokeWidth={1.5} />,
   }[run.status];
 
-  const statusLabel = { running: '运行中', success: '成功', error: '失败', stopped: '已停止', queued: '排队', paused_for_human: '等待操作' }[run.status];
-  const statusVariant = { success: 'emerald', error: 'red', running: 'blue', queued: 'amber', stopped: 'default', paused_for_human: 'amber' }[run.status] as 'emerald' | 'red' | 'blue' | 'amber' | 'default';
+  const statusLabel = { running: '运行中', success: '成功', error: '失败', stopped: '已停止', queued: '排队', awaiting_confirmation: '等待操作' }[run.status];
+  const statusVariant = { success: 'emerald', error: 'red', running: 'blue', queued: 'amber', stopped: 'default', awaiting_confirmation: 'amber' }[run.status] as 'emerald' | 'red' | 'blue' | 'amber' | 'default';
   const firstArtifact = run.artifacts?.[0];
 
   return (

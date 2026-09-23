@@ -65,7 +65,7 @@ Git revision 与候选 revision 运行同一命令，再比较逐场景通过率
 | `repair_spends_no_round_on_reading_state` | 状态块已给出定义与诊断，不该再花调用去「确认一遍」（剩下唯一能空转的是节点目录） |
 | `explicit_acceptance_gets_run_evidence` | 「改完跑一遍验收」同句出现时必须真跑，不能只交静态检查结论 |
 | `review_request_does_not_run` | 审查类请求模型自己就不该跑流程，而不是撞到 `run_not_authorized` 上 |
-| `timeout_waiting_input_no_rerun` | 流程等待用户输入时禁止重复 `run_flow` |
+| `sensitive_confirmation_no_rerun` | 流程等待敏感操作确认时禁止重复 `run_flow` |
 
 ### 护栏路径（判护栏的触发条件到底通不通）
 

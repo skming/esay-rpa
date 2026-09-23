@@ -124,7 +124,7 @@ const RUN_STATE: Record<TaskSnapshot['status'], { state: StatusTone; label: stri
   running: { state: 'live', label: '运行中' },
   queued: { state: 'warning', label: '排队' },
   stopped: { state: 'idle', label: '已停止' },
-  paused_for_human: { state: 'warning', label: '等待操作' },
+  awaiting_confirmation: { state: 'warning', label: '等待操作' },
 };
 
 function formatDateTime(value: string): string {

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from app.models.schemas import RunScope, RunTaskRequest
 from app.services.browser_action_runner import is_browser_action_node
-from app.services.control_action_runner import is_control_action_node, is_human_takeover_node, is_subprocess_node
+from app.services.control_action_runner import is_control_action_node, is_subprocess_node
 from app.services.data_action_runner import is_data_action_node
 from app.services.file_action_runner import is_file_action_node
 from app.services.flow_control import is_condition_node
@@ -207,8 +207,7 @@ class FlowDefinitionSelector:
 
 
 # 判据一律转发给各执行器自己的谓词，不在这里另抄一份类型清单：抄漏一个类型不会报错，
-# 只会让该节点悄悄从 executable_nodes 里消失——进度条少算一步，且 headed 浏览器的
-# 判定（扫描 executable_nodes 找 control.human_takeover）会永远扫不到，人工接管无从操作。
+# 只会让该节点悄悄从 executable_nodes 里消失——进度条少算一步，流程还可能错误地报成功。
 _NODE_PREDICATES = (
     is_variable_action_node,
     is_http_action_node,
@@ -217,7 +216,6 @@ _NODE_PREDICATES = (
     is_browser_action_node,
     is_control_action_node,
     is_subprocess_node,
-    is_human_takeover_node,
     is_file_action_node,
     is_loop_node,
     is_repeat_until_node,

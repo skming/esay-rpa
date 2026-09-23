@@ -143,7 +143,7 @@ def _lint_login_detection_risks(nodes: list[dict[str, Any]]) -> list[dict[str, A
 
 
 def _lint_login_challenge_risks(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """检查登录二次验证建模是否自洽，而不是偏向某一种登录方式。"""
+    """运行中登录挑战暂不支持，流程必须从已经登录的浏览器会话开始。"""
     findings: list[dict[str, Any]] = []
     has_password_fill = any(
         node.get("type") == "browser.fill"
@@ -163,40 +163,24 @@ def _lint_login_challenge_risks(nodes: list[dict[str, Any]]) -> list[dict[str, A
         "otp", "二次验证", "双因素", "扫码", "二维码", "授权登录", "oauth", "sso",
     )
     mentions_challenge = any(keyword in flow_text for keyword in challenge_keywords)
-    has_runtime_input = any(
-        node.get("type") == "variable.input"
-        for node in nodes
-    )
-    has_challenge_fill = any(
-        node.get("type") == "browser.fill"
-        and any(keyword in f"{node.get('title', '')} {node.get('selector', '')} {node.get('inputValue', '')}".lower()
-                for keyword in challenge_keywords)
-        for node in nodes
-    )
-    has_qr_or_oauth_wait = any(
-        node.get("type") == "browser.wait"
-        and any(keyword in f"{node.get('title', '')} {node.get('selector', '')}".lower()
-                for keyword in ("扫码", "二维码", "qr", "授权", "oauth", "sso", "nav", "menu", "首页"))
-        for node in nodes
-    )
-    if mentions_challenge and not (has_runtime_input or has_challenge_fill or has_qr_or_oauth_wait):
+    if mentions_challenge:
         password_node = next(
             node for node in nodes
             if node.get("type") == "browser.fill"
             and ("password" in str(node.get("selector", "")).lower() or "密码" in str(node.get("title", "")))
         )
         findings.append({
-            "severity": "warn",
+            "severity": "error",
             "node_id": str(password_node.get("id", "?")),
             "node_title": str(password_node.get("title") or password_node.get("id", "?")),
-            "issue": "login_challenge_not_modeled",
+            "issue": "login_challenge_requires_pre_authenticated_session",
             "message": (
-                "流程文本提到了验证码/2FA/扫码/授权等登录挑战，但账号密码后没有对应的运行时输入、"
-                "验证码填写、扫码等待或授权完成等待链路。"
+                "流程包含验证码、2FA、扫码或授权确认等运行中登录挑战。当前流程无法保证"
+                "交互发生在原任务浏览器上下文，因此该流程不能稳定交付。"
             ),
             "fix": (
-                "先根据 inspect_page/用户需求分类登录方式：图形验证码/短信/TOTP 用 variable.input；"
-                "扫码/OAuth/SSO 用 browser.wait 等待授权后应用导航或目标页出现；不要把一种登录方式硬套到另一种。"
+                "删除运行中的登录挑战链路，让用户先在扩展连接的真实浏览器标签页完成登录；"
+                "随后从已登录的目标数据页重新 inspect_page 并创建流程。"
             ),
         })
     return findings
@@ -1110,7 +1094,7 @@ _SEMANTIC_HONEST_MARKERS = ("原文摘录", "摘录", "要点提取", "节选", 
 _SEMANTIC_CLAIM_EXEMPT_PREFIXES = ("browser.", "ui.", "control.")
 _SEMANTIC_CLAIM_EXEMPT_TYPES = frozenset({
     "file.read", "file.list", "file.watch", "excel.read", "http.request",
-    "data.json.parse", "variable.get", "variable.input", "variable.log",
+    "data.json.parse", "variable.get", "variable.log",
 })
 
 

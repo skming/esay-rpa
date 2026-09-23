@@ -28,6 +28,7 @@ const CONDITION_FALSE_BRANCH_LABELS = new Set(['0', 'false', 'no', 'n', '否', '
 const LOOP_BODY_EDGE_LABELS = new Set(['body', 'loop', 'loop-body', 'foreach-body', 'each', 'iterate', 'true', 'yes', '是', '循环', '循环体', '每项', '迭代']);
 const LOOP_EXIT_EDGE_LABELS = new Set(['exit', 'done', 'complete', 'loop-exit', 'foreach-exit', 'false', 'no', '否', '完成', '结束', '退出', '跳出']);
 const ABSOLUTE_URL_ACTION_TYPES = new Set(['browser.fetch', 'browser.open', 'browser.tab.open', 'http.request']);
+const REMOVED_ACTION_TYPES = new Set(['control.human_takeover', 'variable.input']);
 
 /** Pre-flight validator: reachability, node config, flow structure (conditions/loops), and variable dependencies in topological order. */
 export function validateRunConfiguration(
@@ -236,6 +237,14 @@ function validateNodeAction(node: Node<RpaNodeData>, action: RpaNodeAction): Run
   const type = action.type;
   const actionUrl = action.targetUrl ?? action.url;
 
+  if (REMOVED_ACTION_TYPES.has(type)) {
+    return [{
+      nodeId: node.id,
+      severity: 'error',
+      message: `节点“${title}”使用了已移除的交互节点；请先在扩展连接的浏览器中完成登录，再删除该节点`
+    }];
+  }
+
   if (type === 'browser.fetch') {
     requireField(action.targetUrl, '目标网址');
     requireField(action.selector, '选择器');
@@ -383,7 +392,7 @@ function validateNodeAction(node: Node<RpaNodeData>, action: RpaNodeAction): Run
     issues.push({ nodeId: node.id, severity: 'error', message: `节点“${title}”缺少有效的延时毫秒数` });
   }
 
-  if (type === 'variable.set' || type === 'variable.get' || type === 'variable.input') {
+  if (type === 'variable.set' || type === 'variable.get') {
     requireField(action.variableName, '变量名');
   }
 
@@ -746,7 +755,7 @@ function collectProducedVariableNames(action: RpaNodeAction): string[] {
     add(action.indexVariable);
   }
 
-  if (action.type === 'variable.set' || action.type === 'variable.input') {
+  if (action.type === 'variable.set') {
     add(action.variableName);
   }
 

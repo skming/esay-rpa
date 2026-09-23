@@ -348,7 +348,7 @@ function StatusPill({ electron }: { electron: ElectronBridgeState }): ReactEleme
     success: { icon: <CheckCircle2 className="h-3 w-3" strokeWidth={1.5} />, label: '已完成', cls: 'border-emerald-200 bg-emerald-50 text-emerald-700' },
     error: { icon: <XCircle className="h-3 w-3" strokeWidth={1.5} />, label: '运行失败', cls: 'border-red-200 bg-red-50 text-red-700' },
     stopped: { icon: <CirclePause className="h-3 w-3" strokeWidth={1.5} />, label: '已停止', cls: 'border-amber-200 bg-amber-50 text-amber-700' },
-    paused_for_human: { icon: <Square className="h-3 w-3" strokeWidth={1.5} />, label: '等待接管', cls: 'border-amber-200 bg-amber-50 text-amber-700' },
+    awaiting_confirmation: { icon: <Square className="h-3 w-3" strokeWidth={1.5} />, label: '等待确认', cls: 'border-amber-200 bg-amber-50 text-amber-700' },
   };
 
   const { icon, label, cls } = cfg[runtimeStatus];

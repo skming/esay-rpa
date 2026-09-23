@@ -6,7 +6,7 @@ Chrome 的 ProcessSingleton 遇到已被占用的 user-data-dir 时不会报错�
 用户拿到的是一屏浏览器启动参数，看不出该去关哪个窗口。
 
 各处 launch_persistent_context 之前都按状态自查（"有没有 status == running 的任务"）行不通：
-paused_for_human 的任务照样开着浏览器，拾取器、inspect_page 也都占着同一个 profile，
+awaiting_confirmation 的任务照样开着浏览器，拾取器、inspect_page 也都占着同一个 profile，
 每加一种占用方就要去所有调用点补一次判断，漏一个就退化成上面那条天书。
 所以改成占用方登记：谁开谁登记，拿不到就带着占用方是谁当场失败。
 """
@@ -60,7 +60,7 @@ def release(profile_dir: str, owner: str) -> None:
 def busy_message(holder_label: str) -> str:
     return (
         f"浏览器窗口正被「{holder_label}」占用，同一个浏览器用户目录只能被一个运行打开。"
-        "如果它在等待人工接管，请在页面顶部的接管卡片点「已完成，继续」；"
+        "如果它在等待敏感操作确认，请在页面顶部卡片点「确认并继续」；"
         "否则先停止该运行，再重试。"
     )
 

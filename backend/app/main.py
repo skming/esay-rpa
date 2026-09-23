@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -66,7 +66,6 @@ from app.models.schemas import (
     ArtifactContent,
     ArtifactSnapshot,
     DebugControlRequest,
-    UserInputRequest,
     FlowCreateRequest,
     FlowMoveRequest,
     FlowRunRequest,
@@ -96,7 +95,6 @@ from app.services.notification_config_service import NotificationConfigService, 
 from app.services.notifier import DingTalkNotifier
 from app.services.extension_bridge_service import ExtensionBridgeService
 from app.services.extension_config_service import ExtensionConfigService
-from app.services.overlay_analyzer import OverlayAnalyzer
 from app.services.picker_service import PickerCloseRequest, PickerOpenRequest, PickerService
 from app.services.runtime_factory import create_runtime_services
 from app.services.scheduler_service import SchedulerLoop
@@ -111,7 +109,6 @@ os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(storage.resolve_playwright
 ai_config_service = AiConfigService(database_url=settings.database_url)
 notification_config_service = NotificationConfigService()
 dingtalk_notifier = DingTalkNotifier(config_service=notification_config_service)
-overlay_analyzer = OverlayAnalyzer(config_service=ai_config_service)
 ai_chat_store = AiChatStore()
 _browser_session_dir = str(storage.resolve_browser_profile_dir())
 extension_bridge_service = ExtensionBridgeService()
@@ -124,8 +121,6 @@ _setup_file_logging(
 )
 runtime_services = create_runtime_services(settings=settings, broker=broker)
 task_manager = runtime_services.task_manager
-task_manager.set_notifier(dingtalk_notifier)
-task_manager.set_overlay_analyzer(overlay_analyzer)
 task_manager.set_extension_bridge(extension_bridge_service, is_extension_enabled=lambda: bool(extension_config_service.load()["enabled"]))
 picker_service = PickerService(session_dir=_browser_session_dir, extension_provider=task_manager.extension_exploration_executor)
 code_generator = ScraplingCodeGenerator()
@@ -152,10 +147,6 @@ _self_heal_service = SelfHealService(
     config_service=ai_config_service,
 )
 scheduler_service.set_task_started_hook(_self_heal_service.watch_task)
-
-
-class ResumeHumanTakeoverRequest(BaseModel):
-    resume_mode: str = "next_node"   # "next_node" | "current_node"
 
 
 class AiCatalogModelRequest(BaseModel):
@@ -389,19 +380,11 @@ async def stop_task(task_id: str) -> TaskSnapshot:
     return snapshot
 
 
-@app.post("/api/tasks/{task_id}/input", response_model=TaskSnapshot)
-async def provide_task_input(task_id: str, request: UserInputRequest) -> TaskSnapshot:
-    snapshot = await task_manager.provide_input(task_id, request.value)
-    if snapshot is None:
-        raise HTTPException(status_code=404, detail="Task not found or not waiting for input")
-    return snapshot
-
-
 @app.post("/api/tasks/{task_id}/resume", response_model=TaskSnapshot)
-async def resume_human_takeover(task_id: str, request: ResumeHumanTakeoverRequest = Body(default=ResumeHumanTakeoverRequest())) -> TaskSnapshot:
-    snapshot = await task_manager.resume_human_takeover(task_id, request.resume_mode)
+async def resume_confirmation(task_id: str) -> TaskSnapshot:
+    snapshot = await task_manager.resume_confirmation(task_id)
     if snapshot is None:
-        raise HTTPException(status_code=404, detail="任务不存在或未处于等待人工接管状态")
+        raise HTTPException(status_code=404, detail="任务不存在或未处于等待敏感操作确认状态")
     return snapshot
 
 

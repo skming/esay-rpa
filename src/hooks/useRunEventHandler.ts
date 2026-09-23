@@ -21,9 +21,7 @@ type UseRunEventHandlerParams = {
   setArtifacts: Dispatch<SetStateAction<ArtifactSnapshot[]>>;
   setFlows: Dispatch<SetStateAction<FlowSnapshot[]>>;
   setGeneratedScript: Dispatch<SetStateAction<GeneratedScriptResult | null>>;
-  setInputPrompt: Dispatch<SetStateAction<string | null>>;
-  setHumanTakeoverMessage: Dispatch<SetStateAction<string | null>>;
-  setPausedPageUrl: Dispatch<SetStateAction<string | null>>;
+  setConfirmationMessage: Dispatch<SetStateAction<string | null>>;
   setLogs: Dispatch<SetStateAction<RunLogEntry[]>>;
   setNodeStates: Dispatch<SetStateAction<Record<string, NodeRuntimeState>>>;
   setProgress: Dispatch<SetStateAction<RuntimeProgress>>;
@@ -45,9 +43,7 @@ export function useRunEventHandler({
   setArtifacts,
   setFlows,
   setGeneratedScript,
-  setInputPrompt,
-  setHumanTakeoverMessage,
-  setPausedPageUrl,
+  setConfirmationMessage,
   setLogs,
   setNodeStates,
   setProgress,
@@ -68,9 +64,7 @@ export function useRunEventHandler({
         setActiveRunFlowId(event.payload.flowId ?? null);
         setLastRunId(event.payload.runId);
         setRuntimeStatus(event.payload.status);
-        setInputPrompt(null);
-        setHumanTakeoverMessage(null);
-        setPausedPageUrl(null);
+        setConfirmationMessage(null);
         setLogs([]);
         setVariables([]);
         setArtifacts([]);
@@ -104,27 +98,8 @@ export function useRunEventHandler({
       if (event.type === 'log:append') {
         setLogs((current) => [...current, event.payload].slice(-200));
         if (event.payload.level === 'input') {
-          const detail = event.payload.detail ?? '';
-          const nl = detail.lastIndexOf('\n');
-          const lastPart = nl >= 0 ? detail.slice(nl + 1).trim() : '';
-          const detailUrl = lastPart.startsWith('http') ? lastPart : null;
-          const detailText = detailUrl !== null ? detail.slice(0, nl) : detail;
-          if (event.payload.message.startsWith('等待人工接管')) {
-            const nodeTitle = event.payload.message.replace(/^等待人工接管 · /, '');
-            // Extract ⏱{ms} timeout marker from backend detail
-            const timerMatch = detailText.match(/\n?⏱(\d+)$/);
-            const timeoutMs = timerMatch ? parseInt(timerMatch[1], 10) : 300_000;
-            const cleanBody = timerMatch ? detailText.slice(0, timerMatch.index).trim() : detailText.trim();
-            // Encode as: "{nodeTitle}\n{body}\n⏱{timeoutMs}" — parseMessage always strips ⏱ last
-            const encoded = cleanBody
-              ? `${nodeTitle}\n${cleanBody}\n⏱${timeoutMs}`
-              : `${nodeTitle}\n⏱${timeoutMs}`;
-            setHumanTakeoverMessage(encoded);
-            setPausedPageUrl(detailUrl);
-          } else {
-            setInputPrompt(detailText || event.payload.message.replace(/^等待用户输入 · /, ''));
-            setPausedPageUrl(detailUrl);
-          }
+          setConfirmationMessage(event.payload.detail?.trim() || event.payload.message);
+          setRuntimeStatus('awaiting_confirmation');
         }
         if (event.payload.level === 'warn' && event.payload.message.startsWith('命中断点')) {
           useBottomPanelStore.getState().setActiveTab('breakpoints');
@@ -149,15 +124,19 @@ export function useRunEventHandler({
         return;
       }
 
+      if (event.type === 'run:confirmation') {
+        setConfirmationMessage(event.payload.message);
+        setRuntimeStatus(event.payload.message === null ? 'running' : 'awaiting_confirmation');
+        return;
+      }
+
       if (event.type === 'run:finish') {
         lastRunIdRef.current = event.payload.runId;
         activeRunIdRef.current = null;
         setLastRunId(event.payload.runId);
         setActiveRunId(null);
         setActiveRunFlowId(null);
-        setInputPrompt(null);
-        setHumanTakeoverMessage(null);
-        setPausedPageUrl(null);
+        setConfirmationMessage(null);
         setRuntimeStatus(event.payload.status);
         void callBridge((api) => api.listTaskVariables(event.payload.runId), undefined, { silent: true }).then((result) => {
           if (result !== null && isCurrentRunEvent(event, activeRunIdRef.current, lastRunIdRef.current)) {
@@ -217,9 +196,7 @@ export function useRunEventHandler({
       setArtifacts,
       setFlows,
       setGeneratedScript,
-      setInputPrompt,
-      setHumanTakeoverMessage,
-      setPausedPageUrl,
+      setConfirmationMessage,
       setLogs,
       setNodeStates,
       setProgress,

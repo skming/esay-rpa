@@ -44,7 +44,7 @@ export function TitleBar({ electron }: { electron: ElectronBridgeState }): React
 }
 
 const STATUS_LABEL: Record<ElectronBridgeState['runtimeStatus'], string> = {
-  error: '失败', ready: '', running: '运行中', stopped: '已停止', success: '已完成', paused_for_human: '等待接管'
+  error: '失败', ready: '', running: '运行中', stopped: '已停止', success: '已完成', awaiting_confirmation: '等待确认'
 };
 
 const STATUS_TONE: Record<ElectronBridgeState['runtimeStatus'], string> = {
@@ -52,7 +52,7 @@ const STATUS_TONE: Record<ElectronBridgeState['runtimeStatus'], string> = {
   success: 'border-emerald-200 bg-emerald-50 text-emerald-700',
   error: 'border-red-200 bg-red-50 text-red-700',
   stopped: 'border-slate-200 bg-slate-50 text-slate-500',
-  paused_for_human: 'border-amber-200 bg-amber-50 text-amber-700',
+  awaiting_confirmation: 'border-amber-200 bg-amber-50 text-amber-700',
   ready: ''
 };
 
@@ -63,7 +63,7 @@ function StatusIcon({ status }: { status: ElectronBridgeState['runtimeStatus'] }
   if (status === 'success') return <CheckCircle2 className={cls} strokeWidth={sw} />;
   if (status === 'error') return <AlertCircle className={cls} strokeWidth={sw} />;
   if (status === 'stopped') return <CirclePause className={cls} strokeWidth={sw} />;
-  if (status === 'paused_for_human') return <Square className={cls} strokeWidth={sw} />;
+  if (status === 'awaiting_confirmation') return <Square className={cls} strokeWidth={sw} />;
   return <CheckCircle2 className={cls} strokeWidth={sw} />;
 }
 

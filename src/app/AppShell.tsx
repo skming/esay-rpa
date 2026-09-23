@@ -6,8 +6,7 @@ import { TitleBar } from '../components/layout/TitleBar';
 import { ToastStack } from '../components/layout/ToastStack';
 import { TopBar } from '../components/layout/TopBar';
 import { DeleteNodeDialog } from '../components/studio/DeleteNodeDialog';
-import { HumanTakeoverBanner } from '../components/studio/HumanTakeoverBanner';
-import { UserInputDialog } from '../components/studio/UserInputDialog';
+import { SensitiveActionConfirmation } from '../components/studio/SensitiveActionConfirmation';
 import type { AppRuntimeContext } from './appContext';
 import { AppRoutes } from './AppRoutes';
 import { BackendBootScreen } from './BackendBootScreen';
@@ -63,25 +62,10 @@ export function AppShell(context: AppRuntimeContext): ReactElement {
         onOpenChange={(open) => { if (!open) context.canvas.setDeleteTarget(null); }}
         target={context.canvas.deleteTarget}
       />
-      <UserInputDialog
-        prompt={context.electron.inputPrompt}
-        url={context.electron.pausedPageUrl}
-        onCancel={() => { void context.electron.stopRun(); }}
-        onSubmit={(value) => { void context.electron.provideInput(value); }}
-      />
-      <HumanTakeoverBanner
-        message={context.electron.humanTakeoverMessage}
-        url={context.electron.pausedPageUrl}
-        onResume={(mode) => { void context.electron.resumeHumanTakeover(mode); }}
+      <SensitiveActionConfirmation
+        message={context.electron.confirmationMessage}
+        onConfirm={() => { void context.electron.resumeConfirmation(); }}
         onStop={() => { void context.electron.stopRun(); }}
-        onOpenPage={(targetUrl) => {
-          void context.electron.openPicker({
-            browserExecutor: context.electron.currentFlow?.defaultBrowserExecutor ?? 'playwright',
-            mode: 'browse',
-            requestId: crypto.randomUUID(),
-            targetUrl: targetUrl.trim() || undefined
-          });
-        }}
       />
     </div>
   );

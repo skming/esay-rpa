@@ -25,7 +25,7 @@ from app.services import ai_repair_ledger as repair_ledger
 from app.services.browser_action_runner import detect_blocking_interstitial, persistent_browser_context
 from app.services.extension_executor import ExtensionBusyError, extension_busy_message
 import app.services.ai_tools.extension_page_channel as _extension_page
-from app.services.ai_tools.catalog import select_node_types
+from app.services.ai_tools.catalog import REMOVED_FLOW_NODE_TYPES, select_node_types
 from app.services.ai_tools.schemas import validate_tool_arguments
 from app.services.ai_tools.diagnostics import (
     SELECTOR_MATCH_HIDDEN_OR_NOT_VISIBLE,
@@ -73,6 +73,25 @@ if TYPE_CHECKING:
     from app.services.flow_service import FlowService
     from app.services.scheduler_service import ScheduleService
     from app.services.task_manager import TaskManager
+
+
+def _unavailable_interactive_node_refs(nodes: list[dict[str, Any]]) -> list[dict[str, str]]:
+    return [
+        {"id": str(node.get("id") or "?"), "type": str(node.get("type"))}
+        for node in nodes
+        if node.get("type") in REMOVED_FLOW_NODE_TYPES
+    ]
+
+
+def _unavailable_interactive_nodes_result(nodes: list[dict[str, str]]) -> dict[str, Any]:
+    return {
+        "status": "unsupported_interactive_nodes",
+        "nodes": nodes,
+        "message": (
+            "这些运行时交互节点已移除。请删除它们；验证码、短信码、TOTP、"
+            "扫码或授权登录须先在扩展连接的真实浏览器中完成。"
+        ),
+    }
 
 
 _OBSERVED_PAGE_ACTIONS = frozenset({"click", "fill", "select_option", "press", "hover", "scroll"})
@@ -699,6 +718,10 @@ class RpaToolExecutor:
         nodes = _normalize_generated_nodes(nodes)
         edges = _normalize_generated_edges(edges)
 
+        unavailable_nodes = _unavailable_interactive_node_refs(nodes)
+        if unavailable_nodes:
+            return _unavailable_interactive_nodes_result(unavailable_nodes)
+
         node_ids = {n.get("id") for n in nodes if isinstance(n, dict)}
         biz_nodes = [n for n in nodes if isinstance(n, dict) and n.get("id") not in ("start", "end")]
 
@@ -967,6 +990,9 @@ class RpaToolExecutor:
             }
 
         generated_business_nodes = any(node.get("type") not in {"start", "end"} for node in nodes)
+        unavailable_nodes = _unavailable_interactive_node_refs(nodes)
+        if unavailable_nodes:
+            return _unavailable_interactive_nodes_result(unavailable_nodes)
         contract_ready = not contract_validation_errors(
             flow.acceptance_contract,
             defined_variables=set(_collect_defined_vars(nodes, [iv.name for iv in flow.input_variables])),
@@ -1356,9 +1382,6 @@ class RpaToolExecutor:
             "count": len(schedules),
         }
 
-    # 无人值守适配检查：定时任务运行时没人补输入/接管浏览器。
-    _UNATTENDED_INCOMPATIBLE_NODE_TYPES = frozenset({"variable.input", "control.human_takeover"})
-
     async def _create_schedule(
         self,
         flow_id: str,
@@ -1379,23 +1402,6 @@ class RpaToolExecutor:
         if flow is None:
             return {"error": f"流程 {flow_id} 不存在"}
 
-        nodes: list[Any] = flow.definition.get("nodes", [])
-        pause_nodes = [
-            {"id": n.get("id"), "type": n.get("type"), "title": n.get("title")}
-            for n in nodes
-            if isinstance(n, dict) and n.get("type") in self._UNATTENDED_INCOMPATIBLE_NODE_TYPES
-        ]
-        if pause_nodes:
-            return {
-                "error": "流程含需要人工参与的节点，不适合定时无人值守运行",
-                "pause_nodes": pause_nodes,
-                "hint": (
-                    "定时触发时没有人补输入或接管浏览器，这些节点会让任务一直挂起直到超时。"
-                    "请先改造流程（如改用 input_variables 静态凭据、依靠 browser.ensureLogin 复用登录态），"
-                    "或改为手动运行。"
-                ),
-            }
-
         run_variables = variables or {}
         missing_vars = [
             {"name": iv.name, "category": getattr(iv, "category", "credential")}
@@ -1410,6 +1416,20 @@ class RpaToolExecutor:
             }
 
         effective_executor = browser_executor or getattr(flow, "default_browser_executor", None) or "playwright"
+        # requireConfirmation 只在扩展执行器下挂起等待确认；定时无人值守没人点，会挂到 120s
+        # 超时后 CancelledError 取消整个任务，每次触发都失败。playwright 下该标志本就不生效，无需拦。
+        if effective_executor == "extension":
+            confirmation_nodes = [
+                {"id": n.get("id"), "type": n.get("type"), "title": n.get("title")}
+                for n in flow.definition.get("nodes", [])
+                if isinstance(n, dict) and n.get("requireConfirmation") is True
+            ]
+            if confirmation_nodes:
+                return {
+                    "error": "流程含 requireConfirmation 敏感动作，扩展执行器定时无人值守运行会挂起到确认超时后失败",
+                    "confirmation_nodes": confirmation_nodes,
+                    "hint": "去掉这些节点的 requireConfirmation，或改为手动运行。",
+                }
         try:
             request = ScheduleCreateRequest(
                 name=name or flow.name,
@@ -1545,7 +1565,7 @@ class RpaToolExecutor:
                 "empty_credential_fields": readiness["empty_credential_fields"],
                 "message": (
                     f"凭据变量 {readiness['empty_credential_fields']} 有引用但没有值，运行必然失败。"
-                    "**不要自行编造或猜测凭据值**，也不要改用 variable.input 绕开——"
+                    "**不要自行编造或猜测凭据值**——"
                     "请告知用户在右侧「输入变量」面板填写后再运行。"
                 ),
             }
@@ -1663,8 +1683,6 @@ class RpaToolExecutor:
             except Exception:
                 pass  # 经验记录失败不能影响 run_flow 本身
 
-        has_input_nodes = any(n.get("type") == "variable.input" for n in nodes)
-        has_takeover_nodes = any(n.get("type") == "control.human_takeover" for n in nodes)
         result: dict[str, Any] = {
             "task_id": task.task_id,
             "status": task.status if task.status in _TERMINAL else "timeout",
@@ -1674,23 +1692,13 @@ class RpaToolExecutor:
             "progress": task.progress.model_dump(mode="json") if task.progress else {},
         }
         if task.status not in _TERMINAL:
-            # 「跑得慢」和「停下来等人」都表现为非终态，但处理方式相反：前者继续等，
-            # 后者重跑只会再起一个任务、把旧的留在后台继续等。这个判断由本工具给出，
-            # 不能丢给模型自己翻流程定义猜——它猜错的代价是一个孤儿任务。
-            if task.status == "paused_for_human" or has_takeover_nodes:
-                result["status"] = "paused_for_human"
+            if task.status == "awaiting_confirmation":
+                result["status"] = "awaiting_confirmation"
                 result["waiting_for_user_action"] = True
                 result["message"] = (
-                    "流程已暂停等待人工接管，浏览器窗口已在桌面打开。"
-                    "请提示用户完成操作后在界面顶部卡片点击【已完成，继续】，不要重新运行流程。"
+                    "流程已暂停等待用户确认扩展中的敏感操作。"
+                    "请提示用户核对操作后在界面顶部卡片点击【确认并继续】，不要重新运行流程。"
                 )
-            elif has_input_nodes:
-                result["status"] = "waiting_for_user_input"
-                result["message"] = (
-                    "流程含 variable.input 节点，正在等待用户在界面输入变量后继续。"
-                    "请提示用户到 RPA 界面底部填写输入后点击【继续】，不要重新运行流程。"
-                )
-                result["waiting_for_user_input"] = True
             else:
                 # 不提示模型去查状态：每轮开头的状态块会自动刷新这个任务的真实进展。
                 result["message"] = (

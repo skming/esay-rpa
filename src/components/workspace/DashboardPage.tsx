@@ -1,4 +1,4 @@
-import { Activity, AlertTriangle, ArrowUpRight, CalendarClock, CheckCircle2, Clock3, Hand } from 'lucide-react';
+import { Activity, AlertTriangle, ArrowUpRight, CalendarClock, CheckCircle2, Clock3, ShieldCheck } from 'lucide-react';
 import type { ReactElement } from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
@@ -228,7 +228,7 @@ function AttentionPanel({
 }
 
 const ATTENTION_META = {
-  human: { icon: Hand, label: '等待接管', surface: 'bg-amber-50', text: 'text-amber-700' },
+  confirmation: { icon: ShieldCheck, label: '等待确认', surface: 'bg-amber-50', text: 'text-amber-700' },
   'run-error': { icon: AlertTriangle, label: '运行失败', surface: 'bg-red-50', text: 'text-red-600' },
   'schedule-error': { icon: CalendarClock, label: '调度错误', surface: 'bg-red-50', text: 'text-red-600' },
 } satisfies Record<OperationalAttentionItem['kind'], { icon: typeof AlertTriangle; label: string; surface: string; text: string }>;

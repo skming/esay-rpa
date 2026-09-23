@@ -282,12 +282,6 @@ NODE_TYPE_CATALOG: list[dict[str, str]] = [
         ),
     },
     {
-        "type": "control.human_takeover",
-        "key_fields": "title, message, timeoutMs",
-        "output_var_field": "（无输出变量）",
-        "description": "暂停流程等待人工接管：流程进入 paused_for_human 状态，桌面弹出操作卡片。title（必填，6字以内）显示为卡片标题（如「请完成滑块验证」「请扫码登录」）；message（必填）两句话：① 原因句说明为何暂停/检测到什么（如「检测到极验滑块验证，自动化无法通过」），② 操作句告知用户在浏览器中要做什么——禁止写泛化描述「请完成手动操作」，禁止写 UI 导航指引「点击继续/橙色横幅」；timeoutMs 默认 600000（10 分钟），超时按任务停止（非失败）处理。",
-    },
-    {
         "type": "control.subprocess",
         "key_fields": "flowId",
         "output_var_field": "（无输出变量）",
@@ -305,12 +299,6 @@ NODE_TYPE_CATALOG: list[dict[str, str]] = [
         "key_fields": "variableName",
         "output_var_field": "outputVariable（读取值存入该变量）",
         "description": "读取变量值到另一个变量",
-    },
-    {
-        "type": "variable.input",
-        "key_fields": "message（提示文字）, variableName（存储变量名，必填）",
-        "output_var_field": "variableName（用户输入存入该变量，必填；注意：不是 outputVariable）",
-        "description": "弹出输入框等待用户输入，message 为提示文字，variableName 为存储变量名",
     },
     {
         "type": "variable.log",
@@ -393,13 +381,12 @@ NODE_TYPE_CATALOG: list[dict[str, str]] = [
             "若用户需要在本地查看/编辑脚本文件，同时填 path（相对路径如 scripts/run.py）和 code（初始内容），"
             "首次运行时自动在工作区生成该文件，后续执行用户修改后的版本。"
             "path 只能是相对路径，工作区根目录为 ~/.easy-rpa/workspace/。"
-            "【关键】脚本是独立子进程，流程变量必须从环境变量读取："
-            "import json,os; _v=json.loads(os.environ.get('RPA_VARIABLES_JSON','{}')); val=_v.get('变量名','')"
-            "——直接写变量名（如 data=my_var）会报 NameError。"
+            "【关键】运行器自动注入完整变量字典 _vars，使用 _vars.get('变量名') 读取；"
+            "直接写变量名（如 data=my_var）会报 NameError。"
             "普通运行时变量自动注入；读取 sensitive:true 或 category:'credential' 的受保护变量时，"
             "节点必须在 inputVariables 中显式授权。"
-            "【输出文件】产物写到 _v['output_dir'] 下、文件名带 _v['run_timestamp']（如 "
-            "os.path.join(_v['output_dir'], 'data_%s.json' % _v['run_timestamp'])），先 os.makedirs(_v['output_dir'], exist_ok=True)。"
+            "【输出文件】产物写到 _vars['output_dir'] 下、文件名带 _vars['run_timestamp']（如 "
+            "os.path.join(_vars['output_dir'], 'data_%s.json' % _vars['run_timestamp'])），先 os.makedirs(_vars['output_dir'], exist_ok=True)。"
             + describe_script_capabilities()
         ),
     },
@@ -516,6 +503,10 @@ NODE_TYPE_CATALOG: list[dict[str, str]] = [
         "description": "按列过滤或排序 Excel 行；filter 是等值匹配，不支持表达式。column 缺失时原样返回全部行",
     },
 ]
+
+
+# 已移除的流程节点。保留集合只为在写入/运行前给出明确错误，避免未知节点被静默跳过。
+REMOVED_FLOW_NODE_TYPES = frozenset({"control.human_takeover", "variable.input"})
 
 
 def select_node_types(types: list[str] | None) -> dict[str, object]:

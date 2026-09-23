@@ -133,24 +133,12 @@ class BackendClient {
     });
   }
 
-  async provideInput(taskId, value) {
-    if (typeof taskId !== 'string' || taskId.length === 0) {
-      throw new Error('taskId is required.');
-    }
-    return this.#request(`/api/tasks/${encodeURIComponent(taskId)}/input`, {
-      method: 'POST',
-      body: { value: typeof value === 'string' ? value : '' },
-      timeoutMs: 5000
-    });
-  }
-
-  async resumeHumanTakeover(taskId, resumeMode) {
+  async resumeConfirmation(taskId) {
     if (typeof taskId !== 'string' || taskId.length === 0) {
       throw new Error('taskId is required.');
     }
     return this.#request(`/api/tasks/${encodeURIComponent(taskId)}/resume`, {
       method: 'POST',
-      body: { resume_mode: typeof resumeMode === 'string' ? resumeMode : 'next_node' },
       timeoutMs: 5000
     });
   }

@@ -43,8 +43,8 @@ export interface ContentAction {
   | 'automation.pointer'
   | 'automation.activity'
   | 'automation.pageBlock'
-  | 'takeover.show'
-  | 'takeover.hide';
+  | 'confirmation.show'
+  | 'confirmation.hide';
   /** 优先定位方式：上一次 query/find 快照里返回的 ref */
   ref?: string;
   /** 兼容/兜底定位方式：裸 CSS 选择器（用于手工测试或 ref 未产出的场景） */
@@ -67,16 +67,16 @@ export interface ContentAction {
   limit?: number;
   /** browser.scroll 使用：page-level 滚动像素数，对齐 BrowserActionRunner 的 distance 字段名 */
   distance?: number;
-  /** takeover.show 使用：展示给用户的接管说明文案 */
+  /** confirmation.show 使用：展示给用户的敏感操作说明 */
   message?: string;
-  /** takeover.show 使用：所属的后端任务 id，点击"继续"按钮时带回去调 resume 接口 */
+  /** confirmation.show 使用：所属的后端任务 id，点击"继续"按钮时带回去调 resume 接口 */
   taskId?: string;
   /** automation.pointer 使用：视口坐标，由 background 的 CDP 可信输入路径回传视觉反馈 */
   x?: number;
   y?: number;
   /** automation.pointer 使用：是否在该坐标绘制点击波纹 */
   pulse?: boolean;
-  /** automation.pageBlock 使用：运行中禁用页面交互，人工接管/流程结束时放开 */
+  /** automation.pageBlock 使用：运行中禁用页面交互，等待确认或流程结束时放开 */
   blocked?: boolean;
   /** page.observe 使用：只观察这个选择器命中的区域；命中不到直接报错，绝不回退整页 */
   scope?: string | null;

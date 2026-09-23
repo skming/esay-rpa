@@ -254,7 +254,7 @@ function createRuntimeController({ backendClient = new BackendClient(), sendEven
       knownNodeIds: collectKnownNodeIds(payload.flowDefinition),
       lastActiveNodeId: null,
       artifactIds: new Set(),
-      lastInputPrompt: null,
+      lastConfirmationMessage: null,
       lastLogIds: new Set(),
       nodeStates: new Map(),
       runId,
@@ -304,10 +304,10 @@ function createRuntimeController({ backendClient = new BackendClient(), sendEven
         }
       }
 
-      // Poll-based fallback: surface the input dialog even when the WebSocket log was missed.
-      if (snapshot.inputPrompt != null && snapshot.inputPrompt !== activeRun.lastInputPrompt) {
-        activeRun.lastInputPrompt = snapshot.inputPrompt;
-        const syntheticId = `${runId}:poll-input`;
+      // Poll-based fallback: surface the sensitive-action confirmation even when the WebSocket log was missed.
+      if (snapshot.confirmationMessage != null && snapshot.confirmationMessage !== activeRun.lastConfirmationMessage) {
+        activeRun.lastConfirmationMessage = snapshot.confirmationMessage;
+        const syntheticId = `${runId}:poll-confirmation`;
         if (!activeRun.lastLogIds.has(syntheticId)) {
           activeRun.lastLogIds.add(syntheticId);
           emit(activeRun.win, {
@@ -317,13 +317,15 @@ function createRuntimeController({ backendClient = new BackendClient(), sendEven
               id: syntheticId,
               time: formatLogTime(new Date()),
               level: 'input',
-              message: snapshot.inputPrompt,
+              message: snapshot.confirmationMessage,
               nodeId: activeRun.lastActiveNodeId ?? 'n1'
             }
           });
         }
-      } else if (snapshot.inputPrompt == null) {
-        activeRun.lastInputPrompt = null;
+      } else if (snapshot.confirmationMessage == null && activeRun.lastConfirmationMessage !== null) {
+        // 确认被解决/超时清空后派发清除，否则桌面确认浮层会一直挂到 run:finish。
+        activeRun.lastConfirmationMessage = null;
+        emit(activeRun.win, { type: 'run:confirmation', payload: { runId, message: null } });
       }
 
       const totalSteps = readBackendTotalSteps(snapshot.progress);
@@ -485,10 +487,10 @@ function createRuntimeController({ backendClient = new BackendClient(), sendEven
       activeRun.lastLogIds.add(log.id);
     }
     const level = normalizeLogLevel(log.level);
-    // Track input prompt so the poll-based fallback can detect duplicates.
+    // Track the confirmation message so the poll-based fallback can detect duplicates.
     if (level === 'input' && activeRun?.runId === runId) {
-      activeRun.lastInputPrompt = log.detail ?? log.message;
-      activeRun.lastLogIds.add(`${runId}:poll-input`);
+      activeRun.lastConfirmationMessage = log.detail ?? log.message;
+      activeRun.lastLogIds.add(`${runId}:poll-confirmation`);
     }
     const nodeId = resolveBackendLogNodeId(log, activeRun?.lastActiveNodeId);
     applyBackendNodeState(win, runId, nodeId, log);
