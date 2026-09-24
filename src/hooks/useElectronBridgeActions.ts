@@ -254,6 +254,12 @@ export function useElectronBridgeActions({
           pushToast('error', '流程文件不是有效 JSON');
           return false;
         }
+        // JSON 合法不等于是流程文件：不校验的话任意 JSON（如 package.json）也会被存成一个空流程。
+        // 复用画布还原逻辑判定——还原不出任何节点即判为非流程文件，避免再立一套结构白名单。
+        if (restoreFlowCanvas(definition) === null) {
+          pushToast('error', '该文件不是有效的流程文件');
+          return false;
+        }
 
         // 清除旧草稿，避免页面重新挂载时恢复之前的流程
         clearDraftStorage();

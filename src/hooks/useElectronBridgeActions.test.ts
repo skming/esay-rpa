@@ -161,6 +161,55 @@ describe('流程恢复的输入变量归属', () => {
   });
 });
 
+describe('导入流程文件', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  // openFlow 与 createFlow 都经 callBridge 调用，桥接层按被调方法名分发并解包 BridgeResult。
+  function importBridge(fileContent: string, createFlow: ReturnType<typeof vi.fn>) {
+    const openFlow = vi.fn(async () => ({ ok: true as const, data: { canceled: false, name: '导入.rpa.json', content: fileContent } }));
+    const call = async <T,>(action: (api: import('../types/electron').RpaBridge) => Promise<BridgeResult<T>>): Promise<T | null> => {
+      const result = await action({ openFlow, createFlow } as unknown as import('../types/electron').RpaBridge);
+      return result.ok ? result.data ?? null : null;
+    };
+    return { call, openFlow };
+  }
+
+  it('合法 JSON 但不是流程文件时报错，不创建流程也不动画布', async () => {
+    const createFlow = vi.fn();
+    const { call } = importBridge('{"dependencies":{"react":"^19"}}', createFlow);
+    const { actions, params } = renderActions(call);
+
+    expect(await actions.openFlow()).toBe(false);
+    expect(params.pushToast).toHaveBeenCalledWith('error', '该文件不是有效的流程文件');
+    expect(createFlow).not.toHaveBeenCalled();
+    expect(params.setFlowNodes).not.toHaveBeenCalled();
+    expect(params.resetRunView).not.toHaveBeenCalled();
+  });
+
+  it('内容不是 JSON 时报错', async () => {
+    const createFlow = vi.fn();
+    const { call } = importBridge('not json at all', createFlow);
+    const { actions, params } = renderActions(call);
+
+    expect(await actions.openFlow()).toBe(false);
+    expect(params.pushToast).toHaveBeenCalledWith('error', '流程文件不是有效 JSON');
+    expect(createFlow).not.toHaveBeenCalled();
+  });
+
+  it('有效流程文件正常导入并保存', async () => {
+    const createFlow = vi.fn(async (payload) => ({ ok: true as const, data: { ...savedFlow, ...payload, flowId: 'imported' } }));
+    const content = JSON.stringify(buildFlowDefinition(initialNodes, initialEdges, savedVariables, '导入的流程'));
+    const { call } = importBridge(content, createFlow);
+    const { actions, params } = renderActions(call);
+
+    expect(await actions.openFlow()).toBe(true);
+    expect(createFlow).toHaveBeenCalledWith(expect.objectContaining({ name: '导入的流程', status: 'draft' }));
+    expect(params.setFlowNodes).toHaveBeenCalledOnce();
+  });
+});
+
 describe('脚本生成与导出', () => {
   beforeEach(() => {
     vi.clearAllMocks();
