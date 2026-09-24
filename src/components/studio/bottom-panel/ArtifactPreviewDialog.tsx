@@ -3,8 +3,8 @@ import { JsonView, allExpanded } from 'react-json-view-lite';
 import 'react-json-view-lite/dist/index.css';
 import './json-view-theme.css';
 import { rpaJsonViewStyles } from './jsonViewStyles';
-import type { ReactElement, ReactNode } from 'react';
-import { useEffect, useRef, useState } from 'react';
+import type { MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, ReactElement, ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
@@ -174,9 +174,8 @@ export function ArtifactPreviewContent({ content, loading }: { content: Artifact
         )}
       </div>
       {isImage ? (
-        <div className="grid min-h-0 flex-1 place-items-center overflow-auto bg-slate-900 p-4">
-          <img alt={filename} className="max-h-full max-w-full rounded border border-white/10 object-contain" src={content.content} />
-        </div>
+        // key 让换图时缩放状态随之复位到 100%，无需在 effect 里手工重置
+        <ImagePreview alt={filename} key={artifactId} src={content.content} />
       ) : ooxmlExt ? (
         // key 让换文档时预览器整体重挂载，页码/状态随之复位，无需在 effect 里手工重置
         <OoxmlPreview content={content.content} ext={ooxmlExt} key={artifactId} />
@@ -197,12 +196,172 @@ export function ArtifactPreviewContent({ content, loading }: { content: Artifact
   );
 }
 
+// 平移边界：offsetWidth/Height 是 transform 前的布局尺寸，乘 scale 得显示尺寸；只有溢出容器的部分可平移
+function clampPan(container: HTMLElement | null, img: HTMLElement | null, x: number, y: number, scale: number): { x: number; y: number } {
+  if (container === null || img === null) return { x, y };
+  const maxX = Math.max(0, (img.offsetWidth * scale - container.clientWidth) / 2);
+  const maxY = Math.max(0, (img.offsetHeight * scale - container.clientHeight) / 2);
+  return { x: Math.min(maxX, Math.max(-maxX, x)), y: Math.min(maxY, Math.max(-maxY, y)) };
+}
+
+function ImagePreview({ alt, src }: { alt: string; src: string }): ReactElement {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const imgRef = useRef<HTMLImageElement>(null);
+  const dragRef = useRef<{ x: number; y: number; ox: number; oy: number } | null>(null);
+  const [scale, setScale] = useState(1);
+  const [offset, setOffset] = useState({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+  const [ratioVisible, setRatioVisible] = useState(false);
+  // wheel/拖拽/双击高频触发：实时值累积到 ref，用 rAF 每帧只提交一次 state；缩放以焦点为锚
+  const scaleRef = useRef(1);
+  const offsetRef = useRef({ x: 0, y: 0 });
+  const committedScaleRef = useRef(1);  // offsetRef 所对应的已提交缩放，是缩放锚点换算的分母；双击直改缩放时必须一起更新
+  const hideTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  // 展示比例并计时淡出；wheel 与双击共用同一 ref 计时器；useCallback 保持引用稳定，wheel effect 才能只订阅一次
+  const pokeRatio = useCallback((): void => {
+    setRatioVisible(true);
+    clearTimeout(hideTimerRef.current);
+    hideTimerRef.current = setTimeout(() => setRatioVisible(false), 800);
+  }, []);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (el === null) return;
+    // 滚轮与触控板捏合统一走 wheel 缩放；React onWheel 是 passive 无法 preventDefault，只有原生非 passive 监听能拦掉整页缩放
+    let raf = 0;
+    const flush = (): void => {
+      raf = 0;
+      const s = scaleRef.current;
+      // 以容器中心为锚：offset 随缩放比例同步放缩，让中心处的图像点在缩放中保持不动
+      const prev = committedScaleRef.current;
+      const anchored = s <= 1
+        ? { x: 0, y: 0 }
+        : { x: offsetRef.current.x * (s / prev), y: offsetRef.current.y * (s / prev) };
+      const clamped = clampPan(containerRef.current, imgRef.current, anchored.x, anchored.y, s);
+      committedScaleRef.current = s;
+      offsetRef.current = clamped;
+      setScale(s);
+      setOffset(clamped);
+    };
+    const onWheel = (e: WheelEvent): void => {
+      e.preventDefault();
+      // 不做 0.01 量化，保留触控板捏合的连续步进；比例数字在渲染处再取整
+      scaleRef.current = Math.min(4, Math.max(0.25, scaleRef.current * Math.exp(-e.deltaY * 0.0015)));
+      if (raf === 0) raf = requestAnimationFrame(flush);
+      pokeRatio();
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => {
+      el.removeEventListener('wheel', onWheel);
+      clearTimeout(hideTimerRef.current);
+      if (raf !== 0) cancelAnimationFrame(raf);
+    };
+  }, [pokeRatio]);
+
+  const onPointerDown = (e: ReactPointerEvent<HTMLDivElement>): void => {
+    if (scaleRef.current <= 1) return;
+    dragRef.current = { x: e.clientX, y: e.clientY, ox: offsetRef.current.x, oy: offsetRef.current.y };
+    setDragging(true);
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+  const onPointerMove = (e: ReactPointerEvent<HTMLDivElement>): void => {
+    const d = dragRef.current;
+    if (d === null) return;
+    const next = clampPan(containerRef.current, imgRef.current, d.ox + e.clientX - d.x, d.oy + e.clientY - d.y, scaleRef.current);
+    offsetRef.current = next;
+    setOffset(next);
+  };
+  const endDrag = (): void => {
+    dragRef.current = null;
+    setDragging(false);
+  };
+  // 双击切换：已放大则复位到适配；否则放大到双击点并保持该点不动
+  const onToggleZoom = (e: ReactMouseEvent<HTMLDivElement>): void => {
+    const c = containerRef.current;
+    if (c === null) return;
+    if (scaleRef.current > 1) {
+      scaleRef.current = 1;
+      committedScaleRef.current = 1;
+      offsetRef.current = { x: 0, y: 0 };
+      setScale(1);
+      setOffset({ x: 0, y: 0 });
+    } else {
+      const s1 = committedScaleRef.current;
+      const s2 = 2;
+      const rect = c.getBoundingClientRect();
+      // 双击点相对容器中心的位移；screenRel = o + s·u 恒定 → o2 = screenRel·(1 - s2/s1) + o1·(s2/s1) 使该点缩放后不动
+      const px = e.clientX - rect.left - rect.width / 2;
+      const py = e.clientY - rect.top - rect.height / 2;
+      const o = clampPan(
+        c,
+        imgRef.current,
+        px * (1 - s2 / s1) + offsetRef.current.x * (s2 / s1),
+        py * (1 - s2 / s1) + offsetRef.current.y * (s2 / s1),
+        s2,
+      );
+      scaleRef.current = s2;
+      committedScaleRef.current = s2;
+      offsetRef.current = o;
+      setScale(s2);
+      setOffset(o);
+    }
+    pokeRatio();
+  };
+
+  return (
+    <div className="relative flex min-h-0 flex-1 flex-col bg-slate-900">
+      <div
+        className="grid min-h-0 flex-1 place-items-center overflow-hidden p-4"
+        onDoubleClick={onToggleZoom}
+        onPointerDown={onPointerDown}
+        onPointerLeave={endDrag}
+        onPointerMove={onPointerMove}
+        onPointerUp={endDrag}
+        ref={containerRef}
+        style={{ cursor: scale > 1 ? (dragging ? 'grabbing' : 'grab') : 'default' }}
+      >
+        <img
+          alt={alt}
+          className="max-h-full max-w-full select-none rounded border border-white/10 object-contain"
+          draggable={false}
+          ref={imgRef}
+          src={src}
+          style={{ transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale})` }}
+        />
+      </div>
+      <div
+        className={`pointer-events-none absolute bottom-4 left-1/2 -translate-x-1/2 rounded-full bg-slate-950/80 px-3 py-1 font-mono text-[11px] tabular-nums text-slate-100 shadow-lg backdrop-blur transition-opacity duration-300 ${ratioVisible ? 'opacity-100' : 'opacity-0'}`}
+      >
+        {Math.round(scale * 100)}%
+      </div>
+    </div>
+  );
+}
+
 type PagedViewer = {
   destroy(): void;
   next?(): Promise<void>;
   prev?(): Promise<void>;
   pageCount: number;
 };
+
+// adaptive：超预算时降采样而非硬失败；256MiB 为经验上限
+// 勿静态 import 该包类型：会把其声明图连带 @types/node/ffi.d.ts 拉进 tsc，本地 tsc 解析不了会整 build 失败
+const OOXML_IMAGE_RESOURCES = {
+  strategy: 'adaptive',
+  resolution: 'display',
+  decodedByteBudget: 256 * 1024 * 1024,
+} as const;
+
+// 按 code 鸭子判别而非 import 运行时 guard：保住按格式懒加载，不把 ooxml 主包提前打进 bundle
+function friendlyOoxmlError(e: unknown): string {
+  const err = e as { code?: unknown; message?: unknown } | null;
+  const code = typeof err?.code === 'string' ? err.code : '';
+  if (code === 'ooxml-decoded-image-limit') return '内嵌图片过大，超出预览解码上限；请用本地软件打开。';
+  if (code === 'ooxml-resource-limit') return '文档过大或过于复杂，超出预览上限；请用本地软件打开。';
+  return typeof err?.message === 'string' && err.message ? err.message : '文件解析失败';
+}
 
 function OoxmlPreview({ content, ext }: { content: string; ext: string }): ReactElement {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -235,7 +394,7 @@ function OoxmlPreview({ content, ext }: { content: string; ext: string }): React
         if (isXlsx) {
           const mod = await withTimeout(import('@silurus/ooxml/xlsx'), 15000, 'import xlsx');
           if (cancelled || !containerRef.current) return;
-          const v = new mod.XlsxViewer(containerRef.current);
+          const v = new mod.XlsxViewer(containerRef.current, { imageResources: OOXML_IMAGE_RESOURCES });
           console.debug('[OoxmlPreview] XlsxViewer created, loading…');
           await withTimeout(v.load(buffer), 30000, 'xlsx load');
           if (cancelled) { v.destroy(); return; }
@@ -244,7 +403,7 @@ function OoxmlPreview({ content, ext }: { content: string; ext: string }): React
         } else if (isDocx) {
           const mod = await withTimeout(import('@silurus/ooxml/docx'), 15000, 'import docx');
           if (cancelled || !canvasRef.current) return;
-          const v = new mod.DocxViewer(canvasRef.current);
+          const v = new mod.DocxViewer(canvasRef.current, { imageResources: OOXML_IMAGE_RESOURCES });
           console.debug('[OoxmlPreview] DocxViewer created, loading…');
           await withTimeout(v.load(buffer), 30000, 'docx load');
           if (cancelled) { v.destroy(); return; }
@@ -260,7 +419,7 @@ function OoxmlPreview({ content, ext }: { content: string; ext: string }): React
         } else {
           const mod = await withTimeout(import('@silurus/ooxml/pptx'), 15000, 'import pptx');
           if (cancelled || !canvasRef.current) return;
-          const v = new mod.PptxViewer(canvasRef.current);
+          const v = new mod.PptxViewer(canvasRef.current, { imageResources: OOXML_IMAGE_RESOURCES });
           console.debug('[OoxmlPreview] PptxViewer created, loading…');
           await withTimeout(v.load(buffer), 30000, 'pptx load');
           if (cancelled) { v.destroy(); return; }
@@ -277,7 +436,7 @@ function OoxmlPreview({ content, ext }: { content: string; ext: string }): React
         if (!cancelled) setStatus('ready');
       } catch (e) {
         console.error('[OoxmlPreview] error:', e);
-        if (!cancelled) { setError((e as Error).message ?? String(e)); setStatus('error'); }
+        if (!cancelled) { setError(friendlyOoxmlError(e)); setStatus('error'); }
       }
     };
 
