@@ -12,12 +12,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from httpx import ASGITransport, AsyncClient
+
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
-
-from httpx import ASGITransport, AsyncClient
-
 
 @dataclass(frozen=True)
 class MonitorRecord:

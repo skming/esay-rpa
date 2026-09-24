@@ -6,14 +6,14 @@ import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from lxml import html
+
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from lxml import html
-
-from app.models.schemas import AnalyzeSiteRequest
-from app.services.site_analyzer import SiteAnalyzer
+from app.models.schemas import AnalyzeSiteRequest  # noqa: E402
+from app.services.site_analyzer import SiteAnalyzer  # noqa: E402
 
 
 @dataclass(frozen=True)

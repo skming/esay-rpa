@@ -6,7 +6,6 @@ unread_node_field 的判据是「平台没人读这个键」，名单少收一�
 """
 from __future__ import annotations
 
-import json
 import pathlib
 import re
 

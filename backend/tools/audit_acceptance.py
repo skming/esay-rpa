@@ -5,7 +5,6 @@ import json
 import os
 import re
 import shutil
-import sys
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path

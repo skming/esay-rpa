@@ -11,16 +11,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from httpx import ASGITransport, AsyncClient
+
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from httpx import ASGITransport, AsyncClient
-
-from app.models.schemas import RunTaskRequest, ScrapeResult
-from app.services.log_broker import LogBroker
-from app.services.scheduler_service import ScheduleService
-from app.services.task_manager import TaskManager
+from app.models.schemas import RunTaskRequest, ScrapeResult  # noqa: E402
+from app.services.log_broker import LogBroker  # noqa: E402
+from app.services.scheduler_service import ScheduleService  # noqa: E402
+from app.services.task_manager import TaskManager  # noqa: E402
 
 
 @dataclass(frozen=True)
