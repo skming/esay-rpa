@@ -6,7 +6,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import update
 
 import app.main as main_module
-from app.models.schemas import FlowCreateRequest, FlowUpdateRequest, RunTaskRequest, RuntimeProgress, ScheduleSnapshot, TaskSnapshot
+from app.models.schemas import FlowCreateRequest, FlowUpdateRequest, RunTaskRequest, RuntimeProgress, ScheduleSnapshot, ScheduleTaskRequest, TaskSnapshot
 from app.services.flow_service import FlowService
 from app.services.flow_store import FlowRow, SqlAlchemyFlowStore
 from app.services.schedule_store import ScheduleRow, SqlAlchemyScheduleStore, create_schedule_engine
@@ -39,6 +39,15 @@ def _definition() -> dict:
 
 def _task_request() -> RunTaskRequest:
     return RunTaskRequest(
+        flowId="flow-current",
+        flowName="当前契约任务",
+        acceptanceContract=_contract(),
+        timeoutMs=1000,
+    )
+
+
+def _schedule_task_request() -> ScheduleTaskRequest:
+    return ScheduleTaskRequest(
         flowId="flow-current",
         flowName="当前契约任务",
         acceptanceContract=_contract(),
@@ -87,7 +96,7 @@ async def test_current_contract_round_trips_through_all_stores(tmp_path) -> None
         cronExpression="* * * * *",
         timezone="UTC",
         status="enabled",
-        task=_task_request(),
+        task=_schedule_task_request(),
         createdAt=now,
         updatedAt=now,
         nextRunAt=now + timedelta(minutes=1),

@@ -428,6 +428,36 @@ async def test_task_debug_endpoint_continues_paused_breakpoint() -> None:
 async def test_schedule_crud_and_manual_trigger_endpoints() -> None:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
         try:
+            # 绑定一个真实的 active 流程，让手动触发有确定的运行目标：不绑定即「所有流程」模式，
+            # 触发结果取决于全局库里恰好残留了哪些别的测试建的流程，孤立运行时库为空会正确报「没有可运行的流程」。
+            flow_response = await client.post(
+                "/api/flows",
+                json={
+                    "name": "调度 CRUD 流程",
+                    "version": "v1.0.0",
+                    "status": "active",
+                    "definition": {
+                        "nodes": [
+                            {"id": "start", "type": "start"},
+                            {
+                                "id": "fetch",
+                                "type": "browser.fetch",
+                                "targetUrl": "https://quotes.toscrape.com/",
+                                "selector": ".quote .text::text",
+                                "fetcher": "static",
+                                "extractMode": "text",
+                                "outputVariable": "crud_rows",
+                                "timeoutMs": 1000,
+                            },
+                        ],
+                        "edges": [{"source": "start", "target": "fetch"}],
+                    },
+                    "acceptanceContract": acceptance_contract("crud_rows"),
+                },
+            )
+            assert flow_response.status_code == 200
+            crud_flow_id = flow_response.json()["flowId"]
+
             create_response = await client.post(
                 "/api/schedules",
                 json={
@@ -436,6 +466,7 @@ async def test_schedule_crud_and_manual_trigger_endpoints() -> None:
                     "timezone": "Asia/Shanghai",
                     "enabled": True,
                     "task": {
+                        "flowId": crud_flow_id,
                         "flowName": "调度 API 测试",
                         "targetUrl": "https://quotes.toscrape.com/",
                         "selector": ".quote .text::text",
@@ -536,6 +567,16 @@ async def test_schedule_trigger_runs_bound_flow_endpoint() -> None:
             filtered_response = await client.get(f"/api/tasks?flowId={flow_id}&limit=5")
             assert filtered_response.status_code == 200
             assert [run["taskId"] for run in filtered_response.json()] == [task_id]
+
+            summaries_response = await client.get("/api/schedules:run-summaries")
+            assert summaries_response.status_code == 200
+            summaries = summaries_response.json()
+            assert schedule_id in summaries
+            summary = summaries[schedule_id]
+            assert summary["scheduleId"] == schedule_id
+            assert summary["total"] >= 1
+            assert task_id in summary["taskIds"]
+            assert summary["status"] in {"running", "success", "failed", "partial", "stopped", "empty"}
         finally:
             await restart_global_workers()
 
@@ -804,3 +845,18 @@ async def test_extension_execute_hook_refuses_when_disabled_in_settings(monkeypa
 
     assert response.status_code == 409
     assert "关闭" in response.json()["detail"]
+
+
+async def test_schedule_preview_uses_backend_cron_and_rejects_invalid_expression() -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        preview = await client.get(
+            "/api/schedules:preview",
+            params={"cronExpression": "0 9 1 * 1", "timezone": "Asia/Shanghai"},
+        )
+        invalid = await client.get(
+            "/api/schedules:preview",
+            params={"cronExpression": "99 99 * * *", "timezone": "Asia/Shanghai"},
+        )
+    assert preview.status_code == 200
+    assert len(preview.json()) == 5
+    assert invalid.status_code == 422

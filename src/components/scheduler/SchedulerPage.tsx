@@ -22,8 +22,8 @@ export function SchedulerPage({ electron }: { electron: ElectronBridgeState }): 
   const query = searchParams.get('q') ?? '';
 
   const schedules = useMemo(
-    () => filterSchedules(electron.schedules, filter, query),
-    [electron.schedules, filter, query],
+    () => filterSchedules(electron.schedules, filter, query, electron.scheduleRunSummaries),
+    [electron.schedules, electron.scheduleRunSummaries, filter, query],
   );
 
   useEffect(() => {
@@ -31,7 +31,22 @@ export function SchedulerPage({ electron }: { electron: ElectronBridgeState }): 
     loadedRef.current = true;
     void electron.loadFlows({ silent: true });
     void electron.loadSchedules({ silent: true });
+    void electron.loadScheduleRunSummaries({ silent: true });
   }, [electron]);
+
+  const { loadSchedules, loadScheduleRunSummaries } = electron;
+  useEffect(() => {
+    let refreshing = false;
+    const timer = window.setInterval(() => {
+      if (refreshing || document.visibilityState === 'hidden') return;
+      refreshing = true;
+      void Promise.all([
+        loadSchedules({ silent: true }),
+        loadScheduleRunSummaries({ silent: true }),
+      ]).finally(() => { refreshing = false; });
+    }, 5_000);
+    return () => window.clearInterval(timer);
+  }, [loadSchedules, loadScheduleRunSummaries]);
 
   const updateSearch = (next: { filter?: ScheduleFilter; query?: string }): void => {
     const params = new URLSearchParams(searchParams);
@@ -48,7 +63,7 @@ export function SchedulerPage({ electron }: { electron: ElectronBridgeState }): 
 
   const counts: Record<ScheduleFilter, number> = {
     all: electron.schedules.length,
-    attention: electron.schedules.filter(hasScheduleError).length,
+    attention: electron.schedules.filter((schedule) => hasScheduleError(schedule, electron.scheduleRunSummaries[schedule.scheduleId])).length,
     disabled: electron.schedules.filter((schedule) => schedule.status === 'disabled').length,
     enabled: electron.schedules.filter((schedule) => schedule.status === 'enabled').length,
   };
@@ -57,7 +72,7 @@ export function SchedulerPage({ electron }: { electron: ElectronBridgeState }): 
     <WorkspaceShell
       actions={
         <>
-          <RefreshButton variant="subtle" onClick={() => electron.loadSchedules()}>刷新</RefreshButton>
+          <RefreshButton variant="subtle" onClick={() => { void electron.loadSchedules(); void electron.loadScheduleRunSummaries(); }}>刷新</RefreshButton>
           <Button onClick={() => setCreateOpen(true)} variant="primary" className="h-8 rounded-md px-3.5">
             <Plus className="h-3.5 w-3.5" strokeWidth={1.75} />
             新建调度
@@ -67,7 +82,7 @@ export function SchedulerPage({ electron }: { electron: ElectronBridgeState }): 
       description="Cron 触发器与手动调度"
       title="调度中心"
     >
-      <SchedulerMetrics schedules={electron.schedules} />
+      <SchedulerMetrics schedules={electron.schedules} runSummaries={electron.scheduleRunSummaries} />
 
       <div className="flex flex-wrap items-center gap-2 rounded-xl border border-rule bg-surface p-2 shadow-xs">
         <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
@@ -110,13 +125,14 @@ export function SchedulerPage({ electron }: { electron: ElectronBridgeState }): 
           hint="新建调度后可在这里启停、手动触发与删除。"
         />
       ) : (
-        <ScheduleListTable electron={electron} schedules={schedules} />
+        <ScheduleListTable electron={electron} runSummaries={electron.scheduleRunSummaries} schedules={schedules} />
       )}
 
       <ScheduleCreateDialog
         flows={electron.flows}
-        onCreate={(options) => { void electron.createDefaultSchedule(options); }}
+        onCreate={electron.createDefaultSchedule}
         onOpenChange={setCreateOpen}
+        onPreview={electron.previewSchedule}
         open={createOpen}
       />
     </WorkspaceShell>

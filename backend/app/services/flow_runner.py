@@ -52,9 +52,8 @@ class FlowRunService:
         executable_nodes = FlowDefinitionSelector.select_executable_nodes(flow.definition, scope=scope, start_node_id=start_node_id)
         if not executable_nodes:
             raise ValueError("流程定义缺少可执行节点")
-        # 默认拒绝：契约是无人值守运行唯一的验收依据，定时任务没人看结果，缺了它跑出垃圾也没人知道。
-        # 但人在面板上点运行时他自己就是验收者，而平台没有任何界面能编写契约，
-        # 一律硬拒等于让手搭的流程一出生就跑不了，且没有出路。
+        # AI 的交付验收要求完整契约；手工运行及空契约调度由调用方显式关闭门控。
+        # 非空契约的调度仍走此校验，避免把残缺契约误当成已验收。
         if enforce_acceptance_contract:
             contract_errors = contract_validation_errors(
                 flow.acceptance_contract,
@@ -81,6 +80,10 @@ class FlowRunService:
             acceptanceContract=flow.acceptance_contract,
             sensitiveVariables=protected_variable_names(flow.input_variables),
             mode=run_request.mode if run_request is not None else mode,
+            # 调度触发时 run_request 实为携带 schedule_id 的 RunTaskRequest；重建请求时若不带过来，
+            # 启动的 task 就与调度失联，批次终态无从聚合、非重叠也判不出。手动运行的 FlowRunRequest
+            # 没有该字段，getattr 取到 None，正是无调度关联的正确值。
+            scheduleId=getattr(run_request, "schedule_id", None) if run_request is not None else None,
             # RunTaskRequest 要求 targetUrl/selector 非空，但非 browser.fetch 流程根本用不到它们；
             # 这里填占位默认值，若存在 browser.fetch 节点会在下方被 build_request_for_fetch_node 覆盖。
             targetUrl="https://quotes.toscrape.com/",

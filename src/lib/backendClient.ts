@@ -20,6 +20,7 @@ import type {
   QueueStats,
   RunStartPayload,
   ScheduleCreatePayload,
+  ScheduleRunSummary,
   ScheduleSnapshot,
   ScheduleUpdatePayload,
   SiteAnalysisResult,
@@ -309,6 +310,15 @@ export class BackendClient {
 
   async listSchedules(): Promise<ScheduleSnapshot[]> {
     return await this.request<ScheduleSnapshot[]>('/api/schedules', { method: 'GET', timeoutMs: 3000 });
+  }
+
+  async listScheduleRunSummaries(): Promise<Record<string, ScheduleRunSummary>> {
+    return await this.request<Record<string, ScheduleRunSummary>>('/api/schedules:run-summaries', { method: 'GET', timeoutMs: 3000 });
+  }
+
+  async previewSchedule(cronExpression: string, timezone: string): Promise<string[]> {
+    const query = new URLSearchParams({ cronExpression, timezone });
+    return await this.request<string[]>(`/api/schedules:preview?${query}`, { method: 'GET', timeoutMs: 3000 });
   }
 
   async createSchedule(payload: ScheduleCreatePayload): Promise<ScheduleSnapshot> {

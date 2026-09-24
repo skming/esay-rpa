@@ -30,6 +30,7 @@ import type {
   RunFailureStrategy,
   RunMode,
   RunScope,
+  ScheduleRunSummary,
   ScheduleSnapshot,
   SiteAnalysisResult,
   TaskSnapshot
@@ -69,6 +70,7 @@ type UseElectronBridgeActionsParams = {
   setRuntimeStatus: Dispatch<SetStateAction<RuntimeStatus>>;
   setRuns: Dispatch<SetStateAction<TaskSnapshot[]>>;
   setSchedules: Dispatch<SetStateAction<ScheduleSnapshot[]>>;
+  setScheduleRunSummaries: Dispatch<SetStateAction<Record<string, ScheduleRunSummary>>>;
   setSiteAnalysis: Dispatch<SetStateAction<SiteAnalysisResult | null>>;
   setVariables: Dispatch<SetStateAction<RuntimeVariable[]>>;
   setLogs: Dispatch<SetStateAction<RunLogEntry[]>>;
@@ -118,10 +120,12 @@ export type ElectronBridgeActions = {
   readArtifact: (taskId: string, artifactId: string) => Promise<void>;
   loadQueueStats: (options?: BridgeCallOptions) => Promise<void>;
   loadSchedules: (options?: BridgeCallOptions) => Promise<void>;
-  createDefaultSchedule: (options?: CreateScheduleOptions) => Promise<void>;
-  createScheduleForFlow: (flowId: string, options?: CreateScheduleOptions) => Promise<void>;
+  loadScheduleRunSummaries: (options?: BridgeCallOptions) => Promise<void>;
+  previewSchedule: (cronExpression: string, timezone: string) => Promise<string[] | null>;
+  createDefaultSchedule: (options?: CreateScheduleOptions) => Promise<boolean>;
+  createScheduleForFlow: (flowId: string, options?: CreateScheduleOptions) => Promise<boolean>;
   updateScheduleEnabled: (scheduleId: string, enabled: boolean) => Promise<void>;
-  updateSchedule: (scheduleId: string, options: CreateScheduleOptions) => Promise<void>;
+  updateSchedule: (scheduleId: string, options: CreateScheduleOptions) => Promise<boolean>;
   deleteSchedule: (scheduleId: string) => Promise<void>;
   triggerSchedule: (scheduleId: string) => Promise<void>;
   minimizeWindow: () => Promise<void>;
@@ -143,10 +147,10 @@ export type StartRunOptions = {
 };
 
 export type CreateScheduleOptions = {
-  browserExecutor?: BrowserExecutorKind;
   cronExpression?: string;
   enabled?: boolean;
   flowId?: string;
+  flowIds?: string[];
   name?: string;
   timezone?: string;
 };
@@ -191,6 +195,7 @@ export function useElectronBridgeActions({
   setRuntimeStatus,
   setRuns,
   setSchedules,
+  setScheduleRunSummaries,
   setSiteAnalysis,
   setVariables,
   setLogs,
@@ -770,20 +775,40 @@ export function useElectronBridgeActions({
           setSchedules(result);
         }
       },
+      loadScheduleRunSummaries: async (options?: BridgeCallOptions) => {
+        const result = await callBridge((api) => api.listScheduleRunSummaries(), undefined, options);
+        if (result !== null) {
+          setScheduleRunSummaries(result);
+        }
+      },
+      previewSchedule: async (cronExpression: string, timezone: string) =>
+        await callBridge((api) => api.previewSchedule(cronExpression, timezone), undefined, { silent: true }),
       createDefaultSchedule: async (options = {}) => {
         const { flowId: targetFlowId } = options;
+        const selectedIds = options.flowIds;
         let taskFlowId: string | undefined;
+        let taskFlowIds: string[] = [];
         let taskFlowName: string;
         let taskFlowDefaultExecutor: BrowserExecutorKind | undefined;
 
-        if (targetFlowId === '__all__') {
+        if (selectedIds !== undefined) {
+          const selected = selectedIds.map((id) => flows.find((flow) => flow.flowId === id));
+          if (selected.some((flow) => flow === undefined)) {
+            pushToast('error', '未找到所选流程');
+            return false;
+          }
+          taskFlowIds = selectedIds.length > 1 ? selectedIds : [];
+          taskFlowId = selectedIds.length === 1 ? selectedIds[0] : undefined;
+          taskFlowName = selectedIds.length === 0 ? '所有流程' : selectedIds.length === 1 ? selected[0]!.name : `${selectedIds.length} 个流程`;
+          taskFlowDefaultExecutor = selectedIds.length === 1 ? selected[0]!.defaultBrowserExecutor : undefined;
+        } else if (targetFlowId === '__all__') {
           taskFlowId = undefined;
           taskFlowName = '所有流程';
         } else if (typeof targetFlowId === 'string' && targetFlowId.length > 0) {
           const target = flows.find((f) => f.flowId === targetFlowId);
           if (target === undefined) {
             pushToast('error', '未找到所选流程');
-            return;
+            return false;
           }
           taskFlowId = target.flowId;
           taskFlowName = target.name;
@@ -792,7 +817,7 @@ export function useElectronBridgeActions({
           const flow = await persistCurrentFlow({ callBridge, currentFlow, flows, flowCanvas, inputVariables });
           if (flow === null) {
             pushToast('error', '创建调度前需要先保存当前流程');
-            return;
+            return false;
           }
           setCurrentFlow(flow);
           setFlows((current) => [flow, ...current.filter((item) => item.flowId !== flow.flowId)]);
@@ -811,8 +836,9 @@ export function useElectronBridgeActions({
               mode: 'run',
               adaptive: true,
               autoSave: true,
-              browserExecutor: options.browserExecutor ?? taskFlowDefaultExecutor,
+              browserExecutor: taskFlowDefaultExecutor,
               flowId: taskFlowId,
+              flowIds: taskFlowIds,
               flowName: taskFlowName,
               timeoutMs: 30_000
             }
@@ -822,12 +848,19 @@ export function useElectronBridgeActions({
           setSchedules((current) => [...current.filter((item) => item.scheduleId !== result.scheduleId), result]);
           pushToast('success', `已创建调度 ${result.name}`);
         }
+        return result !== null;
       },
       createScheduleForFlow: async (flowId: string, options = {}) => {
         const source = flows.find((flow) => flow.flowId === flowId) ?? (currentFlow?.flowId === flowId ? currentFlow : null);
         if (source === null) {
           pushToast('error', '未找到要调度的流程');
-          return;
+          return false;
+        }
+        const selectedIds = options.flowIds ?? [source.flowId];
+        const selected = selectedIds.map((id) => flows.find((flow) => flow.flowId === id));
+        if (selected.some((flow) => flow === undefined)) {
+          pushToast('error', '未找到所选流程');
+          return false;
         }
         const result = await callBridge((api) =>
           api.createSchedule({
@@ -839,9 +872,10 @@ export function useElectronBridgeActions({
               mode: 'run',
               adaptive: true,
               autoSave: true,
-              browserExecutor: options.browserExecutor ?? source.defaultBrowserExecutor,
-              flowId: source.flowId,
-              flowName: source.name,
+              browserExecutor: selectedIds.length === 1 ? selected[0]!.defaultBrowserExecutor : undefined,
+              flowId: selectedIds.length === 1 ? selectedIds[0] : undefined,
+              flowIds: selectedIds.length > 1 ? selectedIds : [],
+              flowName: selectedIds.length === 0 ? '所有流程' : selectedIds.length === 1 ? selected[0]!.name : `${selectedIds.length} 个流程`,
               selector: '',
               targetUrl: '',
               timeoutMs: 30_000
@@ -852,6 +886,7 @@ export function useElectronBridgeActions({
           setSchedules((current) => [...current.filter((item) => item.scheduleId !== result.scheduleId), result]);
           pushToast('success', `已创建调度 ${result.name}`);
         }
+        return result !== null;
       },
       updateScheduleEnabled: async (scheduleId: string, enabled: boolean) => {
         const result = await callBridge((api) => api.updateSchedule(scheduleId, { enabled }));
@@ -862,33 +897,55 @@ export function useElectronBridgeActions({
       },
       updateSchedule: async (scheduleId: string, options: CreateScheduleOptions) => {
         const { flowId: targetFlowId } = options;
-        let taskFlowId: string | undefined;
-        let taskFlowName: string | undefined;
-
-        if (targetFlowId === '__all__') {
-          taskFlowId = undefined;
-          taskFlowName = '所有流程';
-        } else if (typeof targetFlowId === 'string' && targetFlowId.length > 0) {
-          const target = flows.find((f) => f.flowId === targetFlowId);
-          taskFlowId = target?.flowId;
-          taskFlowName = target?.name ?? targetFlowId;
-        }
-
         const existing = (await callBridge((api) => api.listSchedules()))?.find((s) => s.scheduleId === scheduleId);
+        if (existing === undefined) return false;
         const task = existing?.task;
 
+        // flowId 是否随本次编辑传入，决定要不要动流程绑定：
+        // '__all__' 必须真正清空 flowId（改成「所有流程」）；缺省则保留原绑定。
+        // 两者都表现为 flowId 落到 undefined，但含义相反，不能再用 `?? task?.flowId` 混为一谈——
+        // 那正是切「所有流程」后旧 flowId 残留、下次触发仍只跑旧流程的根因。
+        let nextFlowId: string | undefined;
+        let nextFlowIds: string[] = [];
+        let nextFlowName: string | undefined;
+        if (options.flowIds !== undefined) {
+          const selected = options.flowIds.map((id) => flows.find((flow) => flow.flowId === id));
+          if (selected.some((flow) => flow === undefined)) {
+            pushToast('error', '未找到所选流程');
+            return false;
+          }
+          nextFlowIds = options.flowIds.length > 1 ? options.flowIds : [];
+          nextFlowId = options.flowIds.length === 1 ? options.flowIds[0] : undefined;
+          nextFlowName = options.flowIds.length === 0 ? '所有流程' : options.flowIds.length === 1 ? selected[0]!.name : `${options.flowIds.length} 个流程`;
+        } else if (targetFlowId === '__all__') {
+          nextFlowId = undefined;
+          nextFlowName = '所有流程';
+        } else if (typeof targetFlowId === 'string' && targetFlowId.length > 0) {
+          const target = flows.find((f) => f.flowId === targetFlowId);
+          nextFlowId = target?.flowId ?? targetFlowId;
+          nextFlowName = target?.name ?? targetFlowId;
+        } else {
+          nextFlowId = task?.flowId;
+          nextFlowIds = task?.flowIds ?? [];
+          nextFlowName = task?.flowName;
+        }
+
+        // 后端 update_schedule 用 request.task or current.task 整包替换，只有流程绑定变化才重建 task。
+        const shouldReplaceTask = targetFlowId !== undefined || options.flowIds !== undefined;
+        const nextFlow = flows.find((flow) => flow.flowId === nextFlowId);
         const result = await callBridge((api) =>
           api.updateSchedule(scheduleId, {
             name: options.name?.trim() ? options.name.trim() : undefined,
             cronExpression: options.cronExpression ? normalizeCronExpression(options.cronExpression) : undefined,
             timezone: options.timezone?.trim() ? options.timezone.trim() : undefined,
             enabled: options.enabled,
-            task: taskFlowName !== undefined || options.browserExecutor !== undefined
+            task: shouldReplaceTask
               ? {
-                  ...(task ?? { mode: 'run', adaptive: true, autoSave: true, flowName: taskFlowName ?? '未命名流程', timeoutMs: 30_000 }),
-                  flowId: taskFlowId ?? task?.flowId,
-                  flowName: taskFlowName ?? task?.flowName ?? '未命名流程',
-                  browserExecutor: options.browserExecutor ?? task?.browserExecutor
+                  ...(task ?? { mode: 'run', adaptive: true, autoSave: true, flowName: nextFlowName ?? '未命名流程', timeoutMs: 30_000 }),
+                  flowId: nextFlowId,
+                  flowIds: nextFlowIds,
+                  flowName: nextFlowName ?? task?.flowName ?? '未命名流程',
+                  browserExecutor: nextFlow?.defaultBrowserExecutor ?? 'playwright'
                 }
               : undefined
           })
@@ -897,6 +954,7 @@ export function useElectronBridgeActions({
           setSchedules((current) => [...current.filter((item) => item.scheduleId !== result.scheduleId), result]);
           pushToast('success', `调度 ${result.name} 已更新`);
         }
+        return result !== null;
       },
       deleteSchedule: async (scheduleId: string) => {
         const result = await callBridge((api) => api.deleteSchedule(scheduleId));
@@ -958,6 +1016,7 @@ export function useElectronBridgeActions({
       setRuntimeStatus,
       setRuns,
       setSchedules,
+      setScheduleRunSummaries,
       setSelectedNodeId,
       setSiteAnalysis,
       setConfirmationMessage,

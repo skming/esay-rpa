@@ -48,7 +48,8 @@ const IPC_CHANNELS = Object.freeze({
     event: 'run:event'
   }),
   runs: Object.freeze({
-    list: 'runs:list'
+    list: 'runs:list',
+    detail: 'runs:detail'
   }),
   script: Object.freeze({
     generate: 'script:generate',
@@ -90,6 +91,8 @@ const IPC_CHANNELS = Object.freeze({
   }),
   schedules: Object.freeze({
     list: 'schedules:list',
+    runSummaries: 'schedules:runSummaries',
+    preview: 'schedules:preview',
     create: 'schedules:create',
     update: 'schedules:update',
     delete: 'schedules:delete',
@@ -122,6 +125,7 @@ function createRpaBridge(ipcRenderer) {
     resumeConfirmation: (runId) => invoke(IPC_CHANNELS.run.resume, runId),
     debugRun: (runId, command) => invoke(IPC_CHANNELS.run.debug, runId, command),
     listRuns: (options) => invoke(IPC_CHANNELS.runs.list, options),
+    getRunDetail: (taskId) => invoke(IPC_CHANNELS.runs.detail, taskId),
     listFlowRuns: (flowId, options) => invoke(IPC_CHANNELS.flows.runs, flowId, options),
     generateScraplingScript: (payload) => invoke(IPC_CHANNELS.script.generate, payload),
     exportScraplingScript: (payload) => invoke(IPC_CHANNELS.script.export, payload),
@@ -147,6 +151,8 @@ function createRpaBridge(ipcRenderer) {
     deleteAiModel: (modelId) => invoke(IPC_CHANNELS.ai.deleteModel, modelId),
     testAiModel: (payload) => invoke(IPC_CHANNELS.ai.testModel, payload),
     listSchedules: () => invoke(IPC_CHANNELS.schedules.list),
+    listScheduleRunSummaries: () => invoke(IPC_CHANNELS.schedules.runSummaries),
+    previewSchedule: (cronExpression, timezone) => invoke(IPC_CHANNELS.schedules.preview, cronExpression, timezone),
     createSchedule: (payload) => invoke(IPC_CHANNELS.schedules.create, payload),
     updateSchedule: (scheduleId, payload) => invoke(IPC_CHANNELS.schedules.update, scheduleId, payload),
     deleteSchedule: (scheduleId) => invoke(IPC_CHANNELS.schedules.delete, scheduleId),

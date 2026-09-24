@@ -293,6 +293,10 @@ function registerIpcHandlers({
   // 纯后端转发类 IPC 统一用表驱动注册，减少重复 try/catch，也让通道清单更容易审计。
   const backendRoutes = [
     [IPC_CHANNELS.runs.list, (_event, options) => backendClient.listTasks(options)],
+    [IPC_CHANNELS.runs.detail, async (_event, taskId) => {
+      const [run, logs] = await Promise.all([backendClient.getTask(taskId), backendClient.getLogs(taskId)]);
+      return { run, logs };
+    }],
     [IPC_CHANNELS.flows.runs, (_event, flowId, options) => backendClient.listFlowRuns(flowId, options)],
     [IPC_CHANNELS.script.generate, (_event, payload) => generateScraplingScript(payload)],
     [IPC_CHANNELS.site.analyze, (_event, payload) => backendClient.analyzeSite(payload)],
@@ -317,6 +321,8 @@ function registerIpcHandlers({
     [IPC_CHANNELS.ai.deleteModel, (_event, modelId) => backendClient.deleteAiModel(modelId)],
     [IPC_CHANNELS.ai.testModel, (_event, payload) => backendClient.testAiModel(payload)],
     [IPC_CHANNELS.schedules.list, () => backendClient.listSchedules()],
+    [IPC_CHANNELS.schedules.runSummaries, () => backendClient.listScheduleRunSummaries()],
+    [IPC_CHANNELS.schedules.preview, (_event, cronExpression, timezone) => backendClient.previewSchedule(cronExpression, timezone)],
     [IPC_CHANNELS.schedules.create, (_event, payload) => backendClient.createSchedule(payload)],
     [IPC_CHANNELS.schedules.update, (_event, scheduleId, payload) => backendClient.updateSchedule(scheduleId, payload)],
     [IPC_CHANNELS.schedules.delete, (_event, scheduleId) => backendClient.deleteSchedule(scheduleId)]

@@ -1,4 +1,4 @@
-import type { ScheduleSnapshot } from '../types/electron';
+import type { ScheduleRunSummary, ScheduleSnapshot } from '../types/electron';
 
 export type ScheduleFilter = 'all' | 'attention' | 'enabled' | 'disabled';
 export type CronFields = {
@@ -9,12 +9,17 @@ export type CronFields = {
   dayOfWeek: string;
 };
 
-export function filterSchedules(schedules: ScheduleSnapshot[], filter: ScheduleFilter, query: string): ScheduleSnapshot[] {
+export function filterSchedules(
+  schedules: ScheduleSnapshot[],
+  filter: ScheduleFilter,
+  query: string,
+  runSummaries: Record<string, ScheduleRunSummary> = {},
+): ScheduleSnapshot[] {
   const normalizedQuery = query.trim().toLowerCase();
   return [...schedules]
     .filter((schedule) => {
       if (filter === 'all') return true;
-      if (filter === 'attention') return hasScheduleError(schedule);
+      if (filter === 'attention') return hasScheduleError(schedule, runSummaries[schedule.scheduleId]);
       return schedule.status === filter;
     })
     .filter((schedule) => {
@@ -23,11 +28,14 @@ export function filterSchedules(schedules: ScheduleSnapshot[], filter: ScheduleF
       }
       return `${schedule.name} ${schedule.cronExpression} ${schedule.timezone} ${schedule.task.flowName}`.toLowerCase().includes(normalizedQuery);
     })
-    .sort(compareSchedulesForOperations);
+    .sort((left, right) => compareSchedulesForOperations(left, right, runSummaries));
 }
 
-export function hasScheduleError(schedule: ScheduleSnapshot): boolean {
-  return schedule.status === 'enabled' && typeof schedule.lastError === 'string' && schedule.lastError.trim() !== '';
+export function hasScheduleError(schedule: ScheduleSnapshot, runSummary?: ScheduleRunSummary): boolean {
+  return schedule.status === 'enabled' && (
+    (typeof schedule.lastError === 'string' && schedule.lastError.trim() !== '') ||
+    (runSummary !== undefined && ['failed', 'partial', 'stopped'].includes(runSummary.status))
+  );
 }
 
 export function describeCronExpression(expression: string): string {
@@ -66,27 +74,6 @@ export function parseCronFields(expression: string): CronFields {
 
 export function buildCronExpression(fields: CronFields): string {
   return [fields.minute, fields.hour, fields.dayOfMonth, fields.month, fields.dayOfWeek].map((field) => field.trim() || '*').join(' ');
-}
-
-/** Brute-forces minute-by-minute up to ~1 year to find the next `limit` fire times. */
-export function previewNextCronRuns(expression: string, baseDate = new Date(), limit = 5): string[] {
-  const fields = normalizeCronParts(expression);
-  if (fields.length !== 5) {
-    return [];
-  }
-  const matches: Date[] = [];
-  const cursor = new Date(baseDate.getTime());
-  cursor.setSeconds(0, 0);
-  cursor.setMinutes(cursor.getMinutes() + 1);
-
-  for (let i = 0; i < 60 * 24 * 370 && matches.length < limit; i += 1) {
-    if (matchesCron(cursor, fields)) {
-      matches.push(new Date(cursor.getTime()));
-    }
-    cursor.setMinutes(cursor.getMinutes() + 1);
-  }
-
-  return matches.map((date) => formatScheduleDateTime(date.toISOString()));
 }
 
 export function formatScheduleDateTime(value: string | null | undefined): string {
@@ -135,8 +122,8 @@ function normalizeCronParts(expression: string): string[] {
   return parts.length === 6 ? parts.slice(1) : parts;
 }
 
-function compareSchedulesForOperations(left: ScheduleSnapshot, right: ScheduleSnapshot): number {
-  const attentionOrder = Number(hasScheduleError(right)) - Number(hasScheduleError(left));
+function compareSchedulesForOperations(left: ScheduleSnapshot, right: ScheduleSnapshot, runSummaries: Record<string, ScheduleRunSummary>): number {
+  const attentionOrder = Number(hasScheduleError(right, runSummaries[right.scheduleId])) - Number(hasScheduleError(left, runSummaries[left.scheduleId]));
   if (attentionOrder !== 0) return attentionOrder;
 
   const enabledOrder = Number(right.status === 'enabled') - Number(left.status === 'enabled');
@@ -159,32 +146,19 @@ function dateOrZero(value: string): number {
   return Number.isNaN(time) ? 0 : time;
 }
 
-function matchesCron(date: Date, fields: string[]): boolean {
-  const [minute, hour, dayOfMonth, month, dayOfWeek] = fields;
-  return (
-    matchesField(date.getMinutes(), minute, 0, 59) &&
-    matchesField(date.getHours(), hour, 0, 23) &&
-    matchesField(date.getDate(), dayOfMonth, 1, 31) &&
-    matchesField(date.getMonth() + 1, month, 1, 12) &&
-    matchesField(date.getDay() === 0 ? 7 : date.getDay(), dayOfWeek, 1, 7)
-  );
-}
-
-function matchesField(value: number, expression: string | undefined, min: number, max: number): boolean {
-  if (expression === undefined || expression === '*') {
-    return true;
+export function formatZonedDateTime(date: Date, timeZone: string): string {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit'
+  }).formatToParts(date);
+  const lookup: Record<string, string> = {};
+  for (const part of parts) {
+    lookup[part.type] = part.value;
   }
-  if (expression.startsWith('*/')) {
-    const step = Number.parseInt(expression.slice(2), 10);
-    return Number.isInteger(step) && step > 0 && value % step === 0;
-  }
-  if (expression.includes('-')) {
-    const [start, end] = expression.split('-').map((part) => Number.parseInt(part, 10));
-    return Number.isInteger(start) && Number.isInteger(end) && value >= Math.max(start, min) && value <= Math.min(end, max);
-  }
-  if (expression.includes(',')) {
-    return expression.split(',').some((part) => matchesField(value, part, min, max));
-  }
-  const exact = Number.parseInt(expression, 10);
-  return Number.isInteger(exact) && exact >= min && exact <= max && value === exact;
+  return `${lookup.year}-${lookup.month}-${lookup.day} ${lookup.hour}:${lookup.minute}`;
 }

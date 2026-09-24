@@ -46,8 +46,6 @@ export function DashboardPage({ electron }: { electron: ElectronBridgeState }): 
   const nextSchedule = upcoming[0];
 
   const inspectRun = (run: TaskSnapshot): void => {
-    void electron.loadTaskVariables(run.taskId);
-    void electron.loadArtifacts(run.taskId);
     setDetailRun(run);
   };
 
@@ -158,6 +156,7 @@ export function DashboardPage({ electron }: { electron: ElectronBridgeState }): 
       />
 
       <RunDetailDialog
+        onLoadDetail={electron.getRunDetail}
         onOpenArtifact={(artifact) => void electron.openArtifactPath(artifact.storageUrl)}
         onOpenChange={(open) => { if (!open) setDetailRun(null); }}
         open={detailRun !== null}

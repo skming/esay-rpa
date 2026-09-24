@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import JSON, TypeDecorator
 
-from app.models.schemas import RunTaskRequest, ScheduleSnapshot
+from app.models.schemas import ScheduleSnapshot, ScheduleTaskRequest
 
 
 class ScheduleStore(Protocol):
@@ -169,7 +169,7 @@ class SqlAlchemyScheduleStore:
             cron_expression=row.cron_expression,
             timezone=row.timezone,
             status="enabled" if row.enabled else "disabled",
-            task=RunTaskRequest.model_validate(row.task_payload),
+            task=ScheduleTaskRequest.model_validate(row.task_payload),
             created_at=row.created_at,
             updated_at=row.updated_at,
             last_run_at=row.last_run_at,

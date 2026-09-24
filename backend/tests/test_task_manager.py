@@ -3,18 +3,21 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import pytest
 
-from app.models.schemas import RunTaskRequest, ScrapeResult
+from app.models.schemas import RunTaskRequest, RuntimeProgress, ScrapeResult, TaskSnapshot
+from app.services import browser_profile_lock
 from app.services.artifact_store import LocalArtifactStore
 from app.services.file_action_runner import FileActionRunner
 from app.services.log_broker import LogBroker
 from app.services.scrapling_runner import LogCallback
 from app.services.script_action_runner import ScriptActionRunner
 from app.services.task_manager import TaskManager
+from app.services.task_store import InMemoryTaskStore
 
 
 class LocalApiHandler(BaseHTTPRequestHandler):
@@ -94,6 +97,43 @@ class AlwaysFailingRunner:
     async def run(self, task_id: str, request: RunTaskRequest, on_log: LogCallback) -> ScrapeResult:
         await asyncio.sleep(0)
         raise RuntimeError("upstream fetch failed")
+
+
+async def test_terminal_status_is_persisted_after_final_log(tmp_path) -> None:
+    class ObservedStore(InMemoryTaskStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminal_log_seen: list[bool] = []
+
+        async def save_task(self, task: TaskSnapshot, request: RunTaskRequest) -> TaskSnapshot:
+            if task.status in {"success", "error"}:
+                logs = await self.list_logs(task.task_id) or []
+                expected = "任务完成" if task.status == "success" else "任务失败"
+                self.terminal_log_seen.append(any(log.message == expected for log in logs))
+            return await super().save_task(task, request)
+
+    for runner, status in ((FakeRunner(), "success"), (AlwaysFailingRunner(), "error")):
+        store = ObservedStore()
+        manager = TaskManager(
+            runner=runner,
+            broker=LogBroker(),
+            artifact_store=LocalArtifactStore(artifact_root=tmp_path),
+            task_store=store,
+        )
+        try:
+            task = await manager.start_task(RunTaskRequest(
+                flowName="日志提交顺序",
+                targetUrl="https://example.com/",
+                selector=".item::text",
+                flowDefinition={
+                    "nodes": [{"id": "fetch", "type": "browser.fetch", "targetUrl": "https://example.com/", "selector": ".item::text"}],
+                    "edges": [],
+                },
+            ))
+            await wait_for_status(manager, task.task_id, {status})
+            assert store.terminal_log_seen == [True]
+        finally:
+            await manager.stop_workers()
 
 
 class SlowRunner:
@@ -1012,6 +1052,37 @@ async def test_task_manager_preserves_fetch_node_error_when_stop_strategy(tmp_pa
     assert logs is not None
     assert any(log.node_id == "n1" and log.detail == "upstream fetch failed" for log in logs)
     assert not any(log.detail == "name 'node' is not defined" for log in logs)
+
+
+async def test_startup_failure_leaves_task_error_node_empty(tmp_path) -> None:
+    # 首个节点执行前失败（这里是空定义），任务级"任务失败"日志必须留空节点，
+    # 不能硬塞 n1——否则 get_run_error 会把启动阶段的错误反推成第一个节点的锅。
+    manager = TaskManager(runner=FakeRunner(), broker=LogBroker(), artifact_store=LocalArtifactStore(artifact_root=tmp_path))
+    snapshot = await manager.start_task(
+        RunTaskRequest(
+            flowName="空定义流程",
+            targetUrl="https://example.com/",
+            selector=".x::text",
+            flowDefinition={"nodes": [], "edges": []},
+        )
+    )
+
+    for _ in range(20):
+        current = await manager.get_task(snapshot.task_id)
+        assert current is not None
+        if current.status == "error":
+            break
+        await asyncio.sleep(0.01)
+
+    current = await manager.get_task(snapshot.task_id)
+    assert current is not None
+    assert current.status == "error"
+    logs = await manager.get_logs(snapshot.task_id)
+    assert logs is not None
+    failure_logs = [log for log in logs if log.message == "任务失败"]
+    assert failure_logs, "应记录任务失败日志"
+    assert all(log.node_id is None for log in failure_logs)
+    assert not any(log.node_id == "n1" for log in logs)
 
 
 async def test_task_manager_resolves_runtime_variables_between_nodes(tmp_path) -> None:

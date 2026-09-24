@@ -283,6 +283,18 @@ class BackendClient {
     });
   }
 
+  async listScheduleRunSummaries() {
+    return this.#request('/api/schedules:run-summaries', {
+      method: 'GET',
+      timeoutMs: 3000
+    });
+  }
+
+  async previewSchedule(cronExpression, timezone) {
+    const query = new URLSearchParams({ cronExpression, timezone });
+    return this.#request(`/api/schedules:preview?${query}`, { method: 'GET', timeoutMs: 3000 });
+  }
+
   async createSchedule(payload = {}) {
     return this.#request('/api/schedules', {
       method: 'POST',
@@ -391,7 +403,10 @@ class BackendClient {
       cronExpression: typeof payload.cronExpression === 'string' && payload.cronExpression.trim() ? payload.cronExpression : '0 9 * * *',
       timezone: typeof payload.timezone === 'string' && payload.timezone.trim() ? payload.timezone : 'Asia/Shanghai',
       enabled: payload.enabled !== false,
-      task: this.#normalizeRunPayload(payload.task ?? {})
+      task: {
+        ...this.#normalizeRunPayload(payload.task ?? {}),
+        flowIds: Array.isArray(payload.task?.flowIds) ? payload.task.flowIds : []
+      }
     };
   }
 

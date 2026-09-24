@@ -422,6 +422,7 @@ export type SiteAnalysisResult = {
 };
 
 export type ScheduleTaskPayload = RunStartPayload & {
+  flowIds?: string[];
   timeoutMs?: number;
 };
 
@@ -455,6 +456,22 @@ export type ScheduleSnapshot = {
 export type ScheduleTriggerResult = {
   schedule: ScheduleSnapshot;
   run?: RunStartResult | null;
+};
+
+// 后端不落库、按 last_run_at 水位线 + scheduleId 从任务库现算最近一批的终态。
+// 「所有流程」一批会拉起多个 task，故 total 可 >1，status 是整批的聚合而非最后一个 task 的状态。
+export type ScheduleRunSummaryStatus = 'running' | 'success' | 'failed' | 'partial' | 'stopped' | 'empty';
+
+export type ScheduleRunSummary = {
+  scheduleId: string;
+  runAt?: string | null;
+  total: number;
+  running: number;
+  success: number;
+  failed: number;
+  stopped: number;
+  status: ScheduleRunSummaryStatus;
+  taskIds: string[];
 };
 
 export type ArtifactSnapshot = {
@@ -541,6 +558,8 @@ export type BackendTaskLogEntry = {
   nodeId?: string | null;
 };
 
+export type RunDetail = { run: TaskSnapshot; logs: BackendTaskLogEntry[] };
+
 // window.rpaBridge；纯浏览器开发模式下由 polyfill 注入
 export type RpaBridge = {
   openPicker: (payload: PickerOpenPayload) => Promise<BridgeResult<PickerOpenResult>>;
@@ -553,6 +572,7 @@ export type RpaBridge = {
   resumeConfirmation: (runId: string) => Promise<BridgeResult<void>>;
   debugRun: (runId: string, command: DebugControlCommand) => Promise<BridgeResult<RunDebugResult>>;
   listRuns: (options?: { flowId?: string; limit?: number }) => Promise<BridgeResult<TaskSnapshot[]>>;
+  getRunDetail: (taskId: string) => Promise<BridgeResult<RunDetail>>;
   listFlowRuns: (flowId: string, options?: { limit?: number }) => Promise<BridgeResult<TaskSnapshot[]>>;
   generateScraplingScript: (payload: GenerateScriptPayload) => Promise<BridgeResult<GeneratedScriptResult>>;
   exportScraplingScript: (payload: ExportScriptPayload) => Promise<BridgeResult<FlowFileResult>>;
@@ -571,6 +591,8 @@ export type RpaBridge = {
   readArtifact: (taskId: string, artifactId: string) => Promise<BridgeResult<ArtifactContent>>;
   getQueueStats: () => Promise<BridgeResult<QueueStats>>;
   listSchedules: () => Promise<BridgeResult<ScheduleSnapshot[]>>;
+  listScheduleRunSummaries: () => Promise<BridgeResult<Record<string, ScheduleRunSummary>>>;
+  previewSchedule: (cronExpression: string, timezone: string) => Promise<BridgeResult<string[]>>;
   createSchedule: (payload: ScheduleCreatePayload) => Promise<BridgeResult<ScheduleSnapshot>>;
   updateSchedule: (scheduleId: string, payload: ScheduleUpdatePayload) => Promise<BridgeResult<ScheduleSnapshot>>;
   deleteSchedule: (scheduleId: string) => Promise<BridgeResult<{ deleted: boolean }>>;

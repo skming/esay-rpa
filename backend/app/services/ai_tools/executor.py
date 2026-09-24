@@ -1394,7 +1394,7 @@ class RpaToolExecutor:
     ) -> dict[str, Any]:
         from pydantic import ValidationError
 
-        from app.models.schemas import RunTaskRequest, ScheduleCreateRequest
+        from app.models.schemas import ScheduleCreateRequest, ScheduleTaskRequest
 
         if self._schedule_service is None:
             return {"error": "定时任务服务不可用"}
@@ -1416,27 +1416,13 @@ class RpaToolExecutor:
             }
 
         effective_executor = browser_executor or getattr(flow, "default_browser_executor", None) or "playwright"
-        # requireConfirmation 只在扩展执行器下挂起等待确认；定时无人值守没人点，会挂到 120s
-        # 超时后 CancelledError 取消整个任务，每次触发都失败。playwright 下该标志本就不生效，无需拦。
-        if effective_executor == "extension":
-            confirmation_nodes = [
-                {"id": n.get("id"), "type": n.get("type"), "title": n.get("title")}
-                for n in flow.definition.get("nodes", [])
-                if isinstance(n, dict) and n.get("requireConfirmation") is True
-            ]
-            if confirmation_nodes:
-                return {
-                    "error": "流程含 requireConfirmation 敏感动作，扩展执行器定时无人值守运行会挂起到确认超时后失败",
-                    "confirmation_nodes": confirmation_nodes,
-                    "hint": "去掉这些节点的 requireConfirmation，或改为手动运行。",
-                }
         try:
             request = ScheduleCreateRequest(
                 name=name or flow.name,
                 cron_expression=cron_expression,
                 timezone=timezone,
                 enabled=enabled,
-                task=RunTaskRequest(
+                task=ScheduleTaskRequest(
                     flow_id=flow_id,
                     flow_name=flow.name,
                     variables=run_variables,
@@ -1445,7 +1431,12 @@ class RpaToolExecutor:
             )
         except ValidationError as exc:
             return {"error": f"定时任务参数无效：{exc.errors()[0].get('msg', str(exc))}"}
-        snapshot = await self._schedule_service.create_schedule(request)
+        try:
+            snapshot = await self._schedule_service.create_schedule(request)
+        except ValueError as exc:
+            # 与 HTTP 入口同一判据（ScheduleService._assert_bound_flow_schedulable）：草稿/停用/
+            # 归档/暂停等不可调度状态在服务层统一拦下，AI 侧也要给出一致错误而不是抛异常。
+            return {"error": str(exc)}
         result = self._schedule_brief(snapshot)
         result["message"] = (
             f"定时任务已创建（{'已启用' if enabled else '未启用'}），"

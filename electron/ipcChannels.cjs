@@ -45,7 +45,8 @@ const IPC_CHANNELS = Object.freeze({
     event: 'run:event'
   }),
   runs: Object.freeze({
-    list: 'runs:list'
+    list: 'runs:list',
+    detail: 'runs:detail'
   }),
   script: Object.freeze({
     generate: 'script:generate',
@@ -87,6 +88,8 @@ const IPC_CHANNELS = Object.freeze({
   }),
   schedules: Object.freeze({
     list: 'schedules:list',
+    runSummaries: 'schedules:runSummaries',
+    preview: 'schedules:preview',
     create: 'schedules:create',
     update: 'schedules:update',
     delete: 'schedules:delete',

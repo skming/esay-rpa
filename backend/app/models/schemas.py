@@ -609,12 +609,30 @@ class TaskSnapshot(ApiModel):
     confirmation_message: str | None = None
 
 
+class ScheduleTaskRequest(RunTaskRequest):
+    flow_ids: list[str] = Field(default_factory=list, max_length=200)
+
+    @field_validator("flow_ids")
+    @classmethod
+    def validate_flow_ids(cls, value: list[str]) -> list[str]:
+        normalized = [flow_id.strip() for flow_id in value]
+        if any(not flow_id for flow_id in normalized) or len(normalized) != len(set(normalized)):
+            raise ValueError("flowIds 不能包含空值或重复流程")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_flow_selection(self) -> "ScheduleTaskRequest":
+        if self.flow_id is not None and self.flow_ids:
+            raise ValueError("flowId 与 flowIds 不能同时指定")
+        return self
+
+
 class ScheduleCreateRequest(ApiModel):
     name: str = Field(min_length=1, max_length=120)
     cron_expression: str = Field(min_length=9, max_length=120)
     timezone: str = Field(default="Asia/Shanghai", min_length=1, max_length=64)
     enabled: bool = True
-    task: RunTaskRequest
+    task: ScheduleTaskRequest
 
     @field_validator("cron_expression")
     @classmethod
@@ -630,7 +648,7 @@ class ScheduleUpdateRequest(ApiModel):
     cron_expression: str | None = Field(default=None, min_length=9, max_length=120)
     timezone: str | None = Field(default=None, min_length=1, max_length=64)
     enabled: bool | None = None
-    task: RunTaskRequest | None = None
+    task: ScheduleTaskRequest | None = None
 
     @model_validator(mode="after")
     def validate_non_empty_update(self) -> "ScheduleUpdateRequest":
@@ -655,13 +673,29 @@ class ScheduleSnapshot(ApiModel):
     cron_expression: str
     timezone: str
     status: ScheduleStatus
-    task: RunTaskRequest
+    task: ScheduleTaskRequest
     created_at: datetime
     updated_at: datetime
     last_run_at: datetime | None = None
     next_run_at: datetime | None = None
     last_task_id: str | None = None
     last_error: str | None = None
+
+
+class ScheduleRunSummary(ApiModel):
+    """一次触发批次的执行结果聚合。不落库，由 last_run_at 水位线 + schedule_id 从任务库现算：
+    「所有流程」批次会启动多个 task，用最后一个 task 的状态代表整批会把失败说成成功；进程重启后
+    残留的 running 任务已被 reconcile 落成 stopped，读时聚合天然反映真实终态，不会像持久化字段那样卡住。"""
+
+    schedule_id: str
+    run_at: datetime | None = None
+    total: int = 0
+    running: int = 0
+    success: int = 0
+    failed: int = 0
+    stopped: int = 0
+    status: Literal["running", "success", "failed", "partial", "stopped", "empty"]
+    task_ids: list[str] = Field(default_factory=list)
 
 
 def _is_safe_variable_name(value: str) -> bool:

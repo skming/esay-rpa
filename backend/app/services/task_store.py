@@ -12,6 +12,10 @@ from app.models.schemas import ArtifactSnapshot, FlowAcceptanceContract, NodeExe
 from app.services.schedule_store import Base, UTCDateTime, _json_type
 
 
+# 进程仍应「持有」这些任务的状态：重启后内存 record 丢失，它们既不能自动继续也不能 /resume，需启动时对账
+_UNFINISHED_TASK_STATUSES = ("queued", "running", "awaiting_confirmation")
+
+
 class TaskStore(Protocol):
     async def save_task(self, task: TaskSnapshot, request: RunTaskRequest) -> TaskSnapshot: ...
 
@@ -26,6 +30,14 @@ class TaskStore(Protocol):
     async def list_logs(self, task_id: str) -> list[TaskLogEntry] | None: ...
 
     async def list_variables(self, task_id: str) -> list[RuntimeVariableSnapshot] | None: ...
+
+    async def list_unfinished_tasks(self) -> list[TaskSnapshot]: ...
+
+    async def mark_interrupted_stopped(self, task_id: str, *, error: str, log: TaskLogEntry) -> TaskSnapshot | None: ...
+
+    async def has_unfinished_schedule_tasks(self, schedule_id: str) -> bool: ...
+
+    async def list_schedule_batch_tasks(self, schedule_id: str, since: datetime) -> list[TaskSnapshot]: ...
 
 
 @dataclass
@@ -87,6 +99,32 @@ class InMemoryTaskStore:
         if record is None:
             return None
         return list(record.snapshot.variables)
+
+    async def list_unfinished_tasks(self) -> list[TaskSnapshot]:
+        return [record.snapshot for record in self._tasks.values() if record.snapshot.status in _UNFINISHED_TASK_STATUSES]
+
+    async def has_unfinished_schedule_tasks(self, schedule_id: str) -> bool:
+        return any(
+            record.snapshot.schedule_id == schedule_id and record.snapshot.status in _UNFINISHED_TASK_STATUSES
+            for record in self._tasks.values()
+        )
+
+    async def list_schedule_batch_tasks(self, schedule_id: str, since: datetime) -> list[TaskSnapshot]:
+        return [
+            record.snapshot
+            for record in self._tasks.values()
+            if record.snapshot.schedule_id == schedule_id and record.snapshot.created_at >= since
+        ]
+
+    async def mark_interrupted_stopped(self, task_id: str, *, error: str, log: TaskLogEntry) -> TaskSnapshot | None:
+        record = self._tasks.get(task_id)
+        if record is None or record.snapshot.status not in _UNFINISHED_TASK_STATUSES:
+            return None
+        record.snapshot = record.snapshot.model_copy(
+            update={"status": "stopped", "error": error, "confirmation_message": None, "updated_at": datetime.now(UTC)}
+        )
+        record.logs.append(log)
+        return record.snapshot
 
 
 class TaskRow(Base):
@@ -256,6 +294,55 @@ class SqlAlchemyTaskStore:
             result = await session.execute(delete(TaskRow).where(TaskRow.id == task_id))
             await session.commit()
             return (result.rowcount or 0) > 0
+
+    async def list_unfinished_tasks(self) -> list[TaskSnapshot]:
+        statement = select(TaskRow).where(TaskRow.status.in_(_UNFINISHED_TASK_STATUSES))
+        async with self._session_factory() as session:
+            result = await session.scalars(statement)
+            return [self._to_snapshot(row) for row in result]
+
+    async def has_unfinished_schedule_tasks(self, schedule_id: str) -> bool:
+        statement = select(TaskRow.id).where(
+            TaskRow.schedule_id == schedule_id,
+            TaskRow.status.in_(_UNFINISHED_TASK_STATUSES),
+        ).limit(1)
+        async with self._session_factory() as session:
+            return await session.scalar(statement) is not None
+
+    async def list_schedule_batch_tasks(self, schedule_id: str, since: datetime) -> list[TaskSnapshot]:
+        statement = select(TaskRow).where(
+            TaskRow.schedule_id == schedule_id,
+            TaskRow.created_at >= since,
+        ).order_by(TaskRow.created_at.asc())
+        async with self._session_factory() as session:
+            result = await session.scalars(statement)
+            return [self._to_snapshot(row) for row in result]
+
+    async def mark_interrupted_stopped(self, task_id: str, *, error: str, log: TaskLogEntry) -> TaskSnapshot | None:
+        # 状态翻转与终止日志同一事务提交，避免对账中途崩溃留下「已停但无留痕」的半截状态
+        async with self._session_factory() as session:
+            row = await session.get(TaskRow, task_id)
+            if row is None or row.status not in _UNFINISHED_TASK_STATUSES:
+                return None
+            now = datetime.now(UTC)
+            row.status = "stopped"
+            row.error_message = error
+            row.confirmation_message = None
+            row.finished_at = now
+            row.updated_at = now
+            session.add(
+                TaskLogRow(
+                    id=log.id,
+                    task_id=log.task_id,
+                    level=log.level,
+                    message=log.message,
+                    detail=log.detail,
+                    node_id=log.node_id,
+                    created_at=log.time,
+                )
+            )
+            await session.commit()
+            return self._to_snapshot(row)
 
     @staticmethod
     def _apply_task(row: TaskRow, task: TaskSnapshot, request: RunTaskRequest) -> None:

@@ -24,6 +24,8 @@ import type {
   PickerResult,
   QueueStats,
   RpaBridge,
+  RunDetail,
+  ScheduleRunSummary,
   ScheduleSnapshot,
   SiteAnalysisResult,
   TaskSnapshot
@@ -73,6 +75,7 @@ export function useElectronBridge({
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus>('ready');
   const [runs, setRuns] = useState<TaskSnapshot[]>([]);
   const [schedules, setSchedules] = useState<ScheduleSnapshot[]>([]);
+  const [scheduleRunSummaries, setScheduleRunSummaries] = useState<Record<string, ScheduleRunSummary>>({});
   const [variables, setVariables] = useState<RuntimeVariable[]>([]);
   const [toasts, setToasts] = useState<BridgeToast[]>([]);
   const toastIdRef = useRef(0);
@@ -144,6 +147,13 @@ export function useElectronBridge({
     },
     [bridge, pushToast, unwrap]
   );
+
+  const getRunDetail = useCallback(async (taskId: string): Promise<RunDetail> => {
+    if (bridge === undefined) throw new Error('后端桥接服务不可用');
+    const result = await bridge.getRunDetail(taskId);
+    if (!result.ok || result.data === undefined) throw new Error(result.error ?? '读取执行记录失败');
+    return result.data;
+  }, [bridge]);
 
   const debugControl = useCallback(
     (command: DebugControlCommand): void => {
@@ -262,6 +272,7 @@ export function useElectronBridge({
     setRuntimeStatus,
     setRuns,
     setSchedules,
+    setScheduleRunSummaries,
     setSiteAnalysis,
     setVariables,
     setLogs,
@@ -370,12 +381,14 @@ export function useElectronBridge({
       runtimeStatus,
       runs,
       schedules,
+      scheduleRunSummaries,
       toasts,
       inputVariables,
       lastRunOverrideVariables,
       variableViews,
       variables,
       ...actions,
+      getRunDetail,
       debugControl,
       pushToast,
       dismissToast,
@@ -431,6 +444,7 @@ export function useElectronBridge({
       runtimeStatus,
       runs,
       schedules,
+      scheduleRunSummaries,
       toasts,
       inputVariables,
       lastRunOverrideVariables,
@@ -438,6 +452,7 @@ export function useElectronBridge({
       variables,
       windowId,
       debugControl,
+      getRunDetail,
       dismissToast,
       pushToast
     ]

@@ -1822,12 +1822,12 @@ class FakeScheduleService:
         return self._snapshot(name=request.name, cron=request.cron_expression, task=request.task)
 
     async def list_schedules(self):
-        from app.models.schemas import RunTaskRequest
+        from app.models.schemas import ScheduleTaskRequest
 
-        return [self._snapshot(name="已有任务", cron="0 9 * * *", task=RunTaskRequest(flow_id="flow-sched-1", flow_name="定时抓取流程"))]
+        return [self._snapshot(name="已有任务", cron="0 9 * * *", task=ScheduleTaskRequest(flow_id="flow-sched-1", flow_name="定时抓取流程"))]
 
     async def update_schedule(self, schedule_id: str, request):
-        from app.models.schemas import RunTaskRequest
+        from app.models.schemas import ScheduleTaskRequest
 
         self.updated = (schedule_id, request)
         if schedule_id != "sched-1":
@@ -1835,7 +1835,7 @@ class FakeScheduleService:
         return self._snapshot(
             name="已有任务",
             cron="0 9 * * *",
-            task=RunTaskRequest(flow_id="flow-sched-1", flow_name="定时抓取流程"),
+            task=ScheduleTaskRequest(flow_id="flow-sched-1", flow_name="定时抓取流程"),
             status="enabled" if request.enabled else "disabled",
         )
 
@@ -1879,7 +1879,12 @@ async def test_create_schedule_rejects_extension_flow_with_confirmation() -> Non
             {"id": "pay", "title": "提交支付", "type": "browser.click", "requireConfirmation": True},
         ],
     )
-    schedule_service = FakeScheduleService()
+    from app.services.scheduler_service import ScheduleService
+
+    schedule_service = ScheduleService(
+        task_manager=FakeTaskManager(with_failing_tasks=False),  # type: ignore[arg-type]
+        flow_service=FakeScheduleFlowService(flow),  # type: ignore[arg-type]
+    )
     executor = RpaToolExecutor(
         flow_service=FakeScheduleFlowService(flow),  # type: ignore[arg-type]
         task_manager=FakeTaskManager(with_failing_tasks=False),  # type: ignore[arg-type]
@@ -1887,8 +1892,7 @@ async def test_create_schedule_rejects_extension_flow_with_confirmation() -> Non
     )
     result = await executor.execute("create_schedule", {"flow_id": "flow-sched-1", "cron_expression": "0 9 * * *"})
     assert "requireConfirmation" in result["error"]
-    assert result["confirmation_nodes"][0]["id"] == "pay"
-    assert schedule_service.created_request is None
+    assert await schedule_service.list_schedules() == []
 
 
 async def test_create_schedule_allows_playwright_flow_with_confirmation() -> None:

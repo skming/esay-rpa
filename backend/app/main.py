@@ -78,6 +78,7 @@ from app.models.schemas import (
     QueueStats,
     RunTaskRequest,
     ScheduleCreateRequest,
+    ScheduleRunSummary,
     ScheduleSnapshot,
     ScheduleUpdateRequest,
     SiteAnalysisResult,
@@ -182,6 +183,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     ai_config_service.apply_to_env(ai_config_service.load())
     await ai_config_service.init_catalog()
     await runtime_services.start()
+    # schema 就绪后、放开队列与调度前，把上一进程残留的未完成任务对账为 stopped，
+    # 避免持久化里的 awaiting_confirmation 让 UI 显示"可继续"而 /resume 已失效
+    await task_manager.reconcile_interrupted_tasks()
     task_manager.start_workers()
     scheduler_loop.start()
     try:
@@ -500,12 +504,32 @@ async def toggle_schedule(schedule_id: str) -> ScheduleSnapshot:
 @app.post("/api/schedules/{schedule_id}/trigger", response_model=ScheduleSnapshot)
 async def trigger_schedule(schedule_id: str) -> ScheduleSnapshot:
     try:
-        snapshot = await scheduler_service.trigger_schedule(schedule_id)
+        # 面板上点「立即运行」是人主动触发：重叠时要显式报 422 让人看见「上一批还没跑完」，
+        # 而不是像定时轮询那样静默跳过——后者会让用户以为按钮没生效。
+        snapshot = await scheduler_service.trigger_schedule(schedule_id, manual=True)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     if snapshot is None:
         raise HTTPException(status_code=404, detail="Schedule not found")
     return snapshot
+
+
+@app.get("/api/schedules:run-summaries", response_model=dict[str, ScheduleRunSummary])
+async def get_schedule_run_summaries() -> dict[str, ScheduleRunSummary]:
+    # 调度中心展示「最近触发批次的真实终态」：启动成功≠执行成功，「所有流程」更不能用最后一个
+    # task 代表整批，故惰性从任务库按 schedule_id + last_run_at 水位线聚合。键为 schedule_id。
+    return await scheduler_service.run_summaries()
+
+
+@app.get("/api/schedules:preview", response_model=list[datetime])
+async def preview_schedule(
+    cron_expression: str = Query(alias="cronExpression"),
+    timezone: str = Query(),
+) -> list[datetime]:
+    try:
+        return scheduler_service.preview_next_runs(cron_expression, timezone)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.post("/api/schedules:tick", response_model=list[ScheduleSnapshot])

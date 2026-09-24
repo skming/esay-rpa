@@ -238,6 +238,25 @@ class TaskManager:
             await self._queue.enqueue(task_id)
         return snapshot
 
+    async def record_schedule_start_failure(self, request: RunTaskRequest, error: str) -> TaskSnapshot:
+        if request.schedule_id is None:
+            raise ValueError("启动失败记录必须关联调度")
+        now = datetime.now(UTC)
+        snapshot = TaskSnapshot(
+            task_id=f"t_{uuid4()}",
+            flow_id=request.flow_id,
+            schedule_id=request.schedule_id,
+            flow_name=request.flow_name,
+            status="error",
+            mode=request.mode,
+            progress=RuntimeProgress(current_step=0, total_steps=1, percent=0, elapsed_ms=0),
+            run_config=RunConfigSnapshot.from_request(request),
+            error=f"流程启动失败：{error}",
+            created_at=now,
+            updated_at=now,
+        )
+        return await self._task_store.save_task(snapshot, request)
+
     async def get_task(self, task_id: str) -> TaskSnapshot | None:
         record = self._tasks.get(task_id)
         if record is not None:
@@ -264,6 +283,20 @@ class TaskManager:
             key=lambda snapshot: _timestamp_sort_key(snapshot.updated_at),
             reverse=True,
         )[: max(1, min(limit, 200))]
+
+    async def has_unfinished_schedule_tasks(self, schedule_id: str) -> bool:
+        return await self._task_store.has_unfinished_schedule_tasks(schedule_id)
+
+    async def list_schedule_batch_tasks(self, schedule_id: str, since: datetime) -> list[TaskSnapshot]:
+        snapshots = await self._task_store.list_schedule_batch_tasks(schedule_id, since)
+        active = [
+            record.snapshot
+            for record in self._tasks.values()
+            if record.snapshot.schedule_id == schedule_id and record.snapshot.created_at >= since
+        ]
+        merged = {snapshot.task_id: snapshot for snapshot in snapshots}
+        merged.update({snapshot.task_id: snapshot for snapshot in active})
+        return sorted(merged.values(), key=lambda snapshot: snapshot.created_at)
 
     async def get_logs(self, task_id: str) -> list[TaskLogEntry] | None:
         record = self._tasks.get(task_id)
@@ -307,6 +340,27 @@ class TaskManager:
         record.confirmation_waiter.set()
         await self._update_snapshot(record, status="running", confirmation_message=None)
         return record.snapshot
+
+    async def reconcile_interrupted_tasks(self) -> int:
+        """启动对账：进程重启后内存里既没有 TaskRecord，也没有 confirmation waiter 与浏览器上下文，
+        持久化中残留的 queued/running/awaiting_confirmation 都无法真正继续。尤其 awaiting_confirmation——
+        UI 依据持久化状态显示"待确认/可继续"，但 /resume 走内存 record，重启后必然返回 None，形成死状态。
+        统一落成 stopped 并留痕，让持久化状态与"实际不可继续"一致。返回处理的任务数。"""
+        interrupted = await self._task_store.list_unfinished_tasks()
+        reconciled = 0
+        for snapshot in interrupted:
+            if snapshot.task_id in self._tasks:
+                continue  # 本进程正在执行的活跃任务，不是上一进程的残留
+            reason = (
+                "后端重启：待人工确认的任务无法恢复（确认通道随进程结束丢失），已终止，请重新运行。"
+                if snapshot.status == "awaiting_confirmation"
+                else "后端重启：任务执行中被中断，已终止，请重新运行。"
+            )
+            log = TaskLogEntry(task_id=snapshot.task_id, level="warn", message="后端重启，任务已终止", detail=reason, node_id="end")
+            if await self._task_store.mark_interrupted_stopped(snapshot.task_id, error=reason, log=log) is not None:
+                await self._broker.publish(log)
+                reconciled += 1
+        return reconciled
 
     async def stop_task(self, task_id: str) -> TaskSnapshot | None:
         record = self._tasks.get(task_id)
@@ -395,34 +449,44 @@ class TaskManager:
             artifacts = [*record.artifacts, artifact]
             await self._update_snapshot(
                 record,
-                status="success",
                 result=result,
                 artifacts=artifacts,
                 variables=record.variables.snapshots(),
-                progress=RuntimeProgress(current_step=total_steps, total_steps=total_steps, percent=100, elapsed_ms=elapsed_ms),
+                progress=RuntimeProgress(current_step=total_steps, total_steps=total_steps, percent=99, elapsed_ms=elapsed_ms),
             )
             await self._append_log(record, "success", "结果已保存", artifact.storage_url, node_id=record.active_node_id or "end")
             await self._append_log(record, "success", "任务完成", f"提取结果 {result.count} 项", node_id="end")
+            await self._update_snapshot(
+                record,
+                status="success",
+                progress=RuntimeProgress(current_step=total_steps, total_steps=total_steps, percent=100, elapsed_ms=elapsed_ms),
+            )
             await self._notify_flow_run_complete(record, "success")
         except asyncio.CancelledError:
-            await self._update_snapshot(record, status="stopped")
-            await self._append_log(record, "warn", "任务已停止", None, node_id="end")
+            try:
+                await self._append_log(record, "warn", "任务已停止", None, node_id="end")
+            finally:
+                await self._update_snapshot(record, status="stopped")
             await self._notify_flow_run_complete(record, "stopped")
         except Exception as exc:
             elapsed_ms = max(int((datetime.now(UTC) - started).total_seconds() * 1000), 0)
             current_progress = record.snapshot.progress
-            await self._update_snapshot(
-                record,
-                status="error",
-                error=str(exc),
-                progress=RuntimeProgress(
-                    current_step=current_progress.current_step,
-                    total_steps=current_progress.total_steps,
-                    percent=min(current_progress.percent, 99),
-                    elapsed_ms=elapsed_ms,
-                ),
-            )
-            await self._append_log(record, "error", "任务失败", str(exc), node_id=record.active_node_id or "n1")
+            try:
+                # 无活动节点（首个节点执行前的启动/校验阶段失败）时保持空节点，别硬塞 n1：
+                # get_run_error 从最后一条错误日志反推失败节点，假的 n1 会把诊断指向第一个节点。
+                await self._append_log(record, "error", "任务失败", str(exc), node_id=record.active_node_id)
+            finally:
+                await self._update_snapshot(
+                    record,
+                    status="error",
+                    error=str(exc),
+                    progress=RuntimeProgress(
+                        current_step=current_progress.current_step,
+                        total_steps=current_progress.total_steps,
+                        percent=min(current_progress.percent, 99),
+                        elapsed_ms=elapsed_ms,
+                    ),
+                )
             await self._notify_flow_run_complete(record, "error")
 
     async def _notify_flow_run_complete(self, record: TaskRecord, status: str) -> None:

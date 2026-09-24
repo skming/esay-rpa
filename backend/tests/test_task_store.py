@@ -4,7 +4,10 @@ from datetime import UTC, datetime
 
 from app.models.schemas import ArtifactSnapshot, NodeExecutionEvidence, RunTaskRequest, RuntimeProgress, RuntimeVariableSnapshot, ScrapeResult, TaskLogEntry, TaskSnapshot
 from app.services.schedule_store import create_schedule_engine
+from app.services.log_broker import LogBroker
+from app.services.task_manager import TaskManager
 from app.services.task_store import SqlAlchemyTaskStore
+from tests.test_task_manager import FakeRunner
 
 
 def build_task_request() -> RunTaskRequest:
@@ -46,6 +49,26 @@ def build_task_snapshot(task_id: str = "task-1") -> TaskSnapshot:
         createdAt=now,
         updatedAt=now,
     )
+
+
+async def test_schedule_start_failure_survives_task_manager_restart(tmp_path) -> None:
+    engine = create_schedule_engine(f"sqlite+aiosqlite:///{tmp_path / 'failed-start.db'}")
+    store = SqlAlchemyTaskStore(engine)
+    await store.create_schema()
+    try:
+        manager = TaskManager(runner=FakeRunner(), broker=LogBroker(), task_store=store)
+        request = build_task_request().model_copy(update={"schedule_id": "schedule-1"})
+        failure = await manager.record_schedule_start_failure(request, "验收契约缺少 deliverable")
+
+        reloaded = TaskManager(runner=FakeRunner(), broker=LogBroker(), task_store=store)
+        batch = await reloaded.list_schedule_batch_tasks("schedule-1", failure.created_at)
+        assert len(batch) == 1
+        assert batch[0].task_id == failure.task_id
+        assert batch[0].status == "error"
+        assert batch[0].progress.current_step == 0
+        assert "验收契约缺少 deliverable" in (batch[0].error or "")
+    finally:
+        await engine.dispose()
 
 
 async def test_sqlalchemy_task_store_persists_task_logs_and_result(tmp_path) -> None:

@@ -3,6 +3,7 @@ import { CheckCircle2, Clock3, FileJson, History, Inbox, ScanSearch, XCircle, X 
 import type { ReactElement } from 'react';
 
 import { formatElapsedTime } from '../../lib/time';
+import { runOutputSummary } from '../../lib/runPresentation';
 import type { TaskSnapshot } from '../../types/electron';
 import { IconButton } from '../ui/button';
 import { RefreshIconButton } from '../ui/refresh-button';
@@ -113,9 +114,7 @@ export function RunHistoryDrawer({ flowName, onClose, onInspectRun, onRefresh, o
 
                       <span className="inline-flex items-center gap-1.5 font-mono text-[11px] tabular-nums text-ink-3">
                         <FileJson className="h-3 w-3 text-ink-4" strokeWidth={1.5} />
-                        {run.variables?.length ?? 0}
-                        <span className="text-ink-4">/</span>
-                        {run.artifacts?.length ?? 0}
+                        {runOutputSummary(run)}
                       </span>
 
                       <div className="min-w-0">

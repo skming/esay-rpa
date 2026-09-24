@@ -34,10 +34,11 @@ export function ScheduleSection({ electron }: { electron: ElectronBridgeState })
         </div>
       )}
       <ScheduleCreateDialog
-        onCreate={(options) => {
-          void electron.createDefaultSchedule(options);
-        }}
+        flows={electron.flows}
+        initialFlowIds={electron.currentFlow?.status === 'active' ? [electron.currentFlow.flowId] : undefined}
+        onCreate={electron.createDefaultSchedule}
         onOpenChange={setCreateOpen}
+        onPreview={electron.previewSchedule}
         open={createOpen}
       />
     </PanelSection>

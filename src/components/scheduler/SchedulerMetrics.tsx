@@ -2,12 +2,12 @@ import { AlertTriangle, CalendarCheck2, CalendarClock, ListChecks } from 'lucide
 import type { ReactElement } from 'react';
 
 import { countEnabledSchedules, formatScheduleDateTime, hasScheduleError, selectUpcomingSchedules } from '../../lib/schedulePresentation';
-import type { ScheduleSnapshot } from '../../types/electron';
+import type { ScheduleRunSummary, ScheduleSnapshot } from '../../types/electron';
 import { HealthRail, HealthSignal } from '../workspace/surfaces';
 
-export function SchedulerMetrics({ schedules }: { schedules: ScheduleSnapshot[] }): ReactElement {
+export function SchedulerMetrics({ schedules, runSummaries }: { schedules: ScheduleSnapshot[]; runSummaries: Record<string, ScheduleRunSummary> }): ReactElement {
   const enabledCount = countEnabledSchedules(schedules);
-  const attentionCount = schedules.filter(hasScheduleError).length;
+  const attentionCount = schedules.filter((schedule) => hasScheduleError(schedule, runSummaries[schedule.scheduleId])).length;
   const nextSchedule = selectUpcomingSchedules(schedules, 1)[0];
 
   return (
@@ -26,7 +26,7 @@ export function SchedulerMetrics({ schedules }: { schedules: ScheduleSnapshot[] 
         value={enabledCount}
       />
       <HealthSignal
-        detail={attentionCount > 0 ? '排期或触发需要检查' : '没有调度错误'}
+        detail={attentionCount > 0 ? '排期或运行需要检查' : '没有调度错误'}
         icon={<AlertTriangle className="h-3.5 w-3.5" strokeWidth={1.5} />}
         label="需处理"
         state={attentionCount > 0 ? 'error' : 'success'}

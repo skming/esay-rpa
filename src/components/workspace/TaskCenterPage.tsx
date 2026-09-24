@@ -242,10 +242,11 @@ export function TaskCenterPage({
         open={createOpen}
       />
       <ScheduleCreateDialog
-        onCreate={(options) => {
-          if (scheduleFlowId !== null) void electron.createScheduleForFlow(scheduleFlowId, options);
-        }}
+        flows={electron.flows}
+        initialFlowIds={scheduleFlowId === null ? undefined : [scheduleFlowId]}
+        onCreate={(options) => scheduleFlowId === null ? Promise.resolve(false) : electron.createScheduleForFlow(scheduleFlowId, options)}
         onOpenChange={(open) => { if (!open) setScheduleFlowId(null); }}
+        onPreview={electron.previewSchedule}
         open={scheduleFlowId !== null}
       />
       <AlertDialog onOpenChange={(open) => !open && setDeleteFlowId(null)} open={deleteFlowId !== null}>
@@ -270,6 +271,7 @@ export function TaskCenterPage({
         </AlertDialogContent>
       </AlertDialog>
       <RunDetailDialog
+        onLoadDetail={electron.getRunDetail}
         onOpenArtifact={(artifact) => void electron.openArtifactPath(artifact.storageUrl)}
         onOpenChange={(open) => { if (!open) setDetailRun(null); }}
         open={detailRun !== null}
@@ -279,8 +281,6 @@ export function TaskCenterPage({
         flowName={historyTarget?.flow.name ?? ''}
         onClose={() => setHistoryFlowId(null)}
         onInspectRun={(run) => {
-          void electron.loadTaskVariables(run.taskId);
-          void electron.loadArtifacts(run.taskId);
           setDetailRun(run);
         }}
         onRefresh={() => { if (historyFlowId !== null) void electron.loadFlowRuns(historyFlowId, { limit: 20 }); }}

@@ -452,6 +452,14 @@ export function createBrowserBridge({ backendClient = new BackendClient() }: Bro
         return failure(error);
       }
     },
+    getRunDetail: async (taskId) => {
+      try {
+        const [run, logs] = await Promise.all([backendClient.getTask(taskId), backendClient.getLogs(taskId)]);
+        return success({ run, logs });
+      } catch (error) {
+        return failure(error);
+      }
+    },
     listTaskVariables: async (taskId) => {
       try {
         return success(await backendClient.getVariables(taskId));
@@ -462,6 +470,20 @@ export function createBrowserBridge({ backendClient = new BackendClient() }: Bro
     listSchedules: async () => {
       try {
         return success(await backendClient.listSchedules());
+      } catch (error) {
+        return failure(error);
+      }
+    },
+    listScheduleRunSummaries: async () => {
+      try {
+        return success(await backendClient.listScheduleRunSummaries());
+      } catch (error) {
+        return failure(error);
+      }
+    },
+    previewSchedule: async (cronExpression, timezone) => {
+      try {
+        return success(await backendClient.previewSchedule(cronExpression, timezone));
       } catch (error) {
         return failure(error);
       }

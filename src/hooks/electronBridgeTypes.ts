@@ -10,7 +10,9 @@ import type {
   PickerRequest,
   PickerResult,
   QueueStats,
+  RunDetail,
   RunMode,
+  ScheduleRunSummary,
   ScheduleSnapshot,
   SiteAnalysisResult,
   TaskSnapshot
@@ -58,6 +60,7 @@ export type ElectronBridgeState = {
   runtimeStatus: RuntimeStatus;
   runs: TaskSnapshot[];
   schedules: ScheduleSnapshot[];
+  scheduleRunSummaries: Record<string, ScheduleRunSummary>;
   toasts: BridgeToast[];
   inputVariables: RuntimeVariable[];
   lastRunOverrideVariables: RuntimeVariable[];
@@ -96,16 +99,19 @@ export type ElectronBridgeState = {
   exportScraplingScript: (content: string, filename: string) => Promise<void>;
   analyzeCurrentSite: () => Promise<void>;
   loadRuns: (options?: { flowId?: string; limit?: number } & BridgeCallOptions) => Promise<void>;
+  getRunDetail: (taskId: string) => Promise<RunDetail>;
   loadFlowRuns: (flowId: string, options?: { limit?: number } & BridgeCallOptions) => Promise<void>;
   loadTaskVariables: (taskId: string) => Promise<void>;
   loadArtifacts: (taskId: string) => Promise<void>;
   readArtifact: (taskId: string, artifactId: string) => Promise<void>;
   loadQueueStats: (options?: BridgeCallOptions) => Promise<void>;
   loadSchedules: (options?: BridgeCallOptions) => Promise<void>;
-  createDefaultSchedule: (options?: CreateScheduleOptions) => Promise<void>;
-  createScheduleForFlow: (flowId: string, options?: CreateScheduleOptions) => Promise<void>;
+  loadScheduleRunSummaries: (options?: BridgeCallOptions) => Promise<void>;
+  previewSchedule: (cronExpression: string, timezone: string) => Promise<string[] | null>;
+  createDefaultSchedule: (options?: CreateScheduleOptions) => Promise<boolean>;
+  createScheduleForFlow: (flowId: string, options?: CreateScheduleOptions) => Promise<boolean>;
   updateScheduleEnabled: (scheduleId: string, enabled: boolean) => Promise<void>;
-  updateSchedule: (scheduleId: string, options: import('./useElectronBridgeActions').CreateScheduleOptions) => Promise<void>;
+  updateSchedule: (scheduleId: string, options: import('./useElectronBridgeActions').CreateScheduleOptions) => Promise<boolean>;
   deleteSchedule: (scheduleId: string) => Promise<void>;
   triggerSchedule: (scheduleId: string) => Promise<void>;
   refreshBackendStatus: () => Promise<void>;

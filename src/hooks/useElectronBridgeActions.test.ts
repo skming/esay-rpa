@@ -61,6 +61,7 @@ function renderActions(
     setRuntimeStatus: vi.fn(),
     setRuns: vi.fn(),
     setSchedules: vi.fn(),
+    setScheduleRunSummaries: vi.fn(),
     setSiteAnalysis: vi.fn(),
     setVariables: vi.fn(),
     setLogs: vi.fn(),

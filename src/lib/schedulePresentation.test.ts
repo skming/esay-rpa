@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { ScheduleSnapshot } from '../types/electron';
-import { buildCronExpression, countEnabledSchedules, describeCronExpression, describeNextRun, filterSchedules, formatScheduleDateTime, parseCronFields, previewNextCronRuns, selectUpcomingSchedules } from './schedulePresentation';
+import { buildCronExpression, countEnabledSchedules, describeCronExpression, describeNextRun, filterSchedules, formatScheduleDateTime, formatZonedDateTime, parseCronFields, selectUpcomingSchedules } from './schedulePresentation';
 
 function buildSchedule(overrides: Partial<ScheduleSnapshot> = {}): ScheduleSnapshot {
   return {
@@ -59,7 +59,7 @@ describe('schedulePresentation', () => {
     expect(formatScheduleDateTime('2026-06-10T01:02:03.000Z')).toMatch(/2026-06-10/);
   });
 
-  it('解析、组装并预览 Cron 字段', () => {
+  it('解析并组装 Cron 字段', () => {
     expect(parseCronFields('0 9 * * 1-5')).toEqual({
       dayOfMonth: '*',
       dayOfWeek: '1-5',
@@ -68,7 +68,12 @@ describe('schedulePresentation', () => {
       month: '*'
     });
     expect(buildCronExpression({ dayOfMonth: '*', dayOfWeek: '1-5', hour: '9', minute: '30', month: '*' })).toBe('30 9 * * 1-5');
-    expect(previewNextCronRuns('0 9 * * *', new Date('2026-06-10T08:58:00+08:00'), 2)).toHaveLength(2);
+  });
+
+  it('把后端返回的绝对触发时刻按所选时区显示', () => {
+    const instant = new Date('2026-09-28T01:00:00Z');
+    expect(formatZonedDateTime(instant, 'UTC')).toBe('2026-09-28 01:00');
+    expect(formatZonedDateTime(instant, 'Asia/Shanghai')).toBe('2026-09-28 09:00');
   });
 
   it('按下次触发时刻升序取启用调度，忽略停用与未计算的调度', () => {

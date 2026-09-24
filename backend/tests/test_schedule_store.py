@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from app.models.schemas import RunTaskRequest, ScheduleSnapshot
+from app.models.schemas import ScheduleSnapshot, ScheduleTaskRequest
 from app.services.schedule_store import SqlAlchemyScheduleStore, create_schedule_engine
 
 
@@ -14,7 +14,7 @@ def build_schedule(schedule_id: str = "schedule-1") -> ScheduleSnapshot:
         cronExpression="* * * * *",
         timezone="UTC",
         status="enabled",
-        task=RunTaskRequest(
+        task=ScheduleTaskRequest(
             flowName="持久化测试流程",
             targetUrl="https://quotes.toscrape.com/",
             selector=".quote .text::text",
@@ -72,3 +72,20 @@ async def test_sqlite_roundtrip_returns_timezone_aware_timestamps(tmp_path) -> N
     assert reloaded.next_run_at > datetime.now(UTC) - timedelta(hours=1)
 
     await engine.dispose()
+
+
+async def test_sqlite_roundtrip_preserves_selected_flow_ids(tmp_path) -> None:
+    engine = create_schedule_engine(f"sqlite+aiosqlite:///{tmp_path / 'selected-flows.db'}")
+    store = SqlAlchemyScheduleStore(engine)
+    await store.create_schema()
+    try:
+        schedule = build_schedule("selected-flows")
+        schedule = schedule.model_copy(update={
+            "task": schedule.task.model_copy(update={"flow_ids": ["flow-a", "flow-b"]}),
+        })
+        await store.save(schedule)
+        reloaded = await store.get(schedule.schedule_id)
+        assert reloaded is not None
+        assert reloaded.task.flow_ids == ["flow-a", "flow-b"]
+    finally:
+        await engine.dispose()
