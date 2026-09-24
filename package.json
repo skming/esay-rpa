@@ -8,7 +8,7 @@
     "backend:test": "cd backend && uv run pytest",
     "dev": "vite --host 0.0.0.0",
     "build": "tsc --noEmit && eslint . && vite build",
-    "test": "node --test tools/tests/dist-mac.test.cjs && vitest run --exclude 'tools/tests/**'",
+    "test": "node --test tools/tests/*.test.cjs && vitest run --exclude 'tools/tests/**'",
     "preview": "vite preview --host 0.0.0.0",
     "electron:dev": "concurrently -k \"pnpm dev\" \"wait-on tcp:19174 && electron .\"",
     "stack:dev": "concurrently -k \"pnpm backend:dev\" \"pnpm dev\" \"wait-on tcp:19174 tcp:8765 && electron .\"",

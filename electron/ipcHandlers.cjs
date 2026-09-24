@@ -40,8 +40,7 @@ function registerIpcHandlers({
   setMainWindow,
   shell,
   updater,
-  generateScraplingScript,
-  broadcastBackendStatus
+  generateScraplingScript
 }) {
   const handle = (channel, listener) => ipcMain.handle(channel, listener);
 
@@ -164,7 +163,6 @@ function registerIpcHandlers({
     try {
       await backendSupervisor.stop();
       const status = await backendSupervisor.ensureStarted();
-      broadcastBackendStatus(status);
       return success(status);
     } catch (error) {
       return failure(error);

@@ -60,7 +60,6 @@ export function BackendBootScreen({
   }
 
   const lines = error.trim().split('\n').filter((line) => line.trim().length > 0);
-  const isLong = lines.length > 3;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-4 bg-slate-50 px-6">
@@ -72,11 +71,11 @@ export function BackendBootScreen({
             </span>
             <div className="min-w-0">
               <p className="text-xs font-medium text-slate-700">后端启动失败</p>
-              <p className="truncate text-[11px] text-slate-500">{lines[0] ?? error}</p>
+              <p className="break-words text-[11px] text-slate-500">{lines[0] ?? error}</p>
             </div>
           </div>
 
-          {isLong && (
+          {lines.length > 1 && (
             <Collapsible title="错误详情">
               <CodeBlock code={error} maxHeight={200} variant="light" wrap />
             </Collapsible>

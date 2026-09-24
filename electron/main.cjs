@@ -230,7 +230,6 @@ app.whenReady().then(() => {
     app,
     backendClient,
     backendSupervisor,
-    broadcastBackendStatus,
     generateScraplingScript,
     getMainWindow: () => mainWindow,
     getSenderWindow,

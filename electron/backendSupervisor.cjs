@@ -257,7 +257,8 @@ class BackendSupervisor {
     this.#setStatus({ pid: child.pid ?? null });
 
     for (const retryDelayMs of HEALTH_RETRY_DELAYS_MS) {
-      if (await this.#isBackendHealthy()) {
+      const healthy = await this.#isBackendHealthy();
+      if (healthy && !processExited && this.child === child) {
         this.#setStatus({
           error: null,
           managed: true,
@@ -276,8 +277,8 @@ class BackendSupervisor {
 
     this.#setStatus({
       error: outputBuffer.trim() || '后端启动超时，健康检查未通过',
-      managed: true,
-      pid: child.pid ?? null,
+      managed: !processExited,
+      pid: processExited ? null : child.pid ?? null,
       source: 'managed',
       status: 'error'
     });

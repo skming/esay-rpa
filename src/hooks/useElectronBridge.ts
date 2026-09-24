@@ -412,9 +412,15 @@ export function useElectronBridge({
           pushToast('error', result.error ?? '后端重启失败');
           return;
         }
-        if (result.data !== undefined) {
+        if (result.data === undefined) {
+          pushToast('error', '后端重启未返回状态');
+          return;
+        }
+        if (result.data.status !== 'ready' || window.rpaBridge === undefined) {
           setBackendStatus(result.data);
-          pushToast(result.data.status === 'ready' ? 'success' : 'info', result.data.status === 'ready' ? '后端服务已就绪' : '后端服务状态已更新');
+        }
+        if (result.data.status === 'error') {
+          pushToast('error', '后端启动失败，请查看页面错误详情');
         }
       },
       clearToast: () => setToasts([]),
