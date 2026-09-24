@@ -125,7 +125,7 @@ export function applyNodeConfigDraft(data: RpaNodeData, draft: RpaNodeConfigDraf
       autoSave: draft.autoSave,
       continueOnError: draft.continueOnError,
       // 关闭时写 undefined 不留 false：这个标记会跟着流程定义进到 AI 看到的节点上，一个后端永远不读的 false 只是噪声。
-      requireConfirmation: shouldUseRequireConfirmation(actionType) ? (draft.requireConfirmation ? true : undefined) : previous?.requireConfirmation,
+      requireConfirmation: shouldUseRequireConfirmation(actionType) && draft.requireConfirmation ? true : undefined,
       attribute: shouldUseAttribute(actionType) ? text(draft.attribute) : previous?.attribute,
       extractMode: draft.extractMode,
       inputValue: shouldUseInputValue(actionType) ? draft.inputValue : previous?.inputValue,
@@ -307,10 +307,11 @@ function shouldUseTargetUrl(actionType: string | undefined): boolean {
   return actionType === 'browser.fetch' || actionType === 'browser.open' || actionType === 'browser.tab.open' || actionType === 'browser.ensureLogin';
 }
 
-/** 人工确认闸门只由插件执行器实现（task_manager._maybe_confirm_sensitive_action），而它只接浏览器
- *  动作：非浏览器节点打上这个标记不会有任何人被问到。 */
+/** 人工确认闸门只由插件执行器在 _run_browser_action_node（后端 _BROWSER_ACTION_NODE_TYPES）里实现；
+ *  browser.fetch 走的是 _run_fetch_node，从不经过确认门，给它挂这个标记没有任何人会被问到，
+ *  等同非浏览器节点。 */
 export function shouldUseRequireConfirmation(actionType: string | undefined): boolean {
-  return actionType !== undefined && (actionType.startsWith('browser.') || actionType.startsWith('ui.'));
+  return actionType !== undefined && actionType !== 'browser.fetch' && (actionType.startsWith('browser.') || actionType.startsWith('ui.'));
 }
 
 function shouldUseAttribute(actionType: string | undefined): boolean {

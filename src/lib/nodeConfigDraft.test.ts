@@ -144,6 +144,18 @@ describe('nodeConfigDraft', () => {
       action: { type: 'excel.write', filePath: 'out.xlsx' }
     };
     expect(applyNodeConfigDraft(excelNode, { ...createNodeConfigDraft(excelNode), requireConfirmation: true }).action?.requireConfirmation).toBeUndefined();
+
+    // browser.fetch 走 _run_fetch_node，后端从不为它触发确认门；勾选也不能落成 true，否则界面上是个骗人的开关
+    const fetchNode: RpaNodeData = {
+      title: '静态抓取',
+      description: 'quotes.toscrape.com',
+      kind: 'browser',
+      status: 'pending',
+      action: { type: 'browser.fetch', targetUrl: 'https://quotes.toscrape.com', selector: '.quote', timeoutMs: 30_000 }
+    };
+    expect(applyNodeConfigDraft(fetchNode, { ...createNodeConfigDraft(fetchNode), requireConfirmation: true }).action?.requireConfirmation).toBeUndefined();
+    const changedToFetch: RpaNodeData = { ...fetchNode, action: { ...fetchNode.action!, requireConfirmation: true } };
+    expect(applyNodeConfigDraft(changedToFetch, createNodeConfigDraft(changedToFetch)).action?.requireConfirmation).toBeUndefined();
   });
 
   it('应保存浏览器按键提交配置', () => {

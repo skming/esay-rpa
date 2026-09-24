@@ -91,7 +91,7 @@ export function ExecutionStrategySection({
       {draft.requireConfirmation && shouldUseRequireConfirmation(actionType) && (
         <div className="flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-[10px] leading-4 text-amber-800">
           <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" strokeWidth={1.5} />
-          <span>仅插件执行器生效：执行前暂停，等你在浏览器顶部横幅点「完成，继续执行」；2 分钟未确认则中止本次运行。</span>
+          <span>仅插件执行器生效：执行前暂停，等你在浏览器顶部横幅点「确认并继续」；2 分钟未确认则中止本次运行。</span>
         </div>
       )}
 

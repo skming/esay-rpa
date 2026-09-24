@@ -366,50 +366,193 @@ async def test_task_manager_confirms_sensitive_extension_action(tmp_path) -> Non
     assert fake_extension.banner_calls[-1] == ("hide", None)
 
 
-async def test_task_manager_confirms_sensitive_extension_action_once_across_retries(tmp_path) -> None:
-    """契约是"确认后执行一次"：retry 策略重跑动作时横幅不能再弹第二次。"""
+class FailOnceExtensionExecutor(FakeExtensionExecutor):
+    """首次调用失败、之后成功。用于证明"已确认动作失败即停、绝不重跑"。"""
 
-    class FailOnceExtensionExecutor(FakeExtensionExecutor):
-        def __init__(self) -> None:
-            super().__init__()
-            self.run_attempts = 0
+    def __init__(self) -> None:
+        super().__init__()
+        self.run_attempts = 0
 
-        async def run(self, node, variables, context, *, timeout_ms):
-            self.run_attempts += 1
-            if self.run_attempts == 1:
-                raise RuntimeError("首次点击瞬时失败")
-            return await super().run(node, variables, context, timeout_ms=timeout_ms)
+    async def run(self, node, variables, context, *, timeout_ms):
+        self.run_attempts += 1
+        if self.run_attempts == 1:
+            raise RuntimeError("首次点击瞬时失败")
+        return await super().run(node, variables, context, timeout_ms=timeout_ms)
 
-    fake_extension = FailOnceExtensionExecutor()
+
+def _single_confirmation_flow() -> dict[str, object]:
+    return {
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {"id": "submit", "title": "提交支付", "type": "browser.click", "selector": "#submit", "requireConfirmation": True},
+        ],
+        "edges": [{"source": "start", "target": "submit"}],
+    }
+
+
+def _confirmation_then_next_flow() -> dict[str, object]:
+    return {
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {"id": "submit", "title": "提交支付", "type": "browser.click", "selector": "#submit", "requireConfirmation": True},
+            {"id": "verify", "title": "读取回执", "type": "browser.extract", "selector": "#receipt"},
+        ],
+        "edges": [
+            {"source": "start", "target": "submit"},
+            {"source": "submit", "target": "verify"},
+        ],
+    }
+
+
+def _confirming_manager(executor: FakeExtensionExecutor, tmp_path) -> TaskManager:
     manager = TaskManager(runner=FakeRunner(), broker=LogBroker(), artifact_store=LocalArtifactStore(artifact_root=tmp_path))
-    manager._extension_executor = fake_extension  # type: ignore[assignment]
+    manager._extension_executor = executor  # type: ignore[assignment]
     manager._is_extension_enabled = lambda: True  # type: ignore[assignment]
+    return manager
+
+
+@pytest.mark.parametrize("failure_strategy", ["retry", "continue"])
+async def test_confirmed_sensitive_action_runs_once_and_stops_on_failure(tmp_path, failure_strategy) -> None:
+    """已确认的敏感动作一次确认最多一次实际调用：即便 failureStrategy=retry/continue，
+    首次失败也不得重跑或静默继续，任务落 error，后续节点不执行，并留下失败现场。"""
+    fake_extension = FailOnceExtensionExecutor()
+    manager = _confirming_manager(fake_extension, tmp_path)
 
     snapshot = await manager.start_task(
         RunTaskRequest(
-            flowName="敏感操作重试流程",
+            flowName="敏感操作失败即停流程",
             targetUrl="https://example.com/fallback",
             selector=".fallback::text",
             browserExecutor="extension",
-            failureStrategy="retry",
-            flowDefinition={
-                "nodes": [
-                    {"id": "start", "type": "start"},
-                    {"id": "submit", "title": "提交支付", "type": "browser.click", "selector": "#submit", "requireConfirmation": True},
-                ],
-                "edges": [{"source": "start", "target": "submit"}],
-            },
+            failureStrategy=failure_strategy,
+            flowDefinition=_confirmation_then_next_flow(),
         )
     )
 
     await wait_for_status(manager, snapshot.task_id, {"awaiting_confirmation"})
-    resumed = await manager.resume_confirmation(snapshot.task_id)
-    assert resumed is not None
+    assert await manager.resume_confirmation(snapshot.task_id) is not None
 
-    done = await wait_for_status(manager, snapshot.task_id, {"success", "error"})
-    assert done.status == "success"
-    assert fake_extension.run_attempts == 2  # 重试确实重跑了动作
+    done = await wait_for_status(manager, snapshot.task_id, {"success", "error", "stopped"})
+    assert done.status == "error"
+    # 首次调用即抛错（FailOnce 在失败分支未记录 action），run_attempts==1 直接证明：
+    # 确认后只调用一次，retry 不重跑、continue 不吞错继续；verify 若执行计数会变 2。
+    assert fake_extension.run_attempts == 1
+    assert all(action["id"] != "verify" for action in fake_extension.actions)
     assert [call[0] for call in fake_extension.banner_calls].count("show") == 1
+    logs = await manager.get_logs(snapshot.task_id)
+    assert logs is not None
+    assert any("按确认契约不重试" in log.message for log in logs)
+
+
+async def test_confirmed_sensitive_action_continues_to_next_node_on_success(tmp_path) -> None:
+    """确认成功后正常执行本节点并继续后续节点。"""
+    fake_extension = FakeExtensionExecutor()
+    manager = _confirming_manager(fake_extension, tmp_path)
+
+    snapshot = await manager.start_task(
+        RunTaskRequest(
+            flowName="确认后继续流程",
+            targetUrl="https://example.com/fallback",
+            selector=".fallback::text",
+            browserExecutor="extension",
+            flowDefinition=_confirmation_then_next_flow(),
+        )
+    )
+
+    await wait_for_status(manager, snapshot.task_id, {"awaiting_confirmation"})
+    assert await manager.resume_confirmation(snapshot.task_id) is not None
+
+    done = await wait_for_status(manager, snapshot.task_id, {"success", "error", "stopped"})
+    assert done.status == "success"
+    assert [action["id"] for action in fake_extension.actions] == ["submit", "verify"]
+    assert [call[0] for call in fake_extension.banner_calls].count("show") == 1
+
+
+async def test_confirmation_timeout_stops_task_without_running_action(tmp_path) -> None:
+    """确认超时：动作从不执行，任务落 stopped（不确定时停止并留证）。"""
+    fake_extension = FakeExtensionExecutor()
+    manager = _confirming_manager(fake_extension, tmp_path)
+    manager._confirm_timeout_seconds = 0.05  # 缩短仅为覆盖超时分支
+
+    snapshot = await manager.start_task(
+        RunTaskRequest(
+            flowName="确认超时流程",
+            targetUrl="https://example.com/fallback",
+            selector=".fallback::text",
+            browserExecutor="extension",
+            failureStrategy="retry",
+            flowDefinition=_single_confirmation_flow(),
+        )
+    )
+
+    done = await wait_for_status(manager, snapshot.task_id, {"success", "error", "stopped"})
+    assert done.status == "stopped"
+    assert fake_extension.actions == []  # 敏感动作从未真正调用
+    assert [call[0] for call in fake_extension.banner_calls].count("show") == 1
+
+
+async def test_confirmation_cancel_propagates_and_stops(tmp_path) -> None:
+    """awaiting_confirmation 期间取消：取消异常传播，任务落 stopped，动作不执行。"""
+    fake_extension = FakeExtensionExecutor()
+    manager = _confirming_manager(fake_extension, tmp_path)
+
+    snapshot = await manager.start_task(
+        RunTaskRequest(
+            flowName="确认中取消流程",
+            targetUrl="https://example.com/fallback",
+            selector=".fallback::text",
+            browserExecutor="extension",
+            flowDefinition=_single_confirmation_flow(),
+        )
+    )
+
+    await wait_for_status(manager, snapshot.task_id, {"awaiting_confirmation"})
+    await manager.stop_task(snapshot.task_id)
+
+    done = await wait_for_status(manager, snapshot.task_id, {"success", "error", "stopped"})
+    assert done.status == "stopped"
+    assert fake_extension.actions == []
+
+
+async def test_reconcile_interrupted_awaiting_confirmation_after_restart(tmp_path) -> None:
+    """重启对账：持久化的 awaiting_confirmation 在新进程既无内存 record 也无确认通道，
+    必须被落成 stopped 并留痕，且 /resume 明确失效，避免 UI 显示"可继续"却接不上。"""
+    store = InMemoryTaskStore()
+    request = RunTaskRequest(
+        flowName="重启前待确认流程",
+        targetUrl="https://example.com/fallback",
+        selector=".fallback::text",
+        browserExecutor="extension",
+        flowDefinition=_single_confirmation_flow(),
+    )
+    now = datetime.now(UTC)
+    stale = TaskSnapshot(
+        task_id="t_stale_await",
+        flow_name="重启前待确认流程",
+        status="awaiting_confirmation",
+        mode="run",
+        progress=RuntimeProgress(current_step=1, total_steps=3, percent=10, elapsed_ms=0),
+        created_at=now,
+        updated_at=now,
+        confirmation_message="即将执行敏感操作：browser.click #submit",
+    )
+    await store.save_task(stale, request)
+
+    # 模拟重启：全新 TaskManager，_tasks 为空，仅共享持久化 store
+    manager = TaskManager(runner=FakeRunner(), broker=LogBroker(), artifact_store=LocalArtifactStore(artifact_root=tmp_path), task_store=store)
+    assert await manager.reconcile_interrupted_tasks() == 1
+
+    snap = await manager.get_task("t_stale_await")
+    assert snap is not None and snap.status == "stopped"
+    assert snap.error and "重启" in snap.error
+    assert snap.confirmation_message is None
+    assert await manager.resume_confirmation("t_stale_await") is None  # 死状态不可继续
+    logs = await manager.get_logs("t_stale_await")
+    assert logs is not None and any("任务已终止" in log.message for log in logs)
+
+    # 已终态的任务不再被二次对账
+    assert await manager.reconcile_interrupted_tasks() == 0
+
 
 
 async def test_resume_confirmation_is_noop_after_active_cleared(tmp_path) -> None:

@@ -152,6 +152,8 @@ class TaskManager:
         self._queue = queue_factory(self._run_record) if queue_factory is not None else InMemoryTaskQueue(self._run_record, concurrency=concurrency)
         self._extension_executor: ExtensionExecutor | None = None
         self._is_extension_enabled: Callable[[], bool] | None = None
+        # 敏感操作确认等待上限（秒）。抽成属性只为让超时分支可测，生产不改这个值。
+        self._confirm_timeout_seconds: float = 120
 
     def set_extension_bridge(self, bridge: ExtensionBridgeService, *, is_extension_enabled: Callable[[], bool]) -> None:
         """is_extension_enabled 是必传关键字参数：留默认值就等于默认放行，那样设置里关掉插件后，
@@ -1028,14 +1030,19 @@ class TaskManager:
 
     async def _maybe_confirm_sensitive_action(
         self, record: TaskRecord, node: dict[str, object], *, node_id: str, node_title: str
-    ) -> None:
-        """扩展执行器执行显式标记的敏感操作前，暂停等待用户确认。"""
-        if record.request.browser_executor != "extension" or self._extension_executor is None:
-            return
-        if node.get("requireConfirmation") is not True:
-            return
+    ) -> bool:
+        """扩展执行器执行显式标记的敏感操作前，暂停等待用户确认。
 
-        confirm_timeout_seconds = 120  # 2 分钟：给用户看清敏感操作详情再点确认的合理时长
+        返回 True 表示本节点是「已确认的敏感动作」：调用方必须只执行一次、失败即停，
+        不得重试或按 continue 静默继续（一次确认最多对应一次实际调用，避免二次提交等不可逆副作用）。
+        返回 False 表示未触发确认（非扩展执行器或未标记），按普通节点的重试/继续语义处理。
+        确认超时或取消时抛出 CancelledError，由上层落终态。"""
+        if record.request.browser_executor != "extension" or self._extension_executor is None:
+            return False
+        if node.get("requireConfirmation") is not True:
+            return False
+
+        confirm_timeout_seconds = self._confirm_timeout_seconds  # 2 分钟默认：给用户看清敏感操作详情再点确认的合理时长
         detail = _read_node_browser_detail(node) or ""
         message = f"{node_title}\n即将执行敏感操作：{node.get('type')} {detail}\n请确认后继续\n⏱{confirm_timeout_seconds * 1000}"
         completed = await self._wait_for_confirmation(
@@ -1051,6 +1058,7 @@ class TaskManager:
 
         await self._update_snapshot(record, status="running", confirmation_message=None)
         await self._append_log(record, "success", f"人工已确认 · {node_title}", None, node_id=node_id)
+        return True
 
     async def _pause_for_debug_if_needed(self, record: TaskRecord, *, node_id: str, node_title: str) -> None:
         if record.request.mode != "debug":
@@ -1292,7 +1300,7 @@ class TaskManager:
 
         # 只确认一次：契约是"确认后执行一次、不重试当前节点"。留在 _execute 里会随重试和
         # 浮层自动关闭后的重跑反复弹窗，无人值守下再等一轮超时直接取消任务。
-        await self._maybe_confirm_sensitive_action(
+        confirmed = await self._maybe_confirm_sensitive_action(
             record, _resolve_node_variables(node, record.variables), node_id=node_id, node_title=node_title
         )
 
@@ -1312,6 +1320,19 @@ class TaskManager:
                 await self._update_snapshot(record, variables=record.variables.snapshots())
             await self._save_browser_screenshot(record, context, node_id=node_id, node_title=node_title)
             return browser_result.to_scrape_result()
+
+        if confirmed:
+            # 已确认的敏感动作：一次确认最多一次实际调用。绕过 _run_with_retry 与浮层重试，
+            # 无论 failureStrategy=retry 还是 continue/continueOnError 都不得重跑或吞错静默继续，
+            # 否则一次点击可能变成两次提交/两次支付等不可逆副作用。失败即留证并终止本次运行。
+            try:
+                return await _execute()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self._append_log(record, "warn", f"敏感动作失败，按确认契约不重试 · {node_title}", str(exc), node_id=node_id)
+                await self._capture_failure_evidence(record, context, exc, node_id=node_id, node_title=node_title)
+                raise
 
         try:
             return await self._run_with_retry(record, node, node_id=node_id, node_title=node_title, label="浏览器动作", execute=_execute)
