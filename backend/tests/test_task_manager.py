@@ -2539,3 +2539,42 @@ async def test_cancel_during_cookie_export_still_closes_the_browser(tmp_path, mo
         if current is not None:
             browser_profile_lock.release(profile_dir, current)
         await manager.stop_workers()
+
+
+async def test_get_artifact_content_falls_back_to_persisted_snapshot(tmp_path) -> None:
+    """历史任务/重启后内存里已无产物路径映射，get_artifact_content 必须按持久化快照的 storage_url 回读，
+    而非退回 404——否则运行详情里的产物预览对所有非本次运行的任务都失效。"""
+    saved = await LocalArtifactStore(artifact_root=tmp_path).save_bytes(
+        task_id="t_hist",
+        artifact_type="screenshot",
+        filename="shot.png",
+        content=b"\x89PNG\r\n\x1a\nfake",
+        content_type="image/png",
+    )
+    store = InMemoryTaskStore()
+    now = datetime.now(UTC)
+    await store.save_task(
+        TaskSnapshot(
+            task_id="t_hist",
+            flow_name="历史任务",
+            status="success",
+            mode="run",
+            progress=RuntimeProgress(current_step=1, total_steps=1, percent=100, elapsed_ms=0),
+            created_at=now,
+            updated_at=now,
+            artifacts=[saved],
+        ),
+        RunTaskRequest(
+            flowName="历史任务",
+            targetUrl="https://example.com/",
+            selector=".item::text",
+            flowDefinition={"nodes": [{"id": "fetch", "type": "browser.fetch", "targetUrl": "https://example.com/", "selector": ".item::text"}], "edges": []},
+        ),
+    )
+
+    # 模拟重启：全新 TaskManager + 全新 store 实例，内存映射为空，仅共享落盘产物与持久化 store
+    manager = TaskManager(runner=FakeRunner(), broker=LogBroker(), artifact_store=LocalArtifactStore(artifact_root=tmp_path), task_store=store)
+    content = await manager.get_artifact_content("t_hist", saved.artifact_id)
+    assert content is not None
+    assert content.content.startswith("data:image/png;base64,")
+    assert await manager.get_artifact_content("t_hist", "missing") is None

@@ -100,6 +100,7 @@ export type ElectronBridgeState = {
   analyzeCurrentSite: () => Promise<void>;
   loadRuns: (options?: { flowId?: string; limit?: number } & BridgeCallOptions) => Promise<void>;
   getRunDetail: (taskId: string) => Promise<RunDetail>;
+  getArtifactContent: (taskId: string, artifactId: string) => Promise<ArtifactContent | null>;
   loadFlowRuns: (flowId: string, options?: { limit?: number } & BridgeCallOptions) => Promise<void>;
   loadTaskVariables: (taskId: string) => Promise<void>;
   loadArtifacts: (taskId: string) => Promise<void>;

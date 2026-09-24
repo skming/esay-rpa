@@ -155,6 +155,12 @@ export function useElectronBridge({
     return result.data;
   }, [bridge]);
 
+  // 运行详情弹窗按需读取单个产物内容做预览，走独立返回值而非共享的 artifactContent，避免与底部面板串扰
+  const getArtifactContent = useCallback(
+    (taskId: string, artifactId: string): Promise<ArtifactContent | null> => callBridge((api) => api.readArtifact(taskId, artifactId)),
+    [callBridge]
+  );
+
   const debugControl = useCallback(
     (command: DebugControlCommand): void => {
       if (runtimeStatus !== 'running') {
@@ -389,6 +395,7 @@ export function useElectronBridge({
       variables,
       ...actions,
       getRunDetail,
+      getArtifactContent,
       debugControl,
       pushToast,
       dismissToast,
@@ -459,6 +466,7 @@ export function useElectronBridge({
       windowId,
       debugControl,
       getRunDetail,
+      getArtifactContent,
       dismissToast,
       pushToast
     ]

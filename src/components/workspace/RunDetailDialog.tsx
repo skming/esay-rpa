@@ -1,11 +1,12 @@
-import { AlertCircle, CheckCircle2, ChevronRight, Clock3, DatabaseZap, FileJson, FolderOpen, Loader2, ScrollText, XCircle } from 'lucide-react';
+import { AlertCircle, CheckCircle2, ChevronRight, Clock3, DatabaseZap, Eye, FileJson, FolderOpen, Loader2, ScrollText, XCircle } from 'lucide-react';
 import type { ReactElement } from 'react';
 import { useEffect, useState } from 'react';
 
 import { formatElapsedTime } from '../../lib/time';
 import { cn } from '../../lib/utils';
-import type { ArtifactSnapshot, BackendTaskLogEntry, RunDetail, TaskSnapshot } from '../../types/electron';
+import type { ArtifactContent, ArtifactSnapshot, BackendTaskLogEntry, RunDetail, TaskSnapshot } from '../../types/electron';
 import type { RunLogLevel } from '../../types/rpa';
+import { ArtifactPreviewDialog } from '../studio/bottom-panel/ArtifactPreviewDialog';
 import { getLogTone } from '../studio/bottom-panel/bottomPanelUtils';
 import { Badge } from '../ui/badge';
 import { Button } from '../ui/button';
@@ -25,12 +26,14 @@ function logLevelLabel(level: string): string {
 
 export function RunDetailDialog({
   onOpenArtifact,
+  onReadArtifact,
   onOpenChange,
   onLoadDetail,
   open,
   run: listedRun,
 }: {
   onOpenArtifact?: (artifact: ArtifactSnapshot) => void;
+  onReadArtifact?: (taskId: string, artifactId: string) => Promise<ArtifactContent | null>;
   onOpenChange: (open: boolean) => void;
   onLoadDetail: (taskId: string) => Promise<RunDetail>;
   open: boolean;
@@ -39,7 +42,20 @@ export function RunDetailDialog({
   const [detail, setDetail] = useState<{ taskId: string; run: TaskSnapshot; logs: BackendTaskLogEntry[] } | null>(null);
   const [loadError, setLoadError] = useState<{ taskId: string; message: string } | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
+  const [preview, setPreview] = useState<{ artifact: ArtifactSnapshot; content: ArtifactContent | null } | null>(null);
   const taskId = listedRun?.taskId;
+
+  // 预览按需读取内容，只保留仍指向当前产物的结果；读取失败（返回 null，callBridge 已弹 toast）则关闭预览
+  const handlePreview = (artifact: ArtifactSnapshot): void => {
+    if (onReadArtifact === undefined) return;
+    setPreview({ artifact, content: null });
+    void onReadArtifact(artifact.taskId, artifact.artifactId).then((content) => {
+      setPreview((current) => {
+        if (current === null || current.artifact.artifactId !== artifact.artifactId) return current;
+        return content === null ? null : { ...current, content };
+      });
+    });
+  };
 
   useEffect(() => {
     if (!open || taskId === undefined) return;
@@ -81,11 +97,13 @@ export function RunDetailDialog({
     if (!nextOpen) {
       setDetail(null);
       setLoadError(null);
+      setPreview(null);
     }
     onOpenChange(nextOpen);
   };
 
   return (
+    <>
     <Dialog onOpenChange={handleOpenChange} open={open}>
       <DialogContent className="flex max-h-[min(82vh,700px)] w-200 max-w-[calc(100vw-32px)] flex-col overflow-hidden">
         <DialogHeader>
@@ -150,13 +168,20 @@ export function RunDetailDialog({
                   <FileJson className="h-3.5 w-3.5 text-emerald-500" strokeWidth={1.5} />
                   产物（{run.artifacts?.length ?? 0} 个）
                 </div>
+                {/* 同一次运行的产物同处一个目录，只在标题栏给一个入口，不必每行都放 */}
+                {onOpenArtifact && (
+                  <button aria-label="打开产物目录" className="flex items-center gap-1 rounded px-1.5 py-0.5 font-normal text-slate-500 hover:text-slate-800" onClick={() => { const first = run.artifacts?.[0]; if (first) onOpenArtifact(first); }} type="button">
+                    <FolderOpen className="h-3.5 w-3.5" strokeWidth={1.5} />
+                    打开目录
+                  </button>
+                )}
               </div>
               <div className="max-h-25 space-y-1 overflow-auto rounded-md border border-slate-200 bg-slate-50 p-2">
                 {(run.artifacts ?? []).map((a) => (
                   <div className="group flex items-center justify-between gap-2 rounded px-1 py-0.5 text-[11px] transition-colors hover:bg-slate-100" key={a.artifactId}>
                     <span className="min-w-0 flex-1 truncate font-mono text-slate-700">{a.filename}</span>
                     <span className="shrink-0 text-slate-500">{formatBytes(a.sizeBytes)}</span>
-                    {onOpenArtifact && <button aria-label={`打开 ${a.filename} 所在位置`} className="rounded p-1 text-slate-500 hover:text-slate-800" onClick={() => onOpenArtifact(a)} type="button"><FolderOpen className="h-3.5 w-3.5" strokeWidth={1.5} /></button>}
+                    {onReadArtifact && <button aria-label={`预览 ${a.filename}`} className="rounded p-1 text-slate-500 hover:text-slate-800" onClick={() => handlePreview(a)} type="button"><Eye className="h-3.5 w-3.5" strokeWidth={1.5} /></button>}
                   </div>
                 ))}
               </div>
@@ -184,6 +209,14 @@ export function RunDetailDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+    <ArtifactPreviewDialog
+      artifact={preview?.artifact ?? null}
+      content={preview?.content ?? null}
+      loading={preview !== null && preview.content === null}
+      onOpenChange={(nextOpen) => { if (!nextOpen) setPreview(null); }}
+      open={preview !== null}
+    />
+    </>
   );
 }
 

@@ -272,6 +272,7 @@ export function TaskCenterPage({
       </AlertDialog>
       <RunDetailDialog
         onLoadDetail={electron.getRunDetail}
+        onReadArtifact={electron.getArtifactContent}
         onOpenArtifact={(artifact) => void electron.openArtifactPath(artifact.storageUrl)}
         onOpenChange={(open) => { if (!open) setDetailRun(null); }}
         open={detailRun !== null}

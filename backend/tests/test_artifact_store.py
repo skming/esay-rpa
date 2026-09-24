@@ -80,3 +80,59 @@ async def test_artifact_store_reads_binary_artifact_as_data_url(tmp_path) -> Non
     assert artifact.content_type == "image/png"
     assert content is not None
     assert content.content.startswith("data:image/png;base64,")
+
+
+async def test_local_store_reads_content_from_persisted_snapshot(tmp_path) -> None:
+    # 模拟进程重启：产物已落盘，新建 store 的内存路径映射为空，只能按持久化 storage_url 回读。
+    store = LocalArtifactStore(tmp_path)
+    artifact = await store.save_bytes(
+        task_id="task-1",
+        artifact_type="screenshot",
+        filename="node.png",
+        content=b"\x89PNG\r\n\x1a\nfake",
+        content_type="image/png",
+    )
+
+    reopened = LocalArtifactStore(tmp_path)
+    assert reopened.read_artifact_content("task-1", artifact.artifact_id) is None
+    content = reopened.read_snapshot_content(artifact)
+    assert content is not None
+    assert content.content.startswith("data:image/png;base64,")
+
+
+async def test_minio_store_reads_snapshot_when_filename_has_url_special_chars() -> None:
+    # 文件名里的 # ? 会被 urlparse 当作 fragment/query 截断，重启后按 bucket 前缀切出完整对象名才能回读。
+    client = FakeMinioClient()
+    store = MinioArtifactStore(client=client, bucket="rpa-artifacts")
+
+    for filename in ("summary#2.txt", "report?v=1.txt"):
+        artifact = await store.save_bytes(
+            task_id="task-1",
+            artifact_type="dataset",
+            filename=filename,
+            content=b"payload-body",
+            content_type="text/plain",
+        )
+        assert filename in artifact.storage_url
+
+        reopened = MinioArtifactStore(client=client, bucket="rpa-artifacts")
+        content = reopened.read_snapshot_content(artifact)
+        assert content is not None
+        assert content.content == "payload-body"
+
+
+async def test_minio_store_reads_content_from_persisted_snapshot() -> None:
+    client = FakeMinioClient()
+    store = MinioArtifactStore(client=client, bucket="rpa-artifacts")
+    artifact = await store.save_json(
+        task_id="task-1",
+        artifact_type="dataset",
+        filename="result.json",
+        payload=ScrapeResult(url="https://example.com/", selector="h1::text", count=1, values=["hello"]),
+    )
+
+    reopened = MinioArtifactStore(client=client, bucket="rpa-artifacts")
+    assert reopened.read_artifact_content("task-1", artifact.artifact_id) is None
+    content = reopened.read_snapshot_content(artifact)
+    assert content is not None
+    assert '"hello"' in content.content

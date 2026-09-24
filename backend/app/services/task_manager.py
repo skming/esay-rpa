@@ -326,9 +326,17 @@ class TaskManager:
         return snapshot.artifacts or self._artifact_store.list_task_artifacts(task_id)
 
     async def get_artifact_content(self, task_id: str, artifact_id: str) -> ArtifactContent | None:
-        if await self.get_task(task_id) is None:
+        snapshot = await self.get_task(task_id)
+        if snapshot is None:
             return None
-        return self._artifact_store.read_artifact_content(task_id, artifact_id)
+        content = self._artifact_store.read_artifact_content(task_id, artifact_id)
+        if content is not None:
+            return content
+        # 内存映射只覆盖本进程本次运行；历史任务/重启后改从持久化快照的 storage_url 直读。
+        artifact = next((a for a in snapshot.artifacts if a.artifact_id == artifact_id), None)
+        if artifact is None:
+            return None
+        return self._artifact_store.read_snapshot_content(artifact)
 
     async def queue_stats(self) -> QueueStats:
         snapshot = await self._queue.snapshot()

@@ -14,6 +14,8 @@ from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 from typing import BinaryIO, Protocol
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 from uuid import uuid4
 
 from minio import Minio
@@ -62,6 +64,8 @@ class ArtifactStore(Protocol):
     def list_task_artifacts(self, task_id: str) -> list[ArtifactSnapshot] | None: ...
 
     def read_artifact_content(self, task_id: str, artifact_id: str) -> ArtifactContent | None: ...
+
+    def read_snapshot_content(self, artifact: ArtifactSnapshot) -> ArtifactContent | None: ...
 
 
 class MinioClientProtocol(Protocol):
@@ -178,11 +182,20 @@ class LocalArtifactStore:
         # 避免未来传入畸形 filename/flow_id 时读到 artifact_root 外的文件。
         if not resolved.is_relative_to(self._artifact_root):
             raise ValueError(f"artifact path escapes storage root: {resolved}")
+        return _artifact_content_from_bytes(artifact, resolved.read_bytes())
 
-        if artifact.content_type.startswith("text/") or artifact.content_type.endswith("/json"):
-            return ArtifactContent(artifact=artifact, content=resolved.read_text("utf-8"))
-        encoded = base64.b64encode(resolved.read_bytes()).decode("ascii")
-        return ArtifactContent(artifact=artifact, content=f"data:{artifact.content_type};base64,{encoded}")
+    def read_snapshot_content(self, artifact: ArtifactSnapshot) -> ArtifactContent | None:
+        # 内存里的 _artifact_paths 只覆盖本进程本次运行；历史任务/重启后改从持久化的 storage_url 直读磁盘。
+        parsed = urlparse(artifact.storage_url)
+        if parsed.scheme != "file":
+            return None
+        resolved = Path(url2pathname(parsed.path)).resolve()
+        # storage_url 来自持久化记录，仍按同一存储根做穿越校验后再读。
+        if not resolved.is_relative_to(self._artifact_root):
+            raise ValueError(f"artifact path escapes storage root: {resolved}")
+        if not resolved.is_file():
+            return None
+        return _artifact_content_from_bytes(artifact, resolved.read_bytes())
 
 
 class MinioArtifactStore:
@@ -282,13 +295,24 @@ class MinioArtifactStore:
         obj = self._artifact_objects.get(artifact_id)
         if obj is None:
             return None
+        return self._read_object(artifact, obj)
+
+    def read_snapshot_content(self, artifact: ArtifactSnapshot) -> ArtifactContent | None:
+        # 内存里的 _artifact_objects 只覆盖本进程；历史任务改从持久化的 s3:// storage_url 直读。
+        # 对象名可能含 # ?（_safe_filename 只滤 / \），urlparse 会把它们当 fragment/query 截断，
+        # 故从已知 bucket 前缀切出完整对象名，不走 URL 解析（写入时同样用 self._bucket 拼接，两端对称）。
+        prefix = f"s3://{self._bucket}/"
+        if not artifact.storage_url.startswith(prefix):
+            return None
+        obj = artifact.storage_url[len(prefix):]
+        if not obj:
+            return None
+        return self._read_object(artifact, obj)
+
+    def _read_object(self, artifact: ArtifactSnapshot, obj: str) -> ArtifactContent:
         response = self._client.get_object(self._bucket, obj)
         try:
-            data = response.read()
-            if artifact.content_type.startswith("text/") or artifact.content_type.endswith("/json"):
-                return ArtifactContent(artifact=artifact, content=data.decode("utf-8"))
-            encoded = base64.b64encode(data).decode("ascii")
-            return ArtifactContent(artifact=artifact, content=f"data:{artifact.content_type};base64,{encoded}")
+            return _artifact_content_from_bytes(artifact, response.read())
         finally:
             close = getattr(response, "close", None)
             if callable(close):
@@ -313,6 +337,14 @@ def create_minio_client(*, endpoint: str, access_key: str, secret_key: str, secu
 def _encode_json(payload: JsonPayload) -> bytes:
     raw = payload.model_dump(mode="json", by_alias=True) if isinstance(payload, BaseModel) else payload
     return json.dumps(raw, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def _artifact_content_from_bytes(artifact: ArtifactSnapshot, data: bytes) -> ArtifactContent:
+    # 文本/JSON 原样返回字符串，其余按 content_type 打成 data URL；本地与 MinIO 两条读路径共用一套编码。
+    if artifact.content_type.startswith("text/") or artifact.content_type.endswith("/json"):
+        return ArtifactContent(artifact=artifact, content=data.decode("utf-8"))
+    encoded = base64.b64encode(data).decode("ascii")
+    return ArtifactContent(artifact=artifact, content=f"data:{artifact.content_type};base64,{encoded}")
 
 
 def _stringify_metadata(metadata: ArtifactMetadata) -> dict[str, str]:
