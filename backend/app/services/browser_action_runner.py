@@ -177,11 +177,14 @@ async def open_stealth_session(profile_dir: str, *, headless: bool) -> object:
     )
     try:
         await session.start()
-    except Exception:
-        # start() 后半段（页面池、CDP 握手）失败时浏览器进程已经起来了，
-        # 把 session 连同异常一起丢掉就等于把进程留在那儿占着 profile，
-        # 而调用方随后的回落会拿裸 Playwright 再开第二个。
-        await session.close()
+    except BaseException:
+        # start() 后半段失败或被取消时浏览器已起来，不关就把进程留着占 profile；
+        # 用 BaseException 一并接住 CancelledError。close() 自身再抛错只记日志、不外抛，
+        # 否则关闭错误会顶掉真正的启动失败/取消原因，让人照着假原因白修。
+        try:
+            await session.close()
+        except Exception:
+            logger.warning("隐身会话启动失败后清理也失败", exc_info=True)
         raise
     return session
 
@@ -211,8 +214,13 @@ async def open_persistent_context(profile_dir: str, *, headless: bool) -> tuple[
     playwright = await async_playwright().start()
     try:
         context = await launch_persistent_chrome(playwright, profile_dir, headless=headless)
-    except Exception:
-        await playwright.stop()
+    except BaseException:
+        # 取消也要 stop()：CancelledError 不属 Exception，漏接就把 playwright 进程留着。
+        # stop() 自身再抛错只记日志、不外抛，保留原始启动失败/取消原因。
+        try:
+            await playwright.stop()
+        except Exception:
+            logger.warning("Playwright 启动失败后 stop() 也失败", exc_info=True)
         raise
 
     async def close() -> None:
@@ -262,35 +270,47 @@ class BrowserActionRunner:
         if self._session_dir is not None:
             profile_path = Path(self._session_dir)
             profile_path.mkdir(parents=True, exist_ok=True)
-            # 登记放在拉起浏览器之前：占用冲突要在起进程前就判掉，
-            # 否则多出一个僵尸进程要善后
+            # 登记放在拉起浏览器之前：占用冲突要在起进程前就判掉，否则多出一个僵尸进程要善后。
+            # acquire_exclusive 还让同一 profile 的运行排队——同批调度里两个都要开浏览器的流程，
+            # 后到的在这里等前一个 close_context 放锁，而不是撞上 ProcessSingleton 秒失败。
+            # 每次运行只走到这里一次（state.browser_context 建一次），不会自锁死。
             owner_label = owner or "另一个运行"
-            browser_profile_lock.acquire(str(profile_path), owner_label)
+            await browser_profile_lock.acquire_exclusive(str(profile_path), owner_label)
             closer: object | None = None
+            context_ready = False
             try:
-                browser_context, closer = await open_persistent_context(str(profile_path), headless=headless)
-                page = await browser_context.new_page()
-            except Exception as exc:
-                # new_page() 失败时浏览器已经开着。销号却不关它，profile 就成了「记账上空闲、
-                # 实际被占」——下一次运行照常 acquire，撞上 ProcessSingleton，
-                # 报的还是那句看不懂的 browser has been closed。
-                if closer is not None:
-                    await closer()
-                browser_profile_lock.release(str(profile_path), owner_label)
-                translated = browser_profile_lock.translate_launch_error(str(profile_path), exc)
-                if translated is None:
-                    raise
-                raise RuntimeError(translated) from exc
-            return BrowserActionContext(
-                playwright=None,
-                browser=browser_context,
-                page=page,
-                closer=closer,
-                persistent=True,
-                headless=headless,
-                profile_dir=str(profile_path),
-                profile_owner=owner_label,
-            )
+                try:
+                    browser_context, closer = await open_persistent_context(str(profile_path), headless=headless)
+                    page = await browser_context.new_page()
+                except Exception as exc:
+                    # 只翻译 Chrome 让位那类「browser has been closed」；关浏览器与放锁交给下面的 finally
+                    translated = browser_profile_lock.translate_launch_error(str(profile_path), exc)
+                    if translated is None:
+                        raise
+                    raise RuntimeError(translated) from exc
+                context = BrowserActionContext(
+                    playwright=None,
+                    browser=browser_context,
+                    page=page,
+                    closer=closer,
+                    persistent=True,
+                    headless=headless,
+                    profile_dir=str(profile_path),
+                    profile_owner=owner_label,
+                )
+                context_ready = True
+                return context
+            finally:
+                # 成功交出 context 才留着锁（由 close_context 释放）；其余退出——含绕过 except Exception
+                # 的 CancelledError、closer() 再抛错——都在此关浏览器并放锁，否则锁与进程悬挂、后续运行永久排队。
+                if not context_ready:
+                    try:
+                        if closer is not None:
+                            await closer()
+                    except Exception:
+                        pass  # 关不掉也要放锁，关闭错误不能盖过真正的失败
+                    finally:
+                        browser_profile_lock.release_exclusive(str(profile_path), owner_label)
 
         playwright = await async_playwright().start()
 
@@ -315,7 +335,7 @@ class BrowserActionRunner:
         finally:
             # 关闭失败也要销号：否则一次异常退出会让 profile 在本进程里永久"被占用"
             if context.profile_dir is not None and context.profile_owner is not None:
-                browser_profile_lock.release(context.profile_dir, context.profile_owner)
+                browser_profile_lock.release_exclusive(context.profile_dir, context.profile_owner)
 
     async def screenshot(self, context: BrowserActionContext) -> bytes:
         return await context.page.screenshot(full_page=True, type="png")

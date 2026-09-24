@@ -2277,3 +2277,122 @@ async def test_task_manager_repeat_until_fails_when_max_iterations_exhausted(tmp
 
     current = await wait_for_status(manager, snapshot.task_id, {"error", "success"})
     assert current.status == "error"
+
+
+class LockingBlockingBrowserRunner(FakeBrowserActionRunner):
+    """create_context 登记 profile 锁、动作节点阻塞、close_context 释放锁——复刻停止时的解锁路径。"""
+
+    def __init__(self, profile_dir: str) -> None:
+        super().__init__()
+        self._profile_dir = profile_dir
+        self.acquired = asyncio.Event()
+        self._owner: str | None = None
+
+    async def create_context(self, *, headless: bool = True, owner: str | None = None) -> object:
+        self._owner = owner or "另一个运行"
+        browser_profile_lock.acquire(self._profile_dir, self._owner)
+        self.acquired.set()
+        return object()
+
+    async def close_context(self, context: object | None) -> None:
+        if self._owner is not None:
+            browser_profile_lock.release(self._profile_dir, self._owner)
+
+    async def run(self, node, variables, context, *, timeout_ms):
+        await asyncio.Event().wait()  # 停在动作节点上占着锁，直到 stop_task 取消运行协程
+        raise AssertionError("unreachable")
+
+
+async def test_stop_releases_browser_profile_lock_before_returning(tmp_path) -> None:
+    profile_dir = str(tmp_path / "profile")
+    fake_browser = LockingBlockingBrowserRunner(profile_dir)
+    manager = TaskManager(runner=FakeRunner(), broker=LogBroker(), artifact_store=LocalArtifactStore(artifact_root=tmp_path))
+    manager._browser_action_runner = fake_browser  # type: ignore[attr-defined]
+    try:
+        snapshot = await manager.start_task(
+            RunTaskRequest(
+                flowName="停止解锁流程",
+                targetUrl="https://example.com/",
+                selector=".item::text",
+                flowDefinition={
+                    "nodes": [
+                        {"id": "start", "type": "start"},
+                        {"id": "click", "title": "点击", "type": "browser.click", "selector": "#submit"},
+                    ],
+                    "edges": [{"source": "start", "target": "click"}],
+                },
+            )
+        )
+        # 等到浏览器上下文建立、profile 锁登记，运行协程停在动作节点上
+        await asyncio.wait_for(fake_browser.acquired.wait(), timeout=2)
+        assert browser_profile_lock.holder(profile_dir) is not None
+
+        stopped = await manager.stop_task(snapshot.task_id)
+        assert stopped is not None
+        # stop_task 返回时锁必须已释放：早返回（收尾还没跑）会让此断言失败，正是本次修复点
+        assert browser_profile_lock.holder(profile_dir) is None
+    finally:
+        current = browser_profile_lock.holder(profile_dir)
+        if current is not None:
+            browser_profile_lock.release(profile_dir, current)
+        await manager.stop_workers()
+
+
+class LockingBrowserRunner(FakeBrowserActionRunner):
+    """create_context 登记锁、动作节点正常返回、close_context 释放锁并留痕——
+    用来验证收尾一定会关浏览器（放锁），无论导出 Cookie 是否半途出事。"""
+
+    def __init__(self, profile_dir: str) -> None:
+        super().__init__()
+        self._profile_dir = profile_dir
+        self._owner: str | None = None
+        self.closed = asyncio.Event()
+
+    async def create_context(self, *, headless: bool = True, owner: str | None = None) -> object:
+        self._owner = owner or "另一个运行"
+        browser_profile_lock.acquire(self._profile_dir, self._owner)
+        return object()
+
+    async def close_context(self, context: object | None) -> None:
+        if self._owner is not None:
+            browser_profile_lock.release(self._profile_dir, self._owner)
+        self.closed.set()
+
+
+async def test_cancel_during_cookie_export_still_closes_the_browser(tmp_path, monkeypatch) -> None:
+    """收尾里先 await _export_browser_cookies()（内部 await storage_state()），取消恰好落在这个
+    await 上时 CancelledError 会逃出该函数（它只吞 Exception）。close_context 必须仍然执行，
+    否则浏览器进程与 profile 独占锁永久悬挂。"""
+    profile_dir = str(tmp_path / "profile")
+    fake_browser = LockingBrowserRunner(profile_dir)
+    manager = TaskManager(runner=FakeRunner(), broker=LogBroker(), artifact_store=LocalArtifactStore(artifact_root=tmp_path))
+    manager._browser_action_runner = fake_browser  # type: ignore[attr-defined]
+
+    async def _cancelled_export(context: object | None) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("app.services.task_manager._export_browser_cookies", _cancelled_export)
+
+    try:
+        await manager.start_task(
+            RunTaskRequest(
+                flowName="导出取消收尾流程",
+                targetUrl="https://example.com/",
+                selector=".item::text",
+                flowDefinition={
+                    "nodes": [
+                        {"id": "start", "type": "start"},
+                        {"id": "click", "title": "点击", "type": "browser.click", "selector": "#submit"},
+                    ],
+                    "edges": [{"source": "start", "target": "click"}],
+                },
+            )
+        )
+        # 导出 Cookie 抛 CancelledError 后，close_context 仍须跑完——否则这里超时
+        await asyncio.wait_for(fake_browser.closed.wait(), timeout=2)
+        assert browser_profile_lock.holder(profile_dir) is None
+    finally:
+        current = browser_profile_lock.holder(profile_dir)
+        if current is not None:
+            browser_profile_lock.release(profile_dir, current)
+        await manager.stop_workers()

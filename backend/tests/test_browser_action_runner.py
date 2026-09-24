@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from app.services import browser_action_runner
@@ -826,6 +828,122 @@ async def test_stealth_session_is_closed_when_it_fails_half_way_up(tmp_path, mon
     assert closed == ["session"]
 
 
+async def test_stealth_session_is_closed_when_start_is_cancelled(tmp_path, monkeypatch) -> None:
+    """start() 被取消时浏览器已起来；CancelledError 不属 Exception，漏接就把进程留着占 profile。
+    close() 必须照跑，且原始 CancelledError 原样抛出。"""
+    closed: list[str] = []
+    started = asyncio.Event()
+
+    class HangingSession:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        async def start(self) -> None:
+            started.set()
+            await asyncio.Event().wait()  # 永不返回，等外部取消
+
+        async def close(self) -> None:
+            closed.append("session")
+
+    monkeypatch.setattr("scrapling.fetchers.AsyncStealthySession", HangingSession)
+
+    task = asyncio.create_task(browser_action_runner.open_stealth_session(str(tmp_path), headless=True))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert closed == ["session"]
+
+
+async def test_playwright_fallback_stops_when_launch_is_cancelled(tmp_path, monkeypatch) -> None:
+    """回落到裸 Playwright 后 launch 被取消：playwright 已 start()，
+    CancelledError 漏接就留个孤儿进程。stop() 必须照跑，原始取消异常原样抛出。"""
+    events: list[str] = []
+    started = asyncio.Event()
+
+    class Launcher:
+        @property
+        def chromium(self) -> "Launcher":
+            return self
+
+        async def launch_persistent_context(self, profile_dir: str, *, headless: bool = True, channel: str | None = None) -> object:
+            started.set()
+            await asyncio.Event().wait()  # 永不返回，等外部取消
+
+        async def stop(self) -> None:
+            events.append("playwright")
+
+    class FakePlaywright:
+        async def start(self) -> Launcher:
+            return launcher
+
+    async def _boom(profile_dir: str, *, headless: bool) -> object:
+        raise ModuleNotFoundError("No module named 'scrapling'")
+
+    launcher = Launcher()
+    monkeypatch.setattr(browser_action_runner, "open_stealth_session", _boom)
+    monkeypatch.setattr("playwright.async_api.async_playwright", FakePlaywright)
+
+    task = asyncio.create_task(browser_action_runner.open_persistent_context(str(tmp_path), headless=True))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert events == ["playwright"]
+
+
+async def test_stealth_close_error_does_not_mask_start_failure(tmp_path, monkeypatch) -> None:
+    """start() 失败后 close() 又抛错时，抛出的仍须是 start 的原因：
+    关闭错误若顶掉根因，用户会照着「关闭失败」这个假原因白修。"""
+
+    class FailingSession:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        async def start(self) -> None:
+            raise RuntimeError("start boom")
+
+        async def close(self) -> None:
+            raise RuntimeError("close boom")
+
+    monkeypatch.setattr("scrapling.fetchers.AsyncStealthySession", FailingSession)
+
+    with pytest.raises(RuntimeError, match="start boom"):
+        await browser_action_runner.open_stealth_session(str(tmp_path), headless=True)
+
+
+async def test_playwright_fallback_stop_error_does_not_mask_launch_failure(tmp_path, monkeypatch) -> None:
+    """回落后 launch 失败、stop() 又抛错时，抛出的仍须是 launch 的原因。"""
+
+    class Launcher:
+        @property
+        def chromium(self) -> "Launcher":
+            return self
+
+        async def launch_persistent_context(self, profile_dir: str, *, headless: bool = True, channel: str | None = None) -> object:
+            raise RuntimeError("launch boom")
+
+        async def stop(self) -> None:
+            raise RuntimeError("stop boom")
+
+    launcher = Launcher()
+
+    class FakePlaywright:
+        async def start(self) -> Launcher:
+            return launcher
+
+    async def _boom(profile_dir: str, *, headless: bool) -> object:
+        raise ModuleNotFoundError("No module named 'scrapling'")
+
+    monkeypatch.setattr(browser_action_runner, "open_stealth_session", _boom)
+    monkeypatch.setattr("playwright.async_api.async_playwright", FakePlaywright)
+
+    with pytest.raises(RuntimeError, match="launch boom"):
+        await browser_action_runner.open_persistent_context(str(tmp_path), headless=True)
+
+
 async def test_create_context_closes_the_browser_when_the_first_page_fails(tmp_path, monkeypatch) -> None:
     """销号却不关浏览器，profile 就成了「记账上空闲、实际被占」——
     下一次运行照常 acquire，撞上 ProcessSingleton。"""
@@ -859,6 +977,141 @@ async def _acquires_cleanly(tmp_path) -> bool:
         return False
     browser_profile_lock.release(str(tmp_path), "运行 t_2")
     return True
+
+
+async def test_two_create_contexts_on_one_profile_serialize_instead_of_failing(tmp_path, monkeypatch) -> None:
+    """同一 user-data-dir 的两次 create_context 必须排队：后到的等前一个 close_context 放锁再开，
+    而不是像 acquire 那样撞上占用直接抛 Busy。这是让同批多流程都能开浏览器（而非第二个秒失败）的关键。"""
+    from app.services import browser_profile_lock
+
+    browser_profile_lock._holders.clear()  # noqa: SLF001
+    browser_profile_lock._serial_locks.clear()  # noqa: SLF001
+
+    order: list[str] = []
+
+    class FakeContext:
+        async def new_page(self) -> object:
+            return object()
+
+    async def _open(profile_dir: str, *, headless: bool):
+        async def close() -> None:
+            return None
+
+        return FakeContext(), close
+
+    monkeypatch.setattr(browser_action_runner, "open_persistent_context", _open)
+    runner = BrowserActionRunner(session_dir=str(tmp_path))
+
+    first = await runner.create_context(headless=True, owner="运行 t_1")
+
+    async def second() -> None:
+        order.append("t_2 waiting")
+        ctx = await runner.create_context(headless=True, owner="运行 t_2")
+        order.append("t_2 opened")
+        await runner.close_context(ctx)
+
+    task2 = asyncio.create_task(second())
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    # t_1 尚未 close：t_2 已排队但拿不到独占，且没有抛 Busy
+    assert order == ["t_2 waiting"]
+    assert not task2.done()
+    assert browser_profile_lock.holder(str(tmp_path)) == "运行 t_1"
+
+    await runner.close_context(first)
+    await asyncio.wait_for(task2, timeout=1.0)
+
+    assert order == ["t_2 waiting", "t_2 opened"]
+    assert browser_profile_lock.holder(str(tmp_path)) is None
+
+
+async def test_launch_failure_with_a_failing_closer_still_frees_the_profile(tmp_path, monkeypatch) -> None:
+    """new_page 失败后连 closer() 都抛错时也必须放掉目录锁——否则 context 没交出去、
+    外层无从 close_context，同 profile 的后续运行会永久排队。且真正的启动失败要原样抛出，不能被 closer 的错盖掉。"""
+    from app.services import browser_profile_lock
+
+    browser_profile_lock._holders.clear()  # noqa: SLF001
+    browser_profile_lock._serial_locks.clear()  # noqa: SLF001
+
+    class BrokenContext:
+        async def new_page(self) -> object:
+            raise RuntimeError("renderer crashed")
+
+    async def _open_broken(profile_dir: str, *, headless: bool):
+        async def close() -> None:
+            raise RuntimeError("closer boom")
+
+        return BrokenContext(), close
+
+    monkeypatch.setattr(browser_action_runner, "open_persistent_context", _open_broken)
+    runner = BrowserActionRunner(session_dir=str(tmp_path))
+
+    with pytest.raises(RuntimeError, match="renderer crashed"):
+        await runner.create_context(headless=True, owner="运行 t_1")
+
+    assert browser_profile_lock.holder(str(tmp_path)) is None
+    assert not browser_profile_lock._serial_lock(str(tmp_path)).locked()  # noqa: SLF001
+
+    # 第二个运行能在不超时的情况下拿到 profile：锁若没真放掉，acquire_exclusive 会在这死等
+    class OkContext:
+        async def new_page(self) -> object:
+            return object()
+
+    async def _open_ok(profile_dir: str, *, headless: bool):
+        async def close() -> None:
+            return None
+
+        return OkContext(), close
+
+    monkeypatch.setattr(browser_action_runner, "open_persistent_context", _open_ok)
+    ctx = await asyncio.wait_for(runner.create_context(headless=True, owner="运行 t_2"), timeout=1.0)
+    assert browser_profile_lock.holder(str(tmp_path)) == "运行 t_2"
+    await runner.close_context(ctx)
+    assert browser_profile_lock.holder(str(tmp_path)) is None
+
+async def test_cancelled_launch_frees_the_profile(tmp_path, monkeypatch) -> None:
+    """启动阶段被取消（CancelledError 属 BaseException，绕过 except Exception）也必须放锁：
+    此时 context 没返回给 TaskManager，外层拿不到它来 close_context，锁会永久悬挂。"""
+    from app.services import browser_profile_lock
+
+    browser_profile_lock._holders.clear()  # noqa: SLF001
+    browser_profile_lock._serial_locks.clear()  # noqa: SLF001
+
+    started = asyncio.Event()
+
+    async def _hang(profile_dir: str, *, headless: bool):
+        started.set()
+        await asyncio.Event().wait()  # 永不返回，模拟启动阶段被外部取消
+
+    monkeypatch.setattr(browser_action_runner, "open_persistent_context", _hang)
+    runner = BrowserActionRunner(session_dir=str(tmp_path))
+
+    task = asyncio.create_task(runner.create_context(headless=True, owner="运行 t_1"))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    assert browser_profile_lock.holder(str(tmp_path)) == "运行 t_1"
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert browser_profile_lock.holder(str(tmp_path)) is None
+    assert not browser_profile_lock._serial_lock(str(tmp_path)).locked()  # noqa: SLF001
+
+    # 第二个运行能顺利拿到 profile
+    class OkContext:
+        async def new_page(self) -> object:
+            return object()
+
+    async def _open_ok(profile_dir: str, *, headless: bool):
+        async def close() -> None:
+            return None
+
+        return OkContext(), close
+
+    monkeypatch.setattr(browser_action_runner, "open_persistent_context", _open_ok)
+    ctx = await asyncio.wait_for(runner.create_context(headless=True, owner="运行 t_2"), timeout=1.0)
+    assert browser_profile_lock.holder(str(tmp_path)) == "运行 t_2"
+    await runner.close_context(ctx)
 
 
 async def test_persistent_context_does_not_fall_back_when_the_profile_is_busy(tmp_path, monkeypatch) -> None:

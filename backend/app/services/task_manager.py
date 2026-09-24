@@ -93,6 +93,9 @@ class TaskRecord:
     # 超时到 CancelledError 落终态之间 status 仍是 awaiting_confirmation，单凭它 resume 会误翻回
     # running；改用这个同步置位/清位的标志作为 resume 的真正闸门。
     confirmation_active: bool = False
+    # stop_task 等这个信号确认收尾跑完再返回。取消只是给运行协程投递 CancelledError，真正的
+    # close_context→释放 profile 锁发生在它随后的 finally 里；早返回会让紧接着的重跑撞上仍登记的占用。
+    done_waiter: asyncio.Event = field(default_factory=asyncio.Event)
     # 惰性填充（见 _has_breakpoint），避免每次 debug step 都重建节点映射
     breakpoint_ids: frozenset[str] | None = field(default=None, init=False, repr=False, compare=False)
 
@@ -111,6 +114,10 @@ class FlowRunState:
 
 
 _SENTINEL = object()
+
+# stop_task 等待运行协程收尾（关闭浏览器、释放 profile 锁）的上限：正常关闭一秒内完成，给足余量。
+# 上限只为不让某个不响应取消的操作把停止接口一起拖死，超时后照常返回（此时锁可能仍在释放中）。
+_STOP_TEARDOWN_TIMEOUT_SECONDS = 10.0
 
 
 class TaskManager:
@@ -382,6 +389,13 @@ class TaskManager:
         )
         if record.snapshot.status == "queued" or canceled_running_task:
             await self._update_snapshot(record, status="stopped", progress=progress)
+        if canceled_running_task:
+            # cancel() 只投递 CancelledError，浏览器关闭与 profile 锁释放在运行协程随后的 finally 里。
+            # 等收尾信号再返回，让紧接着的重跑不再撞上仍登记的占用；有上限，挂死的操作不该拖死停止接口。
+            try:
+                await asyncio.wait_for(record.done_waiter.wait(), timeout=_STOP_TEARDOWN_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                await self._append_log(record, "warn", "停止后浏览器收尾超时", "浏览器用户目录可能仍被占用，稍后可重试或重启后端", node_id="end")
         return record.snapshot
 
     async def debug_control(self, task_id: str, command: DebugControlCommand) -> TaskSnapshot | None:
@@ -409,9 +423,19 @@ class TaskManager:
 
     async def _run_record(self, task_id: str) -> None:
         record = self._tasks[task_id]
+        try:
+            await self._execute_record(record, task_id)
+        finally:
+            # 无论成功/失败/被取消，收尾（含 close_context→释放 profile 锁）到此都已完成，
+            # 置位让等待的 stop_task 返回。见 done_waiter 定义处。
+            record.done_waiter.set()
+
+    async def _execute_record(self, record: TaskRecord, task_id: str) -> None:
         if record.canceled:
-            await self._update_snapshot(record, status="stopped")
-            await self._append_log(record, "warn", "任务已在排队阶段停止", None, node_id="start")
+            try:
+                await self._append_log(record, "warn", "任务已在排队阶段停止", None, node_id="start")
+            finally:
+                await self._update_snapshot(record, status="stopped")
             return
         started = datetime.now(UTC)
         try:
@@ -555,15 +579,20 @@ class TaskManager:
                 if node is not None and node.get("disabled") is not True:
                     await self._execute_flow_node(record, state, node, outgoing_edges=[], should_follow_edges=False)
         finally:
-            await _export_browser_cookies(state.browser_context)
+            # 关浏览器套在 _export_browser_cookies 的 finally 里：导出 Cookie 要 await storage_state()，
+            # 取消恰好落在这个 await 上时 CancelledError 会越过后面的语句，close_context 被跳过，
+            # 浏览器进程与 profile 独占锁就永久悬挂、后续同目录运行全排不进来。
             try:
-                await self._resolve_browser_executor(record).close_context(state.browser_context)
-            except Exception as exc:
-                # finally 里抛出的异常会顶掉 try 里真正的失败原因。运行途中在设置里关掉插件开关
-                # 就会走到这里：真正的节点报错会被改写成"插件已关闭"，用户照着去开开关也修不好。
-                # 清理失败要留痕（上下文可能泄漏），但不能替换根因，也不能跳过下面的产物清理。
-                await self._append_log(record, "warn", "浏览器上下文清理失败", str(exc), node_id=record.active_node_id or "end")
-            self._prune_run_outputs(record)
+                await _export_browser_cookies(state.browser_context)
+            finally:
+                try:
+                    await self._resolve_browser_executor(record).close_context(state.browser_context)
+                except Exception as exc:
+                    # finally 里抛出的异常会顶掉 try 里真正的失败原因。运行途中在设置里关掉插件开关
+                    # 就会走到这里：真正的节点报错会被改写成"插件已关闭"，用户照着去开开关也修不好。
+                    # 清理失败要留痕（上下文可能泄漏），但不能替换根因，也不能跳过下面的产物清理。
+                    await self._append_log(record, "warn", "浏览器上下文清理失败", str(exc), node_id=record.active_node_id or "end")
+                self._prune_run_outputs(record)
 
         if state.results:
             return _merge_scrape_results(state.results)
