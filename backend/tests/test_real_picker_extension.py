@@ -73,7 +73,13 @@ async def test_real_extension_picker_keeps_request_tab_document_and_lease_bounda
     async def connected(socket):
         await bridge.handle_connection(SocketAdapter(socket))
 
-    async with serve(connected, "127.0.0.1", 0) as server:
+    async with serve(
+        connected,
+        "127.0.0.1",
+        0,
+        process_request=lambda connection, request: connection.respond(200, '{"status":"ok"}')
+        if request.path == "/api/health" else None,
+    ) as server:
         port = server.sockets[0].getsockname()[1]
         extension = tmp_path / "extension"
         shutil.copytree(build, extension)
