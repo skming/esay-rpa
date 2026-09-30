@@ -1,11 +1,13 @@
-import * as TabsPrimitive from '@radix-ui/react-tabs';
-import type { ComponentProps, ReactElement } from 'react';
+import { Tabs as TabsPrimitive } from '@base-ui/react/tabs';
+import type { ReactElement } from 'react';
 
 import { cn } from '../../lib/utils';
 
-const Tabs = TabsPrimitive.Root;
+function Tabs(props: TabsPrimitive.Root.Props): ReactElement {
+  return <TabsPrimitive.Root data-slot="tabs" {...props} />;
+}
 
-function TabsList({ className, ...props }: ComponentProps<typeof TabsPrimitive.List>): ReactElement {
+function TabsList({ className, ...props }: TabsPrimitive.List.Props): ReactElement {
   return (
     <TabsPrimitive.List
       className={cn('inline-flex items-center text-[11px] font-medium text-slate-500', className)}
@@ -15,11 +17,11 @@ function TabsList({ className, ...props }: ComponentProps<typeof TabsPrimitive.L
   );
 }
 
-function TabsTrigger({ className, ...props }: ComponentProps<typeof TabsPrimitive.Trigger>): ReactElement {
+function TabsTrigger({ className, ...props }: TabsPrimitive.Tab.Props): ReactElement {
   return (
-    <TabsPrimitive.Trigger
+    <TabsPrimitive.Tab
       className={cn(
-        'relative inline-flex items-center justify-center whitespace-nowrap transition hover:text-ink focus-visible:ring-2 focus-visible:ring-rule disabled:pointer-events-none disabled:opacity-50 data-[state=active]:text-ink data-[state=active]:after:absolute data-[state=active]:after:inset-x-0 data-[state=active]:after:bottom-0 data-[state=active]:after:h-0.5 data-[state=active]:after:bg-accent',
+        'relative inline-flex items-center justify-center whitespace-nowrap transition hover:text-ink focus-visible:ring-2 focus-visible:ring-rule disabled:pointer-events-none disabled:opacity-50 data-active:text-ink data-active:after:absolute data-active:after:inset-x-0 data-active:after:bottom-0 data-active:after:h-0.5 data-active:after:bg-accent',
         className
       )}
       data-slot="tabs-trigger"
@@ -28,8 +30,8 @@ function TabsTrigger({ className, ...props }: ComponentProps<typeof TabsPrimitiv
   );
 }
 
-function TabsContent({ className, ...props }: ComponentProps<typeof TabsPrimitive.Content>): ReactElement {
-  return <TabsPrimitive.Content className={cn('focus-visible:outline-none', className)} data-slot="tabs-content" {...props} />;
+function TabsContent({ className, ...props }: TabsPrimitive.Panel.Props): ReactElement {
+  return <TabsPrimitive.Panel className={cn('focus-visible:outline-none', className)} data-slot="tabs-content" {...props} />;
 }
 
 export { Tabs, TabsContent, TabsList, TabsTrigger };

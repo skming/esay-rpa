@@ -383,8 +383,8 @@ export function RunConfigDialog({
         </DialogBody>
 
         <DialogFooter>
-          <DialogClose asChild>
-            <Button variant="outline">取消</Button>
+          <DialogClose render={<Button variant="outline" />}>
+            取消
           </DialogClose>
           <Button disabled={startDisabled} onClick={handleStart} variant="primary">
             <Play className="h-3.5 w-3.5 fill-current" strokeWidth={1.5} />

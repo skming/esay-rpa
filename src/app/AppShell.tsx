@@ -3,7 +3,7 @@ import { useLocation, useNavigate } from 'react-router-dom';
 
 import { NavRail } from '../components/layout/NavRail';
 import { TitleBar } from '../components/layout/TitleBar';
-import { ToastStack } from '../components/layout/ToastStack';
+import { Toaster } from '../components/ui/toast';
 import { TopBar } from '../components/layout/TopBar';
 import { DeleteNodeDialog } from '../components/studio/DeleteNodeDialog';
 import { SensitiveActionConfirmation } from '../components/studio/SensitiveActionConfirmation';
@@ -46,6 +46,8 @@ export function AppShell(context: AppRuntimeContext): ReactElement {
               <TopBar
                 draftAutosave={context.draftAutosave}
                 electron={context.electron}
+                flowNodes={context.canvas.flowNodes}
+                onRenameVariableReferences={context.canvas.renameVariableReferences}
                 selectedNodeAction={context.canvas.selectedNode?.data.action}
                 selectedNodeId={context.canvas.selectedNodeId}
                 selectedNodeTitle={context.canvas.selectedNode?.data.title ?? '未选择步骤'}
@@ -56,7 +58,7 @@ export function AppShell(context: AppRuntimeContext): ReactElement {
           )}
         </div>
       </div>
-      <ToastStack onDismiss={context.electron.dismissToast} toasts={context.electron.toasts} />
+      <Toaster />
       <DeleteNodeDialog
         onConfirm={context.canvas.confirmDeleteNode}
         onOpenChange={(open) => { if (!open) context.canvas.setDeleteTarget(null); }}

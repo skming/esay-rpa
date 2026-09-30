@@ -81,7 +81,7 @@ describe('配色签名的对比度覆盖', () => {
 
   it('选择器只挂配色签名，不挂元素名或圆角', () => {
     // 加回 button. / span. / .rounded-full 会重新引入两条静默失配路径：
-    // <Button asChild> 把标签换成 <a>，twMerge 让调用点把 rounded-full 换成 rounded-md。
+    // <Button render={<a />}> 会把标签换成 <a>，twMerge 也允许调用点覆盖圆角。
     expect(STYLES).not.toContain('button.bg-red-500');
     expect(STYLES).not.toContain('span.rounded-full');
   });

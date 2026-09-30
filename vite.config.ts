@@ -2,11 +2,15 @@ import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import { defineConfig } from 'vite';
 import wasm from 'vite-plugin-wasm';
+import { fileURLToPath, URL } from 'node:url';
 
 export default defineConfig({
   base: './',
   plugins: [wasm(), react(), tailwindcss()],
   resolve: {
+    alias: {
+      '@': fileURLToPath(new URL('./src', import.meta.url)),
+    },
     dedupe: ['react', 'react-dom'],
   },
   worker: {
@@ -49,8 +53,8 @@ export default defineConfig({
           if (id.includes('@xyflow/') || id.includes('/d3-') || id.includes('/internmap/') || id.includes('/robust-predicates/')) {
             return 'vendor-flow';
           }
-          // Radix primitives, Floating UI, Lucide icons — all UI chrome.
-          if (id.includes('@radix-ui/') || id.includes('lucide-react') || id.includes('@floating-ui/') || id.includes('cmdk') || id.includes('vaul')) {
+          // Base UI primitives, Floating UI, Lucide icons — all UI chrome.
+          if (id.includes('@base-ui/') || id.includes('lucide-react') || id.includes('@floating-ui/') || id.includes('cmdk') || id.includes('vaul')) {
             return 'vendor-ui';
           }
           // Markdown pipeline: react-markdown + unified ecosystem.

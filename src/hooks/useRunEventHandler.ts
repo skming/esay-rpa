@@ -5,14 +5,15 @@ import { useBottomPanelStore } from '../stores/useBottomPanelStore';
 import { useNotificationStore } from '../stores/useNotificationStore';
 import type { ArtifactContent, ArtifactSnapshot, BridgeResult, FlowSnapshot, GeneratedScriptResult, RpaBridge, RunEvent } from '../types/electron';
 import type { NodeRuntimeState, RunLogEntry, RuntimeProgress, RuntimeStatus, RuntimeVariable } from '../types/rpa';
-import type { BridgeCallOptions, BridgeToast } from './electronBridgeTypes';
+import type { BridgeCallOptions } from './electronBridgeTypes';
+import type { ToastKind } from '../lib/toastManager';
 
 type UseRunEventHandlerParams = {
   activeRunIdRef: MutableRefObject<string | null>;
   activeFlowNameRef: MutableRefObject<string>;
   callBridge: <T>(action: (bridge: RpaBridge) => Promise<BridgeResult<T>>, successMessage?: string, options?: BridgeCallOptions) => Promise<T | null>;
   lastRunIdRef: MutableRefObject<string | null>;
-  pushToast: (type: BridgeToast['type'], message: string) => void;
+  pushToast: (type: ToastKind, message: string) => void;
   onArtifactsReady?: () => void;
   setActiveRunId: Dispatch<SetStateAction<string | null>>;
   setActiveRunFlowId: Dispatch<SetStateAction<string | null>>;

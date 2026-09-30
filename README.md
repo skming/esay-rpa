@@ -16,7 +16,7 @@ Easy RPA 是一个本地桌面端 RPA（机器人流程自动化）工具，用�
 | 层级   | 技术                                                     |
 | ------ | -------------------------------------------------------- |
 | 桌面端 | Electron                                                 |
-| 前端   | React、TypeScript、Tailwind CSS、Radix UI、@xyflow/react |
+| 前端   | React、TypeScript、Tailwind CSS、Base UI、@xyflow/react  |
 | 后端   | Python 3.12+、FastAPI、SQLite                            |
 | 自动化 | Playwright、Scrapling                                    |
 | AI     | LiteLLM 多模型供应商路由                                 |

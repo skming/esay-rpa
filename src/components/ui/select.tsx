@@ -1,103 +1,113 @@
-import * as SelectPrimitive from '@radix-ui/react-select';
+import { Select as SelectPrimitive } from '@base-ui/react/select';
 import { Check, ChevronDown, ChevronUp } from 'lucide-react';
-import type { ComponentProps, ReactElement } from 'react';
+import type { ReactElement } from 'react';
 
 import { cn } from '../../lib/utils';
 
 const Select = SelectPrimitive.Root;
-const SelectGroup = SelectPrimitive.Group;
-const SelectValue = SelectPrimitive.Value;
 
-function SelectTrigger({ children, className, ...props }: ComponentProps<typeof SelectPrimitive.Trigger>): ReactElement {
+function SelectGroup({ className, ...props }: SelectPrimitive.Group.Props): ReactElement {
+  return <SelectPrimitive.Group className={cn('scroll-my-1 p-1', className)} data-slot="select-group" {...props} />;
+}
+
+function SelectValue({ className, ...props }: SelectPrimitive.Value.Props): ReactElement {
+  return <SelectPrimitive.Value className={cn('flex flex-1 text-left', className)} data-slot="select-value" {...props} />;
+}
+
+function SelectTrigger({ children, className, ...props }: SelectPrimitive.Trigger.Props): ReactElement {
   return (
     <SelectPrimitive.Trigger
       className={cn(
-        'flex h-8 w-full items-center justify-between rounded-md border border-slate-200 bg-white px-2 text-[11px] text-slate-700 outline-none transition focus-visible:border-accent-line focus-visible:ring-2 focus-visible:ring-accent-soft disabled:cursor-not-allowed disabled:opacity-50',
+        'flex h-8 w-full items-center justify-between rounded-md border border-slate-200 bg-white px-2 text-[11px] text-slate-700 outline-none transition focus-visible:border-accent-line focus-visible:ring-2 focus-visible:ring-accent-soft disabled:cursor-not-allowed disabled:opacity-50 data-placeholder:text-slate-400',
         className
       )}
       data-slot="select-trigger"
       {...props}
     >
       {children}
-      <SelectPrimitive.Icon asChild>
-        <ChevronDown className="h-3.5 w-3.5 text-slate-400" strokeWidth={1.5} />
-      </SelectPrimitive.Icon>
+      <SelectPrimitive.Icon render={<ChevronDown className="h-3.5 w-3.5 text-slate-400" strokeWidth={1.5} />} />
     </SelectPrimitive.Trigger>
   );
 }
 
-function SelectScrollUpButton({ className, ...props }: ComponentProps<typeof SelectPrimitive.ScrollUpButton>): ReactElement {
-  return (
-    <SelectPrimitive.ScrollUpButton
-      className={cn('flex cursor-default items-center justify-center py-1', className)}
-      data-slot="select-scroll-up-button"
-      {...props}
-    >
-      <ChevronUp className="h-3.5 w-3.5" strokeWidth={1.5} />
-    </SelectPrimitive.ScrollUpButton>
-  );
-}
-
-function SelectScrollDownButton({ className, ...props }: ComponentProps<typeof SelectPrimitive.ScrollDownButton>): ReactElement {
-  return (
-    <SelectPrimitive.ScrollDownButton
-      className={cn('flex cursor-default items-center justify-center py-1', className)}
-      data-slot="select-scroll-down-button"
-      {...props}
-    >
-      <ChevronDown className="h-3.5 w-3.5" strokeWidth={1.5} />
-    </SelectPrimitive.ScrollDownButton>
-  );
-}
-
 function SelectContent({
+  align = 'center',
+  alignItemWithTrigger = true,
+  alignOffset = 0,
   children,
   className,
-  position = 'popper',
+  side = 'bottom',
+  sideOffset = 4,
   ...props
-}: ComponentProps<typeof SelectPrimitive.Content>): ReactElement {
+}: SelectPrimitive.Popup.Props & Pick<SelectPrimitive.Positioner.Props, 'align' | 'alignItemWithTrigger' | 'alignOffset' | 'side' | 'sideOffset'>): ReactElement {
   return (
     <SelectPrimitive.Portal>
-      <SelectPrimitive.Content
-        className={cn(
-          'relative z-(--z-select) max-h-72 min-w-32 overflow-hidden rounded-md border border-slate-200 bg-white text-slate-700 shadow-lg data-[side=bottom]:translate-y-1 data-[side=top]:-translate-y-1 data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95 data-[state=open]:duration-150 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[state=closed]:duration-100',
-          position === 'popper' && 'data-[side=left]:-translate-x-1 data-[side=right]:translate-x-1',
-          className
-        )}
-        data-slot="select-content"
-        position={position}
-        {...props}
+      <SelectPrimitive.Positioner
+        align={align}
+        alignItemWithTrigger={alignItemWithTrigger}
+        alignOffset={alignOffset}
+        className="isolate z-(--z-select)"
+        side={side}
+        sideOffset={sideOffset}
       >
-        <SelectScrollUpButton />
-        <SelectPrimitive.Viewport
-          className={cn('p-1', position === 'popper' && 'h-(--radix-select-trigger-height) min-w-(--radix-select-trigger-width)')}
-          data-slot="select-viewport"
+        <SelectPrimitive.Popup
+          className={cn(
+            'relative max-h-(--available-height) w-(--anchor-width) min-w-32 origin-(--transform-origin) overflow-x-hidden overflow-y-auto rounded-md border border-slate-200 bg-white text-slate-700 shadow-lg outline-none data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95',
+            className
+          )}
+          data-slot="select-content"
+          {...props}
         >
-          {children}
-        </SelectPrimitive.Viewport>
-        <SelectScrollDownButton />
-      </SelectPrimitive.Content>
+          <SelectScrollUpButton />
+          <SelectPrimitive.List className="p-1">{children}</SelectPrimitive.List>
+          <SelectScrollDownButton />
+        </SelectPrimitive.Popup>
+      </SelectPrimitive.Positioner>
     </SelectPrimitive.Portal>
   );
 }
 
-function SelectItem({ children, className, ...props }: ComponentProps<typeof SelectPrimitive.Item>): ReactElement {
+function SelectItem({ children, className, ...props }: SelectPrimitive.Item.Props): ReactElement {
   return (
     <SelectPrimitive.Item
       className={cn(
-        'relative flex h-7 w-full cursor-default select-none items-center rounded-sm py-1.5 pl-7 pr-2 text-[11px] outline-none focus:bg-accent-soft focus:text-accent-strong data-[state=checked]:font-medium data-[state=checked]:text-accent-strong data-disabled:pointer-events-none data-disabled:opacity-50',
+        'relative flex h-7 w-full cursor-default select-none items-center rounded-sm py-1.5 pl-7 pr-2 text-[11px] outline-none focus:bg-accent-soft focus:text-accent-strong data-selected:font-medium data-selected:text-accent-strong data-disabled:pointer-events-none data-disabled:opacity-50',
         className
       )}
       data-slot="select-item"
       {...props}
     >
-      <span className="absolute left-2 flex h-3.5 w-3.5 items-center justify-center">
-        <SelectPrimitive.ItemIndicator>
-          <Check className="h-3.5 w-3.5 text-accent" strokeWidth={2} />
-        </SelectPrimitive.ItemIndicator>
-      </span>
+      <SelectPrimitive.ItemIndicator
+        render={<span className="pointer-events-none absolute left-2 flex h-3.5 w-3.5 items-center justify-center" />}
+      >
+        <Check className="h-3.5 w-3.5 text-accent" strokeWidth={2} />
+      </SelectPrimitive.ItemIndicator>
       <SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText>
     </SelectPrimitive.Item>
+  );
+}
+
+function SelectScrollUpButton({ className, ...props }: SelectPrimitive.ScrollUpArrow.Props): ReactElement {
+  return (
+    <SelectPrimitive.ScrollUpArrow
+      className={cn('sticky top-0 z-10 flex w-full cursor-default items-center justify-center bg-white py-1', className)}
+      data-slot="select-scroll-up-button"
+      {...props}
+    >
+      <ChevronUp className="h-3.5 w-3.5" strokeWidth={1.5} />
+    </SelectPrimitive.ScrollUpArrow>
+  );
+}
+
+function SelectScrollDownButton({ className, ...props }: SelectPrimitive.ScrollDownArrow.Props): ReactElement {
+  return (
+    <SelectPrimitive.ScrollDownArrow
+      className={cn('sticky bottom-0 z-10 flex w-full cursor-default items-center justify-center bg-white py-1', className)}
+      data-slot="select-scroll-down-button"
+      {...props}
+    >
+      <ChevronDown className="h-3.5 w-3.5" strokeWidth={1.5} />
+    </SelectPrimitive.ScrollDownArrow>
   );
 }
 

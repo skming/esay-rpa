@@ -118,7 +118,7 @@ export default function App(): ReactElement {
   );
 
   return (
-    <TooltipProvider delayDuration={400}>
+    <TooltipProvider delay={400}>
       <HashRouter>
         <AppShell
           ai={ai}

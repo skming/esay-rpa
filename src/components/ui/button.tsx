@@ -1,6 +1,6 @@
-import { Slot } from '@radix-ui/react-slot';
+import { Button as ButtonPrimitive } from '@base-ui/react/button';
 import { cva, type VariantProps } from 'class-variance-authority';
-import type { ComponentProps, ReactElement, ReactNode } from 'react';
+import type { ReactElement, ReactNode } from 'react';
 
 import { cn } from '../../lib/utils';
 import { Tooltip, TooltipContent, TooltipTrigger } from './tooltip';
@@ -33,14 +33,10 @@ const buttonVariants = cva(
   }
 );
 
-export type ButtonProps = ComponentProps<'button'> &
-  VariantProps<typeof buttonVariants> & {
-    asChild?: boolean;
-  };
+export type ButtonProps = ButtonPrimitive.Props & VariantProps<typeof buttonVariants>;
 
-export function Button({ asChild = false, className, size, type = 'button', variant, ...props }: ButtonProps): ReactElement {
-  const Comp = asChild ? Slot : 'button';
-  return <Comp className={cn(buttonVariants({ className, size, variant }))} data-slot="button" type={type} {...props} />;
+export function Button({ className, size, type = 'button', variant, ...props }: ButtonProps): ReactElement {
+  return <ButtonPrimitive className={cn(buttonVariants({ className, size, variant }))} data-slot="button" type={type} {...props} />;
 }
 
 export function IconButton({
@@ -51,13 +47,13 @@ export function IconButton({
   ...props
 }: Omit<ButtonProps, 'aria-label' | 'children' | 'size'> & {
   active?: boolean;
-  children: ReactNode;
+  children?: ReactNode;
   label: string;
 }): ReactElement {
   return (
     <Tooltip>
-      <TooltipTrigger asChild>
-        <Button
+      <TooltipTrigger
+        render={<Button
           aria-label={label}
           className={cn(
             'text-slate-500 hover:bg-slate-100 hover:text-slate-700',
@@ -67,9 +63,9 @@ export function IconButton({
           size="icon"
           variant="ghost"
           {...props}
-        >
+        />}
+      >
           {children}
-        </Button>
       </TooltipTrigger>
       <TooltipContent side="bottom">{label}</TooltipContent>
     </Tooltip>

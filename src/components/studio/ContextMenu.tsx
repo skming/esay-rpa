@@ -1,6 +1,6 @@
 import { Bug, Circle, Copy, Pencil, Play, Plus, Trash2 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
-import type { ReactElement, ReactNode } from 'react';
+import type { ReactElement } from 'react';
 
 import { cn } from '../../lib/utils';
 import type { ContextMenuAction } from '../../types/rpa';
@@ -14,7 +14,7 @@ export function ContextMenu({
   onAction,
   onOpenChange
 }: {
-  children: ReactNode;
+  children: ReactElement;
   hasBreakpoint?: boolean;
   nodeId: string;
   nodeTitle: string;
@@ -35,7 +35,7 @@ export function ContextMenu({
 
   return (
     <UiContextMenu onOpenChange={onOpenChange}>
-      <ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
+      <ContextMenuTrigger render={children} />
       <ContextMenuContent className="w-40">
         <div className="border-b border-slate-100 px-2 pb-1.5 text-[10px] text-slate-500">{nodeTitle}</div>
         {actions.map((action, index) => {
@@ -48,7 +48,7 @@ export function ContextMenu({
             <ContextMenuItem
               className={cn('gap-2', action.color)}
               key={action.label}
-              onSelect={() => {
+              onClick={() => {
                 if (action.action !== undefined) {
                   onAction(action.action, nodeId);
                 }
