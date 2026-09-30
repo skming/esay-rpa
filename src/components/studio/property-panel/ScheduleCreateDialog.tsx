@@ -29,7 +29,7 @@ const cronPresets = [
 
 const timezoneOptions = ['Asia/Shanghai', 'UTC', 'America/Los_Angeles', 'Europe/London'] as const;
 
-function buildInitialDraft(schedule?: ScheduleSnapshot, initialFlowIds?: string[]): ScheduleDraft {
+function buildInitialDraft(schedule?: ScheduleSnapshot): ScheduleDraft {
   if (schedule !== undefined) {
     return {
       cronExpression: schedule.cronExpression,
@@ -42,7 +42,7 @@ function buildInitialDraft(schedule?: ScheduleSnapshot, initialFlowIds?: string[
   return {
     cronExpression: '0 9 * * *',
     enabled: true,
-    flowIds: initialFlowIds ?? [],
+    flowIds: [],
     name: '每日订单采集',
     timezone: 'Asia/Shanghai'
   };
@@ -50,7 +50,6 @@ function buildInitialDraft(schedule?: ScheduleSnapshot, initialFlowIds?: string[
 
 export function ScheduleCreateDialog({
   flows = [],
-  initialFlowIds,
   onCreate,
   onOpenChange,
   onPreview,
@@ -59,7 +58,6 @@ export function ScheduleCreateDialog({
   schedule
 }: {
   flows?: FlowSnapshot[];
-  initialFlowIds?: string[];
   onCreate?: (options: CreateScheduleOptions) => Promise<boolean>;
   onOpenChange: (open: boolean) => void;
   onPreview: (cronExpression: string, timezone: string) => Promise<string[] | null>;
@@ -68,7 +66,7 @@ export function ScheduleCreateDialog({
   schedule?: ScheduleSnapshot;
 }): ReactElement {
   const isEdit = schedule !== undefined;
-  const [draft, setDraft] = useState<ScheduleDraft>(() => buildInitialDraft(schedule, initialFlowIds));
+  const [draft, setDraft] = useState<ScheduleDraft>(() => buildInitialDraft(schedule));
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [previewResult, setPreviewResult] = useState<{ key: string; runs: string[] | null } | null>(null);
@@ -98,7 +96,7 @@ export function ScheduleCreateDialog({
   const [prevOpen, setPrevOpen] = useState(open);
   if (open !== prevOpen) {
     setPrevOpen(open);
-    setDraft(buildInitialDraft(schedule, initialFlowIds));
+    setDraft(buildInitialDraft(schedule));
     setError(null);
   }
 
@@ -175,7 +173,7 @@ export function ScheduleCreateDialog({
             </Label>
             <Label className="grid gap-1">
               <span>时区</span>
-              <Select onValueChange={(value) => updateDraft('timezone', value)} value={draft.timezone}>
+              <Select onValueChange={(value) => { if (value !== null) updateDraft('timezone', value); }} value={draft.timezone}>
                 <SelectTrigger>
                   <SelectValue />
                 </SelectTrigger>
@@ -205,7 +203,7 @@ export function ScheduleCreateDialog({
               ))}
             </div>
           </div>
-          <p className="-mt-2 text-[11px] text-slate-500">
+          <p className="-mt-2 text-[11px] text-ink-3">
             {draft.flowIds.length === 0 ? '所有流程' : `已选 ${draft.flowIds.length} 个流程`}，分别按自身配置执行
             {usesExtension && '；触发时需保持插件连接'}
           </p>
@@ -240,12 +238,12 @@ export function ScheduleCreateDialog({
             </CardHeader>
             <CardContent className="grid grid-cols-5 gap-1.5">
               {(!previewIsValid || previewRuns === null ? ['表达式无效或预览服务不可用'] : previewRuns === undefined ? ['计算中…'] : previewRuns.map((run) => formatZonedDateTime(new Date(run), draft.timezone))).map((item) => (
-                <div className="rounded bg-slate-50 px-2 py-1 font-mono text-[10px] text-slate-600" key={item}>{item}</div>
+                <div className="rounded bg-paper-sunk px-2 py-1 font-mono text-[10px] text-ink-2" key={item}>{item}</div>
               ))}
             </CardContent>
           </Card>
 
-          <div className="flex h-8 items-center justify-between rounded-lg border border-slate-200 bg-slate-50 px-3 text-[11px] text-slate-600">
+          <div className="flex h-8 items-center justify-between rounded-lg border border-rule bg-paper-sunk px-3 text-[11px] text-ink-2">
             <span className="inline-flex items-center gap-2">
               <Clock3 className="h-3.5 w-3.5 text-blue-500" strokeWidth={1.5} />
               {isEdit ? '当前启用状态' : '保存后立即启用'}

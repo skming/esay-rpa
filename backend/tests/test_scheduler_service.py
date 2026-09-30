@@ -512,7 +512,9 @@ async def test_batch_flows_sharing_the_browser_profile_all_succeed(tmp_path, mon
         await task_manager.stop_workers()
 
 
-async def test_selected_flows_schedule_records_deleted_flow_failure() -> None:
+async def test_selected_flows_blocked_flow_reports_via_last_error_without_task_flood() -> None:
+    # 选中的多流程里某个在启用后变得不可调度（此处删除），按预检拦下：原因进 last_error，
+    # 但不为它建任务记录；反复触发也不堆积——否则长期不合格的流程会每个 tick 塞一条 error 记录淹掉历史。
     task_manager = TaskManager(runner=FakeRunner(), broker=LogBroker())
     flow_service = FlowService()
     service = ScheduleService(
@@ -531,13 +533,41 @@ async def test_selected_flows_schedule_records_deleted_flow_failure() -> None:
         ))
         await flow_service.delete_flow(removed.flow_id)
 
-        triggered = await service.trigger_schedule(schedule.schedule_id)
+        # 首触发：被删流程只反映在 last_error，不建记录；等 kept 跑到终态好让第二次不被在飞检测跳过
+        first = await service.trigger_schedule(schedule.schedule_id)
+        assert first is not None and first.last_error is not None and "1/2" in first.last_error
+        assert first.last_task_id is not None
+        await wait_for_status(task_manager, first.last_task_id, {"success", "error", "stopped"})
 
-        assert triggered is not None
-        assert triggered.last_error is not None and "1/2" in triggered.last_error
-        tasks = await task_manager.list_tasks(schedule_id=schedule.schedule_id, limit=10)
-        assert {task.flow_id for task in tasks} == {kept.flow_id, removed.flow_id}
-        assert any(task.flow_id == removed.flow_id and task.status == "error" for task in tasks)
+        second = await service.trigger_schedule(schedule.schedule_id)
+        assert second is not None and second.last_error is not None and "1/2" in second.last_error
+        assert second.last_task_id is not None
+        await wait_for_status(task_manager, second.last_task_id, {"success", "error", "stopped"})
+
+        tasks = await task_manager.list_tasks(schedule_id=schedule.schedule_id, limit=50)
+        # 两次触发只留 kept 的两条任务，被拦的 removed 一条都不落，不随触发次数增长
+        assert not any(task.flow_id == removed.flow_id for task in tasks)
+        assert {task.flow_id for task in tasks} == {kept.flow_id}
+    finally:
+        await task_manager.stop_workers()
+
+
+async def test_delete_schedule_prunes_trigger_lock() -> None:
+    # 触发会按 schedule_id 惰性建一把锁；删除后必须一并清掉，否则长期运行进程里锁只增不减。
+    task_manager = TaskManager(runner=FakeRunner(), broker=LogBroker())
+    service = ScheduleService(task_manager=task_manager)
+    try:
+        schedule = await service.create_schedule(ScheduleCreateRequest(
+            name="待删调度",
+            cronExpression="0 * * * *",
+            timezone="UTC",
+            task=build_task_request(),
+        ))
+        await service.trigger_schedule(schedule.schedule_id)
+        assert schedule.schedule_id in service._trigger_locks  # noqa: SLF001
+
+        assert await service.delete_schedule(schedule.schedule_id) is True
+        assert schedule.schedule_id not in service._trigger_locks  # noqa: SLF001
     finally:
         await task_manager.stop_workers()
 

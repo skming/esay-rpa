@@ -123,7 +123,6 @@ export type ElectronBridgeActions = {
   loadScheduleRunSummaries: (options?: BridgeCallOptions) => Promise<void>;
   previewSchedule: (cronExpression: string, timezone: string) => Promise<string[] | null>;
   createDefaultSchedule: (options?: CreateScheduleOptions) => Promise<boolean>;
-  createScheduleForFlow: (flowId: string, options?: CreateScheduleOptions) => Promise<boolean>;
   updateScheduleEnabled: (scheduleId: string, enabled: boolean) => Promise<void>;
   updateSchedule: (scheduleId: string, options: CreateScheduleOptions) => Promise<boolean>;
   deleteSchedule: (scheduleId: string) => Promise<void>;
@@ -846,44 +845,6 @@ export function useElectronBridgeActions({
               flowId: taskFlowId,
               flowIds: taskFlowIds,
               flowName: taskFlowName,
-              timeoutMs: 30_000
-            }
-          })
-        );
-        if (result !== null) {
-          setSchedules((current) => [...current.filter((item) => item.scheduleId !== result.scheduleId), result]);
-          pushToast('success', `已创建调度 ${result.name}`);
-        }
-        return result !== null;
-      },
-      createScheduleForFlow: async (flowId: string, options = {}) => {
-        const source = flows.find((flow) => flow.flowId === flowId) ?? (currentFlow?.flowId === flowId ? currentFlow : null);
-        if (source === null) {
-          pushToast('error', '未找到要调度的流程');
-          return false;
-        }
-        const selectedIds = options.flowIds ?? [source.flowId];
-        const selected = selectedIds.map((id) => flows.find((flow) => flow.flowId === id));
-        if (selected.some((flow) => flow === undefined)) {
-          pushToast('error', '未找到所选流程');
-          return false;
-        }
-        const result = await callBridge((api) =>
-          api.createSchedule({
-            name: normalizeScheduleName(options.name ?? `${source.name} 定时任务`),
-            cronExpression: normalizeCronExpression(options.cronExpression),
-            timezone: normalizeScheduleTimezone(options.timezone),
-            enabled: options.enabled ?? true,
-            task: {
-              mode: 'run',
-              adaptive: true,
-              autoSave: true,
-              browserExecutor: selectedIds.length === 1 ? selected[0]!.defaultBrowserExecutor : undefined,
-              flowId: selectedIds.length === 1 ? selectedIds[0] : undefined,
-              flowIds: selectedIds.length > 1 ? selectedIds : [],
-              flowName: selectedIds.length === 0 ? '所有流程' : selectedIds.length === 1 ? selected[0]!.name : `${selectedIds.length} 个流程`,
-              selector: '',
-              targetUrl: '',
               timeoutMs: 30_000
             }
           })

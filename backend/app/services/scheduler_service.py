@@ -153,7 +153,11 @@ class ScheduleService:
         return await self._store.save(updated)
 
     async def delete_schedule(self, schedule_id: str) -> bool:
-        return await self._store.delete(schedule_id)
+        deleted = await self._store.delete(schedule_id)
+        if deleted:
+            # 触发锁按 schedule_id 惰性建，删除时一并清掉，避免长期运行进程里只增不减。
+            self._trigger_locks.pop(schedule_id, None)
+        return deleted
 
     async def trigger_schedule(self, schedule_id: str, *, manual: bool = False) -> ScheduleSnapshot | None:
         lock = self._trigger_locks.setdefault(schedule_id, asyncio.Lock())
@@ -248,16 +252,9 @@ class ScheduleService:
             last_ok = None
             failures: list[tuple[str, BaseException]] = []
             if selected_ids:
-                for blocked_id, name, reason in blocked:
-                    failures.append((name, ValueError(reason)))
-                    await self._task_manager.record_schedule_start_failure(
-                        task_with_schedule_id.model_copy(update={
-                            "flow_id": blocked_id,
-                            "flow_ids": [],
-                            "flow_name": name,
-                        }),
-                        reason,
-                    )
+                # 预检就拦下的（草稿/停用/不存在等）只计入 partial_error 交给 last_error 呈现，不建任务记录：
+                # 对齐单流程被拦只落 last_error 的处理，也避免长期不合格的流程每个 tick 堆一条 error 记录淹掉历史。
+                failures.extend((name, ValueError(reason)) for _, name, reason in blocked)
             for t, (f, flow_request) in zip(tasks, flow_requests):
                 if isinstance(t, BaseException):
                     failures.append((f.name, t))

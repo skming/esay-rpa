@@ -76,13 +76,18 @@ export function buildCronExpression(fields: CronFields): string {
   return [fields.minute, fields.hour, fields.dayOfMonth, fields.month, fields.dayOfWeek].map((field) => field.trim() || '*').join(' ');
 }
 
-export function formatScheduleDateTime(value: string | null | undefined): string {
+// nextRunAt/lastRunAt 是后端 UTC 瞬时值（isoformat 带偏移）；行内同时展示 schedule.timezone，
+// 若按浏览器本地渲染会与那个时区标签对不上，故传入 timeZone 时一律按调度自身时区还原挂钟时间。
+export function formatScheduleDateTime(value: string | null | undefined, timeZone?: string): string {
   if (value === null || value === undefined) {
     return '未计算';
   }
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) {
     return value;
+  }
+  if (timeZone !== undefined && timeZone.trim() !== '') {
+    return formatZonedDateTime(date, timeZone);
   }
   return `${date.getFullYear()}-${padTime(String(date.getMonth() + 1))}-${padTime(String(date.getDate()))} ${padTime(String(date.getHours()))}:${padTime(String(date.getMinutes()))}`;
 }
@@ -100,7 +105,7 @@ export function selectUpcomingSchedules(schedules: ScheduleSnapshot[], limit?: n
 
 export function describeNextRun(schedule: ScheduleSnapshot): string {
   if (typeof schedule.nextRunAt === 'string' && schedule.nextRunAt.trim() !== '') {
-    return formatScheduleDateTime(schedule.nextRunAt);
+    return formatScheduleDateTime(schedule.nextRunAt, schedule.timezone);
   }
   // 停用与"排期被系统清掉"都表现为 nextRunAt 为空，混成一句会把用户自己按的暂停说成故障。
   if (schedule.status !== 'enabled') {

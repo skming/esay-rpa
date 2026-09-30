@@ -4,6 +4,7 @@ import { useRef, useState } from 'react';
 
 import type { ElectronBridgeState } from '../../hooks/useElectronBridge';
 import { describeCronExpression, describeNextRun, formatScheduleDateTime, hasScheduleError } from '../../lib/schedulePresentation';
+import { TASK_STATUS_META } from '../../lib/runPresentation';
 import type { ScheduleRunSummary, ScheduleSnapshot, TaskSnapshot } from '../../types/electron';
 import { IconButton } from '../ui/button';
 import {
@@ -32,16 +33,6 @@ const RUN_RESULT_META: Record<ScheduleRunSummary['status'], { label: string; ton
   partial: { label: '部分成功', tone: 'warning' },
   stopped: { label: '已停止', tone: 'idle' },
   empty: { label: '无结果', tone: 'idle' },
-};
-
-// 批次列表里单个任务的终态；与 RunDetailDialog 顶部状态语义保持一致。
-const TASK_STATUS_META: Record<TaskSnapshot['status'], { label: string; tone: StatusTone }> = {
-  queued: { label: '排队', tone: 'idle' },
-  running: { label: '运行中', tone: 'live' },
-  success: { label: '成功', tone: 'success' },
-  stopped: { label: '已停止', tone: 'idle' },
-  error: { label: '失败', tone: 'error' },
-  awaiting_confirmation: { label: '等待操作', tone: 'warning' },
 };
 
 export function ScheduleListTable({
@@ -164,7 +155,7 @@ export function ScheduleListTable({
                     <span className="block font-mono text-[10px] tabular-nums text-ink-3">
                       {schedule.lastRunAt === null || schedule.lastRunAt === undefined
                         ? '尚未运行'
-                        : formatScheduleDateTime(schedule.lastRunAt)}
+                        : formatScheduleDateTime(schedule.lastRunAt, schedule.timezone)}
                     </span>
                     {runResult !== undefined && (
                       <button
@@ -176,7 +167,7 @@ export function ScheduleListTable({
                       >
                         <StateTag label={RUN_RESULT_META[runResult.status].label} state={RUN_RESULT_META[runResult.status].tone} />
                         {runResult.total > 1 && (
-                          <span className="font-mono text-[10px] tabular-nums text-ink-4">{runResult.success}/{runResult.total}</span>
+                          <span className="font-mono text-[10px] tabular-nums text-ink-3">{runResult.success}/{runResult.total}</span>
                         )}
                       </button>
                     )}
@@ -190,40 +181,38 @@ export function ScheduleListTable({
                   <TableCell className="pr-5">
                     <div className="flex justify-end">
                       <DropdownMenu>
-                        <DropdownMenuTrigger asChild>
-                          <IconButton label="更多操作">
-                            <MoreHorizontal className="h-3.5 w-3.5" strokeWidth={1.5} />
-                          </IconButton>
+                        <DropdownMenuTrigger render={<IconButton label="更多操作" />}>
+                          <MoreHorizontal className="h-3.5 w-3.5" strokeWidth={1.5} />
                         </DropdownMenuTrigger>
                         <DropdownMenuContent align="end" className="w-40">
                           <DropdownMenuItem
                             disabled={resolveTaskIds(schedule).length === 0}
-                            onSelect={() => viewResult(schedule)}
+                            onClick={() => viewResult(schedule)}
                           >
                             <Eye className="mr-2 h-3.5 w-3.5 text-ink-3" strokeWidth={1.5} />
                             查看运行详情
                           </DropdownMenuItem>
                           <DropdownMenuSeparator />
                           <DropdownMenuItem
-                            onSelect={() => void electron.updateScheduleEnabled(schedule.scheduleId, !enabled)}
+                            onClick={() => void electron.updateScheduleEnabled(schedule.scheduleId, !enabled)}
                           >
                             {enabled
                               ? <PowerOff className="mr-2 h-3.5 w-3.5 text-ink-3" strokeWidth={1.5} />
                               : <Power className="mr-2 h-3.5 w-3.5 text-emerald-600" strokeWidth={1.5} />}
                             {enabled ? '停用调度' : '启用调度'}
                           </DropdownMenuItem>
-                          <DropdownMenuItem onSelect={() => void electron.triggerSchedule(schedule.scheduleId)}>
+                          <DropdownMenuItem onClick={() => void electron.triggerSchedule(schedule.scheduleId)}>
                             <Zap className="mr-2 h-3.5 w-3.5 text-ink-3" strokeWidth={1.5} />
                             立即触发
                           </DropdownMenuItem>
-                          <DropdownMenuItem onSelect={() => setEditSchedule(schedule)}>
+                          <DropdownMenuItem onClick={() => setEditSchedule(schedule)}>
                             <Pencil className="mr-2 h-3.5 w-3.5 text-ink-3" strokeWidth={1.5} />
                             编辑调度
                           </DropdownMenuItem>
                           <DropdownMenuSeparator />
                           <DropdownMenuItem
                             className="text-red-600 focus:text-red-600"
-                            onSelect={() => setDeleteSchedule(schedule)}
+                            onClick={() => setDeleteSchedule(schedule)}
                           >
                             <Trash2 className="mr-2 h-3.5 w-3.5" strokeWidth={1.5} />
                             删除调度

@@ -36,7 +36,7 @@ export function SchedulerMetrics({ schedules, runSummaries }: { schedules: Sched
         detail={nextSchedule?.name ?? '没有启用调度'}
         icon={<CalendarClock className="h-3.5 w-3.5" strokeWidth={1.5} />}
         label="下次触发"
-        value={nextSchedule === undefined ? '无启用调度' : formatScheduleDateTime(nextSchedule.nextRunAt)}
+        value={nextSchedule === undefined ? '无启用调度' : formatScheduleDateTime(nextSchedule.nextRunAt, nextSchedule.timezone)}
       />
     </HealthRail>
   );

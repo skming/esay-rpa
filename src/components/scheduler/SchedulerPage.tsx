@@ -1,5 +1,5 @@
 import { CalendarClock, Plus } from 'lucide-react';
-import { EmptyPanel, SearchField } from '../workspace/surfaces';
+import { EmptyPanel, FilterBar, LoadingPanel } from '../workspace/surfaces';
 import { WorkspaceShell } from '../workspace/WorkspaceShell';
 import type { ReactElement } from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -7,7 +7,6 @@ import { useSearchParams } from 'react-router-dom';
 
 import type { ElectronBridgeState } from '../../hooks/useElectronBridge';
 import { filterSchedules, hasScheduleError, type ScheduleFilter } from '../../lib/schedulePresentation';
-import { cn } from '../../lib/utils';
 import { Button } from '../ui/button';
 import { RefreshButton } from '../ui/refresh-button';
 import { ScheduleCreateDialog } from '../studio/property-panel/ScheduleCreateDialog';
@@ -16,6 +15,7 @@ import { ScheduleListTable } from './ScheduleListTable';
 
 export function SchedulerPage({ electron }: { electron: ElectronBridgeState }): ReactElement {
   const [createOpen, setCreateOpen] = useState(false);
+  const [firstLoad, setFirstLoad] = useState(true);
   const loadedRef = useRef(false);
   const [searchParams, setSearchParams] = useSearchParams();
   const filter = normalizeScheduleFilter(searchParams.get('view'));
@@ -30,8 +30,10 @@ export function SchedulerPage({ electron }: { electron: ElectronBridgeState }): 
     if (loadedRef.current) return;
     loadedRef.current = true;
     void electron.loadFlows({ silent: true });
-    void electron.loadSchedules({ silent: true });
-    void electron.loadScheduleRunSummaries({ silent: true });
+    void Promise.all([
+      electron.loadSchedules({ silent: true }),
+      electron.loadScheduleRunSummaries({ silent: true }),
+    ]).finally(() => setFirstLoad(false));
   }, [electron]);
 
   const { loadSchedules, loadScheduleRunSummaries } = electron;
@@ -84,41 +86,20 @@ export function SchedulerPage({ electron }: { electron: ElectronBridgeState }): 
     >
       <SchedulerMetrics schedules={electron.schedules} runSummaries={electron.scheduleRunSummaries} />
 
-      <div className="flex flex-wrap items-center gap-2 rounded-xl border border-rule bg-surface p-2 shadow-xs">
-        <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
-          {SCHEDULE_FILTERS.map((item) => (
-            <button
-              aria-pressed={filter === item.value}
-              className={cn(
-                'flex h-8 shrink-0 items-center gap-1.5 rounded-md px-2.5 text-[11px] font-medium transition-colors',
-                filter === item.value
-                  ? 'bg-accent-soft text-accent-strong'
-                  : 'text-ink-3 hover:bg-paper-sunk hover:text-ink-2',
-              )}
-              key={item.value}
-              onClick={() => updateSearch({ filter: item.value })}
-              type="button"
-            >
-              {item.label}
-              <span className={cn(
-                'font-mono text-[10px] tabular-nums',
-                filter === item.value ? 'text-accent-strong' : 'text-ink-4',
-              )}>
-                {counts[item.value]}
-              </span>
-            </button>
-          ))}
-        </div>
-        <SearchField
-          className="w-64 flex-none"
-          label="搜索调度"
-          onChange={(nextQuery) => updateSearch({ query: nextQuery })}
-          placeholder="搜索调度名称或流程…"
-          value={query}
-        />
-      </div>
+      <FilterBar
+        counts={counts}
+        filters={SCHEDULE_FILTERS}
+        onQueryChange={(nextQuery) => updateSearch({ query: nextQuery })}
+        onValueChange={(nextFilter) => updateSearch({ filter: nextFilter })}
+        query={query}
+        searchLabel="搜索调度"
+        searchPlaceholder="搜索调度名称或流程…"
+        value={filter}
+      />
 
-      {schedules.length === 0 ? (
+      {firstLoad && electron.schedules.length === 0 ? (
+        <LoadingPanel label="加载调度…" />
+      ) : schedules.length === 0 ? (
         <EmptyPanel
           icon={<CalendarClock className="h-6 w-6" strokeWidth={1.25} />}
           title="暂无匹配调度"
