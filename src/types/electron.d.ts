@@ -97,8 +97,7 @@ export type AiProviderGroupMeta = { id: string; label: string; env_key: string }
 export type AiModelsResult = {
   models: AiModelMeta[];
   default: string;
-  /** 老后端不返回此字段，前端回退到按 models 推导 */
-  providers?: AiProviderGroupMeta[];
+  providers: AiProviderGroupMeta[];
 };
 
 export type AiModelTestPayload = {
