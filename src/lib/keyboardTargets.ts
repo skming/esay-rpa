@@ -39,13 +39,13 @@ export function isInteractiveTarget(target: EventTarget | null): boolean {
   return target.closest(INTERACTIVE_SELECTOR) !== null;
 }
 
-// Radix 的对话框与菜单把焦点锁在浮层内，但 keydown 照样冒泡到 window：不让路的话，
+// Base UI 的对话框与菜单把焦点锁在浮层内，但 keydown 照样冒泡到 window：不让路的话，
 // 删除确认框上按 Enter 会先在这里被 preventDefault 掉、确认按钮永不触发，按 b 则是在
 // 被浮层挡住、什么反馈都看不到的画布上悄悄切了断点。
-// 必须按 role 过滤而不是只看 data-state="open"：tooltip 同样带这个属性，而鼠标停在画布
+// 必须按 role 过滤而不是只看 data-open：tooltip 同样带这个属性，而鼠标停在画布
 // 任一控件上就会开一个，拿它当「有浮层」会让快捷键随机失效。
 const OVERLAY_SELECTOR = ['dialog', 'alertdialog', 'menu', 'listbox']
-  .map((role) => `[role="${role}"][data-state="open"]`)
+  .map((role) => `[role="${role}"][data-open]`)
   .join(',');
 
 /** 有对话框或菜单正拿着键盘 */

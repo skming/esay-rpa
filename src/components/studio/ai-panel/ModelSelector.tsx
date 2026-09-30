@@ -60,8 +60,7 @@ export function ModelSelector({
 
   return (
     <DropdownMenu onOpenChange={setOpen} open={open}>
-      <DropdownMenuTrigger asChild disabled={disabled}>
-        <button
+      <DropdownMenuTrigger disabled={disabled} render={<button
           aria-label={`AI 模型：${currentLabel}`}
           className={cn(
             'flex h-6 items-center gap-1 rounded-md text-[11px] transition-colors',
@@ -73,10 +72,9 @@ export function ModelSelector({
           )}
           title={disabled ? '生成中，下次发送时生效' : undefined}
           type="button"
-        >
+        />}>
           <span className="max-w-30 truncate font-medium">{currentLabel}</span>
           <ChevronDown className={cn('h-3 w-3 shrink-0 text-slate-500 transition-transform', open && 'rotate-180')} />
-        </button>
       </DropdownMenuTrigger>
 
       <DropdownMenuContent
@@ -109,7 +107,7 @@ export function ModelSelector({
                     const unavailable = !backendDown && m.configured === false && !m.local;
                     return (
                       <DropdownMenuRadioItem
-                        className="h-7 gap-2 rounded-md pl-7 pr-2 text-[11px] data-[state=checked]:bg-accent-soft data-[state=checked]:text-accent-strong"
+                        className="h-7 gap-2 rounded-md pl-7 pr-2 text-[11px] data-checked:bg-accent-soft data-checked:text-accent-strong"
                         disabled={unavailable}
                         key={m.id}
                         value={m.id}

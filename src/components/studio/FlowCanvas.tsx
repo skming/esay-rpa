@@ -557,6 +557,8 @@ function FlowCanvasInner({
                 nodeStrokeWidth={0}
                 pannable
                 style={{
+                  width: 156,
+                  height: 116,
                   backgroundColor: 'var(--color-canvas)',
                   borderRadius: 10,
                   overflow: 'hidden',

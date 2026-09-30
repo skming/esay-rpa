@@ -26,7 +26,7 @@ import { SettingsContent, SettingsLoadError } from './SettingsContent';
 
 type ProviderGroup = { key: string; label: string; env_key: string; placeholder: string; docsUrl: string };
 
-// 只放目录里没有、也不该由目录承载的取密钥入口；厂商本身来自目录
+// 这里只补充取密钥入口；厂商分组由后端 providers 提供。
 const PROVIDER_HINTS: Record<string, { placeholder: string; docsUrl: string }> = {
   anthropic: { placeholder: 'sk-ant-api03-…', docsUrl: 'https://console.anthropic.com/settings/keys' },
   openai: { placeholder: 'sk-proj-…', docsUrl: 'https://platform.openai.com/api-keys' },
@@ -37,13 +37,9 @@ const PROVIDER_HINTS: Record<string, { placeholder: string; docsUrl: string }> =
   xai: { placeholder: 'xai-…', docsUrl: 'https://console.x.ai/' },
 };
 
-/** 厂商分组来自后端，不由模型目录推导。按目录推导的话，删掉某厂商最后一个模型
- *  就等于把这条分组连同它的 API Key 输入框一起删掉——而「添加模型」必须挂在已有分组下，
- *  这个厂商于是再也加不回来，已存的密钥也变成读不到又清不掉的孤儿。
- *  只有老后端不返回 providers 时才回退到按目录推导（此时空分组仍会丢）。 */
-function toProviderGroups(providers: AiProviderGroupMeta[], catalog: AiModelMeta[]): ProviderGroup[] {
-  const source = providers.length > 0 ? providers : deriveProviderGroupsFromCatalog(catalog);
-  return source.map(p => ({
+/** 厂商分组由后端单独提供，删除最后一个模型时仍保留该厂商的密钥和添加入口。 */
+function toProviderGroups(providers: AiProviderGroupMeta[]): ProviderGroup[] {
+  return providers.map(p => ({
     key: p.id,
     label: p.label,
     env_key: p.env_key,
@@ -51,22 +47,10 @@ function toProviderGroups(providers: AiProviderGroupMeta[], catalog: AiModelMeta
   }));
 }
 
-function deriveProviderGroupsFromCatalog(catalog: AiModelMeta[]): AiProviderGroupMeta[] {
-  const groups = new Map<string, AiProviderGroupMeta>();
-  for (const model of catalog) {
-    if (!model.provider || !model.env_key || groups.has(model.provider)) continue;
-    groups.set(model.provider, {
-      id: model.provider,
-      label: model.provider_label ?? model.provider,
-      env_key: model.env_key,
-    });
-  }
-  return [...groups.values()];
-}
-
 type TestStatus = 'idle' | 'testing' | 'ok' | 'fail';
 /** 按模型 id 归属，不是按 env_key：一个服务商下各模型在中转上的可用性互不代表。 */
 type TestResult = { status: TestStatus; latencyMs?: number; error?: string; servedBy?: string };
+const TEST_RESULT_DURATION_MS = 6_000;
 
 const aiFieldClass = 'h-8 w-full rounded-md border border-rule-2 bg-surface px-2.5 text-[11px] text-ink-2 outline-none transition placeholder:text-ink-3 focus-visible:border-accent-line focus-visible:ring-2 focus-visible:ring-accent-soft';
 const aiMonoFieldClass = cn(aiFieldClass, 'font-mono');
@@ -110,23 +94,46 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
   const [showKeys, setShowKeys] = useState<Record<string, boolean>>({});
   const [testResults, setTestResults] = useState<Record<string, TestResult>>({});
   const testTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const testGeneration = useRef(0);
+
+  useEffect(() => {
+    const timers = testTimers.current;
+    return () => {
+      testGeneration.current += 1;
+      Object.values(timers).forEach(clearTimeout);
+    };
+  }, []);
+
+  const clearTestResults = useCallback((): void => {
+    testGeneration.current += 1;
+    Object.keys(testTimers.current).forEach(modelId => {
+      clearTimeout(testTimers.current[modelId]);
+      delete testTimers.current[modelId];
+    });
+    setTestResults({});
+  }, []);
+
+  const finishTest = (modelId: string, result: TestResult): void => {
+    clearTimeout(testTimers.current[modelId]);
+    setTestResults(prev => ({ ...prev, [modelId]: result }));
+    testTimers.current[modelId] = setTimeout(() => {
+      setTestResults(prev => ({ ...prev, [modelId]: { status: 'idle' } }));
+      delete testTimers.current[modelId];
+    }, TEST_RESULT_DURATION_MS);
+  };
 
   const bridge = typeof window !== 'undefined' ? (window.rpaBridge ?? null) : null;
 
-  const applyModelsResult = (result: AiModelsResult | undefined): void => {
-    if (!result) return;
-    if (Array.isArray(result.models)) {
-      setModelCatalog(result.models.filter(model => !model.custom));
+  const applyModelsResult = useCallback((result: AiModelsResult): void => {
+    if (!result || !Array.isArray(result.models) || !Array.isArray(result.providers)) {
+      throw new Error('模型目录响应缺少 models 或 providers');
     }
-    // 只在后端确实给了才覆盖：老后端不返回该字段，写空数组会把分组清光
-    if (Array.isArray(result.providers)) {
-      setProviderMeta(result.providers);
-    }
-  };
+    setModelCatalog(result.models.filter(model => !model.custom));
+    setProviderMeta(result.providers);
+    clearTestResults();
+  }, [clearTestResults]);
 
 
-  // 不在开头 setLoading(true)：loading 初值即为 true，而模型测试后的那次刷新是后台刷新，
-  // 不该把整个面板打回骨架屏
   const load = useCallback(async () => {
     try {
       const cfg = await (async (): Promise<AiConfig> => {
@@ -155,18 +162,22 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
     } finally {
       setLoading(false);
     }
-  }, [bridge, electron.available]);
+  }, [applyModelsResult, bridge, electron.available]);
 
   // 误报：load 里 setState 全在 await 之后，规则只看回调体内有无 setState，不区分 await 边界
   // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => { void load(); }, [load]);
 
   const handleSave = async (): Promise<void> => {
+    if (Object.values(draftKeys).some(value => value.includes('****'))) {
+      electron.pushToast('error', '新密钥不能包含连续四个星号');
+      return;
+    }
     setSaving(true);
     try {
       const payload = {
-        // 空字符串表示"清除该密钥"，必须发给后端；只过滤含掩码的中间态输入。
-        api_keys: Object.fromEntries(Object.entries(draftKeys).filter(([, v]) => !v.includes('****'))),
+        // 空字符串表示清除该密钥，必须发给后端。
+        api_keys: draftKeys,
         base_urls: draftBaseUrls,
         default_model: draftDefaultModel,
       };
@@ -194,8 +205,9 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
 
   const handleTestModel = async (provider: ProviderGroup, modelId: string): Promise<void> => {
     const envKey = provider.env_key;
+    const generation = testGeneration.current;
+    clearTimeout(testTimers.current[modelId]);
     setTestResults(prev => ({ ...prev, [modelId]: { status: 'testing' } }));
-    if (testTimers.current[modelId]) clearTimeout(testTimers.current[modelId]);
     try {
       const payload = {
         env_key: envKey,
@@ -216,22 +228,14 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
       const result: TestResult = data.ok
         ? { status: 'ok', latencyMs: data.latency_ms, servedBy: data.served_by ?? undefined }
         : { status: 'fail', error: data.error };
-      setTestResults(prev => ({ ...prev, [modelId]: result }));
+      if (generation === testGeneration.current) finishTest(modelId, result);
       // 这里刻意不重新拉配置：测试连接不写盘，没有新状态可读回，
       // 而 load() 会用已存值覆盖 draftBaseUrls —— 刚输入还没保存的 Base URL 会被抹掉。
-      testTimers.current[modelId] = setTimeout(
-        () => setTestResults(prev => ({ ...prev, [modelId]: { status: 'idle' } })),
-        5000
-      );
     } catch (err) {
       const message = err instanceof TypeError && String(err.message).includes('fetch')
         ? '无法连接后端服务，请检查后端是否已启动'
         : String(err);
-      setTestResults(prev => ({ ...prev, [modelId]: { status: 'fail', error: message } }));
-      testTimers.current[modelId] = setTimeout(
-        () => setTestResults(prev => ({ ...prev, [modelId]: { status: 'idle' } })),
-        5000
-      );
+      if (generation === testGeneration.current) finishTest(modelId, { status: 'fail', error: message });
     }
   };
 
@@ -255,9 +259,10 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
 
   const handleSubmitModelDialog = async (): Promise<void> => {
     if (!modelDialog) return;
-    const contextWindow = Number.parseInt(draftCatalogModel.context_window, 10);
-    if (!Number.isFinite(contextWindow) || contextWindow < 0) {
-      electron.pushToast('error', '上下文长度必须是非负数字');
+    const contextWindowText = draftCatalogModel.context_window.trim();
+    const contextWindow = Number(contextWindowText);
+    if (!/^\d+$/.test(contextWindowText) || !Number.isSafeInteger(contextWindow)) {
+      electron.pushToast('error', '上下文长度必须是非负整数');
       return;
     }
 
@@ -278,10 +283,10 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
           tier: draftCatalogModel.tier || 'standard',
           recommended: draftCatalogModel.recommended,
         };
-        const refreshed = await (async (): Promise<AiModelsResult | undefined> => {
+        const refreshed = await (async (): Promise<AiModelsResult> => {
           if (electron.available && bridge) {
             const result = await bridge.addAiModel(payload);
-            if (!result.ok) throw new Error(result.error ?? '模型添加失败');
+            if (!result.ok || !result.data) throw new Error(result.error ?? '模型添加失败');
             return result.data;
           }
           return await backend.addAiModel(payload);
@@ -307,10 +312,10 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
         tier: draftCatalogModel.tier || 'standard',
         recommended: draftCatalogModel.recommended,
       };
-      const refreshed = await (async (): Promise<AiModelsResult | undefined> => {
+      const refreshed = await (async (): Promise<AiModelsResult> => {
         if (electron.available && bridge) {
           const result = await bridge.updateAiModel(payload);
-          if (!result.ok) throw new Error(result.error ?? '模型更新失败');
+          if (!result.ok || !result.data) throw new Error(result.error ?? '模型更新失败');
           return result.data;
         }
         return await backend.updateAiModel(payload);
@@ -328,16 +333,16 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
   const handleDeleteModel = async (model: AiModelMeta): Promise<void> => {
     setCatalogBusy(`delete:${model.id}`);
     try {
-      const refreshed = await (async (): Promise<AiModelsResult | undefined> => {
+      const refreshed = await (async (): Promise<AiModelsResult> => {
         if (electron.available && bridge) {
           const result = await bridge.deleteAiModel(model.id);
-          if (!result.ok) throw new Error(result.error ?? '模型删除失败');
+          if (!result.ok || !result.data) throw new Error(result.error ?? '模型删除失败');
           return result.data;
         }
         return await backend.deleteAiModel(model.id);
       })();
       applyModelsResult(refreshed);
-      if (refreshed?.default) {
+      if (refreshed.default) {
         setDraftDefaultModel(refreshed.default);
         setConfig((current) => current === null ? current : { ...current, default_model: refreshed.default });
       }
@@ -350,17 +355,14 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
     }
   };
 
-  const providerGroups = toProviderGroups(providerMeta, modelCatalog);
+  const providerGroups = toProviderGroups(providerMeta);
   const hasChanges = config !== null && (
-    Object.keys(draftKeys).length > 0
+    Object.entries(draftKeys).some(([envKey, value]) => value !== '' || Boolean(config.api_keys[envKey]))
     || draftDefaultModel !== config.default_model
     || JSON.stringify(draftBaseUrls) !== JSON.stringify(config.base_urls ?? {})
   );
 
-  const configuredCount = providerGroups.filter(g => {
-    const draft = draftKeys[g.env_key];
-    return draft !== undefined ? draft !== '' : !!(config?.api_keys[g.env_key]);
-  }).length;
+  const configuredCount = providerGroups.filter(g => !!config?.api_keys[g.env_key]).length;
   const catalogCount = modelCatalog.length;
 
   const getTestResult = (modelId: string): TestResult =>
@@ -373,7 +375,7 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
           <Loader2 className="h-3.5 w-3.5 animate-spin text-ink-4" />
         ) : (
           <span className="font-mono text-[11px] tabular-nums text-ink-3">
-            已配置 {configuredCount}/{providerGroups.length} · 模型 {catalogCount}
+            已配置 {configuredCount}/{providerGroups.length} · 模型 {catalogCount}{hasChanges ? ' · 未保存' : ''}
           </span>
         )
       }
@@ -393,9 +395,10 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
         )}
         {config !== null && modelCatalog.length > 0 && (
           <div className="grid gap-1.5">
-            <label className="text-[11px] font-medium text-ink-2" htmlFor="default-ai-model">后台分析默认模型</label>
+            <label className="text-[11px] font-medium text-ink-2" htmlFor="default-ai-model">默认 AI 模型</label>
             <select
               className={aiFieldClass}
+              disabled={saving}
               id="default-ai-model"
               onChange={(event) => setDraftDefaultModel(event.target.value)}
               value={draftDefaultModel}
@@ -404,7 +407,7 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
                 <option key={model.id} value={model.id}>{model.label} · {model.id}</option>
               ))}
             </select>
-            <p className="text-[11px] text-ink-3">用于页面遮罩分析、自愈和未指定模型的请求。</p>
+            <p className="text-[11px] text-ink-3">用于未指定模型的 AI 对话，以及定时任务失败后的自动诊断。</p>
           </div>
         )}
         <div className="grid gap-2">
@@ -428,7 +431,7 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
                 <Collapsible
                   badge={
                     <div className="flex items-center gap-1.5">
-                      <ProviderStatusBadge configured={isConfigured} />
+                      <ProviderStatusBadge configured={storedValue !== ''} dirty={draftValue !== undefined && (draftValue !== '' || storedValue !== '')} />
                       <span className="rounded bg-paper-sunk px-1.5 py-0.5 font-mono text-[10px] text-ink-3">
                         {providerModels.length}
                       </span>
@@ -452,32 +455,43 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
                         密钥配置
                       </div>
 
-                      <div className="relative min-w-0">
-                        <input
-                          aria-label={`${g.label} API Key`}
-                          className={cn(aiMonoFieldClass, 'pr-8')}
-                          placeholder={storedValue && draftValue === undefined ? `已配置 ${storedValue}` : g.placeholder}
-                          type={isVisible ? 'text' : 'password'}
-                          value={displayValue}
-                          onChange={e => setDraftKeys(prev => ({ ...prev, [g.env_key]: e.target.value }))}
-                        />
-                        <button
-                          className="absolute right-1.5 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-ink-4 transition-colors hover:bg-paper-sunk hover:text-ink"
-                          onClick={() => setShowKeys(prev => ({ ...prev, [g.env_key]: !prev[g.env_key] }))}
-                          title={isVisible ? '隐藏密钥' : '显示密钥'}
-                          type="button"
-                        >
-                          {isVisible ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
-                        </button>
+                      <div className="grid min-w-0 gap-1">
+                        <div className="relative min-w-0">
+                          <input
+                            aria-label={`${g.label} API Key`}
+                            className={cn(aiMonoFieldClass, 'pr-8')}
+                            disabled={saving}
+                            placeholder={storedValue && draftValue === undefined ? `已配置 ${storedValue}` : g.placeholder}
+                            type={isVisible ? 'text' : 'password'}
+                            value={displayValue}
+                            onChange={e => { setDraftKeys(prev => ({ ...prev, [g.env_key]: e.target.value })); clearTestResults(); }}
+                          />
+                          <button
+                            className="absolute right-1.5 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-ink-4 transition-colors hover:bg-paper-sunk hover:text-ink"
+                            disabled={saving || !displayValue}
+                            onClick={() => setShowKeys(prev => ({ ...prev, [g.env_key]: !prev[g.env_key] }))}
+                            title={isVisible ? '隐藏新密钥' : '显示新密钥'}
+                            type="button"
+                          >
+                            {isVisible ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
+                          </button>
+                        </div>
+                        {storedValue && draftValue === undefined && (
+                          <button className="w-fit text-[10px] text-ink-3 underline-offset-2 hover:text-ink-2 hover:underline" disabled={saving} onClick={() => { setDraftKeys(prev => ({ ...prev, [g.env_key]: '' })); clearTestResults(); }} type="button">
+                            清除已保存密钥
+                          </button>
+                        )}
+                        {storedValue && draftValue === '' && <p className="text-[10px] text-amber-800">保存后将移除密钥。</p>}
                       </div>
 
                       <input
                         aria-label={`${g.label} Base URL`}
                         className={aiMonoFieldClass}
+                        disabled={saving}
                         placeholder="Base URL"
                         type="text"
                         value={draftBaseUrls[g.env_key] ?? ''}
-                        onChange={e => setDraftBaseUrls(prev => ({ ...prev, [g.env_key]: e.target.value }))}
+                        onChange={e => { setDraftBaseUrls(prev => ({ ...prev, [g.env_key]: e.target.value })); clearTestResults(); }}
                       />
 
                       <div className="flex h-7 items-center justify-end gap-1 @min-3xl:gap-0.5 @min-3xl:rounded-md @min-3xl:bg-surface @min-3xl:p-0.5">
@@ -485,12 +499,10 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
                           <IconButton
                             className="h-6 w-6 text-ink-4 hover:text-ink"
                             label={`打开 ${g.label} API Key 页面`}
+                            render={<a href={g.docsUrl} rel="noreferrer" target="_blank" />}
                             variant="ghost"
-                            asChild
                           >
-                            <a href={g.docsUrl} rel="noreferrer" target="_blank">
-                              <ExternalLink className="h-3.5 w-3.5" strokeWidth={1.5} />
-                            </a>
+                            <ExternalLink className="h-3.5 w-3.5" strokeWidth={1.5} />
                           </IconButton>
                         )}
                         <IconButton
@@ -526,6 +538,11 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
                           </div>
                           {providerModels.map(model => {
                             const mt = getTestResult(model.id);
+                            if (mt.status === 'ok') return (
+                              <p className="mt-1.5 rounded-md bg-emerald-50/70 px-2.5 py-1.5 font-mono text-[11px] leading-snug text-emerald-700" key={model.id} role="status">
+                                <span className="font-semibold">{model.id}</span>：连接正常{mt.latencyMs !== undefined ? ` · ${mt.latencyMs}ms` : ''}{mt.servedBy ? ` · 实际由 ${mt.servedBy} 应答` : ''}
+                              </p>
+                            );
                             if (mt.status !== 'fail' || !mt.error) return null;
                             return (
                               <p
@@ -585,17 +602,19 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
   );
 }
 
-function ProviderStatusBadge({ configured }: { configured: boolean }): ReactElement {
+function ProviderStatusBadge({ configured, dirty }: { configured: boolean; dirty: boolean }): ReactElement {
   return (
     <span
       className={cn(
         'inline-flex h-4 shrink-0 items-center rounded px-1.5 text-[10px] font-medium',
-        configured
+        dirty
+          ? 'border border-amber-200 bg-amber-50 text-amber-800'
+          : configured
           ? 'bg-emerald-50 text-emerald-700'
           : 'border border-rule bg-paper-sunk text-ink-4',
       )}
     >
-      {configured ? '已配置' : '未配置'}
+      {dirty ? '未保存' : configured ? '已配置' : '未配置'}
     </span>
   );
 }

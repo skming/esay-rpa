@@ -22,9 +22,9 @@ export const useAiModelCatalogStore = create<AiModelCatalogStore>()((set, get) =
     set({ status: 'loading' });
     try {
       const data = await backend.listAiModels(signal);
-      const list = data.models ?? [];
-      if (Array.isArray(list) && list.length > 0) {
-        set({ models: list, providers: data.providers ?? [], status: 'ready' });
+      const list = data.models;
+      if (Array.isArray(list) && list.length > 0 && Array.isArray(data.providers)) {
+        set({ models: list, providers: data.providers, status: 'ready' });
       } else {
         set({ status: 'error' });
       }

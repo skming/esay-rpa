@@ -1,5 +1,5 @@
 import type { ReactElement } from 'react';
-import { useMemo } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { useFlowCanvas } from '../../hooks/useFlowCanvas';
 import type { useAiPanelState } from '../../hooks/useAiPanelState';
 import type { useElectronBridge } from '../../hooks/useElectronBridge';
@@ -13,6 +13,7 @@ import { ComponentLibrary } from './ComponentLibrary';
 import { AiAssistantFab } from './AiAssistantFab';
 import { FlowCanvas } from './FlowCanvas';
 import { PropertyPanel } from './property-panel/PropertyPanel';
+import { canDockAiSidebar } from './studioLayout';
 
 interface StudioWorkspaceProps {
   canvas: ReturnType<typeof useFlowCanvas>;
@@ -39,6 +40,48 @@ export function StudioWorkspace({
   const setLibraryCollapsed = useStudioLayoutStore((state) => state.setLibraryCollapsed);
   const propertyCollapsed = usePropertyPanelStore((state) => state.collapsed);
   const setPropertyCollapsed = usePropertyPanelStore((state) => state.setCollapsed);
+  const { aiPanelMode, aiPanelOpen, setAiPanelMode } = ai;
+  const canvasColumnRef = useRef<HTMLDivElement>(null);
+  const responsiveAiFloatRef = useRef(false);
+  const [canvasColumnWidth, setCanvasColumnWidth] = useState<number | null>(null);
+
+  useEffect(() => {
+    const element = canvasColumnRef.current;
+    if (element === null) return;
+    const observer = new ResizeObserver(([entry]) => {
+      setCanvasColumnWidth(Math.round(entry.contentRect.width));
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  const aiSidebarDocked = aiPanelOpen && aiPanelMode === 'sidebar';
+  const aiSidebarAvailable = canvasColumnWidth === null
+    || canDockAiSidebar(canvasColumnWidth, aiSidebarDocked);
+
+  useEffect(() => {
+    if (!aiPanelOpen) {
+      if (responsiveAiFloatRef.current && aiPanelMode === 'float') {
+        setAiPanelMode('sidebar');
+      }
+      responsiveAiFloatRef.current = false;
+      return;
+    }
+    if (aiPanelMode === 'sidebar' && !aiSidebarAvailable) {
+      responsiveAiFloatRef.current = true;
+      setAiPanelMode('float');
+      return;
+    }
+    if (aiPanelMode === 'float' && responsiveAiFloatRef.current && aiSidebarAvailable) {
+      responsiveAiFloatRef.current = false;
+      setAiPanelMode('sidebar');
+    }
+  }, [aiPanelMode, aiPanelOpen, aiSidebarAvailable, setAiPanelMode]);
+
+  const handleAiPanelModeChange = (mode: 'sidebar' | 'float'): void => {
+    responsiveAiFloatRef.current = false;
+    setAiPanelMode(mode);
+  };
 
   // 专注模式：一键收起组件库/属性面板/日志面板/AI 面板，把工作区让给画布；
   // 退出时按进入前的快照还原，而不是一律展开——否则会把用户本来就收着的面板打开
@@ -84,7 +127,7 @@ export function StudioWorkspace({
           工作区路由自己已有 h1），所以这里只补一个不占位的路由级标题。 */}
       <h1 className="sr-only">流程编辑器</h1>
       <ComponentLibrary onQuickAdd={canvas.addNodeAfterSelection} />
-      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+      <div className="flex min-w-0 flex-1 flex-col overflow-hidden" ref={canvasColumnRef}>
         <FlowCanvas
           onAddNode={canvas.addNodeAtPosition}
           onBeginNodeDrag={canvas.beginNodeDrag}
@@ -118,14 +161,15 @@ export function StudioWorkspace({
         >
           <div className="overflow-hidden">
             <BottomPanel
+              aiBusy={ai.aiBusy}
               electron={electron}
               flowNodes={canvas.flowNodes}
               onAiAnalyze={(taskId, errorSummary) => {
                 ai.setAiPanelOpen(true);
                 ai.setAiPendingMessage(
-                  `刚才运行失败了，任务ID：${taskId}。日志面板中可见的错误：\n${errorSummary}\n\n` +
-                  '请先调用 get_run_error 获取错误详情与失败现场截图，结合日志定位失败节点、解释失败根因，' +
-                  '再修复当前流程；修复完成后重新运行验证，确认问题确实解决。',
+                  `请排查当前流程最近一次失败运行。\n任务 ID：${taskId}\n错误面板摘要：\n${errorSummary}\n\n` +
+                  '先调用 get_run_error 读取该任务的错误详情和可用现场证据，再定位失败节点与根因。' +
+                  '仅在证据支持时修改流程；修改后重新运行，并用实际输出验收。无法完成时明确说明阻塞原因。',
                 );
               }}
               onBreakpointChange={canvas.updateNodeBreakpoint}
@@ -143,8 +187,6 @@ export function StudioWorkspace({
         onUpdateNodeData={canvas.updateNodeData}
         selectedNode={canvas.selectedNode}
       />
-      {/* 悬浮球脱开画布单独挂在工作区上：它是助手的常驻入口，不该跟着画布的滚动、
-          缩放或面板收合走，也不该被画布容器裁掉 */}
       <AiAssistantFab
         busy={ai.aiBusy}
         hidden={ai.aiPanelOpen}
@@ -153,8 +195,9 @@ export function StudioWorkspace({
       {/* AiPanel: 始终挂载以保留对话历史，通过 open prop 控制动画显隐 */}
       <AiPanel
         flowId={electron.currentFlow?.flowId ?? null}
+        mode={aiPanelMode}
         onClose={ai.closePanel}
-        onModeChange={ai.setAiPanelMode}
+        onModeChange={handleAiPanelModeChange}
         onApplySuccess={(fid) => {
           // 同一流程用轻量刷新，避免清空运行日志、弹出多余的"已打开"提示；不同流程才整体切换
           if (fid === electron.currentFlow?.flowId) {
@@ -167,6 +210,7 @@ export function StudioWorkspace({
         onFocusNode={canvas.focusNode}
         open={ai.aiPanelOpen}
         pendingMessage={ai.aiPendingMessage}
+        sidebarAvailable={aiSidebarAvailable}
         onClearPendingMessage={() => ai.setAiPendingMessage(null)}
       />
     </div>

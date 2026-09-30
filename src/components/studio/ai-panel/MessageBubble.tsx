@@ -235,7 +235,7 @@ export const MessageBubble = memo(function MessageBubble({
         )}
 
         {!isUser && message.error && (
-          <div className="mt-1.5 flex w-full items-start gap-2 rounded-xl border border-red-100 bg-red-50 px-3 py-2">
+          <div className="mt-1.5 flex w-full items-start gap-2 rounded-xl border border-red-100 bg-red-50 px-3 py-2" role="alert">
             <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-400" strokeWidth={1.8} />
             <p className="min-w-0 flex-1 text-[11.5px] leading-relaxed text-red-700">{message.error}</p>
             {onRetry && (

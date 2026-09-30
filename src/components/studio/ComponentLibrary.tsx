@@ -12,6 +12,11 @@ import { Input } from '../ui/input';
 import { Label } from '../ui/label';
 import { cn } from '../../lib/utils';
 
+const featuredComponents = componentGroups.flatMap((group) => {
+  const item = group.items.find((candidate) => candidate.popular === true);
+  return item === undefined ? [] : [{ group: group.id, item }];
+});
+
 export function ComponentLibrary({
   onQuickAdd,
 }: {
@@ -22,7 +27,7 @@ export function ComponentLibrary({
   const setCollapsed = useStudioLayoutStore((state) => state.setLibraryCollapsed);
   const [query, setQuery] = useState('');
   const [expanded, setExpanded] = useState<Record<NodeKind, boolean>>({
-    browser: true, excel: false, ui: false, file: false,
+    browser: false, excel: false, ui: false, file: false,
     data: false, script: false, control: false, variable: false,
   });
 
@@ -40,6 +45,7 @@ export function ComponentLibrary({
         .filter((g) => normalizedQuery.length === 0 || g.items.length > 0),
     [normalizedQuery],
   );
+  const resultCount = filteredGroups.reduce((sum, group) => sum + group.items.length, 0);
 
   return (
     <aside
@@ -79,23 +85,38 @@ export function ComponentLibrary({
       >
         <div className="px-2.5 pt-2.5 pb-1.5">
           <Label
+            htmlFor="component-library-search"
             className={cn(
               'flex h-7 items-center gap-2 rounded-lg border px-2.5 text-slate-500 transition-[border-color,background-color,box-shadow] duration-150',
               'border-slate-200 bg-slate-50/60',
               'focus-within:border-accent-line focus-within:bg-white focus-within:ring-3 focus-within:ring-accent-soft',
             )}
           >
+            <span className="sr-only">搜索组件</span>
             <Search className="h-3 w-3 shrink-0" strokeWidth={1.5} />
             <Input
+              id="component-library-search"
               className="h-auto min-w-0 flex-1 rounded-none border-0 bg-transparent px-0 text-[11px] text-slate-700 placeholder:text-slate-500 focus:ring-0 focus:outline-hidden"
               onChange={(e) => setQuery(e.target.value)}
               placeholder="搜索组件…"
+              type="search"
               value={query}
             />
           </Label>
         </div>
 
         <div className="px-2 pb-3">
+          {normalizedQuery.length === 0 && (
+            <section className="mb-2 border-b border-slate-100 pb-2" aria-labelledby="featured-components-heading">
+              <h2 className="px-2 pb-1 text-[10px] font-medium text-slate-500" id="featured-components-heading">常用</h2>
+              <div className="grid grid-cols-2 gap-1">
+                {featuredComponents.map(({ group, item }) => (
+                  <ComponentLibraryItem compact group={group} item={item} key={`${group}-${item.label}`} onQuickAdd={onQuickAdd} />
+                ))}
+              </div>
+            </section>
+          )}
+          {normalizedQuery.length === 0 && <h2 className="px-2 pb-1 text-[10px] font-medium text-slate-500">全部组件</h2>}
           {filteredGroups.map((group) => {
             const style = kindStyles[group.id];
             const Icon = group.icon;
@@ -104,7 +125,10 @@ export function ComponentLibrary({
             return (
               <section className="mb-0.5" key={group.id}>
                 <button
-                  className="flex h-8 w-full items-center justify-start gap-2 rounded-lg px-2 text-left text-[11px] font-semibold text-slate-700 transition-colors duration-150 hover:bg-slate-50"
+                  aria-controls={`component-group-${group.id}`}
+                  aria-expanded={isExpanded}
+                  className="flex h-8 w-full items-center justify-start gap-2 rounded-lg px-2 text-left text-[11px] font-semibold text-slate-700 transition-colors duration-150 hover:bg-slate-50 disabled:cursor-default disabled:hover:bg-transparent"
+                  disabled={normalizedQuery.length > 0}
                   onClick={() => setExpanded((cur) => ({ ...cur, [group.id]: !cur[group.id] }))}
                   type="button"
                 >
@@ -121,7 +145,7 @@ export function ComponentLibrary({
                     : <ChevronRight className="h-3 w-3 text-slate-400" strokeWidth={1.5} />}
                 </button>
                 {isExpanded && (
-                  <div className="mt-0.5 space-y-px pl-7 pr-1">
+                  <div className="mt-0.5 space-y-px pl-7 pr-1" id={`component-group-${group.id}`}>
                     {group.items.map((item) => (
                       <ComponentLibraryItem group={group.id} item={item} key={item.label} onQuickAdd={onQuickAdd} />
                     ))}
@@ -130,6 +154,9 @@ export function ComponentLibrary({
               </section>
             );
           })}
+          {normalizedQuery.length > 0 && resultCount === 0 && (
+            <p className="px-2 py-6 text-center text-[11px] text-slate-500">没有匹配的组件</p>
+          )}
         </div>
       </div>
 
@@ -140,15 +167,18 @@ export function ComponentLibrary({
           collapsed ? 'pointer-events-none opacity-0' : 'opacity-100',
         )}
       >
-        <span className="truncate">共 {totalComponents} 个组件 · 拖拽或双击添加</span>
+        <span className="truncate">
+          {normalizedQuery.length > 0 ? `找到 ${resultCount} 个组件` : `共 ${totalComponents} 个组件 · 拖拽或双击添加`}
+        </span>
       </div>
     </aside>
   );
 }
 
 function ComponentLibraryItem({
-  group, item, onQuickAdd,
+  compact = false, group, item, onQuickAdd,
 }: {
+  compact?: boolean;
   group: NodeKind;
   item: ComponentItem;
   onQuickAdd: (payload: ComponentDragPayload) => void;
@@ -164,7 +194,8 @@ function ComponentLibraryItem({
   return (
     <button
       className={cn(
-        'group flex h-8 w-full cursor-grab items-center justify-start gap-2 rounded-lg px-2 text-left text-[11px] text-slate-600',
+        'group flex w-full cursor-grab items-center justify-start gap-2 rounded-lg px-2 text-left text-[11px] text-slate-600',
+        compact ? 'h-7 bg-slate-50/80' : 'h-8',
         'transition-[background-color,color,transform] duration-150 hover:bg-accent-soft hover:text-accent-strong',
         'active:cursor-grabbing active:scale-[0.98]',
       )}
@@ -183,7 +214,7 @@ function ComponentLibraryItem({
     >
       <span className="h-1.5 w-1.5 shrink-0 rounded-full opacity-70" style={{ background: style.accent }} />
       <span className="min-w-0 flex-1 truncate">{item.label}</span>
-      {item.popular && (
+      {item.popular && !compact && (
         <Badge className="rounded-md px-1 text-[9px]" variant="amber">
           常用
         </Badge>

@@ -156,6 +156,17 @@ summary:focus-visible {
   outline: none;
 }
 
+/* 选区与光标默认是浏览器灰蓝，不属于任何设计系统里的颜色。
+   只染选区底色不染文字色：控制台/JSON 查看器是深底浅字，强行统一文字色会把选中的字压进背景。 */
+::selection {
+  background: color-mix(in srgb, var(--color-accent) 22%, transparent);
+}
+
+input,
+textarea {
+  caret-color: var(--color-accent);
+}
+
 /* ── 对比度覆盖：挂配色签名，不挂组件 ────────────────────────────────────────
    button.tsx / badge.tsx 是项目自己的代码，改得动；这几个值仍然放在这里，是因为签名
    选择器同时修好了别处写出同一组合的裸元素——FlowNodes 的状态 pill（待运行/跳过/失败）
@@ -165,7 +176,7 @@ summary:focus-visible {
 
 /* danger 变体：白字压 red-500 是 3.82，抬到 red-600（4.76）。hover/active 必须一起抬，
    否则它们的工具类落在 layer 里、被这条规则吃掉，按钮就没有按下反馈了。
-   不带 button. 前缀：<Button asChild> 渲染 Radix Slot，标签会变成 <a> 之类而静默失配。 */
+   不带 button. 前缀：<Button render={<a />}> 可替换元素标签，标签变化会让签名静默失配。 */
 .bg-red-500.text-white {
   background-color: #e7000b;
   /* red-600 */
@@ -247,8 +258,6 @@ select {
 }
 
 .react-flow__minimap {
-  width: 156px;
-  height: 116px;
   margin: 14px;
   border: 1px solid var(--color-rule);
   border-radius: 12px;
@@ -498,33 +507,150 @@ select {
   }
 }
 
-/* 助手悬浮球「正在处理」：同一套 live 蓝，但环从按钮自身边缘往外扩。
-   直接复用 .live-dot 不行——它的 0.55 起始缩放是给 6px 圆点调的，套在 44px 按钮上
-   会先在按钮内部画一圈蓝线；而且它带 position:relative，会顶掉按钮的 absolute 定位。 */
-.fab-live-ring::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  border-radius: 9999px;
-  border: 1.5px solid var(--color-live);
-  opacity: 0;
-  animation: fab-live-ping 2s cubic-bezier(0.16, 1, 0.3, 1) infinite;
-  pointer-events: none;
+.ai-assistant-blob-body {
+  transform-box: view-box;
+  transform-origin: 50% 55%;
+  animation: ai-assistant-idle 12s linear infinite;
 }
 
-@keyframes fab-live-ping {
-  0% {
-    transform: scale(1);
-    opacity: 0.65;
-  }
+.ai-assistant-blob-gaze {
+  transform-box: view-box;
+  transform-origin: 50% 47%;
+  animation: ai-assistant-gaze 9.6s ease-in-out infinite;
+}
 
-  70% {
-    transform: scale(1.45);
-    opacity: 0;
-  }
+.ai-assistant-blob-blink {
+  transform-box: view-box;
+  transform-origin: 50% 47%;
+  animation: ai-assistant-blink 10.8s linear infinite;
+}
 
+.ai-assistant-blob-sleepy-eyes,
+.ai-assistant-blob-wide-eyes {
+  transform-box: view-box;
+  transform-origin: 50% 47%;
+  transition:
+    opacity 140ms cubic-bezier(0.16, 1, 0.3, 1),
+    transform 220ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.ai-assistant-blob-sleepy-eyes {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.ai-assistant-blob-wide-eyes {
+  opacity: 0;
+  transform: translateY(0.35px) scale(0.72, 0.34);
+}
+
+.group:is(:hover, :focus-visible) .ai-assistant-blob-sleepy-eyes {
+  opacity: 0;
+  transform: translateY(0.35px) scale(1, 0.55);
+}
+
+.group:is(:hover, :focus-visible) .ai-assistant-blob-wide-eyes {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.ai-assistant-blob-busy .ai-assistant-blob-sleepy-eyes {
+  opacity: 0;
+  transform: translateY(0.35px) scale(1, 0.55);
+}
+
+.ai-assistant-blob-busy .ai-assistant-blob-wide-eyes {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.ai-assistant-blob-busy .ai-assistant-blob-body {
+  animation: ai-assistant-think 2.4s cubic-bezier(0.16, 1, 0.3, 1) infinite alternate;
+}
+
+.ai-assistant-fab-dragging {
+  /* 指针移动时禁用位置过渡，释放后再恢复吸边动画。 */
+  transition-property: color, opacity, transform;
+}
+
+.ai-assistant-fab-dragging .ai-assistant-blob-body,
+.ai-assistant-fab-dragging .ai-assistant-blob-gaze,
+.ai-assistant-fab-dragging .ai-assistant-blob-blink,
+button[aria-hidden="true"] .ai-assistant-blob-body,
+button[aria-hidden="true"] .ai-assistant-blob-gaze,
+button[aria-hidden="true"] .ai-assistant-blob-blink {
+  animation-play-state: paused;
+}
+
+@keyframes ai-assistant-idle {
+  0%,
+  68%,
   100% {
-    opacity: 0;
+    transform: rotate(0deg);
+  }
+
+  72% {
+    transform: rotate(-1.1deg);
+  }
+
+  76% {
+    transform: rotate(0.7deg);
+  }
+
+  80% {
+    transform: rotate(0deg);
+  }
+}
+
+@keyframes ai-assistant-think {
+  0%,
+  12% {
+    transform: translateY(0) rotate(-1.1deg);
+  }
+
+  88%,
+  100% {
+    transform: translateY(-0.55px) rotate(1.1deg);
+  }
+}
+
+@keyframes ai-assistant-gaze {
+  0%,
+  14%,
+  100% {
+    transform: translate(0, 0);
+  }
+
+  31% {
+    transform: translate(0.26px, -0.14px);
+  }
+
+  52% {
+    transform: translate(-0.2px, 0.12px);
+  }
+
+  73% {
+    transform: translate(0.12px, 0.2px);
+  }
+
+  88% {
+    transform: translate(-0.08px, -0.08px);
+  }
+}
+
+@keyframes ai-assistant-blink {
+  0%,
+  38%,
+  41.2%,
+  70%,
+  73.2%,
+  100% {
+    transform: scaleY(1);
+  }
+
+  39.6%,
+  71.6% {
+    transform: scaleY(0.08);
   }
 }
 
@@ -595,8 +721,22 @@ select {
     scroll-behavior: auto !important;
   }
 
+  /* 加载态转圈是状态反馈不是装饰：冻结后无法区分「加载中」与「卡死」，故豁免。
+     必须同时恢复 iteration-count，否则上面的 `1` 会让它转一圈就停。 */
+  .animate-spin {
+    animation-duration: 1s !important;
+    animation-iteration-count: infinite !important;
+  }
+
   .live-dot::after {
     display: none;
+  }
+
+  .ai-assistant-blob-body,
+  .ai-assistant-blob-gaze,
+  .ai-assistant-blob-blink {
+    animation: none !important;
+    transform: none;
   }
 
   /* The .edge-running rule above is !important (it has to beat React Flow's own
