@@ -4,6 +4,7 @@ release/
 output/
 backend/.venv/
 backend/.bundle-python/
+backend/.bundle-venv/
 backend/.pytest_cache/
 backend/storage/
 .playwright-cli/

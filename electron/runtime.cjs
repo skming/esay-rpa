@@ -780,7 +780,7 @@ async function generateScraplingScript(payload = {}, backendClient = new Backend
   return {
     filename: `${slugify(flowName)}.py`,
     language: 'python',
-    dependencies: ['scrapling[all]>=0.4.10'],
+    dependencies: ['scrapling[fetchers]>=0.4.10'],
     ...(degradedReason === '' ? {} : { degraded: true, degradedReason }),
     content: [
       ...degradedHeader,

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
@@ -9,9 +10,13 @@ const { w, IS_TTY, makeSpinner } = require('./lib/ui.cjs');
 
 const ROOT = path.resolve(__dirname, '..');
 const BACKEND_DIR = path.join(ROOT, 'backend');
-const TARGET_DIR = path.join(BACKEND_DIR, '.bundle-python');
-const STAMP_FILE = path.join(TARGET_DIR, '.build-stamp.json');
+const RUNTIME_DIR = path.join(BACKEND_DIR, '.bundle-python');
+const VENV_DIR = path.join(BACKEND_DIR, '.bundle-venv');
+const STAMP_FILE = path.join(VENV_DIR, '.build-stamp.json');
+const LOCK_FILE = path.join(BACKEND_DIR, 'uv.lock');
+const PROJECT_FILE = path.join(BACKEND_DIR, 'pyproject.toml');
 const PYTHON_VERSION = process.env.RPA_BUNDLE_PYTHON_VERSION || '3.12';
+const BUNDLE_SCHEMA_VERSION = 1;
 const IS_WIN = process.platform === 'win32';
 
 function run(command, args, options = {}) {
@@ -21,10 +26,54 @@ function run(command, args, options = {}) {
     stdio: ['ignore', 'pipe', 'pipe'],
     ...options,
   });
+  if (result.error) {
+    throw new Error(`${command} 启动失败\n${result.error.message}`);
+  }
   if (result.status !== 0) {
     throw new Error(`${command} ${args.join(' ')} 失败\n${result.stderr || result.stdout}`);
   }
   return result.stdout.trim();
+}
+
+function hashFile(filePath) {
+  return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+}
+
+function normalizeArch(machine) {
+  const value = String(machine).trim().toLowerCase();
+  if (value === 'arm64' || value === 'aarch64') return 'arm64';
+  if (value === 'x64' || value === 'x86_64' || value === 'amd64') return 'x64';
+  return value;
+}
+
+function bundledPythonPath() {
+  return IS_WIN
+    ? path.join(RUNTIME_DIR, 'python.exe')
+    : path.join(RUNTIME_DIR, 'bin', 'python3.12');
+}
+
+function sitePackagesPath() {
+  if (IS_WIN) return path.join(VENV_DIR, 'Lib', 'site-packages');
+  return path.join(VENV_DIR, 'lib', 'python3.12', 'site-packages');
+}
+
+function readPythonInfo(pythonExecutable) {
+  const output = run(pythonExecutable, [
+    '-c',
+    'import json, platform, sys; print(json.dumps({"arch": platform.machine(), "version": platform.python_version(), "executable": sys.executable}))',
+  ]);
+  return JSON.parse(output);
+}
+
+function expectedFingerprint() {
+  return {
+    bundleSchemaVersion: BUNDLE_SCHEMA_VERSION,
+    platform: process.platform,
+    arch: process.arch,
+    pythonVersion: PYTHON_VERSION,
+    lockHash: hashFile(LOCK_FILE),
+    projectHash: hashFile(PROJECT_FILE),
+  };
 }
 
 function copyDir(src, dest) {
@@ -60,14 +109,17 @@ function normalizePythonSymlinks(runtimeDir) {
   }
 }
 
-// 检查是否已有匹配版本的缓存（conda 来源 / 无 sourceRoot 的旧 stamp 视为无效）
-function isAlreadyBuilt() {
+function isAlreadyBuilt(fingerprint) {
   try {
     const stamp = JSON.parse(fs.readFileSync(STAMP_FILE, 'utf8'));
-    if (stamp.pythonVersion !== PYTHON_VERSION || stamp.platform !== process.platform) return false;
-    const src = stamp.sourceRoot;
-    if (!src || /conda|miniconda|anaconda/i.test(src)) return false;
-    return true;
+    for (const [key, value] of Object.entries(fingerprint)) {
+      if (stamp[key] !== value) return false;
+    }
+    if (!stamp.sourceRoot || !fs.existsSync(stamp.sourceRoot)) return false;
+    const pythonExecutable = bundledPythonPath();
+    if (!fs.existsSync(pythonExecutable) || !fs.existsSync(sitePackagesPath())) return false;
+    const info = readPythonInfo(pythonExecutable);
+    return normalizeArch(info.arch) === process.arch && info.version === stamp.exactPythonVersion;
   } catch {
     return false;
   }
@@ -75,8 +127,7 @@ function isAlreadyBuilt() {
 
 function writeStamp(info) {
   fs.writeFileSync(STAMP_FILE, JSON.stringify({
-    pythonVersion: PYTHON_VERSION,
-    platform: process.platform,
+    ...expectedFingerprint(),
     builtAt: new Date().toISOString(),
     ...info,
   }, null, 2));
@@ -84,76 +135,88 @@ function writeStamp(info) {
 
 function main() {
   const uvCmd = IS_WIN ? 'uv.exe' : 'uv';
+  const fingerprint = expectedFingerprint();
 
-  // 如果已缓存且版本匹配，跳过耗时的复制步骤
-  if (isAlreadyBuilt()) {
-    const msg = `Python ${PYTHON_VERSION} 运行时已缓存，跳过重新准备`;
+  if (isAlreadyBuilt(fingerprint)) {
+    const msg = `Python ${PYTHON_VERSION} ${process.arch} 生产 Bundle 已缓存`;
     if (IS_TTY) w(`  ${pc.dim('·')}  ${pc.dim(msg)}\n`);
-    else process.stdout.write(JSON.stringify({ ok: true, cached: true, pythonVersion: PYTHON_VERSION }) + '\n');
+    else process.stdout.write(JSON.stringify({ ok: true, cached: true, ...fingerprint }) + '\n');
     return;
   }
 
-  let sp;
-  if (IS_TTY) {
-    sp = makeSpinner(`准备 Python ${PYTHON_VERSION} 运行时`);
-  }
+  const sp = IS_TTY ? makeSpinner(`准备 Python ${PYTHON_VERSION} ${process.arch} 生产 Bundle`) : null;
 
   try {
-    // UV_PYTHON_PREFERENCE=only-managed 确保使用 uv 下载的独立 Python，
-    // 避免误用系统 Conda/Miniconda Python（会带入 envs/pkgs 等 GB 级目录）
     const uvEnv = { ...process.env, UV_PYTHON_PREFERENCE: 'only-managed' };
-
-    // 安装 & 定位
     run(uvCmd, ['python', 'install', PYTHON_VERSION], { env: uvEnv });
     const pythonPath = run(uvCmd, ['python', 'find', PYTHON_VERSION], { env: uvEnv });
+    const pythonRoot = IS_WIN ? path.dirname(pythonPath) : path.dirname(path.dirname(pythonPath));
 
-    const pythonRoot = IS_WIN
-      ? path.dirname(pythonPath)
-      : path.dirname(path.dirname(pythonPath));
-    const realPython = fs.realpathSync(pythonPath);
+    if (sp) sp.update(`复制 Python ${PYTHON_VERSION} ${process.arch} 运行时...`);
+    copyDir(pythonRoot, RUNTIME_DIR);
+    if (!IS_WIN) normalizePythonSymlinks(RUNTIME_DIR);
 
-    if (IS_TTY) sp.update(`复制 Python ${PYTHON_VERSION} 运行时...`);
+    const pythonExecutable = bundledPythonPath();
+    const pythonInfo = readPythonInfo(pythonExecutable);
+    const runtimeArch = normalizeArch(pythonInfo.arch);
+    if (runtimeArch !== process.arch) {
+      throw new Error(`Python 运行时架构不匹配：主机 ${process.arch}，运行时 ${runtimeArch}`);
+    }
 
-    copyDir(pythonRoot, TARGET_DIR);
-    if (!IS_WIN) normalizePythonSymlinks(TARGET_DIR);
+    if (sp) sp.update('安装锁定的生产依赖...');
+    fs.rmSync(VENV_DIR, { recursive: true, force: true });
+    run(uvCmd, [
+      'sync',
+      '--project', BACKEND_DIR,
+      '--frozen',
+      '--no-dev',
+      '--no-install-project',
+      '--link-mode', 'copy',
+      '--python', pythonExecutable,
+    ], {
+      env: {
+        ...uvEnv,
+        UV_PROJECT_ENVIRONMENT: VENV_DIR,
+      },
+    });
 
-    const bundledPython = IS_WIN
-      ? path.join(TARGET_DIR, 'python.exe')
-      : path.join(TARGET_DIR, 'bin', 'python3.12');
+    if (!fs.existsSync(sitePackagesPath())) {
+      throw new Error(`生产依赖目录不存在：${sitePackagesPath()}`);
+    }
 
-    // 自检
-    const check = spawnSync(bundledPython, ['-c', 'import sys; print(sys.version)'], { encoding: 'utf8' });
-    if (check.status !== 0) throw new Error(`打包 Python 自检失败\n${check.stderr}`);
-
-    writeStamp({ sourceRoot: pythonRoot, bundledPython });
+    writeStamp({
+      exactPythonVersion: pythonInfo.version,
+      sourceRoot: pythonRoot,
+      sourcePython: pythonPath,
+      bundledPython: pythonExecutable,
+      sitePackages: sitePackagesPath(),
+    });
 
     const result = {
       ok: true,
       cached: false,
-      platform: process.platform,
-      pythonVersion: PYTHON_VERSION,
+      ...fingerprint,
+      exactPythonVersion: pythonInfo.version,
       sourceRoot: pythonRoot,
-      sourcePython: pythonPath,
-      realPython,
-      targetDir: TARGET_DIR,
-      bundledPython,
-      version: check.stdout.trim(),
+      targetRuntimeDir: RUNTIME_DIR,
+      targetVenvDir: VENV_DIR,
+      bundledPython: pythonExecutable,
+      sitePackages: sitePackagesPath(),
     };
 
-    if (IS_TTY) {
-      sp.done(`Python ${PYTHON_VERSION} 运行时就绪`);
+    if (sp) sp.done(`Python ${pythonInfo.version} ${process.arch} 生产 Bundle 就绪`);
+    else process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+  } catch (error) {
+    if (sp) {
+      sp.fail('Python 生产 Bundle 准备失败');
+      w(pc.red(error.message) + '\n');
     } else {
-      process.stdout.write(JSON.stringify(result, null, 2) + '\n');
-    }
-  } catch (e) {
-    if (IS_TTY) {
-      sp.fail(`Python 运行时准备失败`);
-      w(pc.red(e.message) + '\n');
-    } else {
-      process.stderr.write(JSON.stringify({ ok: false, message: e.message }) + '\n');
+      process.stderr.write(JSON.stringify({ ok: false, message: error.message }) + '\n');
     }
     process.exit(1);
   }
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { expectedFingerprint, isAlreadyBuilt, normalizeArch };

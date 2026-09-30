@@ -24,14 +24,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-15
             platform: darwin
-            artifact: release-macos
+            arch: arm64
+            artifact: release-macos-arm64
+          - os: macos-15-intel
+            platform: darwin
+            arch: x64
+            artifact: release-macos-x64
           - os: windows-latest
             platform: win32
+            arch: x64
             artifact: release-windows
           - os: ubuntu-latest
             platform: linux
+            arch: x64
             artifact: release-linux
 
     env:
@@ -44,7 +51,7 @@ jobs:
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 10.24.0
+          version: 12.6.0
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -55,7 +62,7 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
         with:
-          version: "0.5.31"
+          version: "0.12.19"
           enable-cache: true
 
       - name: Install Node dependencies
@@ -114,9 +121,11 @@ jobs:
           name: ${{ matrix.artifact }}
           path: |
             release/*.dmg
+            release/*.zip
             release/*.exe
             release/*.AppImage
             release/*.blockmap
+            release/latest*.yml
           if-no-files-found: error
           retention-days: 30
 

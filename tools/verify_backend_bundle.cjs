@@ -2,6 +2,7 @@
 'use strict';
 
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const pc = require('picocolors');
@@ -11,7 +12,7 @@ const ROOT = path.resolve(__dirname, '..');
 const BACKEND_DIR = path.join(ROOT, 'backend');
 const VENV_DIR = process.env.RPA_BACKEND_BUNDLE_VENV
   ? path.resolve(process.env.RPA_BACKEND_BUNDLE_VENV)
-  : path.join(BACKEND_DIR, '.venv');
+  : path.join(BACKEND_DIR, '.bundle-venv');
 const PYTHON_RUNTIME_DIR = process.env.RPA_BACKEND_BUNDLE_PYTHON
   ? path.resolve(process.env.RPA_BACKEND_BUNDLE_PYTHON)
   : path.join(BACKEND_DIR, '.bundle-python');
@@ -33,11 +34,11 @@ function assertExists(filePath, label) {
   if (!fs.existsSync(filePath)) fail(`${label} 不存在`, { path: filePath });
 }
 
-function readLinkIfSymlink(filePath) {
-  try {
-    const stat = fs.lstatSync(filePath);
-    return stat.isSymbolicLink() ? fs.readlinkSync(filePath) : null;
-  } catch { return null; }
+function normalizeArch(machine) {
+  const value = String(machine).trim().toLowerCase();
+  if (value === 'arm64' || value === 'aarch64') return 'arm64';
+  if (value === 'x64' || value === 'x86_64' || value === 'amd64') return 'x64';
+  return value;
 }
 
 function findAbsoluteSymlinks(rootDir) {
@@ -69,9 +70,6 @@ function resolveSitePackages() {
 function main() {
   const sp = IS_TTY ? makeSpinner('Bundle 完整性校验') : null;
 
-  const venvPython = process.platform === 'win32'
-    ? path.join(VENV_DIR, 'Scripts', 'python.exe')
-    : path.join(VENV_DIR, 'bin', 'python');
   const bundledPython = process.platform === 'win32'
     ? path.join(PYTHON_RUNTIME_DIR, 'python.exe')
     : path.join(PYTHON_RUNTIME_DIR, 'bin', 'python3.12');
@@ -80,7 +78,6 @@ function main() {
   assertExists(path.join(BACKEND_DIR, 'app', 'main.py'),              '后端入口 app/main.py');
   assertExists(path.join(BACKEND_DIR, 'config', 'model_catalog.json'), 'AI 模型目录 config/model_catalog.json');
   assertExists(path.join(BACKEND_DIR, 'pyproject.toml'),               '后端 pyproject.toml');
-  assertExists(venvPython,    '后端虚拟环境 Python');
   assertExists(bundledPython, '可随包 Python 运行时');
   assertExists(sitePackages,  '后端依赖 site-packages');
 
@@ -92,31 +89,46 @@ function main() {
     });
   }
 
-  const venvPythonLink = readLinkIfSymlink(venvPython);
-  if (venvPythonLink !== null && path.isAbsolute(venvPythonLink) && !fs.existsSync(bundledPython)) {
-    fail('后端 Python 是绝对路径软链接，打包后将依赖构建机本地路径', {
-      python: venvPython,
-      linkTarget: venvPythonLink,
-      mitigation: [
-        '执行 pnpm backend:bundle:prepare 生成 backend/.bundle-python',
-        '或设置 RPA_BACKEND_BUNDLE_PYTHON 指向可迁移的 Python 运行时',
-      ],
+  const absoluteDependencySymlinks = findAbsoluteSymlinks(sitePackages);
+  if (absoluteDependencySymlinks.length > 0) {
+    fail('生产依赖包含绝对路径软链接，复制到其他机器后会失效', {
+      links: absoluteDependencySymlinks.slice(0, 20),
+      mitigation: '重新执行 pnpm backend:bundle:prepare',
     });
   }
 
-  const CHECKED_IMPORTS = ['fastapi', 'uvicorn', 'playwright', 'scrapling', 'openpyxl'];
+  const CHECKED_IMPORTS = [
+    'fastapi', 'uvicorn', 'playwright', 'scrapling', 'openpyxl',
+    'litellm', 'sqlalchemy', 'redis', 'minio', 'jsonschema', 'asyncpg', 'app.main',
+  ];
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-rpa-bundle-verify-'));
+  const env = {
+    ...process.env,
+    RPA_APP_DATA_DIR: tempDir,
+    RPA_WORKSPACE_ROOT: path.join(tempDir, 'workspace'),
+    RPA_LOG_DIR: path.join(tempDir, 'logs'),
+    RPA_CACHE_DIR: path.join(tempDir, 'cache'),
+    PYTHONPATH: [sitePackages, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
+  };
+  const archResult = spawnSync(
+    bundledPython,
+    ['-c', 'import platform; print(platform.machine())'],
+    { cwd: BACKEND_DIR, env, encoding: 'utf8' },
+  );
+  if (archResult.status !== 0 || normalizeArch(archResult.stdout) !== process.arch) {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+    fail('Python 运行时架构与构建主机不一致', {
+      expected: process.arch,
+      actual: archResult.stdout.trim() || 'unknown',
+      stderr: archResult.stderr.trim(),
+    });
+  }
   const result = spawnSync(
     bundledPython,
     ['-c', `import ${CHECKED_IMPORTS.join(', ')}; print("ok")`],
-    {
-      cwd: BACKEND_DIR,
-      env: {
-        ...process.env,
-        PYTHONPATH: [sitePackages, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
-      },
-      encoding: 'utf8',
-    }
+    { cwd: BACKEND_DIR, env, encoding: 'utf8' },
   );
+  fs.rmSync(tempDir, { recursive: true, force: true });
 
   if (result.status !== 0) {
     if (sp) sp.fail();
@@ -133,8 +145,7 @@ function main() {
     pythonRuntimeDir: PYTHON_RUNTIME_DIR,
     bundledPython,
     sitePackages,
-    venvPython,
-    venvPythonLink,
+    arch: process.arch,
     checkedImports: CHECKED_IMPORTS,
   };
 

@@ -21,11 +21,13 @@ pnpm backend:bundle:prepare
 pnpm backend:bundle:verify
 ```
 
-`backend:bundle:prepare` 会把 uv 管理的 Python 3.12 复制到 `backend/.bundle-python`；
+`backend:bundle:prepare` 会把 uv 管理的 Python 3.12 复制到 `backend/.bundle-python`，并把锁定的生产依赖安装到 `backend/.bundle-venv`；
 `backend:bundle:verify` 会确认 `backend/app/main.py`、`backend/config/model_catalog.json`、
-`backend/.bundle-python/bin/python3.12`、`backend/.venv/lib/python3.12/site-packages`
+`backend/.bundle-python/bin/python3.12`、`backend/.bundle-venv/lib/python3.12/site-packages`
 和关键依赖存在。正式包启动后端时优先使用 `resources/backend/python/bin/python3.12`，
 并通过 `PYTHONPATH` 加载 `resources/backend/.venv` 中的依赖，避免依赖构建机本地 Miniconda/Homebrew 路径。
+
+macOS 的 arm64 与 x64 包必须分别在对应架构的 runner 上构建。打包完成后会校验 Electron、Python、原生依赖架构，并启动随包后端检查 `/api/health`。
 
 ## 生成安装包
 

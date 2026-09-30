@@ -51,6 +51,14 @@ if (flags.linux && process.platform !== 'linux') {
   process.exit(1);
 }
 
+if (process.arch !== 'x64') {
+  process.stderr.write(
+    pc.red(`${flags.win ? 'Windows' : 'Linux'} x64 包必须在 x64 主机上构建。\n`) +
+    pc.dim(`当前主机架构为 ${process.arch}；随包 Python 与原生依赖不能跨架构复用。\n`)
+  );
+  process.exit(1);
+}
+
 const PLATFORM   = flags.win ? 'win' : 'linux';
 const LABEL      = flags.win ? 'Windows (x64)' : 'Linux (x64 AppImage)';
 const EB_FLAG    = flags.win ? '--win' : '--linux';
@@ -96,24 +104,31 @@ function runElectronBuilder() {
 
     const child = spawn(EB, ['--config', 'electron-builder.config.cjs', EB_FLAG], {
       cwd: ROOT,
-      env: { ...process.env },
+      env: { ...process.env, RPA_TARGET_ARCH: 'x64' },
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: process.platform === 'win32',
     });
 
-    let buf = '';
-    const onData = (chunk) => {
-      buf += chunk.toString();
-      const lines = buf.split('\n');
-      buf = lines.pop();
-      lines.forEach(parseLine);
-    };
-    child.stdout.on('data', onData);
-    child.stderr.on('data', onData);
+    let output = '';
+    let spawnError;
+    const buffers = new Map([[child.stdout, ''], [child.stderr, '']]);
+    for (const stream of [child.stdout, child.stderr]) {
+      stream.setEncoding('utf8');
+      stream.on('data', (chunk) => {
+        output = `${output}${chunk}`.slice(-200_000);
+        const lines = `${buffers.get(stream)}${chunk}`.split('\n');
+        buffers.set(stream, lines.pop());
+        lines.forEach(parseLine);
+      });
+      stream.on('end', () => {
+        const tail = buffers.get(stream);
+        if (tail) parseLine(tail);
+      });
+    }
+    child.on('error', (error) => { spawnError = error; });
 
     // 仅在进程真正退出后标记完成
     child.on('close', (code) => {
-      if (buf) parseLine(buf);
       if (sub.active()) sub.finish();
 
       const total = fmtMs(Date.now() - t0);
@@ -122,7 +137,11 @@ function runElectronBuilder() {
         resolve();
       } else {
         w(`  ${pc.red('✗')}  打包 ${LABEL} 失败\n`);
-        reject(new Error(`electron-builder (${PLATFORM}) 退出码 ${code}`));
+        reject(new Error([
+          `electron-builder (${PLATFORM}) 退出码 ${code}`,
+          spawnError?.message,
+          output.trim(),
+        ].filter(Boolean).join('\n')));
       }
     });
   });

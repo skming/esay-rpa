@@ -5,8 +5,9 @@
  * macOS 打包脚本，带控制台动画进度。
  *
  * 用法：
- *   node tools/dist-mac.cjs              # 交互选择架构，生成 DMG + ZIP
- *   node tools/dist-mac.cjs --arm64      # 仅构建 Apple Silicon；--x64 构建 Intel
+ *   node tools/dist-mac.cjs              # 构建当前主机架构的 DMG + ZIP
+ *   node tools/dist-mac.cjs --arm64      # 显式要求当前 Apple Silicon 主机
+ *   node tools/dist-mac.cjs --x64        # 显式要求当前 Intel 主机
  *   node tools/dist-mac.cjs --dir        # 仅打包 .app，不生成 DMG/ZIP（快速预览）
  *   node tools/dist-mac.cjs --clean      # 打包前先清理 release/ + dist/
  *   node tools/dist-mac.cjs --skip-build   # 跳过前端构建（dist/ 已是最新）
@@ -18,8 +19,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 const { spawn } = require('node:child_process');
 const pc = require('picocolors');
-const prompts = require('prompts');
-const { w, IS_TTY, FRAMES, fmtMs, fmtBytes, fileSize, makeSubSpinner, runSilent, runStep } = require('./lib/ui.cjs');
+const { w, fmtMs, fmtBytes, fileSize, makeSubSpinner, runSilent, runStep } = require('./lib/ui.cjs');
 
 const ROOT = path.resolve(__dirname, '..');
 const IS_SIGNED = process.env.RPA_RELEASE_SIGN === '1';
@@ -86,7 +86,7 @@ function runElectronBuilder(arch, dirOnly) {
 
     const child = spawn(EB, ebArgs, {
       cwd: ROOT,
-      env: { ...process.env, ...envExtra },
+      env: { ...process.env, ...envExtra, RPA_TARGET_ARCH: arch },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
@@ -96,7 +96,7 @@ function runElectronBuilder(arch, dirOnly) {
       let buf = '';
       stream.setEncoding('utf8');
       stream.on('data', chunk => {
-        output += chunk;
+        output = `${output}${chunk}`.slice(-200_000);
         buf += chunk;
         const lines = buf.split('\n');
         buf = lines.pop();
@@ -123,6 +123,29 @@ function runElectronBuilder(arch, dirOnly) {
   });
 }
 
+function resolveArchList(argv = process.argv, hostArch = process.arch) {
+  if (!['arm64', 'x64'].includes(hostArch)) {
+    throw new Error(`不支持在 ${hostArch} 主机上构建 macOS 桌面包`);
+  }
+  const requestedArchs = ['arm64', 'x64'].filter((arch) => argv.includes(`--${arch}`));
+  if (requestedArchs.length > 1) {
+    throw new Error('不能在一次构建中同时生成 arm64 和 x64：Python 运行时与原生依赖必须在对应架构主机上分别准备');
+  }
+  const requestedArch = requestedArchs[0] ?? hostArch;
+  if (requestedArch !== hostArch) {
+    throw new Error(`不能在 ${hostArch} 主机上生成 ${requestedArch} 包：请使用对应架构的 macOS 主机或 CI runner`);
+  }
+  return [requestedArch];
+}
+
+function bundleWasCached(output) {
+  try {
+    return JSON.parse(output).cached === true;
+  } catch {
+    return false;
+  }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────
 async function main() {
   const modeTag = flags.dir
@@ -138,30 +161,12 @@ async function main() {
     w(`  ${pc.green('✓')}  旧产物已清理\n`);
   }
 
-  // 选择打包架构（--dir 模式默认当前架构，不弹菜单）
   let archList;
-  const requestedArchs = ['arm64', 'x64'].filter(arch => process.argv.includes(`--${arch}`));
-  if (requestedArchs.length) {
-    archList = requestedArchs;
-  } else if (flags.dir) {
-    archList = [process.arch === 'x64' ? 'x64' : 'arm64'];
-  } else if (IS_TTY) {
-    const { arch } = await prompts({
-      type: 'select',
-      name: 'arch',
-      message: '选择打包目标',
-      choices: [
-        { title: 'arm64 + x64  (全平台)', value: 'both' },
-        { title: 'Apple Silicon  (arm64)', value: 'arm64' },
-        { title: 'Intel         (x64)', value: 'x64' },
-      ],
-      initial: 0,
-    });
-    if (!arch) { w(pc.dim('  已取消。\n\n')); process.exit(0); }
-    archList = arch === 'both' ? ['arm64', 'x64'] : [arch];
-    w('\n');
-  } else {
-    archList = ['arm64', 'x64'];
+  try {
+    archList = resolveArchList();
+  } catch (error) {
+    w(`${pc.red(error.message)}\n`);
+    process.exit(1);
   }
 
   const t0 = Date.now();
@@ -193,7 +198,7 @@ async function main() {
         runSilent('pnpm', ['build'], { cwd: ROOT })
           .then(() => runSilent('pnpm', ['build'], { cwd: path.join(ROOT, 'extension') })),
         runSilent('node', ['tools/prepare_backend_bundle.cjs'], { cwd: ROOT })
-          .then(r => ({ cached: /cached/.test(r.out) }))
+          .then(r => ({ cached: bundleWasCached(r.out) }))
           .catch(e => { throw e; }),
       ]);
       const suffix = bundleResult?.cached ? pc.dim('  Python 运行时已缓存') : '';
@@ -242,4 +247,4 @@ async function main() {
 
 if (require.main === module) main();
 
-module.exports = { runElectronBuilder };
+module.exports = { bundleWasCached, resolveArchList, runElectronBuilder };

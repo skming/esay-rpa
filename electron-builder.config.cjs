@@ -45,7 +45,7 @@ module.exports = {
       ]
     },
     {
-      from: 'backend/.venv',
+      from: 'backend/.bundle-venv',
       to: 'backend/.venv',
       filter: [
         '**/*',
@@ -60,6 +60,7 @@ module.exports = {
         '!**/.mypy_cache/**',
         '!**/.ruff_cache/**',
         '!**/.DS_Store',
+        '!**/.build-stamp.json',
         // test frameworks — dev only
         '!**/site-packages/pytest/**',
         '!**/site-packages/_pytest/**',
@@ -119,16 +120,12 @@ module.exports = {
     entitlementsInherit: 'buildResources/entitlements.mac.plist',
     identity: isCiRelease ? undefined : null,
     icon: 'buildResources/icon.icns',
-    // Ship both universal targets so the same CI job covers Intel and Apple Silicon
-    target: [
-      { target: 'dmg', arch: ['arm64', 'x64'] },
-      { target: 'zip', arch: ['arm64', 'x64'] }
-    ]
+    target: ['dmg', 'zip']
   },
   dmg: {
     sign: isCiRelease
   },
-  afterPack: isCiRelease ? undefined : 'tools/adhoc-sign-mac.cjs',
+  afterPack: 'tools/after-pack.cjs',
   afterSign: isCiRelease ? 'tools/notarize-mac.cjs' : undefined,
 
   win: {
@@ -148,6 +145,7 @@ module.exports = {
 
   linux: {
     category: 'Development',
+    executableName: 'easy-rpa',
     icon: 'buildResources/icon.png',
     target: [
       { target: 'AppImage', arch: ['x64'] }
