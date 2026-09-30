@@ -1,6 +1,5 @@
 import {
   AUTOMATION_Z_INDEX,
-  BREATHING_ID,
   CURSOR_ID,
   IDLE_HIDE_MS,
   PAGE_BLOCKER_ID,
@@ -13,8 +12,6 @@ const CURSOR_HEIGHT = 24;
 const CURSOR_EASE = 0.34;
 const TRAIL_MIN_DISTANCE = 48;
 const TRAIL_MAX_DOTS = 3;
-// 距上次 action 超过此间隔才判定为"等待/思考"态并点亮呼吸灯，避免连续动作时常亮。
-const BREATHE_THINK_DELAY_MS = 900;
 
 let cursorTargetX = 0;
 let cursorTargetY = 0;
@@ -47,54 +44,72 @@ function ensureCursor(): HTMLDivElement {
   return el;
 }
 
-let breathingEl: HTMLDivElement | null = null;
-function ensureBreathing(): HTMLDivElement {
-  if (breathingEl !== null && breathingEl.isConnected) return breathingEl;
-  ensureAutomationStyle();
-  const el = document.createElement('div');
-  el.id = BREATHING_ID;
-  el.style.cssText =
-    `position:fixed;inset:0;z-index:${AUTOMATION_Z_INDEX + 4};pointer-events:none;opacity:0;` +
-    'contain:layout paint style;transition:opacity 180ms ease-out;';
-  const frame = document.createElement('div');
-  frame.className = 'rpa-studio-frame';
-  frame.style.cssText =
-    'position:absolute;inset:0;border-radius:0;' +
-    'animation:rpa-studio-breathe 3.2s cubic-bezier(0.16,1,0.3,1) infinite;';
-  const sweep = document.createElement('div');
-  sweep.className = 'rpa-studio-frame-sweep';
-  sweep.style.cssText =
-    'position:absolute;left:10%;right:10%;top:0;height:2px;border-radius:9999px;' +
-    'background:linear-gradient(90deg,transparent,rgba(99,102,241,0.28),rgba(59,130,246,0.58),transparent);' +
-    'filter:blur(0.1px);animation:rpa-studio-frame-sweep 3.2s cubic-bezier(0.16,1,0.3,1) infinite;';
-  el.append(frame, sweep);
-  document.documentElement.append(el);
-  breathingEl = el;
-  return el;
-}
-
 let statusEl: HTMLDivElement | null = null;
+let statusIconEl: HTMLSpanElement | null = null;
+let statusTitleEl: HTMLSpanElement | null = null;
+let statusDetailEl: HTMLSpanElement | null = null;
 function ensureStatus(): HTMLDivElement {
   if (statusEl !== null && statusEl.isConnected) return statusEl;
   ensureAutomationStyle();
   const el = document.createElement('div');
   el.id = STATUS_ID;
+  el.setAttribute('role', 'status');
+  el.setAttribute('aria-live', 'polite');
+  el.setAttribute('aria-atomic', 'true');
   el.style.cssText =
-    `position:fixed;right:12px;bottom:12px;z-index:${AUTOMATION_Z_INDEX + 6};pointer-events:none;opacity:0;` +
-    'display:flex;align-items:center;gap:7px;height:24px;padding:0 8px;border-radius:7px;' +
-    'border:1px solid rgba(147,197,253,0.3);background:rgba(15,23,42,0.78);color:#f8fafc;' +
-    'font:12px/1.2 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;' +
-    'box-shadow:0 4px 12px rgba(15,23,42,0.18);backdrop-filter:blur(8px);transition:opacity 140ms ease-out;';
+    `position:fixed;right:16px;bottom:16px;z-index:${AUTOMATION_Z_INDEX + 6};pointer-events:none;opacity:0;` +
+    'box-sizing:border-box;display:flex;align-items:center;gap:8px;width:min(232px,calc(100vw - 32px));min-height:44px;' +
+    'padding:7px 9px;border-radius:10px;border:1px solid rgba(148,163,184,0.3);' +
+    'background:rgba(255,255,255,0.98);color:#0f172a;' +
+    'font-family:"Inter Variable","PingFang SC",system-ui,sans-serif;' +
+    'box-shadow:0 10px 28px rgba(15,23,42,0.12),0 1px 2px rgba(15,23,42,0.08);' +
+    'transform:translate3d(0,4px,0);transition:opacity 140ms ease-out,transform 180ms cubic-bezier(0.16,1,0.3,1);';
+  const icon = document.createElement('span');
+  icon.setAttribute('aria-hidden', 'true');
+  icon.style.cssText =
+    'display:flex;align-items:center;justify-content:center;flex:0 0 auto;width:26px;height:26px;border-radius:8px;' +
+    'background:#eff6ff;color:#2563eb;box-shadow:inset 0 0 0 1px rgba(37,99,235,0.14);';
+  const copy = document.createElement('span');
+  copy.style.cssText = 'display:flex;min-width:0;flex:1;flex-direction:column;gap:2px;';
+  const title = document.createElement('span');
+  title.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11.5px;font-weight:600;line-height:1.25;color:#1e293b;';
+  const detail = document.createElement('span');
+  detail.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;font-weight:400;line-height:1.3;color:#64748b;';
+  copy.append(title, detail);
   const dot = document.createElement('span');
   dot.className = 'rpa-studio-live-dot';
   dot.style.cssText =
-    'width:6px;height:6px;border-radius:9999px;background:#3b82f6;animation:rpa-studio-live-dot 1.6s ease-in-out infinite;';
-  const text = document.createElement('span');
-  text.textContent = 'Easy RPA 正在操作';
-  el.append(dot, text);
+    'flex:0 0 auto;width:6px;height:6px;border-radius:9999px;background:#3b82f6;animation:rpa-studio-live-dot 1.6s ease-in-out infinite;';
+  el.append(icon, copy, dot);
   document.documentElement.append(el);
   statusEl = el;
+  statusIconEl = icon;
+  statusTitleEl = title;
+  statusDetailEl = detail;
+  updateStatusCopy(false);
   return el;
+}
+
+function updateStatusCopy(blocked: boolean): void {
+  if (statusIconEl === null || statusTitleEl === null || statusDetailEl === null) return;
+  statusTitleEl.textContent = blocked ? 'Easy RPA 已接管页面' : 'Easy RPA 正在执行';
+  statusDetailEl.textContent = blocked ? '页面操作已暂时锁定' : '正在操作当前页面';
+  statusIconEl.innerHTML = blocked
+    ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/><path d="M12 14v2"/></svg>'
+    : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 3 13 9-6 1-3 6-4-16Z"/><path d="m12 13 5 5"/></svg>';
+}
+
+function showStatus(blocked: boolean): void {
+  const status = ensureStatus();
+  updateStatusCopy(blocked);
+  status.style.opacity = '1';
+  status.style.transform = 'translate3d(0,0,0)';
+}
+
+function hideStatus(): void {
+  if (statusEl === null) return;
+  statusEl.style.opacity = '0';
+  statusEl.style.transform = 'translate3d(0,4px,0)';
 }
 
 const PAGE_BLOCKED_CLASS = 'rpa-studio-page-blocked';
@@ -161,30 +176,24 @@ export function setPageBlocked(blocked: boolean): void {
   pageBlocked = blocked;
   document.documentElement.classList.toggle(PAGE_BLOCKED_CLASS, blocked);
   ensurePageBlocker().style.display = blocked ? 'block' : 'none';
+  if (blocked) {
+    showStatus(true);
+  } else {
+    hideStatus();
+    if (cursorEl !== null) cursorEl.style.opacity = '0';
+  }
 }
 
 let idleHideTimer: ReturnType<typeof setTimeout> | null = null;
-let breatheShowTimer: ReturnType<typeof setTimeout> | null = null;
 
-// 每次 action：状态徽标立即常亮、静默后淡出；呼吸光晕仅在连续 BREATHE_THINK_DELAY_MS 无新 action 才亮，
-// 亮起后不随后续 action 反复熄重亮（防闪烁），真正熄灭只在整体静默 IDLE_HIDE_MS 之后。
+// 执行中的接管状态持续显示到 pageBlock=false；页面探索等非接管动作仅短暂提示。
 export function markAutomationActivity(): void {
-  const breathing = ensureBreathing();
-  const status = ensureStatus();
-  status.style.opacity = '1';
-
-  if (breathing.style.opacity !== '1') {
-    if (breatheShowTimer !== null) clearTimeout(breatheShowTimer);
-    breatheShowTimer = setTimeout(() => {
-      breathing.style.opacity = '1';
-    }, BREATHE_THINK_DELAY_MS);
-  }
+  showStatus(pageBlocked);
 
   if (idleHideTimer !== null) clearTimeout(idleHideTimer);
   idleHideTimer = setTimeout(() => {
-    if (breatheShowTimer !== null) clearTimeout(breatheShowTimer);
-    breathing.style.opacity = '0';
-    status.style.opacity = '0';
+    if (pageBlocked) return;
+    hideStatus();
     if (cursorEl !== null) cursorEl.style.opacity = '0';
   }, IDLE_HIDE_MS);
 }

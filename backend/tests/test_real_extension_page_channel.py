@@ -17,6 +17,7 @@ from app.core import storage
 from app.services.ai_tools import extension_page_channel, page_session
 from app.services.ai_tools.executor import RpaToolExecutor
 from app.services.extension_bridge_service import ExtensionBridgeService
+from app.services.extension_config_service import ExtensionConfigService
 from app.services.extension_executor import ExtensionExecutor
 
 # 与 test_real_page_flow_replay 的 Playwright 回放共用同一份片段：空表头列的命名与列位
@@ -58,7 +59,9 @@ async def test_extension_observe_act_and_document_boundaries(tmp_path, monkeypat
     if not build.exists():
         pytest.skip("环境缺件：extension/.output/chrome-mv3 不存在，先在 extension/ 执行 pnpm build")
     monkeypatch.setattr(storage, "resolve_logs_dir", lambda: tmp_path / "logs")
-    bridge = ExtensionBridgeService()
+    extension_id = ExtensionConfigService(extension_manifest_path=build / "manifest.json").trusted_extension_id()
+    assert extension_id is not None
+    bridge = ExtensionBridgeService(lambda: extension_id)
     async def connected(socket):
         await bridge.handle_connection(SocketAdapter(socket))
     async with serve(

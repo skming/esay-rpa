@@ -12,6 +12,7 @@ import pytest
 from app.models.schemas import RunTaskRequest, RuntimeProgress, ScrapeResult, TaskSnapshot
 from app.services import browser_profile_lock
 from app.services.artifact_store import LocalArtifactStore
+from app.services.extension_bridge_service import ExtensionActionOutcomeUnknown
 from app.services.file_action_runner import FileActionRunner
 from app.services.log_broker import LogBroker
 from app.services.scrapling_runner import LogCallback
@@ -380,6 +381,16 @@ class FailOnceExtensionExecutor(FakeExtensionExecutor):
         return await super().run(node, variables, context, timeout_ms=timeout_ms)
 
 
+class UnknownOutcomeExtensionExecutor(FakeExtensionExecutor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.run_attempts = 0
+
+    async def run(self, node, variables, context, *, timeout_ms):
+        self.run_attempts += 1
+        raise ExtensionActionOutcomeUnknown("点击已发送，回执丢失")
+
+
 def _single_confirmation_flow() -> dict[str, object]:
     return {
         "nodes": [
@@ -402,6 +413,27 @@ def _confirmation_then_next_flow() -> dict[str, object]:
             {"source": "submit", "target": "verify"},
         ],
     }
+
+
+@pytest.mark.parametrize("failure_strategy", ["retry", "continue"])
+async def test_unknown_extension_action_outcome_stops_without_retry_or_continue(tmp_path, failure_strategy) -> None:
+    fake_extension = UnknownOutcomeExtensionExecutor()
+    manager = _confirming_manager(fake_extension, tmp_path)
+    flow = _confirmation_then_next_flow()
+    flow["nodes"][1].pop("requireConfirmation")
+
+    snapshot = await manager.start_task(RunTaskRequest(
+        flowName="回执丢失流程",
+        targetUrl="https://example.com/fallback",
+        selector=".fallback::text",
+        browserExecutor="extension",
+        failureStrategy=failure_strategy,
+        flowDefinition=flow,
+    ))
+    done = await wait_for_status(manager, snapshot.task_id, {"success", "error"})
+    assert done.status == "error"
+    assert fake_extension.run_attempts == 1
+    await manager.stop_workers()
 
 
 def _confirming_manager(executor: FakeExtensionExecutor, tmp_path) -> TaskManager:

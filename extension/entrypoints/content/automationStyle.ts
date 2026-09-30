@@ -1,6 +1,5 @@
 // 自动化视觉样式：只注入 keyframes/DOM id/动效参数，行为在 automationVisual.ts，避免主流程和 CSS 字符串耦合。
 export const CURSOR_ID = 'rpa-studio-cursor';
-export const BREATHING_ID = 'rpa-studio-breathing';
 export const STATUS_ID = 'rpa-studio-automation-status';
 export const CONFIRMATION_BANNER_ID = 'rpa-studio-confirmation-banner';
 export const PAGE_BLOCKER_ID = 'rpa-studio-page-blocker';
@@ -14,32 +13,6 @@ export function ensureAutomationStyle(): void {
   const style = document.createElement('style');
   style.id = AUTOMATION_STYLE_ID;
   style.textContent = `
-@keyframes rpa-studio-breathe {
-  0%, 100% {
-    opacity: 0.58;
-    box-shadow:
-      inset 0 0 0 1px rgba(37,99,235,0.32),
-      inset 0 0 30px rgba(59,130,246,0.18),
-      inset 0 0 80px rgba(99,102,241,0.13);
-  }
-  50% {
-    opacity: 1;
-    box-shadow:
-      inset 0 0 0 1px rgba(37,99,235,0.62),
-      inset 0 0 56px rgba(59,130,246,0.32),
-      inset 0 0 130px rgba(99,102,241,0.2);
-  }
-}
-@keyframes rpa-studio-frame-sweep {
-  0%, 100% {
-    opacity: 0.32;
-    transform: translate3d(-24%, 0, 0);
-  }
-  50% {
-    opacity: 0.82;
-    transform: translate3d(24%, 0, 0);
-  }
-}
 @keyframes rpa-studio-cursor-core {
   0%, 100% { transform: translate3d(-1px, -1px, 0) rotate(-2deg) scale(1); }
   50% { transform: translate3d(-1px, -1px, 0) rotate(0deg) scale(0.99); }
@@ -75,8 +48,6 @@ html.rpa-studio-page-blocked > body {
 @media (prefers-reduced-motion: reduce) {
   #${CURSOR_ID} { transition: opacity 120ms linear !important; }
   #${CURSOR_ID} .rpa-studio-cursor-hotspot,
-  #${BREATHING_ID} .rpa-studio-frame,
-  #${BREATHING_ID} .rpa-studio-frame-sweep,
   #${STATUS_ID} .rpa-studio-live-dot,
   #${CONFIRMATION_BANNER_ID} { animation: none !important; }
   #${CONFIRMATION_BANNER_ID} .rpa-studio-confirmation-indicator {

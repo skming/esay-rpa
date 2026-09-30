@@ -4,6 +4,7 @@ import base64
 
 import pytest
 
+from app.services.extension_bridge_service import ExtensionActionOutcomeUnknown
 from app.services.extension_executor import ExtensionBusyError, ExtensionExecutionContext, ExtensionExecutor
 from app.services.runtime_variables import RuntimeVariableStore
 
@@ -589,6 +590,24 @@ async def test_non_healable_action_propagates_original_exception() -> None:
 
     assert not any(call["type"] == "browser.elementState" for call in action_calls(bridge))
     assert action_calls(bridge) == []
+
+
+async def test_unknown_click_outcome_never_enters_selector_healing() -> None:
+    class UnknownBridge(FakeBridge):
+        async def execute(self, action: dict, timeout: float = 30.0) -> dict:
+            self.calls.append(action)
+            if action["type"] == "browser.click":
+                raise ExtensionActionOutcomeUnknown("点击已发送，回执丢失")
+            return {}
+
+    bridge = UnknownBridge()
+    executor, context = await make_context(bridge)
+    with pytest.raises(ExtensionActionOutcomeUnknown):
+        await executor.run(
+            {"type": "browser.click", "selector": "#submit", "fallbackSelectors": "#backup"},
+            RuntimeVariableStore.from_initial({}), context, timeout_ms=1000,
+        )
+    assert [call["type"] for call in action_calls(bridge)] == ["highlight", "browser.click"]
 
 
 async def test_healing_gives_up_when_no_candidate_resolves() -> None:

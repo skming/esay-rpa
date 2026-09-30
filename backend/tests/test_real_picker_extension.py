@@ -14,6 +14,7 @@ from websockets.exceptions import ConnectionClosed
 
 from app.core import storage
 from app.services.extension_bridge_service import ExtensionBridgeService
+from app.services.extension_config_service import ExtensionConfigService
 from app.services.extension_executor import ExtensionBusyError, ExtensionExecutor
 from app.services.picker_service import PickerOpenRequest, PickerService
 
@@ -68,7 +69,9 @@ async def test_real_extension_picker_keeps_request_tab_document_and_lease_bounda
     if not build.exists():
         pytest.skip("环境缺件：extension/.output/chrome-mv3 不存在，先在 extension/ 执行 pnpm build")
     monkeypatch.setattr(storage, "resolve_logs_dir", lambda: tmp_path / "logs")
-    bridge = ExtensionBridgeService()
+    extension_id = ExtensionConfigService(extension_manifest_path=build / "manifest.json").trusted_extension_id()
+    assert extension_id is not None
+    bridge = ExtensionBridgeService(lambda: extension_id)
 
     async def connected(socket):
         await bridge.handle_connection(SocketAdapter(socket))

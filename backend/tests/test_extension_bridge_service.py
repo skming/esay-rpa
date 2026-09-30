@@ -9,14 +9,20 @@ import pytest
 from fastapi import WebSocketDisconnect
 
 from app.core import storage
-from app.services.extension_bridge_service import ExtensionBridgeService, audit_scope
+from app.services.extension_bridge_service import ExtensionActionOutcomeUnknown, ExtensionBridgeService, audit_scope
+
+PAIRED_EXTENSION_ID = "abcdefghijklmnopabcdefghijklmnop"
+
+
+def paired_service() -> ExtensionBridgeService:
+    return ExtensionBridgeService(lambda: PAIRED_EXTENSION_ID)
 
 
 class FakeWebSocket:
     """Minimal stand-in for fastapi.WebSocket driven by an asyncio.Queue, so tests can
     push responses and disconnects without a real network connection."""
 
-    def __init__(self, origin: str = "chrome-extension://abcdefghijklmnopabcdefghijklmnop") -> None:
+    def __init__(self, origin: str = f"chrome-extension://{PAIRED_EXTENSION_ID}") -> None:
         self.sent: list[dict] = []
         self.closed = False
         self.close_code: int | None = None
@@ -59,7 +65,7 @@ async def wait_until(condition: Callable[[], bool], *, timeout: float = 1.0) -> 
 
 
 async def test_execute_sends_action_and_resolves_matching_response() -> None:
-    service = ExtensionBridgeService()
+    service = paired_service()
     ws = FakeWebSocket()
     connection_task = asyncio.create_task(service.handle_connection(ws))
     await asyncio.sleep(0)
@@ -84,7 +90,7 @@ async def test_execute_sends_action_and_resolves_matching_response() -> None:
 
 
 async def test_execute_raises_runtime_error_when_response_not_ok() -> None:
-    service = ExtensionBridgeService()
+    service = paired_service()
     ws = FakeWebSocket()
     connection_task = asyncio.create_task(service.handle_connection(ws))
     await asyncio.sleep(0)
@@ -105,12 +111,12 @@ async def test_execute_raises_runtime_error_when_response_not_ok() -> None:
 
 
 async def test_execute_times_out_when_no_response_arrives() -> None:
-    service = ExtensionBridgeService()
+    service = paired_service()
     ws = FakeWebSocket()
     connection_task = asyncio.create_task(service.handle_connection(ws))
     await asyncio.sleep(0)
 
-    with pytest.raises(TimeoutError):
+    with pytest.raises(ExtensionActionOutcomeUnknown):
         await service.execute({"type": "browser.click", "selector": "#a"}, timeout=0.05)
 
     ws.disconnect()
@@ -118,13 +124,13 @@ async def test_execute_times_out_when_no_response_arrives() -> None:
 
 
 async def test_execute_raises_connection_error_when_extension_not_connected() -> None:
-    service = ExtensionBridgeService()
+    service = paired_service()
     with pytest.raises(ConnectionError):
         await service.execute({"type": "browser.click", "selector": "#a"}, timeout=1.0)
 
 
 async def test_is_connected_for_display_smooths_brief_disconnects(monkeypatch: pytest.MonkeyPatch) -> None:
-    service = ExtensionBridgeService()
+    service = paired_service()
     ws = FakeWebSocket()
     connection_task = asyncio.create_task(service.handle_connection(ws))
     await asyncio.sleep(0)
@@ -151,7 +157,7 @@ async def test_second_connection_replaces_first_and_fails_old_pending() -> None:
     旧连接上的未完成请求必须马上失败，否则调用方会继续等待一个不会再响应的
     socket，直到动作超时才暴露问题。
     """
-    service = ExtensionBridgeService()
+    service = paired_service()
     first = FakeWebSocket()
     first_task = asyncio.create_task(service.handle_connection(first))
     await asyncio.sleep(0)
@@ -170,7 +176,7 @@ async def test_second_connection_replaces_first_and_fails_old_pending() -> None:
     # 4409 是被顶替方唯一能区分"另一个浏览器抢走了桥"和"网络断了"的信号；掉回默认 1000
     # 就会被当成普通断线 3s 快速重连，两个浏览器互相顶替，谁的运行都跑不完。
     assert first.close_code == 4409
-    with pytest.raises(ConnectionError, match="顶替"):
+    with pytest.raises(ExtensionActionOutcomeUnknown, match="可能已经生效"):
         await pending_execute
 
     first.disconnect()
@@ -187,7 +193,7 @@ async def test_replaced_connection_finally_does_not_fail_new_pending() -> None:
     旧连接的 finally 只能清理自己的状态；如果无条件清空全局 pending，会把新连接
     刚创建的请求误报为"扩展连接已断开"。
     """
-    service = ExtensionBridgeService()
+    service = paired_service()
     first = FakeWebSocket()
     first_task = asyncio.create_task(service.handle_connection(first))
     await asyncio.sleep(0)
@@ -214,7 +220,7 @@ async def test_replaced_connection_finally_does_not_fail_new_pending() -> None:
 
 
 async def test_audit_log_never_contains_input_value_or_extracted_text() -> None:
-    service = ExtensionBridgeService()
+    service = paired_service()
     ws = FakeWebSocket()
     connection_task = asyncio.create_task(service.handle_connection(ws))
     await asyncio.sleep(0)
@@ -252,7 +258,7 @@ async def test_audit_record_written_when_connection_is_replaced_mid_action() -> 
 
     审计日志的用途是事后追查"到底对这个浏览器做过什么"，异常路径恰恰是最需要它的地方。
     """
-    service = ExtensionBridgeService()
+    service = paired_service()
     first = FakeWebSocket()
     first_task = asyncio.create_task(service.handle_connection(first))
     await asyncio.sleep(0)
@@ -264,7 +270,7 @@ async def test_audit_record_written_when_connection_is_replaced_mid_action() -> 
     second = FakeWebSocket()
     second_task = asyncio.create_task(service.handle_connection(second))
     await asyncio.sleep(0)
-    with pytest.raises(ConnectionError):
+    with pytest.raises(ExtensionActionOutcomeUnknown):
         await pending_execute
 
     first.disconnect()
@@ -284,12 +290,12 @@ async def test_audit_record_written_when_connection_is_replaced_mid_action() -> 
 
 
 async def test_audit_record_written_on_timeout() -> None:
-    service = ExtensionBridgeService()
+    service = paired_service()
     ws = FakeWebSocket()
     connection_task = asyncio.create_task(service.handle_connection(ws))
     await asyncio.sleep(0)
 
-    with pytest.raises(TimeoutError):
+    with pytest.raises(ExtensionActionOutcomeUnknown):
         await service.execute({"type": "browser.click", "selector": "#never"}, timeout=0.01)
 
     ws.disconnect()
@@ -311,9 +317,8 @@ async def test_audit_record_written_on_timeout() -> None:
     ],
 )
 async def test_handshake_from_non_extension_origin_is_refused(origin: str) -> None:
-    """WS 握手不受同源策略约束：任意网页都能连上本机，Origin 是唯一能把它们和扩展分开的信号。
-    放进来的代价是整套操作用户真实登录态浏览器的能力。"""
-    service = ExtensionBridgeService()
+    """来源不匹配时不能建立操作真实浏览器的桥接。"""
+    service = paired_service()
     ws = FakeWebSocket(origin=origin)
 
     await service.handle_connection(ws)
@@ -323,10 +328,44 @@ async def test_handshake_from_non_extension_origin_is_refused(origin: str) -> No
     assert not service.is_connected
 
 
+async def test_missing_trusted_build_or_different_extension_cannot_replace_live_connection() -> None:
+    service = ExtensionBridgeService(lambda: None)
+    no_build = FakeWebSocket()
+    await service.handle_connection(no_build)
+    assert not no_build.accepted
+
+    service = paired_service()
+    real = FakeWebSocket()
+    real_task = asyncio.create_task(service.handle_connection(real))
+    await asyncio.sleep(0)
+    other = FakeWebSocket(origin="chrome-extension://pppppppppppppppppppppppppppppppp")
+    await service.handle_connection(other)
+    assert not other.accepted
+    assert not real.closed
+    assert service.is_connected
+    real.disconnect()
+    await real_task
+
+
+async def test_trusted_build_change_stops_routing_to_old_connection() -> None:
+    trusted_id = PAIRED_EXTENSION_ID
+    service = ExtensionBridgeService(lambda: trusted_id)
+    real = FakeWebSocket()
+    real_task = asyncio.create_task(service.handle_connection(real))
+    await asyncio.sleep(0)
+    assert service.is_connected
+    trusted_id = "pppppppppppppppppppppppppppppppp"
+    assert not service.is_connected
+    with pytest.raises(ConnectionError, match="Easy RPA"):
+        await service.execute({"type": "browser.click", "selector": "#pay"})
+    real.disconnect()
+    await real_task
+
+
 async def test_refused_handshake_does_not_evict_the_live_extension() -> None:
     """顶替发生在校验之后：否则网页只要发起一次握手，就能打断用户正在跑的运行——
     连"能不能操作浏览器"都不用赌，中断本身已经是一个无凭据可触发的动作。"""
-    service = ExtensionBridgeService()
+    service = paired_service()
     real = FakeWebSocket()
     real_task = asyncio.create_task(service.handle_connection(real))
     await asyncio.sleep(0)
@@ -349,9 +388,8 @@ async def test_refused_handshake_does_not_evict_the_live_extension() -> None:
 
 
 async def test_audit_record_carries_run_and_node_attribution() -> None:
-    """一条点了 #pay 必须能落到哪次运行的哪个节点，而不属于任何运行的调用路径（调试接口
-    /api/extension/bridge/execute）不能被盖上上一次运行的标签——错的归属比没有归属更糟。"""
-    service = ExtensionBridgeService()
+    """一条点了 #pay 必须能落到哪次运行的哪个节点。"""
+    service = paired_service()
     ws = FakeWebSocket()
     connection_task = asyncio.create_task(service.handle_connection(ws))
     await asyncio.sleep(0)
@@ -384,13 +422,13 @@ async def test_audit_record_carries_run_and_node_attribution() -> None:
 
 async def test_audit_record_clips_an_overlong_selector() -> None:
     """selector 来自流程定义（AI 也写得出来）：几 KB 一条会把这个事后唯一能翻的文件刷成不可读。"""
-    service = ExtensionBridgeService()
+    service = paired_service()
     ws = FakeWebSocket()
     connection_task = asyncio.create_task(service.handle_connection(ws))
     await asyncio.sleep(0)
 
     selector = "div.row " * 800
-    with pytest.raises(TimeoutError):
+    with pytest.raises(ExtensionActionOutcomeUnknown):
         await service.execute({"type": "browser.click", "selector": selector}, timeout=0.01)
 
     ws.disconnect()

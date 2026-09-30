@@ -112,8 +112,8 @@ notification_config_service = NotificationConfigService()
 dingtalk_notifier = DingTalkNotifier(config_service=notification_config_service)
 ai_chat_store = AiChatStore()
 _browser_session_dir = str(storage.resolve_browser_profile_dir())
-extension_bridge_service = ExtensionBridgeService()
 extension_config_service = ExtensionConfigService()
+extension_bridge_service = ExtensionBridgeService(extension_config_service.trusted_extension_id)
 _setup_file_logging(
     settings.log_dir,
     level=settings.log_level,
@@ -993,26 +993,6 @@ async def get_extension_config() -> dict:
 @app.put("/api/extension/config")
 async def set_extension_config(payload: dict) -> dict:
     return extension_config_service.save(payload)
-
-
-@app.post("/api/extension/execute")
-async def extension_bridge_execute(payload: dict) -> dict:
-    """Manual test hook: send one action to the connected extension and return its result."""
-    action = payload.get("action")
-    if not isinstance(action, dict) or not action.get("type"):
-        raise HTTPException(status_code=422, detail="action.type 不能为空")
-    # 这个口子同样操作用户真实登录的浏览器，开关关掉时不能因为"只是手工测试"就放行。
-    if not extension_config_service.load()["enabled"]:
-        raise HTTPException(status_code=409, detail="插件执行器已在设置中关闭")
-    try:
-        result = await extension_bridge_service.execute(action)
-    except ConnectionError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except TimeoutError as exc:
-        raise HTTPException(status_code=504, detail=str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"result": result}
 
 
 @app.get("/api/browser/cookies")

@@ -47,6 +47,7 @@ export function ExtensionConfigPanel({ electron }: { electron: ElectronBridgeSta
       setStatus(await backend.getExtensionStatus());
       setLoadError(null);
     } catch (error) {
+      setStatus(null);
       setLoadError(error instanceof Error ? error.message : '扩展状态读取失败');
     } finally {
       setLoading(false);
@@ -75,8 +76,8 @@ export function ExtensionConfigPanel({ electron }: { electron: ElectronBridgeSta
   const handleToggleEnabled = async (checked: boolean): Promise<void> => {
     setSavingEnabled(true);
     try {
-      await backend.setExtensionConfig({ enabled: checked });
-      await load();
+      const updated = await backend.setExtensionConfig({ enabled: checked });
+      setStatus(current => current === null ? current : { ...current, enabled: updated.enabled });
       electron.pushToast('success', checked ? '已启用浏览器插件执行器' : '已关闭浏览器插件执行器');
     } catch {
       electron.pushToast('error', '保存失败，请检查后端服务');
@@ -129,10 +130,10 @@ export function ExtensionConfigPanel({ electron }: { electron: ElectronBridgeSta
   };
 
   const connected = status?.connected ?? false;
-  const canExecute = status?.canExecute ?? false;
-  const enabled = status?.enabled ?? true;
+  const enabled = status?.enabled ?? false;
+  const canExecute = enabled && (status?.canExecute ?? false);
   const connectedDuration = formatConnectedDuration(status?.connectedSince ?? null);
-  const reconnecting = connected && !canExecute;
+  const reconnecting = enabled && connected && !canExecute;
   const showInstallAssist = status !== null && enabled && !connected && !loading;
 
   return (
@@ -157,19 +158,23 @@ export function ExtensionConfigPanel({ electron }: { electron: ElectronBridgeSta
             <div className="flex items-center gap-2">
               <span className={cn('h-2 w-2 shrink-0 rounded-full', canExecute ? 'bg-emerald-600' : reconnecting ? 'bg-amber-500' : 'bg-ink-4')} />
               <span className="text-[12px] font-medium text-ink-2">
-                {canExecute ? '已连接到浏览器扩展' : reconnecting ? '连接已中断，正在重连' : '未连接'}
+                {!enabled ? '浏览器插件执行器已关闭' : canExecute ? '已连接到浏览器扩展' : reconnecting ? '连接已中断，正在重连' : '未检测到扩展连接'}
               </span>
             </div>
             <Switch
               aria-label="启用浏览器插件执行器"
               checked={enabled}
-              disabled={savingEnabled}
+              disabled={savingEnabled || status === null || loadError !== null}
               onCheckedChange={(checked) => void handleToggleEnabled(checked)}
             />
           </div>
           <p className="mt-2 text-[11px] leading-relaxed text-ink-3">
             {enabled
-              ? '流程运行时可选择浏览器插件执行。'
+              ? canExecute
+                ? '流程运行时可选择浏览器插件执行。'
+                : reconnecting
+                  ? '正在等待扩展重新连接，请确认 Chrome 已启动且扩展仍已安装。'
+                  : '卸载扩展、关闭 Chrome 或连接失败时都会显示此状态。若已卸载，请按下方步骤重新加载扩展。'
               : '已关闭：运行配置中将无法选择「使用浏览器插件执行」，即使有扩展连接也不会被使用。'}
           </p>
           {canExecute && connectedDuration !== null && (
@@ -180,12 +185,14 @@ export function ExtensionConfigPanel({ electron }: { electron: ElectronBridgeSta
         {showInstallAssist && (
           <div className="rounded-lg border border-rule-2 bg-paper p-4">
             <p className="text-[12px] font-medium text-ink-2">
-              {installInfo?.found === false ? '扩展文件不可用' : '安装浏览器扩展'}
+              {bridge === null ? '在桌面客户端加载扩展' : installInfo?.found === false ? '扩展文件不可用' : '加载或重新加载扩展'}
             </p>
             <p className="mt-1 text-[11px] leading-relaxed text-ink-3">
-              {installInfo?.found === false
+              {bridge === null
+                ? '浏览器预览无法打开客户端内置的扩展文件。请在 Easy RPA 桌面客户端中完成加载。'
+                : installInfo?.found === false
                 ? '客户端中没有找到扩展文件，请重新安装 Easy RPA。'
-                : '扩展已包含在 Easy RPA 中，Chrome 需要你确认加载一次。'}
+                : '扩展已包含在 Easy RPA 中，Chrome 需要你手动确认加载。'}
             </p>
 
             {installInfo?.found !== false && bridge !== null && (
@@ -225,9 +232,6 @@ export function ExtensionConfigPanel({ electron }: { electron: ElectronBridgeSta
                   </button>
                 )}
               </>
-            )}
-            {installInfo?.found !== false && bridge === null && (
-              <p className="mt-3 text-[11px] text-ink-3">请在 Easy RPA 桌面客户端中完成安装。</p>
             )}
           </div>
         )}

@@ -1,6 +1,9 @@
 // Background service worker：桥接后端 WS（extension_bridge_service.py），把 {requestId, action}
 // 转发给激活 tab 的 content script 执行并回传结果。action 与 Playwright 执行器共用同一套指令协议。
 
+// 桥状态的数据契约与 popup 共用同一份定义，避免两端各写一份易漂移（type-only，构建时擦除，不产生运行时耦合）。
+import type { ConnectionStatus, ManagedGroup, ManagedTab } from './popup/lib/connection';
+
 interface BridgeInstruction {
   requestId: string;
   action: {
@@ -43,6 +46,8 @@ interface BridgeResult {
 }
 
 const BACKEND_BASE_URL = 'http://127.0.0.1:8765';
+// 桥的 WS 路径单点声明：连接与 popup 状态查询共用，避免两处各写一份字面量、改协议漏一处。
+const BRIDGE_WS_PATH = '/ws/extension/bridge';
 const INITIAL_RECONNECT_DELAY_MS = 3000;
 const MAX_RECONNECT_DELAY_MS = 30000;
 const NAVIGATION_TIMEOUT_MS = 15000;
@@ -549,7 +554,7 @@ async function connectWhenBackendReady(): Promise<void> {
 
   if (isSocketActive()) return;
 
-  const nextSocket = new WebSocket(buildBackendWebSocketUrl('/ws/extension/bridge'));
+  const nextSocket = new WebSocket(buildBackendWebSocketUrl(BRIDGE_WS_PATH));
   socket = nextSocket;
   let hasOpened = false;
 
@@ -859,6 +864,58 @@ async function injectContentScript(tab: Browser.tabs.Tab): Promise<{ ok: boolean
   }
 }
 
+// 连接元信息任何时候都返回；托管信息只在连上时有意义，断开时一律空（见 ConnectionStatus 注释）。
+async function buildConnectionStatus(connected: boolean): Promise<ConnectionStatus> {
+  const meta = {
+    connected,
+    backendBaseUrl: BACKEND_BASE_URL,
+    bridgeUrl: buildBackendWebSocketUrl(BRIDGE_WS_PATH),
+    heartbeatSeconds: Math.round(HEARTBEAT_INTERVAL_MS / 1000),
+  };
+  if (!connected) {
+    return { ...meta, controlledTab: null, ownedTabCount: 0, group: null, explorationTab: null };
+  }
+  return { ...meta, ...(await collectManagedSession()) };
+}
+
+// 一次 tabs.query 拉全量，再用内存指针切出受控/探索标签页，避免逐个 tabs.get 往返。
+async function collectManagedSession(): Promise<
+  Pick<ConnectionStatus, 'controlledTab' | 'ownedTabCount' | 'group' | 'explorationTab'>
+> {
+  const openTabs = await browser.tabs.query({}).catch(() => [] as Browser.tabs.Tab[]);
+  const byId = new Map<number, Browser.tabs.Tab>();
+  for (const tab of openTabs) {
+    if (tab.id !== undefined) byId.set(tab.id, tab);
+  }
+  let ownedTabCount = 0;
+  // ownedTabIds 只增不删（tab id 会话内不复用），与实时标签求交集才是仍开着的数量。
+  for (const id of ownedTabIds) {
+    if (byId.has(id)) ownedTabCount += 1;
+  }
+  return {
+    controlledTab: toManagedTab(controlledTabId !== null ? byId.get(controlledTabId) : undefined),
+    ownedTabCount,
+    group: await resolveControlledGroup(),
+    explorationTab: toManagedTab(explorationTabId !== null ? byId.get(explorationTabId) : undefined),
+  };
+}
+
+async function resolveControlledGroup(): Promise<ManagedGroup | null> {
+  if (controlledTabGroupId === null) return null;
+  try {
+    const group = await chrome.tabGroups.get(controlledTabGroupId);
+    return { title: group.title?.trim() || 'Easy RPA', color: group.color };
+  } catch {
+    // 用户可能已手动解散分组：读不到就当未分组，不让整次状态查询失败。
+    return null;
+  }
+}
+
+function toManagedTab(tab: Browser.tabs.Tab | null | undefined): ManagedTab | null {
+  if (tab?.id === undefined) return null;
+  return { title: tab.title?.trim() || tab.url || '未命名标签页', url: tab.url ?? '' };
+}
+
 // 确认横幅点「确认并继续」后由 content script 发来（页面主动事件、无 requestId，走不了 WS 协议），直接调后端 REST resume。
 browser.runtime.onMessage.addListener((message) => {
   if (typeof message !== 'object' || message === null) return undefined;
@@ -866,7 +923,7 @@ browser.runtime.onMessage.addListener((message) => {
   if ((message as { type?: string }).type === 'getConnectionStatus') {
     const connected = socket !== null && socket.readyState === WebSocket.OPEN;
     if (!connected) retryConnectionNow();
-    return Promise.resolve({ connected, backendBaseUrl: BACKEND_BASE_URL });
+    return buildConnectionStatus(connected);
   }
 
   if ((message as { source?: string }).source === 'rpa-studio-bridge-event') {

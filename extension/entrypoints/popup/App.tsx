@@ -1,10 +1,12 @@
 import { BackendAddressRow } from './components/BackendAddressRow';
 import { BridgeStatusCard } from './components/BridgeStatusCard';
+import { ManagedSessionCard } from './components/ManagedSessionCard';
 import { useConnectionStatus } from './hooks/useConnectionStatus';
 
 function App() {
   const connection = useConnectionStatus();
-  const connected = connection.status?.connected ?? false;
+  const status = connection.status;
+  const connected = status?.connected ?? false;
 
   return (
     <div className="w-80 overflow-hidden bg-surface text-ink">
@@ -17,9 +19,10 @@ function App() {
       </header>
 
       <main className="space-y-3 px-4 py-3.5">
-        <BridgeStatusCard connected={connected} phase={connection.phase} />
-        {connection.status !== null && (
-          <BackendAddressRow backendBaseUrl={connection.status.backendBaseUrl} />
+        <BridgeStatusCard status={status} phase={connection.phase} />
+        {connected && status && <ManagedSessionCard status={status} />}
+        {status !== null && (
+          <BackendAddressRow backendBaseUrl={status.backendBaseUrl} />
         )}
       </main>
     </div>

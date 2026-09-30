@@ -13,33 +13,75 @@ export const startPicker = (options, emit) => {
     const host = document.createElement('div');
     host.id = overlayId;
     host.setAttribute('aria-live', 'polite');
+    host.dataset.state = 'active';
+    const activeTitle = selectionMode === 'multiple' ? '选择列表行' : '选择页面元素';
+    const activeHint = selectionMode === 'multiple' ? '单击一条记录，自动识别同类项' : '单击目标元素 · Esc 退出';
     const root = host.attachShadow({ mode: 'open' });
     root.innerHTML = `
       <style>
-        :host { all: initial; }
+        :host { all: initial; color-scheme: light; }
+        *, *::before, *::after { box-sizing: border-box; }
         .frame { position: fixed; inset: 0; z-index: 2147483646; pointer-events: none; }
-        .toolbar { position: fixed; top: 12px; right: 12px; display: flex; align-items: center; gap: 8px;
-          padding: 8px 10px; border: 1px solid rgba(129, 140, 248, .52); border-radius: 8px;
-          color: #eef2ff; background: rgba(15, 23, 42, .96); box-shadow: 0 8px 24px rgba(15, 23, 42, .36);
-          font: 13px/1.2 system-ui, sans-serif; pointer-events: auto; }
-        button { border: 0; border-radius: 6px; padding: 5px 8px; color: inherit; background: rgba(129, 140, 248, .22);
-          font: inherit; cursor: pointer; }
-        button:hover { background: rgba(129, 140, 248, .38); }
-        .cancel { background: #dc2626; }
-        .highlight { position: fixed; display: none; box-sizing: border-box; border: 2px solid #818cf8;
-          border-radius: 4px; background: rgba(129, 140, 248, .12); pointer-events: none; }
-        .hint { max-width: 320px; color: #c7d2fe; }
+        .toolbar { position: fixed; top: 16px; right: 16px; z-index: 2147483647; pointer-events: auto;
+          display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; align-items: center; gap: 10px;
+          width: min(390px, calc(100vw - 32px)); min-height: 52px; padding: 8px 9px 8px 10px;
+          border: 1px solid rgba(148, 163, 184, .32); border-radius: 12px; background: rgba(255, 255, 255, .98);
+          color: #0f172a; box-shadow: 0 12px 32px rgba(15, 23, 42, .14), 0 1px 2px rgba(15, 23, 42, .08);
+          font-family: "Inter Variable", "PingFang SC", system-ui, sans-serif; }
+        .mode-icon { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px;
+          border-radius: 8px; color: #2563eb; background: #eff6ff; box-shadow: inset 0 0 0 1px rgba(37, 99, 235, .14); }
+        .copy { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+        .title, .hint { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .title { color: #1e293b; font-size: 12px; font-weight: 600; line-height: 1.25; }
+        .hint { color: #64748b; font-size: 10.5px; font-weight: 400; line-height: 1.3; }
+        .actions { display: flex; align-items: center; gap: 4px; }
+        button { height: 28px; border: 0; border-radius: 7px; padding: 0 9px; color: #334155; background: transparent;
+          font: 500 11px/1 "Inter Variable", "PingFang SC", system-ui, sans-serif; cursor: pointer; }
+        button:hover { background: #f1f5f9; color: #0f172a; }
+        button:focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }
+        .toggle { background: #eef2ff; color: #3730a3; }
+        .toggle:hover { background: #e0e7ff; color: #312e81; }
+        .cancel:hover { background: #fef2f2; color: #b91c1c; }
+        .highlight { position: fixed; display: none; border: 2px solid #2563eb;
+          background: rgba(37, 99, 235, .07); box-shadow: 0 0 0 3px rgba(37, 99, 235, .14), 0 8px 20px rgba(37, 99, 235, .12);
+          pointer-events: none; }
+        .highlight-label { position: absolute; left: -2px; bottom: calc(100% + 6px); max-width: min(360px, calc(100vw - 24px));
+          overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 4px 7px; border-radius: 5px;
+          background: #2563eb; color: #fff; box-shadow: 0 4px 12px rgba(37, 99, 235, .2);
+          font: 500 10px/1.2 "JetBrains Mono Variable", ui-monospace, SFMono-Regular, Menlo, monospace; }
+        .highlight[data-label-align="right"] .highlight-label { right: -2px; left: auto; }
+        .highlight[data-label-position="below"] .highlight-label { top: calc(100% + 6px); bottom: auto; }
+        :host([data-state="paused"]) .mode-icon { color: #92400e; background: #fffbeb;
+          box-shadow: inset 0 0 0 1px rgba(217, 119, 6, .2); }
+        :host([data-state="paused"]) .toggle { background: #0f172a; color: #fff; }
+        :host([data-state="paused"]) .toggle:hover { background: #1e293b; color: #fff; }
+        @media (max-width: 520px) {
+          .toolbar { top: 10px; right: 10px; width: calc(100vw - 20px); }
+          .hint { display: none; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+          .toolbar, .highlight { transition: none !important; }
+        }
       </style>
-      <div class="frame"><div class="highlight"></div><div class="frame-guards"></div></div>
-      <div class="toolbar">
-        <span class="hint">${selectionMode === 'multiple' ? '拾取行或列表项' : '拾取元素'}</span>
-        <button type="button" class="toggle">暂停拾取</button>
-        <button type="button" class="cancel">取消</button>
+      <div class="frame"><div class="highlight"><span class="highlight-label"></span></div><div class="frame-guards"></div></div>
+      <div class="toolbar" role="region" aria-label="Easy RPA 元素拾取器">
+        <span class="mode-icon" aria-hidden="true">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/><path d="M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M19.07 4.93l-2.83 2.83M7.76 16.24l-2.83 2.83"/>
+          </svg>
+        </span>
+        <span class="copy"><strong class="title">${activeTitle}</strong><span class="hint">${activeHint}</span></span>
+        <span class="actions">
+          <button type="button" class="toggle" aria-pressed="false">暂停</button>
+          <button type="button" class="cancel">退出</button>
+        </span>
       </div>`;
     document.documentElement.append(host);
 
     const highlight = root.querySelector('.highlight');
+    const highlightLabel = root.querySelector('.highlight-label');
     const frameGuards = root.querySelector('.frame-guards');
+    const title = root.querySelector('.title');
     const hint = root.querySelector('.hint');
     const toggle = root.querySelector('.toggle');
     const cancel = root.querySelector('.cancel');
@@ -66,10 +108,11 @@ export const startPicker = (options, emit) => {
 
     function setPicking(next) {
         picking = next;
-        toggle.textContent = next ? '暂停拾取' : '继续拾取';
-        hint.textContent = next
-            ? (selectionMode === 'multiple' ? '拾取行或列表项' : '拾取元素')
-            : '已暂停，可操作页面后继续拾取';
+        host.dataset.state = next ? 'active' : 'paused';
+        toggle.textContent = next ? '暂停' : '继续';
+        toggle.setAttribute('aria-pressed', String(!next));
+        title.textContent = next ? activeTitle : '拾取已暂停';
+        hint.textContent = next ? activeHint : '现在可以操作页面，完成后点击继续';
         if (!next) highlight.style.display = 'none';
         frameGuards.style.display = next ? '' : 'none';
         if (next) syncFrames();
@@ -85,6 +128,12 @@ export const startPicker = (options, emit) => {
         highlight.style.top = `${rect.top}px`;
         highlight.style.width = `${Math.max(1, rect.width)}px`;
         highlight.style.height = `${Math.max(1, rect.height)}px`;
+        highlight.dataset.labelPosition = rect.top >= 32 ? 'above' : 'below';
+        const classes = Array.from(target.classList).slice(0, 4).map(name => `.${CSS.escape(name)}`).join('');
+        highlightLabel.textContent = classes || (target.id ? `#${CSS.escape(target.id)}` : target.tagName.toLowerCase());
+        highlight.dataset.labelAlign = rect.left + highlightLabel.getBoundingClientRect().width > window.innerWidth - 12
+            ? 'right'
+            : 'left';
     }
 
     function finish(event) {

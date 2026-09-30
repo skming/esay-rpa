@@ -34,7 +34,7 @@ from app.services.browser_action_runner import (
     _read_target_selector_config,
     _split_selector_candidates,
 )
-from app.services.extension_bridge_service import ExtensionBridgeService, audit_scope
+from app.services.extension_bridge_service import ExtensionActionOutcomeUnknown, ExtensionBridgeService, audit_scope
 from app.services.pagination_probe import (
     EXTENSION_EVIDENCE_SELECTORS,
     FIRST_PAGE_STOP_REASONS,
@@ -217,6 +217,8 @@ class ExtensionExecutor:
         with audit_scope(run_label=context.owner, node_id=_read_optional_string(node, "id")):
             try:
                 return await self._run_action(node, variables, context, timeout_ms=timeout_ms)
+            except ExtensionActionOutcomeUnknown:
+                raise
             except Exception:
                 healed = await self._heal_selector(node, variables)
                 if healed is None:

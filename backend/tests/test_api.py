@@ -833,18 +833,12 @@ async def test_extension_status_reports_canexecute_separately_from_display_conne
     assert body["canExecute"] is False, "测试进程里没有真实插件连接"
 
 
-async def test_extension_execute_hook_refuses_when_disabled_in_settings(monkeypatch) -> None:
-    """手工测试口子同样操作用户真实登录的浏览器，开关关掉时不能因为"只是测试"就放行。"""
-    import app.main as main_module
-
-    monkeypatch.setattr(main_module.extension_config_service, "load", lambda: {"enabled": False})
+async def test_extension_execute_hook_is_not_public() -> None:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
         response = await client.post(
             "/api/extension/execute", json={"action": {"type": "browser.click", "selector": "#x"}}
         )
-
-    assert response.status_code == 409
-    assert "关闭" in response.json()["detail"]
+    assert response.status_code == 404
 
 
 async def test_schedule_preview_uses_backend_cron_and_rejects_invalid_expression() -> None:

@@ -4,7 +4,7 @@ Chrome 扩展让 Easy RPA 可以操作用户真实浏览器标签页，复用当
 
 ## 客户端安装与使用
 
-打包客户端已包含扩展文件，设置页提供安装入口和连接状态。流程可在顶部运行菜单选择“当前 Chrome”。扩展主动连接本机后端，并在客户端重启后自动恢复连接。
+打包客户端已包含扩展文件，设置页提供安装入口和连接状态。加载客户端提供的扩展后会自动连接，无需输入扩展 ID。此前加载的旧版扩展需在 Chrome 扩展管理页重新加载。流程可在顶部运行菜单选择“当前 Chrome”。客户端重启后扩展会自动恢复连接。
 
 ## 开发启动
 
@@ -45,32 +45,6 @@ curl http://127.0.0.1:8765/api/extension/status
 - 截图：`browser.screenshot`
 - 可视化：目标元素高亮、敏感操作确认 Banner
 - 可信输入：动作带 `trusted: true` 时通过 Chrome Debugger/CDP 执行点击或输入
-
-## 手工测试
-
-查询当前受控标签页元素：
-
-```bash
-curl -X POST http://127.0.0.1:8765/api/extension/execute \
-  -H 'content-type: application/json' \
-  -d '{"action":{"type":"query"}}'
-```
-
-点击元素：
-
-```bash
-curl -X POST http://127.0.0.1:8765/api/extension/execute \
-  -H 'content-type: application/json' \
-  -d '{"action":{"type":"browser.click","selector":"button"}}'
-```
-
-可信点击：
-
-```bash
-curl -X POST http://127.0.0.1:8765/api/extension/execute \
-  -H 'content-type: application/json' \
-  -d '{"action":{"type":"browser.click","selector":"button","trusted":true}}'
-```
 
 ## 使用边界
 

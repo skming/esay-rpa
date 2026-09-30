@@ -48,7 +48,7 @@ async def test_composed_probe_and_picker_expression_keep_shared_selector_facts(p
     page = picker_page
     await page.set_content("""
       <input id="keyword" placeholder="关键字">
-      <button id="one">唯一元素</button>
+      <button id="one" class="action primary">唯一元素</button>
       <table id="orders"><tbody>
         <tr><td><button>第一行</button></td></tr>
         <tr id="selected-row"><td><button id="row-button">第二行</button></td></tr>
@@ -60,6 +60,8 @@ async def test_composed_probe_and_picker_expression_keep_shared_selector_facts(p
 
     events: list[dict[str, Any]] = []
     await _start_picker(page, events, "single")
+    await page.locator("#one").hover()
+    assert await page.locator("#rpa-picker-overlay").locator(".highlight-label").text_content() == ".action.primary"
     await page.locator("#one").click()
     single = await _event(events)
     assert single == {
@@ -93,11 +95,14 @@ async def test_picker_rebuilds_open_shadow_roots_after_pause_and_uses_composed_t
     events: list[dict[str, Any]] = []
     await _start_picker(page, events, "single")
     await page.locator("#rpa-picker-overlay").locator("button.toggle").click()
+    assert await page.locator("#rpa-picker-overlay").get_attribute("data-state") == "paused"
+    assert await page.locator("#rpa-picker-overlay").locator(".title").text_content() == "拾取已暂停"
     await page.evaluate("""() => {
       const host = document.querySelector('#host');
       host.attachShadow({ mode: 'open' }).innerHTML = '<button id="late-shadow-button">影子元素</button>';
     }""")
     await page.locator("#rpa-picker-overlay").locator("button.toggle").click()
+    assert await page.locator("#rpa-picker-overlay").get_attribute("data-state") == "active"
     await page.locator("#host").locator("#late-shadow-button").click()
     capture = await _event(events)
     assert capture["type"] == "capture"

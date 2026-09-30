@@ -26,3 +26,8 @@ body {
   margin: 0;
   background: transparent;
 }
+
+::selection {
+  background: #c7d2fe;
+  color: var(--color-ink);
+}

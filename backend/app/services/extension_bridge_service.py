@@ -10,7 +10,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
@@ -40,10 +40,9 @@ _RECEIVE_TIMEOUT_SECONDS = 45.0
 # 得由后端在顶替前主动 ping 现任、按存活情况仲裁，而不是让先到者无条件赢。
 _REPLACED_CONNECTION_CLOSE_CODE = 4409
 
-# WS 握手不受同源策略约束：没有这道判断，用户正在浏览的任意网页都能连上本机这条桥，拿到操作
-# 其真实登录态浏览器的完整能力（同一攻击者对 /api 的跨域 POST 反而会被预检挡住）。
-# 上限：Origin 页面伪造不了，但本机的非浏览器进程能任意设置；挡住后者要配对令牌，本次不做。
-_ALLOWED_ORIGIN_PREFIX = "chrome-extension://"
+# WS 握手不受同源策略约束，必须将浏览器提供的 Origin 与随应用分发的扩展 ID 精确比较。
+# 本机进程能伪造 Origin；本地 HTTP API 同样信任本机进程，不在这里宣称阻断这种调用方。
+_EXTENSION_ORIGIN_PREFIX = "chrome-extension://"
 
 # 插件操作的是用户真实登录态浏览器，单独留痕供事后安全审查；只记录类型/选择器/耗时/成败，
 # 不记录 inputValue 或页面文本（可能含密码、验证码等敏感数据）。
@@ -53,8 +52,8 @@ _AUDIT_LOG_FILENAME = "extension_bridge_audit.jsonl"
 # 唯一能翻的这个文件刷成不可读。保留原长，看得出是被截过。
 _MAX_AUDIT_FIELD_CHARS = 300
 
-# 用 contextvar 不用服务上的字段：服务是单例，还给 /api/extension/bridge/execute 这类不属于任何
-# 运行的路径用，写成字段会给它们盖上上一次运行的标签——错的归属比没有归属更糟。
+# 用 contextvar 不用服务上的字段：服务是单例，某些调用不属于任何运行，写成字段会给它们
+# 盖上上一次运行的标签——错的归属比没有归属更糟。
 _audit_scope: ContextVar[tuple[str | None, str | None]] = ContextVar("extension_audit_scope", default=(None, None))
 
 
@@ -84,9 +83,15 @@ def _write_audit_record(record: dict[str, Any]) -> None:
         logger.exception("写入插件执行器审计日志失败")
 
 
+class ExtensionActionOutcomeUnknown(RuntimeError):
+    """请求可能已送达真实浏览器；调用方不得自动重试或静默继续。"""
+
+
 class ExtensionBridgeService:
-    def __init__(self) -> None:
+    def __init__(self, trusted_extension_id: Callable[[], str | None]) -> None:
+        self._trusted_extension_id = trusted_extension_id
         self._socket: WebSocket | None = None
+        self._socket_origin: str | None = None
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._connected_since: float | None = None
         self._disconnected_at: float | None = None
@@ -95,12 +100,16 @@ class ExtensionBridgeService:
     @property
     def is_connected(self) -> bool:
         """真实连接状态，可安全用于节点执行门控。"""
-        return self._socket is not None
+        return self._socket is not None and self._socket_origin == self._expected_origin()
+
+    def _expected_origin(self) -> str | None:
+        extension_id = self._trusted_extension_id()
+        return f"{_EXTENSION_ORIGIN_PREFIX}{extension_id}" if extension_id else None
 
     @property
     def is_connected_for_display(self) -> bool:
         """带宽限期平滑的连接状态，仅供 UI 展示，不可用于判断能否真正发送动作。"""
-        if self._socket is not None:
+        if self.is_connected:
             return True
         if self._disconnected_at is None:
             return False
@@ -108,15 +117,16 @@ class ExtensionBridgeService:
 
     @property
     def connected_since(self) -> float | None:
-        return self._connected_since
+        return self._connected_since if self.is_connected else None
 
     async def handle_connection(self, websocket: WebSocket) -> None:
         """接受插件 WS 连接并持续处理响应直到断开；新连接总是立即顶替已注册的旧连接。"""
         origin = websocket.headers.get("origin") or ""
-        if not origin.startswith(_ALLOWED_ORIGIN_PREFIX):
+        expected_origin = self._expected_origin()
+        if expected_origin is None or origin != expected_origin:
             # 判在 accept 和顶替之前：顶替会 fail 掉现任连接上正在跑的动作，放到之后就等于让
             # 任意网页无需凭据就能打断别人正在跑的运行。
-            logger.warning("拒绝非扩展来源的插件桥接连接：origin=%r", origin)
+            logger.warning("拒绝非随应用分发的插件桥接连接：origin=%r", origin)
             await self._close_quietly(websocket)
             return
         if self._socket is not None:
@@ -124,6 +134,7 @@ class ExtensionBridgeService:
             self._evict_current_socket()
         await websocket.accept()
         self._socket = websocket
+        self._socket_origin = origin
         self._connected_since = time.time()
         self._disconnected_at = None
         self._last_seen_at = time.time()
@@ -141,6 +152,7 @@ class ExtensionBridgeService:
         finally:
             if self._socket is websocket:
                 self._socket = None
+                self._socket_origin = None
                 self._connected_since = None
                 self._disconnected_at = time.time()
                 self._last_seen_at = None
@@ -153,6 +165,7 @@ class ExtensionBridgeService:
     def _evict_current_socket(self) -> None:
         old_socket = self._socket
         self._socket = None
+        self._socket_origin = None
         self._connected_since = None
         self._disconnected_at = time.time()
         self._last_seen_at = None
@@ -181,8 +194,8 @@ class ExtensionBridgeService:
 
     async def execute(self, action: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
         """向已连接插件发送动作并等待结果；action 形状与 BrowserActionRunner 节点参数一致（selector/inputValue）。"""
-        if self._socket is None:
-            raise ConnectionError("没有已连接的浏览器扩展")
+        if not self.is_connected:
+            raise ConnectionError("没有已连接的 Easy RPA 浏览器扩展")
 
         request_id = str(uuid4())
         started_at = time.monotonic()
@@ -203,13 +216,16 @@ class ExtensionBridgeService:
             response = await asyncio.wait_for(future, timeout=timeout)
         except TimeoutError:
             self._audit_action(audit_base, started_at, error="timeout")
-            raise TimeoutError(f"扩展执行动作超时（{timeout}s）: {action.get('type')}") from None
-        except (Exception, asyncio.CancelledError) as exc:
+            raise ExtensionActionOutcomeUnknown(f"扩展执行动作超时，动作可能已经生效（{timeout}s）: {action.get('type')}") from None
+        except asyncio.CancelledError as exc:
+            self._audit_action(audit_base, started_at, error=str(exc) or exc.__class__.__name__)
+            raise
+        except Exception as exc:
             # 连接被顶替/断开（ConnectionError）、send 失败、运行被中止都走这里。动作可能已经送到
             # 用户真实登录的浏览器并执行完，只是回执送不回来——这份日志的用途正是事后追查"到底
             # 对这个浏览器做过什么"，异常路径不留痕等于在最需要它的地方留白。
             self._audit_action(audit_base, started_at, error=str(exc) or exc.__class__.__name__)
-            raise
+            raise ExtensionActionOutcomeUnknown(f"扩展动作回执丢失，动作可能已经生效: {action.get('type')}") from exc
         finally:
             self._pending.pop(request_id, None)
 

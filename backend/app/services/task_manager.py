@@ -15,7 +15,7 @@ from app.services.acceptance_audit import freeze_contract_inputs
 from app.services.browser_action_runner import BrowserActionContext, BrowserActionResult, BrowserActionRunner, OverlayInfo, apply_browser_result_variables, detect_blocking_overlay, is_browser_action_node, try_auto_dismiss_overlay
 from app.services.browser_executor import BrowserExecutor
 from app.services.control_action_runner import BreakLoopSignal, ControlActionRunner, apply_control_result_variables, is_control_action_node, is_subprocess_node
-from app.services.extension_bridge_service import ExtensionBridgeService
+from app.services.extension_bridge_service import ExtensionActionOutcomeUnknown, ExtensionBridgeService
 from app.services.extension_executor import ExtensionExecutor
 from app.services.execution_evidence import build_node_execution_evidence, definition_digest
 from app.services.data_action_runner import DataActionRunner, apply_data_result_variables, is_data_action_node
@@ -1122,7 +1122,7 @@ class TaskManager:
             try:
                 return await execute()
             except BaseException as exc:
-                if isinstance(exc, asyncio.CancelledError) or (extra_reraise and isinstance(exc, extra_reraise)):
+                if isinstance(exc, (asyncio.CancelledError, ExtensionActionOutcomeUnknown)) or (extra_reraise and isinstance(exc, extra_reraise)):
                     raise
                 if attempt < attempts:
                     await self._append_log(record, "warn", f"重试{label} · {node_title}", str(exc), node_id=node_id)
@@ -1345,6 +1345,8 @@ class TaskManager:
         try:
             return await self._run_with_retry(record, node, node_id=node_id, node_title=node_title, label="浏览器动作", execute=_execute)
         except asyncio.CancelledError:
+            raise
+        except ExtensionActionOutcomeUnknown:
             raise
         except Exception as exc:
             if await self._handle_browser_node_failure(record, context, exc, node=node, node_id=node_id, node_title=node_title):
