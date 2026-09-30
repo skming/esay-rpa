@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 # 自愈诊断等只读场景禁用的写入类工具
 WRITE_TOOLS = frozenset({
-    "create_flow", "update_flow", "apply_node_fix", "set_acceptance_contract", "run_flow", "publish_flow",
+    "create_flow", "update_flow", "apply_node_fix", "set_acceptance_contract", "run_flow",
     "stop_run", "create_schedule", "toggle_schedule",
     # interact_page 是真的在用户已登录的浏览器上点、填、回车，不是读页面：
     # 无人值守自愈时它可能替用户提交一张表单，所以按写入类工具收掉。
@@ -194,6 +194,19 @@ def _check_acceptance_contract_change(
             "验收契约只能在用户本轮明确改变交付目标时修改。"
             "requirement_change_quote 必须是用户最新消息中的连续原文，不能用模型自己的需求复述。"
         ),
+    )
+
+
+def _check_current_flow_target(
+    tool_name: str, args: dict[str, Any], state: GuardState
+) -> dict[str, Any] | None:
+    if not state.flow_id or args.get("flow_id") == state.flow_id:
+        return None
+    return _blocked(
+        tool_name,
+        expected_flow_id=state.flow_id,
+        required_action="use_current_flow",
+        message="工具目标必须是当前会话绑定的流程；操作其他流程请切换到对应流程会话。",
     )
 
 
@@ -440,6 +453,13 @@ GUARDS: tuple[Guard, ...] = (
         check=_check_read_only_mode,
         # 触发条件是调用方传 read_only=True（无人值守自愈），不是用户说了「审查」，
         # 所以没有 contract：写进提示词会让模型以为审查请求下工具会被拦，从而不敢动手。
+    ),
+    Guard(
+        id="current_flow_target",
+        summary="修改、运行和创建调度必须使用当前会话绑定的流程",
+        scope=ToolScope(include=(FLOW_WRITE_TOOLS - {"create_flow"}) | {"run_flow", "create_schedule"}),
+        check=_check_current_flow_target,
+        contract="修改、运行和创建调度使用当前会话的 flow_id，不得替换为其他流程。",
     ),
     Guard(
         id="schedule_requires_user_request",

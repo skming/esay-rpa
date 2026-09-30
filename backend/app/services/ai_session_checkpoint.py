@@ -67,7 +67,7 @@ _PER_ROUND_KEYS = frozenset({
     # 同样另有归属：验收台账已按 flow_id + revision 落盘，每轮开场由
     # load_verification_state 重算。存一份反而更危险——流程在会话之外被改过，
     # 旧的 accepted_revision 会让「这版已验收」凭空成立
-    "current_flow_revision", "run_verified_revision", "accepted_revision",
+    "current_flow_revision", "current_definition_digest", "run_verified_revision", "accepted_revision",
     # 不是事实：flow_id 是检查点文件名本身，_last_tool_args 只在一次调用内传参
     "flow_id", "_last_tool_args",
     # 本轮请求本身：下一轮换了一句话，这些就全过期了

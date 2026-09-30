@@ -33,7 +33,7 @@ from app.services.ai_phases import (
 
 _ALL_TOOLS = frozenset({
     "create_flow", "update_flow", "apply_node_fix", "set_acceptance_contract",
-    "run_flow", "publish_flow", "stop_run", "create_schedule", "toggle_schedule",
+    "run_flow", "stop_run", "create_schedule", "toggle_schedule",
     "inspect_page", "inspect_screenshot", "get_run_error", "get_run_logs",
     "get_run_output", "list_node_types", "list_schedules",
 })
@@ -151,7 +151,7 @@ def test_read_tools_are_never_gated_by_phase() -> None:
 def test_side_line_tools_are_outside_the_phase_machine() -> None:
     """publish / 定时任务 / stop_run 不在构建—验证主线上，用户随时可能单独要求。"""
     state = _ready(page_evidence_required={"url": "u"}, page_evidence_done=False)
-    for tool in ("publish_flow", "create_schedule", "toggle_schedule", "stop_run"):
+    for tool in ("create_schedule", "toggle_schedule", "stop_run"):
         assert apply_phase_gate(tool, {}, state) is None, tool
 
 

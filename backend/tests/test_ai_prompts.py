@@ -57,6 +57,41 @@ def test_prompt_keeps_selector_fallbacks_out_of_the_primary_selector() -> None:
     assert "结构性 CSS 只放 `fallbackSelectors`" in SYSTEM_PROMPT
 
 
+def test_prompt_limits_page_prerequisites_to_web_tasks() -> None:
+    workflow = _SEC["workflow_header"]
+    clarify = _SEC["step0_clarify"]
+    assert "纯文件、Excel、数据处理或 HTTP API 任务不要求浏览器页面取证" in workflow
+    assert "修改、诊断、运行或任务控制请求只执行相关步骤" in workflow
+    assert 'inspect_page(browser_executor="extension")` 并省略 url' in clarify
+    assert "HTTP API 任务确认接口地址与请求要求，不调用浏览器检查接口" in clarify
+    assert "用户没有给出具体 URL →" not in clarify
+    assert "创建流程前强制调用" not in SYSTEM_PROMPT
+
+
+def test_prompt_does_not_allow_guessed_selectors_when_inspection_fails() -> None:
+    selectors = _SEC["step1_selectors"]
+    assert "继续取证或说明阻断原因，不自行拼接未经验证的 selector" in selectors
+    assert "拿不到页面时才自己拼" not in selectors
+    assert "button[type='submit'], button:has-text('登录')" not in selectors
+
+
+def test_success_diagnostics_do_not_substitute_for_acceptance_evidence() -> None:
+    execution = _SEC["step4_execute"]
+    assert "只说明该任务执行未报错，不证明当前流程验收通过" in execution
+    assert "`quality_audit` 缺失不等于验收通过" in execution
+    assert "缺少验收证据时明确说明尚未确认产物" in execution
+    assert "没带→立即停止修复" not in execution
+
+
+def test_write_claims_follow_platform_verification_state() -> None:
+    execution = _SEC["step4_execute"]
+    assert "`verification_status` 和最新状态块为准" in execution
+    assert "只修改流程名称且 `execution_changed=false` 时可保留有效证据" in execution
+    assert "也不能把失败写入当成已修改" in execution
+    assert "当前 revision、definition_digest 对应的验收证据" in execution
+    assert "一旦调用 `create_flow` / `update_flow` / `apply_node_fix`" not in execution
+
+
 def test_prompt_distinguishes_execution_from_acceptance() -> None:
     assert "执行完成，但验收未通过" in SYSTEM_PROMPT
     assert "改动后 `run_flow` 成功" not in SYSTEM_PROMPT

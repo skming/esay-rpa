@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import inspect
 import json
 import re
 import textwrap
+from contextlib import AsyncExitStack
 from dataclasses import replace
+from importlib import import_module
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -57,6 +61,9 @@ from app.services.ai_orchestrator import (
     _tool_schemas_for_round,
     _TurnIntents,
     _unmet_verification_request,
+    _sync_flow_state,
+    _sync_run_result,
+    _validate_tool_result_target,
 )
 from app.services.ai_tools.executor import RpaToolExecutor
 from app.services.ai_tools.schemas import TOOL_SCHEMAS
@@ -223,7 +230,7 @@ def test_ask_user_block_closes_the_round_without_a_canned_reply() -> None:
 
 def test_tool_schemas_follow_the_current_phase() -> None:
     no_url = _TurnIntents(create_requested=True)
-    assert _tool_schemas_for_round(GuardState(), no_url) == []
+    assert "create_flow" in {s["function"]["name"] for s in _tool_schemas_for_round(GuardState(), no_url)}
 
     inspecting = _TurnIntents(create_requested=True, create_url="https://example.com")
     discovering = _ready(
@@ -666,6 +673,10 @@ def test_run_authorization_is_detected_only_from_an_explicit_ask() -> None:
         assert _detect_turn_intents(
             [{"role": "user", "content": text}], "flow-1", blank
         ).run_authorized is False, text
+
+    assert _detect_turn_intents(
+        [{"role": "user", "content": "帮我核对流程配置是否合理"}], "flow-1", blank
+    ).run_authorized is False
 
     # 从零建流程算授权：用户要的是一条能用的流程，而「能不能用」只随 run_flow 的
     # acceptance_audit 回来，建完不跑等于把验证甩给用户自己试。
@@ -1436,6 +1447,212 @@ class _FakeStream:
             raise StopAsyncIteration from None
 
 
+@pytest.fixture
+async def relay_clients(monkeypatch):
+    import_module("litellm")  # LiteLLM 的运行时类型注解需要原始 OpenAI 类。
+    import openai
+    import app.services.ai_orchestrator as orch
+
+    clients = []
+
+    def create_client(**kwargs):
+        client = SimpleNamespace(close=AsyncMock(side_effect=kwargs["http_client"].aclose))
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", create_client)
+    monkeypatch.setattr(orch, "_relay_client_cache", {})
+    monkeypatch.setattr(orch, "_relay_models_cache", {})
+    monkeypatch.setattr(orch, "_resolve_relay_model", AsyncMock(return_value="openai/test-model"))
+    try:
+        yield clients
+    finally:
+        await orch.close_relay_clients()
+
+
+async def test_relay_client_reuse_and_idle_invalidation(relay_clients):
+    import app.services.ai_orchestrator as orch
+
+    async with orch._relay_client_lease("https://relay.test/v1", "fixture-key") as first:
+        async with orch._relay_client_lease("https://relay.test/v1", "fixture-key") as second:
+            assert first is second
+    assert len(relay_clients) == 1
+    first.close.assert_not_awaited()
+    orch._relay_models_cache["fixture"] = (["test-model"], 0)
+    await orch.close_relay_clients()
+    assert not orch._relay_client_cache
+    assert not orch._relay_models_cache
+    first.close.assert_awaited_once()
+    await orch.close_relay_clients()
+    first.close.assert_awaited_once()
+
+
+async def test_relay_invalidation_waits_for_all_active_users(relay_clients):
+    import app.services.ai_orchestrator as orch
+
+    async with AsyncExitStack() as users:
+        first = await users.enter_async_context(orch._relay_client_lease("https://relay.test/v1", "fixture"))
+        async with orch._relay_client_lease("https://relay.test/v1", "fixture") as second:
+            assert first is second
+            await orch.close_relay_clients()
+            async with orch._relay_client_lease("https://relay.test/v1", "fixture") as replacement:
+                assert replacement is not first
+        first.close.assert_not_awaited()
+    first.close.assert_awaited_once()
+    replacement.close.assert_not_awaited()
+    await orch.close_relay_clients()
+    replacement.close.assert_awaited_once()
+
+
+async def test_relay_lease_covers_model_resolution_cancellation(monkeypatch, relay_clients):
+    import app.services.ai_orchestrator as orch
+
+    started = asyncio.Event()
+
+    async def resolve(*args):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(orch, "_resolve_relay_model", resolve)
+    config = SimpleNamespace(
+        get_base_url_for_model=lambda _: "https://relay.test",
+        get_api_key_for_model=lambda _: "fixture",
+    )
+    orchestrator = AiOrchestrator(_FakeExecutor(), config)
+
+    async def request():
+        async with orchestrator._completion_kwargs("test-model"):
+            pytest.fail("model resolution should still be waiting")
+
+    task = asyncio.create_task(request())
+    await asyncio.wait_for(started.wait(), 1)
+    await orch.close_relay_clients()
+    relay_clients[0].close.assert_not_awaited()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    relay_clients[0].close.assert_awaited_once()
+    assert not orch._relay_client_cache
+
+
+async def test_relay_close_failure_does_not_skip_other_clients(relay_clients, caplog):
+    import app.services.ai_orchestrator as orch
+
+    for url in ("https://first.test/v1", "https://second.test/v1"):
+        async with orch._relay_client_lease(url, "fixture"):
+            pass
+    close_transport = relay_clients[0].close.side_effect
+
+    async def fail_close():
+        await close_transport()
+        raise RuntimeError("private-fixture-key")
+
+    relay_clients[0].close.side_effect = fail_close
+    await orch.close_relay_clients()
+    for client in relay_clients:
+        client.close.assert_awaited_once()
+    assert "Failed to close relay client" in caplog.text
+    assert "private-fixture-key" not in caplog.text
+
+
+async def test_inflight_model_lookup_cannot_refill_invalidated_cache(monkeypatch):
+    import httpx
+    import app.services.ai_orchestrator as orch
+
+    started, finish = asyncio.Event(), asyncio.Event()
+
+    class LookupClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, *args, **kwargs):
+            started.set()
+            await finish.wait()
+            return SimpleNamespace(status_code=200, json=lambda: {"data": [{"id": "fixture-model"}]})
+
+    monkeypatch.setattr(httpx, "AsyncClient", LookupClient)
+    monkeypatch.setattr(orch, "_relay_models_cache", {})
+    task = asyncio.create_task(orch._fetch_relay_models("https://relay.test/v1", "fixture"))
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        await orch.close_relay_clients()
+        finish.set()
+        assert await task == ["fixture-model"]
+        assert not orch._relay_models_cache
+    finally:
+        finish.set()
+        await task
+
+
+@pytest.mark.parametrize("exit_kind", ["complete", "cancel", "disconnect", "stream_error", "request_error", "timeout"])
+async def test_relay_round_releases_response_and_client(monkeypatch, relay_clients, exit_kind):
+    import litellm
+    import app.services.ai_orchestrator as orch
+
+    started = asyncio.Event()
+    response = _FakeStream([_chunk(content="你好", finish="stop")])
+    response.aclose = AsyncMock()
+    original_next = response.__anext__
+
+    async def next_chunk():
+        started.set()
+        if exit_kind == "cancel":
+            await asyncio.Event().wait()
+        if exit_kind == "stream_error":
+            raise RuntimeError("fixture stream failure")
+        if exit_kind == "timeout":
+            raise asyncio.TimeoutError
+        return await original_next()
+
+    monkeypatch.setattr(_FakeStream, "__anext__", lambda self: next_chunk())
+
+    async def completion(**kwargs):
+        await orch.close_relay_clients()
+        kwargs["client"].close.assert_not_awaited()
+        if exit_kind == "request_error":
+            raise RuntimeError("fixture request failure")
+        return response
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    config = SimpleNamespace(
+        get_base_url_for_model=lambda _: "https://relay.test/v1",
+        get_api_key_for_model=lambda _: "fixture",
+    )
+    orchestrator = AiOrchestrator(_FakeExecutor(), config)
+    stream = orchestrator.stream([{"role": "user", "content": "你好"}], "test-model")
+
+    if exit_kind == "cancel":
+        async def consume():
+            return [event async for event in stream]
+
+        task = asyncio.create_task(consume())
+        await asyncio.wait_for(started.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    elif exit_kind == "disconnect":
+        async for event in stream:
+            if event["type"] == "text":
+                break
+        assert event["type"] == "text"
+        await stream.aclose()
+    else:
+        events = [event async for event in stream]
+        assert any(event["type"] == "done" for event in events)
+        assert any(event["type"] == "error" for event in events) == (exit_kind != "complete")
+    relay_clients[0].close.assert_awaited_once()
+    if exit_kind == "request_error":
+        response.aclose.assert_not_awaited()
+    else:
+        response.aclose.assert_awaited_once()
+
+
 def _chunk(*, content: str | None = None, tool_calls: list[Any] | None = None, finish: str | None = None) -> Any:
     delta = SimpleNamespace(content=content, tool_calls=tool_calls, reasoning_content=None)
     return SimpleNamespace(choices=[SimpleNamespace(delta=delta, finish_reason=finish)])
@@ -1499,6 +1716,10 @@ class _RunnableFlowExecutor(_FakeExecutor):
                 "definition": _VERIFIABLE_DEFINITION,
                 "acceptance_contract": _VERIFIABLE_CONTRACT,
             }
+        if tool_name == "lint_flow":
+            return {"findings": []}
+        if tool_name == "validate_flow":
+            return {"issues": []}
         return {"status": "ok"}
 
 
@@ -2016,7 +2237,7 @@ def test_runtime_variable_escape_is_booked_separately_from_static_diagnostics() 
     # 只有真实结构修复才解除——再跑一次、再读一次状态都不算
     _orchestrator_guard_after_tool("run_flow", {"status": "error", "error": "boom"}, state)
     assert state.runtime_escape_findings
-    _orchestrator_guard_after_tool("apply_node_fix", {"status": "ok"}, state)
+    _orchestrator_guard_after_tool("apply_node_fix", {"status": "ok", "execution_changed": True}, state)
     assert state.runtime_escape_findings == []
 
 
@@ -2415,3 +2636,601 @@ async def test_invalid_batch_gets_feedback_before_retrying(monkeypatch):
     batch = next(m for m in requests[1] if m.get("tool_calls"))
     response_ids = {m.get("tool_call_id") for m in requests[1] if m["role"] == "tool"}
     assert {c["id"] for c in batch["tool_calls"]} <= response_ids
+
+
+@pytest.mark.parametrize("close_at_yield", [False, True])
+async def test_turn_exit_cancels_and_awaits_all_tool_tasks(monkeypatch, close_at_yield):
+    import litellm
+
+    started = asyncio.Event()
+    cleaned = []
+    tasks = []
+
+    class Executor(_FakeExecutor):
+        async def execute(self, name, args, *rest):
+            tasks.append(asyncio.current_task())
+            if len(tasks) == 2:
+                started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.sleep(0)
+                cleaned.append(name)
+
+    async def completion(**kwargs):
+        return _FakeStream(
+            [
+                _chunk(
+                    tool_calls=[
+                        _tool_call_chunk(0, call_id="logs", name="get_run_logs", arguments='{"task_id":"t"}'),
+                        _tool_call_chunk(1, call_id="types", name="list_node_types", arguments="{}"),
+                    ],
+                    finish="tool_calls",
+                )
+            ]
+        )
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    stream = AiOrchestrator(Executor()).stream([{"role": "user", "content": "读取日志和节点类型"}], "test-model")
+    if close_at_yield:
+        async for event in stream:
+            if event["type"] == "tool_args":
+                await started.wait()
+                break
+        await stream.aclose()
+    else:
+
+        async def consume():
+            async for _ in stream:
+                pass
+
+        consumer = asyncio.create_task(consume())
+        await asyncio.wait_for(started.wait(), timeout=2)
+        consumer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await consumer
+    assert len(tasks) == 2 and all(task.done() for task in tasks)
+    assert sorted(cleaned) == ["get_run_logs", "list_node_types"]
+
+
+async def test_chat_cancellation_closes_run_observer_and_keeps_background_run(monkeypatch):
+    import litellm
+
+    started = asyncio.Event()
+    observer_closed = asyncio.Event()
+    background_gate = asyncio.Event()
+    background = None
+
+    class Executor(_FakeExecutor):
+        async def execute(self, name, args, *rest):
+            nonlocal background
+            if name == "run_flow":
+                background = asyncio.create_task(background_gate.wait())
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    observer_closed.set()
+            return await super().execute(name, args, *rest)
+
+    async def flow_state(*args):
+        return FlowState(flow_id="f", revision=1, is_blank=False)
+
+    async def completion(**kwargs):
+        return _FakeStream(
+            [
+                _chunk(
+                    tool_calls=[
+                        _tool_call_chunk(0, call_id="run", name="run_flow", arguments='{"flow_id":"f"}'),
+                    ],
+                    finish="tool_calls",
+                )
+            ]
+        )
+
+    monkeypatch.setattr("app.services.ai_orchestrator.build_flow_state", flow_state)
+    monkeypatch.setattr(litellm, "acompletion", completion)
+
+    async def consume():
+        async for _ in AiOrchestrator(Executor()).stream([{"role": "user", "content": "运行一次"}], "test-model", "f"):
+            pass
+
+    consumer = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        consumer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await consumer
+        assert observer_closed.is_set()
+        assert background is not None and not background.done()
+    finally:
+        background_gate.set()
+        if background is not None:
+            await background
+
+
+@pytest.mark.parametrize("revision,digest", [(4, "d4"), (3, "changed-without-revision")])
+def test_authoritative_flow_refresh_invalidates_old_evidence(monkeypatch, revision, digest):
+    state = _ready(
+        flow_id="f",
+        current_flow_revision=3,
+        current_definition_digest="d3",
+        run_verified_revision=3,
+        accepted_revision=3,
+        run_succeeded=True,
+        audit_passed=True,
+    )
+    monkeypatch.setattr(
+        "app.services.ai_orchestrator.load_verification_state",
+        lambda *args: {
+            "current_flow_revision": args[1],
+            "run_verified_revision": None,
+            "accepted_revision": None,
+        },
+    )
+    _sync_flow_state(FlowState(flow_id="f", revision=revision, definition_digest=digest), state)
+    assert state.current_flow_revision == revision
+    assert state.current_definition_digest == digest
+    assert state.accepted_revision is None and state.run_verified_revision is None
+    assert not state.audit_passed and not state.run_succeeded
+    from app.services.ai_orchestrator import _overstated_result_claim
+
+    assert _overstated_result_claim("验收通过", state) is not None
+
+
+@pytest.mark.parametrize("status", ["timeout", "running", "pending", "queued", "awaiting_confirmation"])
+def test_unfinished_run_does_not_spend_failure_budget(status):
+    state = _ready()
+    _orchestrator_guard_after_tool("run_flow", {"task_id": "t", "status": status}, state)
+    assert state.run_attempted
+    assert state.attempt_budget["spent"] == 0
+    assert state.attempt_budget["attempts"] == []
+
+
+@pytest.mark.parametrize("passed", [True, False])
+def test_background_completion_updates_evidence_and_is_booked_once(monkeypatch, passed):
+    from app.services.ai_tool_events import current_verification_status
+
+    recorded = []
+    monkeypatch.setattr("app.services.ai_orchestrator.record_events", lambda *args: recorded.append(args))
+    state = _ready(flow_id="f", current_flow_revision=3, current_definition_digest="d3")
+    pending = {"task_id": "t", "status": "timeout", "flow_revision": 3, "definition_digest": "d3"}
+    _orchestrator_guard_after_tool("run_flow", pending, state)
+    completed = {
+        **pending,
+        "status": "success",
+        "acceptance_audit": {
+            "passed": passed,
+            "flow_revision": 3,
+            "definition_digest": "d3",
+            "issues": [] if passed else [{"issue": "missing_records"}],
+        },
+    }
+    assert _sync_run_result(pending, completed, state)
+    assert current_verification_status(state) == ("accepted" if passed else "run_verified")
+    assert state.attempt_budget["spent"] == (0 if passed else 1)
+    assert not _sync_run_result(completed, dict(completed), state)
+    assert len(recorded) == 1
+    assert state.attempt_budget["spent"] == (0 if passed else 1)
+
+
+def test_background_failure_is_booked_once_and_requires_dom(monkeypatch):
+    monkeypatch.setattr("app.services.ai_orchestrator.record_events", lambda *args: None)
+    state = _ready(flow_id="f", current_flow_revision=3, current_definition_digest="d3")
+    pending = {"task_id": "t", "status": "timeout", "flow_revision": 3, "definition_digest": "d3"}
+    completed = {
+        **pending,
+        "status": "error",
+        "error": "selector timeout",
+        "failure_diagnostics": {
+            "inspect_hint": "inspect first",
+            "last_browser_url": "https://example.test",
+        },
+    }
+    assert _sync_run_result(pending, completed, state)
+    assert state.attempt_budget["spent"] == 1
+    assert state.page_evidence_required["url"] == "https://example.test"
+    assert not _sync_run_result(completed, dict(completed), state)
+    assert state.attempt_budget["spent"] == 1
+
+
+def test_stale_background_completion_does_not_affect_current_flow(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.ai_orchestrator.record_events", lambda *args: pytest.fail("stale evidence recorded")
+    )
+    state = _ready(current_flow_revision=4, current_definition_digest="d4")
+    result = {
+        "task_id": "t",
+        "status": "success",
+        "flow_revision": 3,
+        "definition_digest": "d3",
+        "acceptance_audit": {"passed": True},
+    }
+    assert not _sync_run_result(None, result, state)
+    assert state.accepted_revision is None and state.attempt_budget["spent"] == 0
+
+
+@pytest.mark.parametrize("execution_changed", [False, None, True])
+def test_only_effective_execution_changes_clear_repair_obligations(execution_changed):
+    state = _ready(
+        audit_findings={"issues": [{"issue": "missing_records"}]},
+        navigation_failure_hint={"node_id": "n"},
+        runtime_escape_findings=[{"severity": "error", "issue": "runtime_escape"}],
+    )
+    _orchestrator_guard_after_tool(
+        "update_flow",
+        {
+            "status": "applied",
+            "revision": 4,
+            "lint_clean": True,
+            "execution_changed": execution_changed,
+        },
+        state,
+    )
+    assert bool(state.audit_findings) is (execution_changed is not True)
+    assert bool(state.navigation_failure_hint) is (execution_changed is not True)
+    assert bool(state.runtime_escape_findings) is (execution_changed is not True)
+
+
+@pytest.mark.parametrize("tool", ["lint_flow", "validate_flow"])
+@pytest.mark.parametrize("failure", ["exception", "error_result", "invalid_result"])
+async def test_diagnostic_failures_remain_blocking(tool, failure):
+    from app.services.ai_flow_state import _collect_findings
+    from app.services.ai_phases import Phase, resolve_phase
+
+    class Executor:
+        async def execute(self, name, args):
+            if name == tool:
+                if failure == "exception":
+                    raise RuntimeError("storage unavailable")
+                if failure == "error_result":
+                    return {"status": "error", "error": "storage unavailable"}
+                return None
+            return {"findings": []} if name == "lint_flow" else {"issues": []}
+
+    findings = await _collect_findings(Executor(), "f")
+    assert len(findings) == 1 and findings[0]["issue"] == "diagnostic_check_failed"
+    assert tool in findings[0]["message"]
+    assert resolve_phase(_ready(blocking_diagnostics=findings)) is Phase.FIX
+
+
+@pytest.mark.parametrize("initial_status", ["timeout", "awaiting_confirmation"])
+async def test_background_status_refresh_accepts_runtime_failure(initial_status):
+    from app.services.ai_flow_state import _refresh_run
+
+    calls = []
+
+    class Executor:
+        async def execute(self, name, args):
+            calls.append(name)
+            if name == "get_run_status":
+                return {"task_id": "t", "status": "error", "error": "selector timeout"}
+            return {"task_id": "t", "inspect_hint": "inspect first", "last_browser_url": "https://example.test"}
+
+    refreshed = await _refresh_run(Executor(), {"task_id": "t", "status": initial_status})
+    assert refreshed["status"] == "error"
+    assert refreshed["failure_diagnostics"]["inspect_hint"]
+    assert calls == ["get_run_status", "get_run_error"]
+
+
+async def test_external_edit_is_seen_by_claim_guard_in_the_tool_loop(monkeypatch):
+    import litellm
+
+    reads = 0
+
+    async def build(*args):
+        nonlocal reads
+        reads += 1
+        revision = 3 if reads == 1 else 4
+        return FlowState(flow_id="f", revision=revision, definition_digest=f"d{revision}", is_blank=False)
+
+    def evidence(flow_id, revision, digest):
+        return {
+            "current_flow_revision": revision,
+            "run_verified_revision": 3 if revision == 3 else None,
+            "accepted_revision": 3 if revision == 3 else None,
+        }
+
+    rounds = iter(
+        [
+            _FakeStream(
+                [_chunk(tool_calls=[_tool_call_chunk(0, call_id="types", name="list_node_types", arguments="{}")])]
+            ),
+            _FakeStream([_chunk(content="验收通过", finish="stop")]),
+            _FakeStream([_chunk(content="当前改动尚未运行验证。", finish="stop")]),
+        ]
+    )
+
+    async def completion(**kwargs):
+        return next(rounds)
+
+    monkeypatch.setattr("app.services.ai_orchestrator.build_flow_state", build)
+    monkeypatch.setattr("app.services.ai_orchestrator.load_verification_state", evidence)
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    events = [
+        event
+        async for event in AiOrchestrator(_FakeExecutor()).stream(
+            [{"role": "user", "content": "审查当前流程"}], "test-model", "f"
+        )
+    ]
+    assert any(event["type"] == "retract" for event in events)
+    assert {"type": "verification", "status": "modified_unverified", "revision": 4} in events
+    assert not [event for event in events if event["type"] == "error"]
+
+
+async def test_background_completion_reaches_verification_in_the_tool_loop(monkeypatch):
+    import litellm
+    from app.services.execution_evidence import definition_digest
+    from app.services.ai_evidence_ledger import load_verification_state
+
+    digest = definition_digest(_VERIFIABLE_DEFINITION)
+
+    class Executor(_RunnableFlowExecutor):
+        async def execute(self, name, args, *rest):
+            if name == "run_flow":
+                self.calls.append((name, args))
+                return {
+                    "task_id": "background-t",
+                    "flow_id": "background-f",
+                    "flow_revision": 3,
+                    "definition_digest": digest,
+                    "status": "timeout",
+                }
+            if name == "get_run_status":
+                return {"task_id": "background-t", "status": "success"}
+            if name == "audit_run":
+                return {
+                    "task_id": "background-t",
+                    "flow_revision": 3,
+                    "definition_digest": digest,
+                    "passed": True,
+                    "issues": [],
+                }
+            return await super().execute(name, args, *rest)
+
+    rounds = iter(
+        [
+            _FakeStream(
+                [
+                    _chunk(
+                        tool_calls=[
+                            _tool_call_chunk(0, call_id="run", name="run_flow", arguments='{"flow_id":"background-f"}')
+                        ]
+                    )
+                ]
+            ),
+            _FakeStream([_chunk(content="验收通过", finish="stop")]),
+        ]
+    )
+
+    async def completion(**kwargs):
+        return next(rounds)
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    executor = Executor()
+    events = [
+        event
+        async for event in AiOrchestrator(executor).stream(
+            [{"role": "user", "content": "运行一次验收"}], "test-model", "background-f"
+        )
+    ]
+    assert {"type": "verification", "status": "accepted", "revision": 3} in events
+    assert not [event for event in events if event["type"] in {"error", "retract"}]
+    assert sum(name == "run_flow" for name, _ in executor.calls) == 1
+    assert load_verification_state("background-f", 3, digest)["accepted_revision"] == 3
+
+
+@pytest.mark.parametrize("tool", ["update_flow", "apply_node_fix"])
+def test_effective_fix_recomputes_runtime_blockers_in_the_same_batch(tool):
+    escape = {"severity": "error", "issue": "undefined_variable_ref_runtime_escape"}
+    state = _ready(runtime_escape_findings=[escape], blocking_diagnostics=[escape])
+    _orchestrator_guard_after_tool(tool, {
+        "status": "applied", "revision": 4, "execution_changed": True, "lint_clean": True,
+    }, state)
+    assert state.runtime_escape_findings == []
+    assert _orchestrator_guard_before_tool("run_flow", {"flow_id": "f"}, state) is None
+
+
+@pytest.mark.parametrize("name", ["get_flow", "lint_flow", "validate_flow", "get_run_status", "audit_run", "publish_flow", "unknown"])
+def test_model_entry_rejects_platform_and_removed_tools(name):
+    result = _orchestrator_guard_before_tool(name, {}, _ready())
+    assert result["error"] == "unknown_model_tool"
+    assert name not in result["allowed_tools"]
+
+
+def test_result_from_other_flow_cannot_advance_evidence():
+    state = _ready(flow_id="current", current_flow_revision=3, accepted_revision=3)
+    result = _validate_tool_result_target("update_flow", {
+        "status": "applied", "flow_id": "other", "revision": 4,
+    }, state)
+    assert result["error"] == "tool_result_flow_mismatch"
+    _orchestrator_guard_after_tool("update_flow", result, state)
+    assert state.flow_id == "current" and state.accepted_revision == 3
+    assert state.current_flow_revision == 3
+    error = {"status": "error", "error": "not_found", "flow_id": "other"}
+    assert _validate_tool_result_target("update_flow", error, state) is error
+
+
+@pytest.mark.parametrize("tool,flow_id,allowed", [
+    ("create_flow", "local-draft", True),
+    ("update_flow", "local-draft", False),
+    ("create_flow", "persisted-draft", False),
+])
+def test_only_local_draft_creation_can_adopt_a_new_flow_id(tool, flow_id, allowed):
+    result = {"status": "created", "flow_id": "new-flow", "revision": 1}
+    checked = _validate_tool_result_target(tool, result, _ready(flow_id=flow_id))
+    if allowed:
+        assert checked is result
+    else:
+        assert checked["error"] == "tool_result_flow_mismatch"
+
+
+@pytest.mark.parametrize("prompt", [
+    "创建流程，将本地 CSV 转换为 JSON",
+    "创建流程，调用API https://example.com/api 并保存响应为 JSON",
+    "创建流程，用 HTTP 请求 https://example.com/list 保存为 JSON",
+])
+def test_non_browser_creation_keeps_build_tools(prompt):
+    intents = _detect_turn_intents([{"role": "user", "content": prompt}], None, FlowState())
+    assert intents.create_requested and not intents.create_needs_url
+    assert intents.create_url is None
+    assert "create_flow" in {tool["function"]["name"] for tool in _tool_schemas_for_round(GuardState(), intents)}
+
+
+def test_browser_url_with_api_path_still_requires_page_discovery():
+    intents = _detect_turn_intents([{"role": "user", "content": "创建流程，抓取 https://example.com/api 的表格"}], None, FlowState())
+    assert intents.create_url == "https://example.com/api"
+
+
+@pytest.mark.parametrize("prompt,expected", [
+    ("创建流程，用 Chrome 扩展抓取当前标签页", True),
+    ("创建流程，打开 https://example.com 的网页", False),
+])
+def test_creation_distinguishes_current_extension_page(prompt, expected):
+    intents = _detect_turn_intents([{"role": "user", "content": prompt}], None, FlowState())
+    assert intents.create_current_page is expected
+    if expected:
+        assert intents.create_url is None and not intents.create_needs_url
+
+
+async def test_prefetch_stops_at_first_non_parallel_tool():
+    executor = _FakeExecutor()
+    orchestrator = AiOrchestrator(executor)
+    calls = [
+        (0, {"name": "list_schedules", "arguments": "{}"}),
+        (1, {"name": "list_node_types", "arguments": '{"types":["file.write"]}'}),
+        (2, {"name": "create_schedule", "arguments": "{}"}),
+        (3, {"name": "get_run_logs", "arguments": '{"task_id":"t"}'}),
+    ]
+    tasks = orchestrator._prefetch_read_only_tools(calls, GuardState())
+    try:
+        assert set(tasks) == {0, 1}
+        await asyncio.gather(*tasks.values())
+        assert [name for name, _ in executor.calls] == ["list_schedules", "list_node_types"]
+        assert orchestrator._prefetch_read_only_tools(calls[2:], GuardState()) == {}
+    finally:
+        for task in tasks.values():
+            task.cancel()
+        await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+
+async def test_batch_read_observes_preceding_schedule_write(monkeypatch):
+    import litellm
+
+    class Executor(_RunnableFlowExecutor):
+        created = False
+
+        async def execute(self, name, args, *rest):
+            if name == "create_schedule":
+                await asyncio.sleep(0)
+                self.created = True
+                return {"flow_id": "flow-run", "schedule_id": "s", "status": "enabled"}
+            if name == "list_schedules":
+                return {"count": int(self.created)}
+            return await super().execute(name, args, *rest)
+
+    rounds = iter([
+        _FakeStream([_chunk(tool_calls=[
+            _tool_call_chunk(0, call_id="create", name="create_schedule", arguments='{"flow_id":"flow-run","cron_expression":"0 9 * * *"}'),
+            _tool_call_chunk(1, call_id="list", name="list_schedules", arguments="{}"),
+            _tool_call_chunk(2, call_id="types", name="list_node_types", arguments='{"types":["file.write"]}'),
+        ], finish="tool_calls")]),
+        _FakeStream([_chunk(content="定时任务已创建。", finish="stop")]),
+    ])
+
+    async def completion(**kwargs):
+        return next(rounds)
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    events = [event async for event in AiOrchestrator(Executor()).stream(
+        messages=[{"role": "user", "content": "每天 9 点运行"}], flow_id="flow-run", model="test-model",
+    )]
+    result = next(event["result"] for event in events if event["type"] == "tool_result" and event["tool"] == "list_schedules")
+    assert result["count"] == 1
+
+
+async def test_hidden_tool_is_not_dispatched_by_stream(monkeypatch):
+    import litellm
+
+    rounds = iter([
+        _FakeStream([_chunk(tool_calls=[_tool_call_chunk(0, call_id="hidden", name="audit_run", arguments='{"task_id":"t"}')], finish="tool_calls")]),
+        _FakeStream([_chunk(content="无法从模型入口调用内部工具。", finish="stop")]),
+    ])
+
+    async def completion(**kwargs):
+        return next(rounds)
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    executor = _RunnableFlowExecutor()
+    events = [event async for event in AiOrchestrator(executor).stream(
+        messages=[{"role": "user", "content": "查看流程状态"}], flow_id="flow-run", model="test-model",
+    )]
+    assert any(event["type"] == "tool_result" and event["result"].get("error") == "unknown_model_tool" for event in events)
+    assert not any(name == "audit_run" for name, _ in executor.calls)
+    assert any(name == "get_flow" for name, _ in executor.calls)
+
+
+@pytest.mark.parametrize("tool", ["update_flow", "run_flow", "create_schedule"])
+async def test_stream_rejects_cross_flow_calls_before_dispatch(monkeypatch, tmp_path, tool):
+    import litellm
+    from app.services import ai_session_checkpoint
+
+    monkeypatch.setattr(ai_session_checkpoint, "resolve_ai_dir", lambda: tmp_path)
+
+    args = {"flow_id": "other"}
+    if tool == "create_schedule":
+        args["cron_expression"] = "0 9 * * *"
+
+    async def completion(**kwargs):
+        return _FakeStream([_chunk(tool_calls=[_tool_call_chunk(
+            0, call_id="cross-flow", name=tool, arguments=json.dumps(args),
+        )], finish="tool_calls")])
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    executor = _RunnableFlowExecutor()
+    stream = AiOrchestrator(executor).stream(
+        messages=[{"role": "user", "content": "每天运行当前流程"}],
+        flow_id="flow-run", model="test-model",
+    )
+    blocked = None
+    try:
+        async for event in stream:
+            if event["type"] == "tool_result":
+                blocked = event["result"]
+                break
+    finally:
+        await stream.aclose()
+    assert blocked.get("expected_flow_id") == "flow-run", blocked
+    assert not any(name == tool for name, _ in executor.calls)
+
+
+@pytest.mark.parametrize("prompt,discover", [
+    ("创建流程，将本地 CSV 转换为 JSON", False),
+    ("创建流程，调用 API https://example.com/api 保存响应", False),
+    ("创建流程，用 Chrome 扩展抓取当前标签页", True),
+])
+async def test_creation_stream_selects_tools_for_the_actual_source(monkeypatch, prompt, discover):
+    import litellm
+
+    captured = []
+
+    async def completion(**kwargs):
+        captured.append(kwargs)
+        return _FakeStream([_chunk(content="正在处理。", finish="stop")])
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    stream = AiOrchestrator(_FakeExecutor()).stream(
+        messages=[{"role": "user", "content": prompt}], model="test-model",
+    )
+    try:
+        async for event in stream:
+            if event["type"] == "text":
+                break
+    finally:
+        await stream.aclose()
+    names = {schema["function"]["name"] for schema in captured[0]["tools"]}
+    if discover:
+        assert names == {"inspect_page", "interact_page"}
+        assert 'browser_executor="extension"' in captured[0]["messages"][0]["content"]
+    else:
+        assert "create_flow" in names

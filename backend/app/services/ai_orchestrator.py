@@ -8,6 +8,7 @@ import os
 import re
 import time
 from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -49,6 +50,7 @@ from app.services.ai_prompts import PAGE_DISCOVERY_PROMPT, SYSTEM_PROMPT
 from app.services.ai_flow_state import (
     FlowState,
     build_flow_state,
+    is_local_draft_flow_id,
     render_flow_state,
     sync_state_message,
 )
@@ -61,6 +63,14 @@ from app.services.node_semantics import TRANSFORM_NODE_TYPES
 from app.services.ai_tools.lint import is_blocking_finding
 
 logger = logging.getLogger(__name__)
+_PUBLIC_TOOL_NAMES = frozenset(schema["function"]["name"] for schema in TOOL_SCHEMAS)
+
+
+async def _cancel_tool_tasks(tasks: set[asyncio.Task[Any]]) -> None:
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 # 防止上游卡死导致前端一直停在"正在思考…"
 LLM_REQUEST_TIMEOUT = 90       # 连接/读取超时（秒）
@@ -216,7 +226,7 @@ _REPAIR_INTENT_KEYWORDS = frozenset({
 # 因此不收「试试」「验证」这类兼有别义的词（"试试改成 xpath"、"人机验证"），
 # 也不收单独的「审查」——静态审查本身就能交付结论，它不必然要求运行。
 _RUN_AUTHORIZATION_RE = re.compile(
-    r"(验收|核对|跑一下|跑一次|跑一遍|跑通|跑起来看|运行一下|运行一次|运行看|运行验证|"
+    r"(验收|跑一下|跑一次|跑一遍|跑通|跑起来看|运行一下|运行一次|运行看|运行验证|"
     r"执行一下|重跑|重新运行|再跑|测一下|测试一下|能不能用|是否可用|run it)",
     re.IGNORECASE,
 )
@@ -245,8 +255,8 @@ def _is_explicit_channel_switch_request(user_text_lower: str) -> bool:
 
 # 用户消息中表明创建新流程意图的关键字（配合 URL 检测要求先看页面）
 _CREATE_INTENT_KEYWORDS = frozenset({
-    "创建", "新建", "生成流程", "生成一个", "帮我做", "做一个", "建一个", "写一个",
-    "帮我创", "帮我生成", "自动化", "爬取", "抓取", "登录", "流程",
+    "创建", "新建", "生成流程", "生成一个", "帮我做", "做一个", "建一个", "建个流程", "写一个",
+    "帮我创", "帮我生成", "自动化", "爬取", "抓取", "登录",
     "create", "make", "build", "generate", "scrape", "automate",
 })
 
@@ -498,14 +508,18 @@ _WEAK_MODEL_PREAMBLE = (
 _relay_models_cache: dict[str, tuple[list[str], float]] = {}
 _RELAY_CACHE_TTL = 300  # seconds
 
-# (base_url, api_key) -> AsyncOpenAI。客户端按配置复用：一次 30 轮的编排若每轮
-# 新建 AsyncOpenAI + httpx.AsyncClient 且从不关闭，会持续泄漏连接池/socket。
-_relay_client_cache: dict[str, Any] = {}
+@dataclass
+class _RelayClient:
+    client: Any
+    users: int = 0
+    retired: bool = False
 
 
-def _get_relay_client(base_url: str, api_key: str) -> Any | None:
-    """按 (base_url, api_key) 缓存的 AsyncOpenAI 客户端，剥离遥测请求头。"""
-    cache_key = f"{base_url}|{api_key}"
+_relay_client_cache: dict[tuple[str, str], _RelayClient] = {}
+
+
+def _get_relay_client(base_url: str, api_key: str) -> _RelayClient | None:
+    cache_key = (base_url, api_key)
     client = _relay_client_cache.get(cache_key)
     if client is not None:
         return client
@@ -538,8 +552,44 @@ def _get_relay_client(base_url: str, api_key: str) -> Any | None:
         base_url=base_url,
         http_client=_httpx.AsyncClient(transport=_CleanRelay()),
     )
-    _relay_client_cache[cache_key] = client
-    return client
+    entry = _RelayClient(client)
+    _relay_client_cache[cache_key] = entry
+    return entry
+
+
+async def _close_relay_client(entry: _RelayClient) -> None:
+    try:
+        await entry.client.close()
+    except Exception:
+        logger.warning("Failed to close relay client")
+
+
+async def close_relay_clients() -> None:
+    global _relay_models_cache
+    entries = list(_relay_client_cache.values())
+    _relay_client_cache.clear()
+    # 旧的 /models 请求仍可能在等待；它只能写回旧缓存，不能污染新配置。
+    _relay_models_cache = {}
+    for entry in entries:
+        entry.retired = True
+    idle = [entry for entry in entries if entry.users == 0]
+    for entry in idle:
+        await _close_relay_client(entry)
+
+
+@asynccontextmanager
+async def _relay_client_lease(base_url: str | None, api_key: str) -> AsyncIterator[Any]:
+    entry = _get_relay_client(base_url, api_key) if base_url else None
+    if entry is not None:
+        entry.users += 1
+    try:
+        yield entry.client if entry is not None else None
+    finally:
+        if entry is not None:
+            entry.users -= 1
+            # 配置变更不能关闭另一条并发响应正在使用的连接池。
+            if entry.retired and entry.users == 0:
+                await _close_relay_client(entry)
 
 # OpenAI SDK 注入的、部分中转商会拦截的请求头；user-agent 单独替换
 _STRIP_HEADERS = frozenset({
@@ -568,7 +618,8 @@ async def _fetch_relay_models(base_url: str, api_key: str) -> list[str]:
     import httpx
 
     cache_key = f"{base_url}|{api_key}"
-    cached = _relay_models_cache.get(cache_key)
+    cache = _relay_models_cache
+    cached = cache.get(cache_key)
     if cached and time.monotonic() - cached[1] < _RELAY_CACHE_TTL:
         return cached[0]
 
@@ -581,7 +632,7 @@ async def _fetch_relay_models(base_url: str, api_key: str) -> list[str]:
         relay_models = [m["id"] for m in r.json().get("data", []) if m.get("id")] if r.status_code == 200 else []
     except Exception:
         relay_models = []
-    _relay_models_cache[cache_key] = (relay_models, time.monotonic())
+    cache[cache_key] = (relay_models, time.monotonic())
     return relay_models
 
 
@@ -782,7 +833,6 @@ _ROUND_STATUS_BY_TOOL: dict[str, str] = {
     "get_run_logs": "正在阅读运行日志…",
     "inspect_page": "正在解读页面结构…",
     "inspect_screenshot": "正在查看页面截图…",
-    "publish_flow": "正在完成发布…",
     "list_node_types": "正在查询可用节点…",
 }
 
@@ -804,7 +854,6 @@ _EXECUTING_STATUS_BY_TOOL: dict[str, str] = {
     "create_flow": "正在写入流程…",
     "update_flow": "正在写入变更…",
     "apply_node_fix": "正在修改节点…",
-    "publish_flow": "正在发布…",
 }
 
 
@@ -986,7 +1035,9 @@ class _TurnIntents:
     create_requested: bool = False
     # 非 None 即检测到创建意图，值为需求里的首个 URL
     create_url: str | None = None
-    # 本轮已授权运行：用户点明了要跑（验收/跑一下/核对…），或这轮就是从零建流程
+    create_current_page: bool = False
+    create_needs_url: bool = False
+    # 本轮已授权运行：用户点明了要跑（验收/跑一下…），或这轮就是从零建流程
     run_authorized: bool = False
 
 
@@ -1184,10 +1235,20 @@ def _detect_turn_intents(
             or (resolved.resume_requested and resolved.target_url is not None)
         )
         urls = _URL_IN_TEXT_RE.findall(user_text)
-        if urls and intents.create_requested:
+        intent_text = _URL_IN_TEXT_RE.sub("", resolved.requirement_text)
+        api_only = bool(re.search(r"(?<![a-z])(?:api|http)(?![a-z])|接口", intent_text, re.IGNORECASE)) and not re.search(
+            r"网页|页面|浏览器|点击|填表|登录|\b(?:chrome|browser)\b", intent_text, re.IGNORECASE
+        )
+        intents.create_current_page = intents.create_requested and bool(re.search(
+            r"(?:当前|已打开).*(?:页|标签)|current\s+tab", user_text, re.IGNORECASE
+        )) and bool(re.search(r"扩展|chrome|extension", user_text, re.IGNORECASE))
+        if urls and intents.create_requested and not api_only and not intents.create_current_page:
             intents.create_url = urls[0]
-        elif intents.create_requested and resolved.target_url and not _NEW_TASK_RE.search(user_text):
+        elif intents.create_requested and resolved.target_url and not api_only and not intents.create_current_page and not _NEW_TASK_RE.search(user_text):
             intents.create_url = resolved.target_url
+        intents.create_needs_url = (intents.create_requested and not intents.create_url
+                                    and not intents.create_current_page and not api_only
+                                    and bool(re.search(r"网页|网站|网址|页面|浏览器", intent_text)))
     # 从零建流程本身就是运行授权。用户要的是一条能用的流程，而「能不能用」这个判断只随
     # run_flow 的 acceptance_audit 回来；建完不跑就收尾，等于把验证甩回给用户自己试，
     # 而 BUILD→VERIFY 这条主线（含验收契约与预算熔断）在第一轮永远走不到。
@@ -1206,7 +1267,7 @@ def _tool_schemas_for_round(
     """
     if state.terminal_response_only or state.closing_statement_only:
         return []
-    if intents.create_requested and not intents.create_url:
+    if intents.create_needs_url:
         return []
     available = [
         schema for schema in TOOL_SCHEMAS
@@ -1304,8 +1365,8 @@ class AiOrchestrator:
         self._executor = tool_executor
         self._config_service = config_service
 
-    async def _completion_kwargs(self, model: str) -> tuple[str, dict[str, Any]]:
-        """解析中转地址与鉴权，返回 (实际请求的模型名, litellm 额外参数)。"""
+    @asynccontextmanager
+    async def _completion_kwargs(self, model: str) -> AsyncIterator[tuple[str, dict[str, Any]]]:
         raw_base_url = self._config_service.get_base_url_for_model(model) if self._config_service else None
         api_key = self._config_service.get_api_key_for_model(model) if self._config_service else None
         # LiteLLM 直接把 /chat/completions 拼到 base_url 后面，须以 /v1 结尾
@@ -1327,16 +1388,16 @@ class AiOrchestrator:
 
         extra: dict[str, Any] = {}
         effective_model = model
-        if base_url and api_key:
-            effective_model = await _resolve_relay_model(model, base_url, api_key)
-        if base_url:
-            extra["base_url"] = base_url
-            relay_client = _get_relay_client(base_url, api_key or "sk-relay")
+        async with _relay_client_lease(base_url, api_key or "sk-relay") as relay_client:
+            if base_url and api_key:
+                effective_model = await _resolve_relay_model(model, base_url, api_key)
+            if base_url:
+                extra["base_url"] = base_url
             if relay_client is not None:
                 extra["client"] = relay_client
-        if api_key:
-            extra["api_key"] = api_key
-        return effective_model, extra
+            if api_key:
+                extra["api_key"] = api_key
+            yield effective_model, extra
 
     async def stream(
         self,
@@ -1348,7 +1409,7 @@ class AiOrchestrator:
         """流式输出一轮 assistant 回复。
 
         read_only=True 用于自愈诊断等无人值守场景：允许全部诊断类工具，
-        阻断 create_flow / update_flow / apply_node_fix / run_flow / publish_flow。
+        阻断流程写入、运行和调度等有副作用的工具。
 
         探索用的浏览器会话在本轮结束时一定要关掉：它按 owner 登记着 browser profile
         的进程内互斥锁，留着会让用户在界面上手动点运行时被判成「浏览器被占用」。
@@ -1360,18 +1421,26 @@ class AiOrchestrator:
         """
         token = _page_session.new_owner_token()
         reset = _page_session.set_owner(token)
+        tool_tasks: set[asyncio.Task[Any]] = set()
+        inner = self._stream_inner(messages, model, flow_id, read_only, tool_tasks)
         try:
-            async for event in self._stream_inner(messages, model, flow_id, read_only):
+            async for event in inner:
                 yield event
         finally:
             from app.services.ai_tools import extension_page_channel
             try:
-                await _page_session.close_current("turn_end", token=token)
+                try:
+                    await _cancel_tool_tasks(tool_tasks)
+                finally:
+                    await inner.aclose()
             finally:
                 try:
-                    await extension_page_channel.close_current("turn_end", token=token)
+                    await _page_session.close_current("turn_end", token=token)
                 finally:
-                    _page_session.reset_owner(reset)
+                    try:
+                        await extension_page_channel.close_current("turn_end", token=token)
+                    finally:
+                        _page_session.reset_owner(reset)
 
     def _prefetch_read_only_tools(
         self, tool_items: list[tuple[int, dict[str, str]]], guard_state: GuardState
@@ -1381,15 +1450,18 @@ class AiOrchestrator:
         预取发生在串行校验前，必须先用无副作用的阶段查询检查重复取证；
         不能调用会记账的护栏，否则串行执行时会重复扣减预算。"""
         prefetched: dict[int, asyncio.Task[Any]] = {}
-        if sum(1 for _, call in tool_items if call["name"] in _PARALLEL_SAFE_TOOLS) <= 1:
+        prefix: list[tuple[int, dict[str, str]]] = []
+        for item in tool_items:
+            if item[1]["name"] not in _PARALLEL_SAFE_TOOLS:
+                break
+            prefix.append(item)
+        if len(prefix) <= 1:
             return prefetched
         # 同一批里参数完全相同的第二次读取不抢跑：取证类的会被串行门以
         # evidence_already_collected 拒掉（门判的是第一次记账之后的状态），
         # 其余两个读到的也只会是同一份。跳过不改变结果——真到它那一格时串行分支照旧执行。
         batch_prints: set[str] = set()
-        for idx, call in tool_items:
-            if call["name"] not in _PARALLEL_SAFE_TOOLS:
-                continue
+        for idx, call in prefix:
             try:
                 args, duplicate_keys = (
                     _parse_tool_arguments(call["arguments"]) if call["arguments"].strip() else ({}, [])
@@ -1413,6 +1485,7 @@ class AiOrchestrator:
         model: str,
         flow_id: str | None,
         read_only: bool,
+        tool_tasks: set[asyncio.Task[Any]],
     ) -> AsyncIterator[dict[str, Any]]:
         try:
             import litellm
@@ -1473,6 +1546,7 @@ class AiOrchestrator:
             flow_id=flow_id,
             # 验收台账事实：current_flow_revision / run_verified_revision / accepted_revision
             **evidence_state,
+            current_definition_digest=flow_state.definition_digest,
             repair_sessions=int(ledger.get("sessions") or 0) + 1,
             node_field_history=dict(ledger.get("node_field_history") or {}),
             node_selector_fix_counts=dict(ledger.get("node_selector_fix_counts") or {}),
@@ -1527,12 +1601,14 @@ class AiOrchestrator:
             guard_state.browser_chain_node_ids = flow_state.browser_chain_node_ids
             full_messages.append({"role": "system", "content": _GUIDANCE_PRESERVE_EXECUTION_CHANNEL})
 
-        if intents.create_url:
+        if intents.create_url or intents.create_current_page:
             build_tool = "create_flow" if flow_state.is_blank else "update_flow"
             guard_state.page_evidence_required = {
                 "url": intents.create_url,
                 "reason": "build_from_page",
             }
+            if intents.create_current_page:
+                guard_state.page_evidence_required = {"browser_executor": "extension", "reason": "build_from_current_page"}
             guard_state.page_evidence_done = task_state.phase == "page_inspected"
             full_messages.append({"role": "system", "content": _build_guidance_before_create(build_tool)})
 
@@ -1559,39 +1635,73 @@ class AiOrchestrator:
                 flow_state = await build_flow_state(self._executor, flow_id, last_run)
             else:
                 flow_state.last_run = last_run
+            _sync_flow_state(flow_state, guard_state)
+            refreshed_run = flow_state.last_run
+            if _sync_run_result(last_run, refreshed_run, guard_state):
+                _session_checkpoint.save(flow_id, guard_state, rounds=meter.rounds)
+            last_run = refreshed_run
             sync_state_message(full_messages, render_flow_state(flow_state))
             # 阶段由事实推导，所以事实必须每轮跟着状态块一起重算：用户可能在画布上
             # 直接补了节点，也可能把节点删空。存一份「上轮的阶段」就是第二份真相。
             guard_state.blocking_diagnostics = _blocking_diagnostics(flow_state, guard_state)
             guard_state.flow_has_nodes = not flow_state.is_blank
             guard_state.acceptance_contract_initialized = flow_state.acceptance_contract_initialized
+            verification_status = current_verification_status(guard_state)
+            verification_revision = guard_state.current_flow_revision
+            if verification_revision is not None and (
+                verification_status != last_verification_status
+                or verification_revision != last_verification_revision
+            ):
+                last_verification_status = verification_status
+                last_verification_revision = verification_revision
+                yield {"type": "verification", "status": verification_status, "revision": verification_revision}
             _mark_history_cache_anchor(full_messages, model, relayed)
             collected: _RoundOutput = _RoundOutput()
             round_started_at = time.monotonic()
 
             try:
-                effective_model, extra = await self._completion_kwargs(model)
-                full_messages[0] = _build_system_message(
-                    model,
-                    relayed,
-                    _system_prompt_for_round(guard_state),
-                )
-                round_tools = _tool_schemas_for_round(guard_state, intents)
-                completion_args: dict[str, Any] = {
-                    "model": effective_model,
-                    "messages": _serialize_messages(full_messages),
-                    "stream": True,
-                    "stream_options": {"include_usage": True},
-                    "drop_params": True,
-                    "timeout": LLM_REQUEST_TIMEOUT,
-                    **extra,
-                }
-                if round_tools:
-                    completion_args["tools"] = round_tools
-                    completion_args["tool_choice"] = "auto"
-                response = await litellm.acompletion(
-                    **completion_args,
-                )
+                async with self._completion_kwargs(model) as (effective_model, extra):
+                    full_messages[0] = _build_system_message(
+                        model,
+                        relayed,
+                        _system_prompt_for_round(guard_state),
+                    )
+                    round_tools = _tool_schemas_for_round(guard_state, intents)
+                    completion_args: dict[str, Any] = {
+                        "model": effective_model,
+                        "messages": _serialize_messages(full_messages),
+                        "stream": True,
+                        "stream_options": {"include_usage": True},
+                        "drop_params": True,
+                        "timeout": LLM_REQUEST_TIMEOUT,
+                        **extra,
+                    }
+                    if round_tools:
+                        completion_args["tools"] = round_tools
+                        completion_args["tool_choice"] = "auto"
+                    response = await litellm.acompletion(
+                        **completion_args,
+                    )
+                    try:
+                        async for event in _consume_round_stream(
+                            response, collected, model=effective_model, round_num=round_num
+                        ):
+                            yield event
+                        if collected.stall_error is not None:
+                            yield {"type": "error", "message": collected.stall_error}
+                            yield {"type": "done"}
+                            return
+                        round_elapsed = time.monotonic() - round_started_at
+                        _log_prompt_cache_usage(effective_model, round_num, collected.usage, round_elapsed)
+                        meter.add_round(collected.usage, round_elapsed)
+                        yield {"type": "usage", "usage": meter.snapshot(effective_max_rounds)}
+                    finally:
+                        close_response = getattr(response, "aclose", None)
+                        if close_response is not None:
+                            try:
+                                await close_response()
+                            except Exception:
+                                logger.warning("Failed to close LLM response")
             except _MissingApiKeyError as key_exc:
                 yield {"type": "error", "message": str(key_exc)}
                 yield {"type": "done"}
@@ -1603,30 +1713,6 @@ class AiOrchestrator:
                     yield {"type": "status", "delta": "当前模型不支持图片，已移除截图重试…"}
                     continue
                 yield {"type": "error", "message": clean_litellm_error(str(exc))}
-                yield {"type": "done"}
-                return
-
-            try:
-                async for event in _consume_round_stream(
-                    response, collected, model=effective_model, round_num=round_num
-                ):
-                    yield event
-                if collected.stall_error is not None:
-                    yield {"type": "error", "message": collected.stall_error}
-                    yield {"type": "done"}
-                    return
-                round_elapsed = time.monotonic() - round_started_at
-                _log_prompt_cache_usage(effective_model, round_num, collected.usage, round_elapsed)
-                meter.add_round(collected.usage, round_elapsed)
-                yield {"type": "usage", "usage": meter.snapshot(effective_max_rounds)}
-            except Exception as stream_exc:
-                if not vision_fallback_done and is_vision_error(str(stream_exc)) and _strip_image_messages(full_messages):
-                    # 已 yield 的本轮部分文本无法撤回，重试后可能出现重复段落——
-                    # 视觉错误几乎总在首 token 前抛出（请求校验阶段），实际影响可忽略。
-                    vision_fallback_done = True
-                    yield {"type": "status", "delta": "当前模型不支持图片，已移除截图重试…"}
-                    continue
-                yield {"type": "error", "message": clean_litellm_error(str(stream_exc))}
                 yield {"type": "done"}
                 return
 
@@ -1727,6 +1813,7 @@ class AiOrchestrator:
 
             tool_items = list(collected.tool_calls.items())
             prefetched = self._prefetch_read_only_tools(tool_items, guard_state)
+            tool_tasks.update(prefetched.values())
 
             _stop_after: int | None = None
             terminal_response: str | None = None
@@ -1784,6 +1871,7 @@ class AiOrchestrator:
                                         _build_change_context(guard_state),
                                     )
                                 )
+                                tool_tasks.add(tool_task)
                             tool_started_at = time.monotonic()
                             while not tool_task.done():
                                 try:
@@ -1796,6 +1884,7 @@ class AiOrchestrator:
                                         "progress": dict(progress_sink) or None,
                                     }
                             result = tool_task.result()
+                            tool_tasks.discard(tool_task)
                     except Exception as exc:
                         result = {"error": str(exc), "status": "error"}
 
@@ -1810,13 +1899,14 @@ class AiOrchestrator:
                 # 记账与落盘都排在 yield 之前：一旦让出去，用户点停止就会让这个生成器
                 # 停在这里再也不往下走，而这次工具的代价（run_flow 常以分钟计）已经付掉了。
                 last_tool_name = tool_name
+                result = _validate_tool_result_target(tool_name, result, guard_state)
                 result = attach_tool_events(tool_name, result)
                 reduce_evidence_state(guard_state, result)
                 if tool_name in _RUN_STATE_TOOLS and _tool_call_succeeded(result):
                     # 下一轮的状态块要讲「最近一次运行怎么样了」，来源就是这里
                     last_run = result
                 previous_flow_id = flow_id
-                if isinstance(result, dict):
+                if _tool_call_succeeded(result):
                     event_flow_id = result.get("flow_id") or guard_state.flow_id
                     if isinstance(event_flow_id, str):
                         flow_id = event_flow_id
@@ -1883,9 +1973,9 @@ class AiOrchestrator:
                     _stop_after = _exec_idx
                     break
 
-            # 被 guard 拦下或 break 跳过的预取任务不会有人来取结果，留着会变成孤儿任务
-            for _orphan in prefetched.values():
-                _orphan.cancel()
+            orphans = set(prefetched.values())
+            await _cancel_tool_tasks(orphans)
+            tool_tasks.difference_update(orphans)
             prefetched.clear()
 
             if _stop_after is not None and _stop_after + 1 < len(tool_items):
@@ -1933,13 +2023,27 @@ def _tool_call_succeeded(result: Any) -> bool:
         return False
     if result.get("error"):
         return False
-    return result.get("status") not in _NON_EXECUTED_STATUSES
+    return (result.get("status") not in _NON_EXECUTED_STATUSES
+            and not str(result.get("status") or "").startswith("blocked_"))
+
+
+def _validate_tool_result_target(tool_name: str, result: Any, state: GuardState) -> Any:
+    if not _tool_call_succeeded(result) or not state.flow_id:
+        return result
+    if tool_name == "create_flow" and is_local_draft_flow_id(state.flow_id):
+        return result
+    target = result.get("flow_id")
+    if target is None or target == state.flow_id:
+        return result
+    return {"status": "error", "error": "tool_result_flow_mismatch", "tool": tool_name,
+            "expected_flow_id": state.flow_id,
+            "message": "工具结果不属于当前流程，未更新会话状态或验证证据。"}
 
 
 # run_flow 停在这些状态是「轮到用户了」，不是流程没修好。
 # stopped 一并算进来：run_flow 是阻塞轮询的，轮询期间任务变成 stopped 只可能是用户
 # 自己按了停止——把它记成一次失败的修复，等于用户每中止一次就替模型花掉三分之一额度。
-_RUN_WAITING_STATUSES = frozenset({"awaiting_confirmation", "stopped"})
+_RUN_WAITING_STATUSES = frozenset({"awaiting_confirmation", "stopped", "timeout", "running", "pending", "queued"})
 
 # 执行器在起跑前就拒掉的返回：流程一行都没跑。收敛额度定价的是「真跑过一次」的代价，
 # 这些一次都不该按运行计价——`blocked_by_failure_budget` 尤其是自我加固：熔断锁自己的
@@ -2353,6 +2457,41 @@ def _blocking_diagnostics(
     return blocking or None
 
 
+def _sync_flow_state(flow_state: FlowState, state: GuardState) -> None:
+    if (state.current_flow_revision == flow_state.revision
+            and state.current_definition_digest == flow_state.definition_digest):
+        return
+    evidence = load_verification_state(state.flow_id, flow_state.revision, flow_state.definition_digest)
+    state.current_flow_revision = evidence["current_flow_revision"]
+    state.current_definition_digest = flow_state.definition_digest
+    state.run_verified_revision = evidence["run_verified_revision"]
+    state.accepted_revision = evidence["accepted_revision"]
+    state.run_succeeded = False
+    state.audit_passed = False
+    state.run_attempted = False
+    state.verification_nudged = False
+
+
+def _sync_run_result(previous: Any, current: Any, state: GuardState) -> bool:
+    if not isinstance(current, dict):
+        return False
+    if isinstance(previous, dict) and all(
+        previous.get(key) == current.get(key)
+        for key in ("task_id", "status", "acceptance_audit")
+    ):
+        return False
+    # 后台完成的旧任务不能推进另一版流程的证据或修复预算。
+    if (current.get("flow_revision") != state.current_flow_revision
+            or (state.current_definition_digest is not None
+                and current.get("definition_digest") != state.current_definition_digest)):
+        return False
+    result = attach_tool_events("run_flow", current)
+    reduce_evidence_state(state, result)
+    record_events(state.flow_id, [event for event in (result.get("events") or []) if isinstance(event, dict)])
+    _after_run_flow(result, state)
+    return True
+
+
 def _orchestrator_guard_before_tool(
     tool_name: str,
     args: dict[str, Any],
@@ -2362,6 +2501,9 @@ def _orchestrator_guard_before_tool(
 
     授权拒绝优先，避免阶段提示推荐同样未获授权的动作。
     护栏拦截通过 note_guard_block 计入预算，防止重复拒绝形成无限循环。"""
+    if tool_name not in _PUBLIC_TOOL_NAMES:
+        return {"status": "error", "error": "unknown_model_tool", "tool": tool_name,
+                "allowed_tools": sorted(_PUBLIC_TOOL_NAMES)}
     blocked = apply_pre_tool_guards(tool_name, args, state)
     if blocked is not None:
         return note_guard_block(state, tool_name, blocked)
@@ -2786,10 +2928,10 @@ def _after_node_edit(result: dict[str, Any], state: GuardState) -> None:
             sessions=int(state.repair_sessions or 1),
         )
 
-    # 只有真实结构修复才能解除各类失败标记，下一次运行会重新审计。
-    state.audit_findings = None
-    state.navigation_failure_hint = None
-    state.runtime_escape_findings = []
+    if result.get("execution_changed") is True:
+        state.audit_findings = None
+        state.navigation_failure_hint = None
+        state.runtime_escape_findings = []
 
 
 def _after_create_flow(result: dict[str, Any], state: GuardState) -> None:
@@ -2804,20 +2946,21 @@ def _after_create_flow(result: dict[str, Any], state: GuardState) -> None:
 
 
 def _after_update_flow(result: dict[str, Any], state: GuardState) -> None:
-    if result.get("error"):
+    if not _tool_call_succeeded(result) or result.get("execution_changed") is False:
         return
-    _after_flow_write(result, state)
     _after_node_edit(result, state)
+    _after_flow_write(result, state)
 
 
 def _after_apply_node_fix(result: dict[str, Any], state: GuardState) -> None:
-    if result.get("error"):
+    if not _tool_call_succeeded(result):
         return
-    _after_flow_write(result, state)
     _after_node_edit(result, state)
+    _after_flow_write(result, state)
     # 熔断之后唯一还放行的写工具：它成功落盘说明模型确实定位到了单个节点、不是又一次盲改，
     # 所以这把锁只能由它解除。update_flow 不行——整流程重写正是这把锁要拦的东西。
-    state.failure_budget_lock = None
+    if result.get("execution_changed") is True:
+        state.failure_budget_lock = None
 
 
 def _after_set_acceptance_contract(result: dict[str, Any], state: GuardState) -> None:
@@ -2850,7 +2993,6 @@ _AFTER_TOOL_NO_STATE_EFFECT = frozenset({
     "create_schedule",
     "list_node_types",
     "list_schedules",
-    "publish_flow",
     "stop_run",
     "toggle_schedule",
 })
@@ -2869,7 +3011,7 @@ def _orchestrator_guard_after_tool(tool_name: str, result: Any, state: GuardStat
     # terminal_response_only 会走模板回复，把「改了哪个节点的哪个字段」那段顶掉。
     if result.get("required_action") == "ask_user":
         state.closing_statement_only = True
-    if result.get("error") == "invalid_arguments" and tool_name != "run_flow":
+    if result.get("error") in ("invalid_arguments", "unknown_model_tool") and tool_name != "run_flow":
         note_failed_attempt(
             state, kind="invalid_arguments",
             signature=f"{tool_name}:" + json.dumps(result.get("issues", []), sort_keys=True, ensure_ascii=False),

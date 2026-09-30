@@ -75,6 +75,7 @@ class GuardState:
     # 验收台账事实：构造时由 load_verification_state 给，本轮内由
     # reduce_evidence_state 按工具事件推进（写流程作废已验证的 revision）
     current_flow_revision: int | None = None
+    current_definition_digest: str | None = None
     run_verified_revision: int | None = None
     accepted_revision: int | None = None
 

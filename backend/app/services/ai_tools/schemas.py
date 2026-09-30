@@ -328,6 +328,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "（分 时 日 月 周，如 '0 9 * * *' 表示每天 09:00）。"
                 "创建前必须确认流程存在且可运行（凭据类 input_variables 的 value 不能为空——"
                 "定时任务无人值守，无法运行时补输入）；依赖运行中人工操作的流程不能创建定时任务。"
+                "缺少完整验收契约或存在阻断诊断时拒绝创建；草稿请先用 set_acceptance_contract 补齐。"
             ),
             "parameters": {
                 "type": "object",
@@ -445,21 +446,6 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["flow_id", "acceptance_contract"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "publish_flow",
-            "description": "将流程发布为 active 状态，使其可被调度执行。",
-            "parameters": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "flow_id": {"type": "string"}
-                },
-                "required": ["flow_id"],
             },
         },
     },

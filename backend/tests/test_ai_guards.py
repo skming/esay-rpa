@@ -45,7 +45,7 @@ def _blocked_by(tool: str, args: dict[str, Any], state: GuardState) -> dict[str,
 
 def test_read_only_mode_blocks_every_write_but_no_diagnosis() -> None:
     state = GuardState(read_only_tools=True)
-    for tool in ("create_flow", "update_flow", "apply_node_fix", "run_flow", "publish_flow"):
+    for tool in ("create_flow", "update_flow", "apply_node_fix", "run_flow"):
         assert _blocked_by(tool, {}, state)["guard_id"] == "read_only_mode"
     # 诊断手段一个都不能收——只读模式的产物就是一份根因分析
     for tool in ("get_run_error", "inspect_page", "get_run_logs", "get_run_output"):
@@ -342,6 +342,16 @@ def test_every_tool_is_classified_as_writing_or_read_only() -> None:
 
     assert FLOW_WRITE_TOOLS <= WRITE_TOOLS
     assert PARALLEL_SAFE_TOOLS <= _READ_ONLY_TOOLS
+
+
+def test_current_flow_target_rejects_cross_flow_writes() -> None:
+    for tool in ("update_flow", "apply_node_fix", "set_acceptance_contract", "run_flow", "create_schedule"):
+        state = GuardState(flow_id="current", acceptance_contract_initialized=False, user_requirement_text="每天运行")
+        blocked = _blocked_by(tool, {"flow_id": "other"}, state)
+        assert blocked["guard_id"] == "current_flow_target"
+        assert blocked["expected_flow_id"] == "current"
+        if tool != "set_acceptance_contract":
+            assert apply_pre_tool_guards(tool, {"flow_id": "current"}, state) is None
 
 
 def test_every_guard_has_a_test_in_this_file() -> None:

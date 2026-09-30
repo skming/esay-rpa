@@ -673,7 +673,7 @@ class RecordingExecutor:
         for record in reversed(self.evidence):
             if not _record_succeeded(record):
                 continue
-            if record["name"] in ("run_flow", "publish_flow", "set_acceptance_contract", "update_flow"):
+            if record["name"] in ("run_flow", "set_acceptance_contract", "update_flow"):
                 flow_id = record["flow_id"]
                 if flow_id:
                     return flow_id
@@ -697,7 +697,7 @@ def _redact(text: str) -> str:
 
 
 _SYSTEM_HINT = (
-    "这是本地测试页面，可以放心观察和操作。请先看页面，再建流程，"
+    "这是本地测试页面，可以放心观察和操作。请先看页面，再创建流程，"
     "然后用 run_flow 实际跑一次确认结果，不要只写流程不运行。"
 )
 

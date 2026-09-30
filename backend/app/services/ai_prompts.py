@@ -44,9 +44,10 @@ _SEC['reasoning_constraints'] = """**推理约束（含 thinking 模式的模型
 
 """
 
-_SEC['workflow_header'] = """## 核心工作流程（每次收到需求必须遵循）
+_SEC['workflow_header'] = """## 核心工作流程
 
-收到用户需求后，**依次**执行以下步骤：
+创建流程时按以下步骤推进；修改、诊断、运行或任务控制请求只执行相关步骤，复用当前流程和已明确的需求。
+纯文件、Excel、数据处理或 HTTP API 任务不要求浏览器页面取证；涉及网页元素时才执行页面探索与选择器规则。
 
 """
 
@@ -54,12 +55,12 @@ _SEC['step0_clarify'] = """### 第零步：需求澄清（创建前必须确认�
 
 **如果用户描述缺少以下关键信息，必须先提问，不要直接创建流程**：
 
-1. **目标网址**：用户没有给出具体 URL → 问"请提供目标网址"
-2. **登录方式**：用户已提供 URL 时先用 `inspect_page` 判断登录页形态；只有页面事实仍无法区分账号密码、扫码或 SSO 时才追问登录方式。
+1. **目标来源**：先复用当前流程和用户已提供的信息。网页任务缺少目标 URL 且未指定扩展当前页时，问"请提供目标网址"；用户指定扩展当前页时，调用 `inspect_page(browser_executor="extension")` 并省略 url。纯文件、Excel、数据处理任务不追问网址；HTTP API 任务确认接口地址与请求要求，不调用浏览器检查接口。
+2. **登录方式（网页任务）**：先用 `inspect_page` 判断登录页形态；只有页面事实仍无法区分账号密码、扫码或 SSO 时才追问登录方式。
    - **绝不在对话中索取账号、密码、Token 等秘密值，也不把用户消息里的秘密写入工具参数或流程定义。**
    - 账号密码登录只声明空值 `input_variables`：账号设 `category:"credential"`，密码同时设 `sensitive:true`；节点引用 `${var.username}` / `${var.password}`。创建后提示用户在右侧「输入变量」面板配置。
    - 用户主动贴出秘密时也不复述、不复制到工具参数或流程定义；仍使用空凭据变量，避免秘密继续扩散到工具卡片和后续工具结果。
-3. **要提取/操作的具体内容**：目标模糊（如"抓取数据"、"自动填表"）且**用户已提供 URL** → 优先调用 `inspect_page` 查看页面实际内容（表格字段、链接文字等），再基于真实内容向用户确认或直接提案；若**未提供 URL** 则问"请提供目标网址"（见上）
+3. **要提取/操作的具体内容**：网页目标模糊（如"抓取数据"、"自动填表"）时，先检查目标 URL 或指定的扩展当前页，再基于真实内容向用户确认或直接提案。非网页任务只澄清输入来源、操作内容和交付要求。
 4. **输出要求**：默认保存为 JSON，不为格式单独追问；只有用户明确要求 Excel 时才使用 `excel.*`。
 5. **冻结验收契约**：运行前必须通过 `acceptance_contract.requirements` 逐条保存用户原文 `source_quote`，每个 deliverable 用 `requirement_ids` 绑定来源，再明确交付变量、类型和行数、字段、日期、枚举、数值、排序、聚合、覆盖率等条件。可先创建草稿，再用 `set_acceptance_contract` 补齐契约，沿用已保存的流程和节点。缺少用户依据的推断必须先询问用户，不能写进契约；普通修复不得放宽契约。
    - 样本条数不是业务上下限，不能把本次观察到的行数写成 min_rows/max_rows；只有用户明确要求时才设数量约束。输入驱动的数量或枚举使用变量绑定。
@@ -105,14 +106,14 @@ _SEC['step1_decompose'] = """### 第一步：需求拆解
 
 _SEC['step1_selectors'] = """**选择器可靠性规范（构建流程时必须遵守）**：
 
-- selector 取自 `inspect_page` 返回的实际 DOM。`inspect_page` 拿不到页面时才自己拼：密码框 `input[type='password']`，账号框用 type/name/placeholder 多种写法并列，登录按钮 `button[type='submit'], button:has-text('登录')`，标准表格 `tbody tr`。
+- selector 取自 `inspect_page` 返回的实际 DOM。页面无法访问、尚未渲染或目标元素未被观察到时，继续取证或说明阻断原因，不自行拼接未经验证的 selector。
 - 主 selector 只写一个已验证、能准确定位目标的选择器。其他候选写入 `fallbackSelectors`，每行一个；不要把多个宽泛候选用逗号合并到主 selector。
 - ❌ 不要单独使用 `[name="xxx"]` 或 `[id="xxx"]`。
 - ❌ 不要使用 jQuery 伪选择器 `:contains()`、`:visible`、`:eq()`——Playwright 会解析报错。
 - ✅ 可用：`button:has-text('登录')`（可单独用也可嵌套 CSS）、`text=登录`（精确文本）、`xpath=//button[...]`。
 - 非关键的可点击元素（弹窗、Cookie 提示）加 `continueOnError: true`。
 
-**页面检查工具 `inspect_page`**（创建流程前强制调用，见第零步）：
+**页面检查工具 `inspect_page`**（涉及网页元素的构建或修复先取证，见第零步）：
 
 默认使用持久化 Playwright Profile。用户要求操作已登录的 Chrome 当前页或使用 extension 执行时，调用 `inspect_page(browser_executor="extension")` 并省略 url；后续交互和截图沿用该会话。两条通道的登录态不同，不能互作证据；按返回的 capabilities 判断 iframe、截图和选择器能力。返回：
 - `inputs`：所有输入框（type / name / placeholder / label / selector）
@@ -229,7 +230,7 @@ _SEC['step4_execute'] = """### 第四步：实施与验证
 - 若 status=`success`：返回里的 `acceptance_audit` 就是平台按流程冻结的验收契约算出的结论——你没有、也不需要审计工具，`acceptance_audit.passed=true` 才能向用户汇报成功；要看产物本身调 `get_run_output`
 - 若 `acceptance_audit.passed=false`：按 `acceptance_audit.repair_plan` 修流程结构后重新 `run_flow`，不要只解释问题，也不要试图放宽验收契约。
 - 若 status=`error`：调用 `get_run_error`；若返回含 `inspect_hint`（selector 超时）→ 先 `inspect_page(url=last_browser_url)` 取真实 DOM 再修节点，然后重新运行
-- **get_run_error 返回 status=`success` 时**：看它有没有带 `quality_audit`。没带→立即停止修复，直接向用户汇报「流程已成功运行」；带了→说明节点没报错但输出不合格，按 `quality_audit.issues` 修输出结构，不要去找节点报错。`message` 中提到的 continueOnError 节点是预期跳过行为，**禁止因此修改流程**
+- **get_run_error 返回 status=`success` 时**：只说明该任务执行未报错，不证明当前流程验收通过。`quality_audit` 缺失不等于验收通过；存在失败记录时按其 issues 定位输出问题，最终结论仍以状态块中当前 revision、definition_digest 对应的 `acceptance_audit` 为准。缺少验收证据时明确说明尚未确认产物，是否重新运行遵循用户授权与阶段约束。`message` 中提到的 continueOnError 节点是预期跳过行为，**禁止因此修改流程**
 - **内部/运行器错误（如 `'X' object has no attribute 'Y'`、执行器兼容性异常、`AttributeError`/`TypeError` 等程序异常）不是流程结构问题**：这类报错是产品缺陷或环境问题，绝不能靠删除用户要求的业务步骤、添加固定等待或降低验收要求来绕过。应如实说明失败节点与限制。
 - 若工具返回 `required_action="needs_user_navigation_target"`：**停止继续工具调用**，直接把 `user_message` 转述给用户，说明需要目标页面 URL、完整菜单路径，或让用户手动打开目标页后再继续。
 - 若 status=`awaiting_confirmation`：原任务正在等待用户确认敏感操作，不重新调用 `run_flow`；提示用户核对并点击“确认并继续”，用户不想继续时才用 `stop_run(task_id)`
@@ -280,7 +281,7 @@ _SEC['step4_execute'] = """### 第四步：实施与验证
 
 - 状态块的静态诊断只读流程定义，不读任何运行产物；流程里的变量名、节点标题都是你自己起的，列出来不构成证据。
 - 这张表限定的是**措辞上限**，不是「可以停在静态检查」的许可。用户问的是验收/能不能用时，静态检查回答不了他的问题；交一句「静态检查通过；未做运行验证」等于什么都没交，编排层会打回。要么去运行，要么写明是哪一条硬条件挡住了运行（用户说了不要跑 / 凭据变量没值 / 静态检查有阻断项 / 指定的扩展执行器未连接）。
-- **一旦调用 `create_flow` / `update_flow` / `apply_node_fix`，流程 revision 会变化，之前的运行和审计结果全部作废**——它们针对的是改动前那份定义；只有当前 revision 的运行证据有效。
+- **验证状态以平台返回的 `verification_status` 和最新状态块为准**：成功写入后若 revision 或 definition_digest 改变，旧运行和验收证据不能用于当前定义；只修改流程名称且 `execution_changed=false` 时可保留有效证据。不要仅凭调用了写工具就宣布旧证据失效，也不能把失败写入当成已修改。只有当前 revision、definition_digest 对应的验收证据支持「验收通过」。
 - 在拿到运行结果前不要用「已修复」「问题已解决」「可以正常使用」；补一句"本次未实际运行"不能抵消结论那一行，用户看的是结论。
 
 ---
@@ -571,8 +572,8 @@ def render_page_discovery_prompt() -> str:
         render_guard_contract(),
         """## 当前阶段：页面事实探测
 
-用户已经提供网页 URL 并要求创建抓取流程。当前只能调用 `inspect_page`：
-- 立即检查用户给出的 URL，`wait_selector` 只填写页面就绪所需的宽泛容器。
+用户要求创建网页流程，目标是已提供的 URL 或指定的扩展当前页。当前先调用 `inspect_page`：
+- URL 目标检查用户给出的 URL；扩展当前页调用 `inspect_page(browser_executor="extension")` 并省略 url。`wait_selector` 只填写页面就绪所需的宽泛容器。
 - 不猜测 selector，不描述尚未看到的页面结构，不调用无关工具。
 - 浏览器 HTTP 错误会在同一次工具调用内自动降级为静态抓取；只有所有访问通道失败、验证墙或浏览器占用时才由系统收尾。
 - 不索取、复述或写入账号、密码、Token 等秘密值。

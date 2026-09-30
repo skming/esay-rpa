@@ -157,7 +157,6 @@ _DEFAULT_TOOL_RESULTS: dict[str, dict[str, Any] | Callable[[dict[str, Any], list
                       "error_logs": ["selector 定位超时"], "inspect_hint": None},
     "get_run_logs": {"task_id": "eval-task-0001", "logs": []},
     "apply_node_fix": {"flow_id": "eval-flow-0001", "status": "patched", "revision": 2, "lint_clean": True},
-    "publish_flow": {"flow_id": "eval-flow-0001", "status": "published"},
     "inspect_screenshot": {"url": "https://example.com/list", "title": "数据列表",
                            "note": "截图已作为图片提供给模型查看。"},
     # 交互后的观察要照着模型这次点的目标回：写死 action="click" 会让模型 fill 完读到一条

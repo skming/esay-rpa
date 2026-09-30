@@ -25,7 +25,7 @@ EVIDENCE_TOOLS = frozenset({
 # EVIDENCE_TOOLS——「点开面板再看一次」是两个不同的观察，重复取证判据不该拦第二次。
 PAGE_EXPLORE_TOOLS = frozenset({"inspect_page", "interact_page"})
 
-# 受阶段约束的工具。publish_flow / create_schedule / toggle_schedule / stop_run 不在内：
+# 受阶段约束的工具。create_schedule / toggle_schedule / stop_run 不在内：
 # 它们不是「构建—验证」这条主线上的动作，用户随时可能单独要求，挡掉只会答不上话。
 # stop_run 尤其不能挡——它是运行失控时唯一的出路。
 PHASE_GATED_TOOLS = FLOW_WRITE_TOOLS | frozenset({"run_flow"})
@@ -275,6 +275,8 @@ def _refuse_for_phase(
                 payload["suggested_args"]["wait_selector"] = required["wait_selector"]
         if required.get("reason"):
             payload["reason"] = required["reason"]
+        if required.get("browser_executor"):
+            payload["suggested_args"] = {"browser_executor": required["browser_executor"]}
         return _blocked(tool_name, "page_evidence_required", phase, **payload)
     if phase is Phase.BUILD:
         return _blocked(

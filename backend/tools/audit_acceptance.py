@@ -126,30 +126,28 @@ def audit_frontend_component_contract() -> AuditCheck:
     source_root = PROJECT_ROOT / "src"
     package_json = read_json(PROJECT_ROOT / "package.json") or {}
     raw_controls = find_raw_controls(source_root)
-    radix_dependencies = [
-        name
-        for name in (package_json.get("dependencies") or {})
-        if isinstance(name, str) and name.startswith("@radix-ui/")
-    ]
-    has_context_menu = "@radix-ui/react-context-menu" in (package_json.get("dependencies") or {})
-    status: Status = "passed" if not raw_controls and has_context_menu and len(radix_dependencies) >= 5 else "incomplete"
+    package_dependencies = {
+        **(package_json.get("dependencies") or {}),
+        **(package_json.get("devDependencies") or {}),
+    }
+    has_base_ui = "@base-ui/react" in package_dependencies
+    status: Status = "passed" if not raw_controls and has_base_ui else "incomplete"
 
     return AuditCheck(
         id="frontend_modular_shadcn_contract",
-        title="前端模块化与 shadcn/Radix 组件优先",
+        title="前端模块化与 shadcn/Base UI 组件优先",
         status=status,
         criteria=[
             "业务组件不直接使用原生 button/input/select/textarea 控件。",
-            "基础控件集中在 src/components/ui，并使用 Radix/shadcn 风格封装。",
-            "画布右键菜单使用 Radix ContextMenu 封装而不是手写 fixed 浮层。",
+            "基础控件集中在 src/components/ui，并使用 Base UI/shadcn 风格封装。",
+            "画布右键菜单使用 Base UI ContextMenu 封装而不是手写 fixed 浮层。",
         ],
         evidence=[rel(PROJECT_ROOT / "src"), rel(PROJECT_ROOT / "package.json")],
         observed={
             "raw_controls_outside_ui": raw_controls,
-            "radix_dependency_count": len(radix_dependencies),
-            "has_radix_context_menu": has_context_menu,
+            "has_base_ui": has_base_ui,
         },
-        notes=[] if status == "passed" else ["仍存在业务层原生控件或缺少必要 Radix 依赖。"],
+        notes=[] if status == "passed" else ["仍存在业务层原生控件或缺少 Base UI 依赖。"],
     )
 
 

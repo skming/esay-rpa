@@ -43,3 +43,29 @@ def test_new_revision_invalidates_old_run_and_audit_evidence() -> None:
     assert state.run_verified_revision is None
     assert state.accepted_revision is None
     assert result["verification_status"] == "modified_unverified"
+
+
+def test_metadata_only_write_keeps_current_evidence():
+    state = GuardState(
+        current_flow_revision=3, current_definition_digest="d3", run_verified_revision=3, accepted_revision=3
+    )
+    result = attach_tool_events("update_flow", {"status": "applied", "revision": 3, "execution_changed": False})
+    reduce_evidence_state(state, result)
+    assert state.accepted_revision == 3 and state.run_verified_revision == 3
+    assert "events" not in result
+
+
+def test_same_revision_with_different_digest_cannot_be_verified():
+    state = GuardState(current_flow_revision=3, current_definition_digest="current")
+    result = attach_tool_events(
+        "run_flow",
+        {
+            "task_id": "t",
+            "status": "success",
+            "flow_revision": 3,
+            "definition_digest": "old",
+            "acceptance_audit": {"passed": True, "flow_revision": 3, "definition_digest": "old"},
+        },
+    )
+    reduce_evidence_state(state, result)
+    assert state.accepted_revision is None and state.run_verified_revision is None

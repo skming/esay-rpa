@@ -1661,7 +1661,7 @@ def test_runtime_escape_finding_survives_a_clean_static_scan() -> None:
     )
 
     # 真实的结构性修复才允许解锁
-    _orchestrator_guard_after_tool("update_flow", {"status": "updated"}, state)
+    _orchestrator_guard_after_tool("update_flow", {"status": "updated", "execution_changed": True}, state)
     state.blocking_diagnostics = _blocking_diagnostics(clean, state)
     assert _orchestrator_guard_before_tool("run_flow", {}, state) is None
 
@@ -1719,6 +1719,7 @@ async def test_update_flow_renames_placeholder_flow_when_ai_supplies_name() -> N
     result = await executor.execute("update_flow", {"flow_id": "flow-rename-1", "name": "抖店登录流程"})
 
     assert result["flow_name"] == "抖店登录流程"
+    assert result["execution_changed"] is False
     assert flow_service.flow.name == "抖店登录流程"
 
 
@@ -1766,20 +1767,26 @@ def _make_flow_snapshot(
     default_browser_executor: str = "playwright",
 ) -> FlowSnapshot:
     now = datetime.now(UTC)
+    actual_nodes = list(nodes or [
+        {"id": "start", "type": "start"},
+        {"id": "n1", "type": "browser.open", "targetUrl": "https://example.com"},
+    ])
+    actual_nodes.extend([
+        {"id": "result", "type": "variable.set", "variableName": "result", "value": "完成"},
+        {"id": "end", "type": "end"},
+    ])
     return FlowSnapshot(
         flowId="flow-sched-1",
         name="定时抓取流程",
         version="v1.0.0",
         status="active",
         inputVariables=input_variables or [],
+        acceptanceContract=_valid_contract("result"),
         defaultBrowserExecutor=default_browser_executor,
         definition={
-            "nodes": nodes
-            or [
-                {"id": "start", "type": "start"},
-                {"id": "n1", "type": "browser.open", "targetUrl": "https://example.com"},
-            ],
-            "edges": [{"source": "start", "target": "n1"}],
+            "nodes": actual_nodes,
+            "edges": [{"source": source["id"], "target": target["id"]}
+                      for source, target in zip(actual_nodes, actual_nodes[1:])],
         },
         createdAt=now,
         updatedAt=now,
@@ -1870,13 +1877,42 @@ async def test_create_schedule_uses_flow_default_executor_and_returns_snapshot()
     assert "warning" in result  # extension 模式必须携带无人值守告警
 
 
+@pytest.mark.parametrize("variables,required_term,blocked", [
+    (None, "2026-06-01", True),
+    ({"start_date": "2026-07-01"}, "2026-06-01", False),
+    ({"start_date": "2026-07-01"}, "2026-07-01", True),
+])
+async def test_schedule_preflight_uses_defaults_and_explicit_overrides(variables, required_term, blocked):
+    from app.models.schemas import FlowAcceptanceContract
+
+    flow = _make_flow_snapshot(input_variables=[
+        {"name": "start_date", "type": "String", "value": "2026-06-01", "category": "flow"},
+    ])
+    contract = flow.acceptance_contract.model_dump(by_alias=True)
+    contract["deliverables"][0]["requiredTerms"] = [required_term]
+    flow = flow.model_copy(update={"acceptance_contract": FlowAcceptanceContract.model_validate(contract)})
+    schedules = FakeScheduleService()
+    executor = RpaToolExecutor(FakeScheduleFlowService(flow), FakeTaskManager(with_failing_tasks=False), schedules)
+    args = {"flow_id": flow.flow_id, "cron_expression": "0 9 * * *"}
+    if variables is not None:
+        args["variables"] = variables
+    result = await executor.execute("create_schedule", args)
+    if blocked:
+        assert result["error"] == "schedule_not_ready"
+        assert result["status"] == "blocking_acceptance_contract"
+        assert schedules.created_request is None
+    else:
+        assert result["schedule_id"] == "sched-1"
+        assert schedules.created_request.task.variables == variables
+
+
 async def test_create_schedule_rejects_extension_flow_with_confirmation() -> None:
     """扩展执行器 + requireConfirmation 定时无人值守会挂到确认超时，须在建排程时拒绝、不落库。"""
     flow = _make_flow_snapshot(
         default_browser_executor="extension",
         nodes=[
             {"id": "start", "type": "start"},
-            {"id": "pay", "title": "提交支付", "type": "browser.click", "requireConfirmation": True},
+            {"id": "pay", "title": "提交支付", "type": "browser.click", "selector": "button.pay", "requireConfirmation": True},
         ],
     )
     from app.services.scheduler_service import ScheduleService
@@ -1901,7 +1937,7 @@ async def test_create_schedule_allows_playwright_flow_with_confirmation() -> Non
         default_browser_executor="playwright",
         nodes=[
             {"id": "start", "type": "start"},
-            {"id": "pay", "title": "提交支付", "type": "browser.click", "requireConfirmation": True},
+            {"id": "pay", "title": "提交支付", "type": "browser.click", "selector": "button.pay", "requireConfirmation": True},
         ],
     )
     executor = RpaToolExecutor(
@@ -1921,6 +1957,53 @@ async def test_create_schedule_rejects_invalid_cron_expression() -> None:
     )
     result = await executor.execute("create_schedule", {"flow_id": "flow-sched-1", "cron_expression": "9:00 每天运行"})
     assert "定时任务参数无效" in result["error"]
+
+
+@pytest.mark.parametrize("failure", ["contract", "lint", "variable"])
+async def test_ai_schedule_rejects_unrunnable_definitions(failure) -> None:
+    flow = _make_flow_snapshot()
+    if failure == "contract":
+        from app.models.schemas import FlowAcceptanceContract
+        flow = flow.model_copy(update={"acceptance_contract": FlowAcceptanceContract()})
+    elif failure == "lint":
+        flow.definition["nodes"][1] = {"id": "n1", "type": "browser.click"}
+    else:
+        flow.definition["nodes"][2]["value"] = "${var.missing}"
+    schedules = FakeScheduleService()
+    executor = RpaToolExecutor(FakeScheduleFlowService(flow), FakeTaskManager(with_failing_tasks=False), schedules)
+    result = await executor.execute("create_schedule", {"flow_id": flow.flow_id, "cron_expression": "0 9 * * *"})
+    assert result["error"] == "schedule_not_ready"
+    assert schedules.created_request is None
+
+
+@pytest.mark.parametrize("issue,blocking", [
+    ("unread_node_field", True),
+    ("long_wait_timeout", False),
+])
+def test_run_and_schedule_preflight_distinguishes_blocking_warnings(monkeypatch, issue, blocking):
+    from app.services.ai_tools import executor as executor_module
+
+    finding = {"severity": "warn", "issue": issue}
+    monkeypatch.setattr(executor_module, "_lint_flow", lambda *args, **kwargs: [finding])
+    result = RpaToolExecutor._run_definition_block(_make_flow_snapshot(), {})
+    if blocking:
+        assert result["status"] == "blocking_lint_findings"
+        assert result["lint_findings"] == [finding]
+    else:
+        assert result is None
+
+
+async def test_removed_publish_tool_cannot_activate_a_draft() -> None:
+    from app.models.schemas import FlowCreateRequest
+    from app.services.flow_service import FlowService
+
+    flows = FlowService()
+    draft = await flows.create_flow(FlowCreateRequest(name="草稿", status="draft"))
+    executor = RpaToolExecutor(flows, SimpleNamespace())
+    result = await executor.execute("publish_flow", {"flow_id": draft.flow_id})
+    assert "未知工具" in result["error"]
+    assert (await flows.get_flow(draft.flow_id)).status == "draft"
+    assert (await flows.set_flow_status(draft.flow_id, "active")).status == "active"
 
 
 async def test_toggle_and_list_schedules() -> None:

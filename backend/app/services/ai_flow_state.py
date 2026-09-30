@@ -183,7 +183,7 @@ def _contract_findings(
 
 
 # 这些状态下任务还在往前走，状态块里那份就是过期的
-_NON_TERMINAL_RUN_STATUSES = frozenset({"running", "pending", "queued", "timeout", ""})
+_NON_TERMINAL_RUN_STATUSES = frozenset({"running", "pending", "queued", "timeout", "awaiting_confirmation", ""})
 
 
 async def _refresh_run(
@@ -204,10 +204,19 @@ async def _refresh_run(
         except Exception:
             logger.warning("运行状态刷新失败（task_id=%s）", task_id, exc_info=True)
             fresh = None
-        if isinstance(fresh, dict) and not fresh.get("error"):
+        if isinstance(fresh, dict) and fresh.get("task_id") == task_id:
             # 合并而不是替换：get_run_status 只回状态与进度，产物与审计只有另外两处有
             run = dict(last_run)
             run.update({k: v for k, v in fresh.items() if v is not None})
+
+    if run.get("status") == "error" and last_run.get("status") != "error":
+        try:
+            diagnostics = await executor.execute("get_run_error", {"task_id": task_id})
+        except Exception:
+            logger.warning("失败现场刷新失败（task_id=%s）", task_id, exc_info=True)
+        else:
+            if isinstance(diagnostics, dict) and not diagnostics.get("error"):
+                run = {**run, "failure_diagnostics": diagnostics}
 
     if str(run.get("status") or "") == "success":
         try:
@@ -234,17 +243,21 @@ async def _collect_findings(executor: Any, flow_id: str) -> list[dict[str, Any]]
     except Exception:
         logger.warning("静态检查失败（flow_id=%s）", flow_id, exc_info=True)
         lint = None
-    if isinstance(lint, dict):
+    if (isinstance(lint, dict) and not lint.get("error")
+            and lint.get("status") != "error" and isinstance(lint.get("findings"), list)):
         for item in lint.get("findings") or []:
             if isinstance(item, dict):
                 findings.append(item)
+    else:
+        findings.append(_diagnostic_failure("lint_flow"))
 
     try:
         validation = await executor.execute("validate_flow", {"flow_id": flow_id})
     except Exception:
         logger.warning("变量引用校验失败（flow_id=%s）", flow_id, exc_info=True)
         validation = None
-    if isinstance(validation, dict):
+    if (isinstance(validation, dict) and not validation.get("error")
+            and validation.get("status") != "error" and isinstance(validation.get("issues"), list)):
         for issue in validation.get("issues") or []:
             if not isinstance(issue, dict):
                 continue
@@ -258,7 +271,18 @@ async def _collect_findings(executor: Any, flow_id: str) -> list[dict[str, Any]]
                     "或在引用点之前加 variable.set 节点定义它。"
                 ),
             })
+    else:
+        findings.append(_diagnostic_failure("validate_flow"))
     return findings
+
+
+def _diagnostic_failure(tool_name: str) -> dict[str, Any]:
+    return {
+        "severity": "error",
+        "issue": "diagnostic_check_failed",
+        "message": f"{tool_name} 未能完成，当前诊断未知，不能认定静态检查通过。",
+        "fix": "先恢复诊断服务并重试检查，不要修改流程来绕过检查故障。",
+    }
 
 
 def _render_variables(state: FlowState) -> list[str]:
