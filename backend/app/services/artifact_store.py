@@ -307,7 +307,13 @@ class MinioArtifactStore:
         obj = artifact.storage_url[len(prefix):]
         if not obj:
             return None
-        return self._read_object(artifact, obj)
+        try:
+            return self._read_object(artifact, obj)
+        except S3Error as exc:
+            # 历史对象可能已被删，缺失当无内容、对齐 Local；其余错误照抛，不掩盖真实故障
+            if exc.code in ("NoSuchKey", "NoSuchBucket"):
+                return None
+            raise
 
     def _read_object(self, artifact: ArtifactSnapshot, obj: str) -> ArtifactContent:
         response = self._client.get_object(self._bucket, obj)

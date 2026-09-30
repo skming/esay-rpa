@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from io import BytesIO
 
+import pytest
+from minio.error import S3Error
+
 from app.models.schemas import ScrapeResult
 from app.services.artifact_store import LocalArtifactStore, MinioArtifactStore
 
@@ -33,7 +36,18 @@ class FakeMinioClient:
         return object()
 
     def get_object(self, bucket_name: str, object_name: str) -> BytesIO:
-        return BytesIO(self.objects[(bucket_name, object_name)])
+        try:
+            return BytesIO(self.objects[(bucket_name, object_name)])
+        except KeyError:
+            # 对齐真实 minio：缺失对象抛 S3Error(NoSuchKey)
+            raise S3Error(
+                response=None,
+                code="NoSuchKey",
+                message="The specified key does not exist.",
+                resource=f"/{bucket_name}/{object_name}",
+                request_id="",
+                host_id="",
+            ) from None
 
 
 async def test_minio_artifact_store_saves_and_reads_json() -> None:
@@ -136,3 +150,49 @@ async def test_minio_store_reads_content_from_persisted_snapshot() -> None:
     content = reopened.read_snapshot_content(artifact)
     assert content is not None
     assert '"hello"' in content.content
+
+
+async def test_minio_snapshot_content_is_none_when_object_deleted() -> None:
+    # 对象被删后重启回读应降级为 None，而非抛错让预览 500
+    client = FakeMinioClient()
+    store = MinioArtifactStore(client=client, bucket="rpa-artifacts")
+    artifact = await store.save_bytes(
+        task_id="task-1",
+        artifact_type="dataset",
+        filename="gone.txt",
+        content=b"payload-body",
+        content_type="text/plain",
+    )
+    object_name = artifact.storage_url.removeprefix("s3://rpa-artifacts/")
+    del client.objects[("rpa-artifacts", object_name)]
+
+    reopened = MinioArtifactStore(client=client, bucket="rpa-artifacts")
+    assert reopened.read_snapshot_content(artifact) is None
+
+
+async def test_minio_snapshot_content_reraises_non_missing_errors() -> None:
+    # 缺失以外的错误必须抛出，不能被吞成"无内容"
+    client = FakeMinioClient()
+    store = MinioArtifactStore(client=client, bucket="rpa-artifacts")
+    artifact = await store.save_bytes(
+        task_id="task-1",
+        artifact_type="dataset",
+        filename="denied.txt",
+        content=b"payload-body",
+        content_type="text/plain",
+    )
+
+    def deny(bucket_name: str, object_name: str) -> BytesIO:
+        raise S3Error(
+            response=None,
+            code="AccessDenied",
+            message="Access Denied.",
+            resource=f"/{bucket_name}/{object_name}",
+            request_id="",
+            host_id="",
+        )
+
+    client.get_object = deny  # type: ignore[assignment]
+    reopened = MinioArtifactStore(client=client, bucket="rpa-artifacts")
+    with pytest.raises(S3Error):
+        reopened.read_snapshot_content(artifact)
