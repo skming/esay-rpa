@@ -76,13 +76,11 @@ export function VariablePickerField({
           value={value}
         />
         <DropdownMenu onOpenChange={(o) => { setOpen(o); if (!o) setQuery(''); }} open={open}>
-          <DropdownMenuTrigger asChild>
-            <IconButton
+          <DropdownMenuTrigger render={<IconButton
               className="absolute inset-y-1 right-1 h-6 w-6 text-accent-strong hover:bg-accent-soft"
               label="选择变量"
-            >
+            />}>
               <Braces className="h-3.5 w-3.5" strokeWidth={1.5} />
-            </IconButton>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="w-72 p-2">
             <div className="relative mb-2">
@@ -113,7 +111,7 @@ export function VariablePickerField({
                     <DropdownMenuItem
                       className="h-auto gap-2 px-2 py-1.5"
                       key={`${row.scope}-${row.name}`}
-                      onSelect={() => selectVariable(row.name)}
+                      onClick={() => selectVariable(row.name)}
                     >
                       <span className={`mt-1 h-1.5 w-1.5 shrink-0 rounded-full ${scopeDotClass(row.scope)}`} />
                       <span className="min-w-0 flex-1">

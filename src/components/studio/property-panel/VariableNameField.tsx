@@ -71,10 +71,8 @@ export function VariableNameField({
           value={value}
         />
         <DropdownMenu onOpenChange={setOpen} open={open}>
-          <DropdownMenuTrigger asChild>
-            <IconButton className="absolute inset-y-1 right-1 h-6 w-6 text-accent-strong hover:bg-accent-soft" label={`打开${label}选择器`}>
+          <DropdownMenuTrigger render={<IconButton className="absolute inset-y-1 right-1 h-6 w-6 text-accent-strong hover:bg-accent-soft" label={`打开${label}选择器`} />}>
               <Variable className="h-3.5 w-3.5" strokeWidth={1.5} />
-            </IconButton>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="w-72 p-2">
             <div className="relative mb-2">
@@ -101,7 +99,7 @@ export function VariableNameField({
                       {groupIndex > 0 && <DropdownMenuSeparator />}
                       <div className="px-2 py-1 text-[10px] font-bold uppercase tracking-normal text-slate-500">{group.scope}变量</div>
                       {group.rows.map((row) => (
-                        <DropdownMenuItem className="h-auto gap-2 px-2 py-1.5" key={`${group.scope}-${row.name}`} onSelect={() => {
+                        <DropdownMenuItem className="h-auto gap-2 px-2 py-1.5" key={`${group.scope}-${row.name}`} onClick={() => {
                           onChange(row.name);
                           setOpen(false);
                         }}>

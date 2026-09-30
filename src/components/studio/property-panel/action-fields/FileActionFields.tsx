@@ -23,7 +23,7 @@ export function FileActionFields({ draft, electron, node, onDraftPatch }: Pick<A
         <Field label="源路径" mono onChange={(event) => onDraftPatch('path', event.target.value)} placeholder="data/input/" value={draft.path} />
         <Field label="输出路径" mono onChange={(event) => onDraftPatch('targetPath', event.target.value)} placeholder="archives/output.zip" value={draft.targetPath} />
         <LabelLike text="操作方式">
-          <Select onValueChange={(value) => onDraftPatch('operation', value)} value={draft.operation}>
+          <Select onValueChange={(value) => { if (value !== null) onDraftPatch('operation', value); }} value={draft.operation}>
             <SelectTrigger className="font-mono text-[11px]">
               <SelectValue />
             </SelectTrigger>
@@ -96,7 +96,7 @@ export function FileActionFields({ draft, electron, node, onDraftPatch }: Pick<A
         <Field label="CSV 路径" mono onChange={(event) => onDraftPatch('path', event.target.value)} placeholder="data/orders.csv" value={draft.path} />
         <Field label="列名" mono onChange={(event) => onDraftPatch('column', event.target.value)} placeholder="status" value={draft.column} />
         <LabelLike text="操作方式">
-          <Select onValueChange={(value) => onDraftPatch('operation', value)} value={draft.operation}>
+          <Select onValueChange={(value) => { if (value !== null) onDraftPatch('operation', value); }} value={draft.operation}>
             <SelectTrigger className="font-mono text-[11px]">
               <SelectValue />
             </SelectTrigger>

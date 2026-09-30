@@ -10,7 +10,7 @@ type FlowVariableStore = {
   addNamedInputVariable: (name: string) => void;
   removeInputVariable: (name: string) => void;
   replaceAllInputVariables: (variables: RuntimeVariable[]) => void;
-  updateInputVariable: (name: string, patch: Partial<RuntimeVariable>) => void;
+  updateInputVariable: (name: string, patch: Partial<RuntimeVariable>) => RuntimeVariable | null;
 };
 
 const DEFAULT_VARIABLE: RuntimeVariable = {
@@ -24,7 +24,7 @@ const DEFAULT_VARIABLE: RuntimeVariable = {
 
 export const useFlowVariableStore = create<FlowVariableStore>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       inputVariables: [],
       addInputVariable: (category?: VariableCategory) =>
         set((state) => ({
@@ -51,12 +51,16 @@ export const useFlowVariableStore = create<FlowVariableStore>()(
         set({
           inputVariables: normalizeVariables(variables)
         }),
-      updateInputVariable: (name, patch) =>
-        set((state) => ({
-          inputVariables: state.inputVariables.map((variable) =>
-            variable.name === name ? createUniqueVariable({ ...variable, ...patch }, state.inputVariables, name) : variable
-          )
-        }))
+      updateInputVariable: (name, patch) => {
+        const variables = get().inputVariables;
+        const current = variables.find((variable) => variable.name === name);
+        if (current === undefined) return null;
+        const updated = createUniqueVariable({ ...current, ...patch }, variables, name);
+        set({
+          inputVariables: variables.map((variable) => variable.name === name ? updated : variable)
+        });
+        return updated;
+      }
     }),
     {
       name: 'rpa-studio.flow-input-variables'

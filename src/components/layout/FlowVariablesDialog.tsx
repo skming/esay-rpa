@@ -1,4 +1,4 @@
-import { CheckCircle2, CircleAlert, Globe, KeyRound, Plus, Settings2, Trash2, Variable, Workflow } from 'lucide-react';
+import { CheckCircle2, CircleAlert, KeyRound, Plus, Settings2, Trash2, Variable, Workflow } from 'lucide-react';
 import type { KeyboardEvent, ReactElement } from 'react';
 import { useState } from 'react';
 
@@ -17,6 +17,7 @@ export function FlowVariablesDialog({
   onRemove,
   onUpdate,
   open,
+  usageCounts,
   variables,
 }: {
   onAdd: (category?: VariableCategory) => void;
@@ -24,10 +25,11 @@ export function FlowVariablesDialog({
   onRemove: (name: string) => void;
   onUpdate: (name: string, patch: Partial<RuntimeVariable>) => void;
   open: boolean;
+  usageCounts: Record<string, number>;
   variables: RuntimeVariable[];
 }): ReactElement {
   const flowVars = variables.filter((v) => (v.category ?? 'flow') === 'flow');
-  const globalVars = variables.filter((v) => v.category === 'environment' || v.category === 'credential');
+  const protectedVars = variables.filter((v) => v.category === 'environment' || v.category === 'credential');
 
   return (
     <Dialog onOpenChange={onOpenChange} open={open}>
@@ -50,25 +52,27 @@ export function FlowVariablesDialog({
               onRemove={onRemove}
               onUpdate={onUpdate}
               showScope
+              usageCounts={usageCounts}
               variables={flowVars}
             />
           </Section>
 
           <Section
             accent="accent"
-            count={globalVars.length}
-            description="跨流程共享，保存在本地应用中。适合存储 API 密钥、账号密码、服务地址等敏感配置。"
-            icon={<Globe className="h-3.5 w-3.5" strokeWidth={1.5} />}
-            title="全局变量"
+            count={protectedVars.length}
+            description="随当前流程保存，用于账号、密码、API 密钥和服务地址等配置。"
+            icon={<KeyRound className="h-3.5 w-3.5" strokeWidth={1.5} />}
+            title="凭据与环境变量"
           >
             <VariableList
-              emptyText="暂无全局变量，点击下方添加"
-              globalMode
+              emptyText="暂无凭据或环境变量，点击下方添加"
+              protectedMode
               onAdd={() => onAdd('credential')}
               onRemove={onRemove}
               onUpdate={onUpdate}
               showScope={false}
-              variables={globalVars}
+              usageCounts={usageCounts}
+              variables={protectedVars}
             />
           </Section>
         </DialogBody>
@@ -120,19 +124,21 @@ function Section({
 
 function VariableList({
   emptyText,
-  globalMode = false,
+  protectedMode = false,
   onAdd,
   onRemove,
   onUpdate,
   showScope,
+  usageCounts,
   variables,
 }: {
   emptyText: string;
-  globalMode?: boolean;
+  protectedMode?: boolean;
   onAdd: () => void;
   onRemove: (name: string) => void;
   onUpdate: (name: string, patch: Partial<RuntimeVariable>) => void;
   showScope: boolean;
+  usageCounts: Record<string, number>;
   variables: RuntimeVariable[];
 }): ReactElement {
   return (
@@ -145,18 +151,19 @@ function VariableList({
       ) : (
         variables.map((v, i) => (
           <VariableRow
-            globalMode={globalMode}
+            protectedMode={protectedMode}
             key={i}
             onRemove={onRemove}
             onUpdate={onUpdate}
             showScope={showScope}
+            usageCount={usageCounts[v.name] ?? 0}
             variable={v}
           />
         ))
       )}
       <Button className="w-full text-[11px]" onClick={onAdd} variant="outline">
         <Plus className="h-3.5 w-3.5" strokeWidth={1.5} />
-        {globalMode ? '新增全局变量' : '新增流程变量'}
+        {protectedMode ? '新增凭据' : '新增流程变量'}
       </Button>
     </div>
   );
@@ -168,16 +175,18 @@ const GLOBAL_CATEGORY_OPTIONS: Array<{ label: string; value: VariableCategory; i
 ];
 
 function VariableRow({
-  globalMode,
+  protectedMode,
   onRemove,
   onUpdate,
   showScope,
+  usageCount,
   variable,
 }: {
-  globalMode: boolean;
+  protectedMode: boolean;
   onRemove: (name: string) => void;
   onUpdate: (name: string, patch: Partial<RuntimeVariable>) => void;
   showScope: boolean;
+  usageCount: number;
   variable: RuntimeVariable;
 }): ReactElement {
   const [draftName, setDraftName] = useState(variable.name);
@@ -231,7 +240,7 @@ function VariableRow({
             ))}
           </SelectContent>
         </Select>
-        {globalMode && (
+        {protectedMode && (
           <Select
             onValueChange={(v) => onUpdate(variable.name, { category: v as VariableCategory })}
             value={variable.category ?? 'credential'}
@@ -249,9 +258,11 @@ function VariableRow({
           </Select>
         )}
         <Button
-          aria-label="删除变量"
+          aria-label={usageCount > 0 ? `变量被 ${usageCount} 个节点使用，无法删除` : '删除变量'}
           className="h-8 w-9 shrink-0 px-0"
+          disabled={usageCount > 0}
           onClick={() => onRemove(variable.name)}
+          title={usageCount > 0 ? `先移除 ${usageCount} 个节点中的变量引用` : '删除变量'}
           variant="outline"
         >
           <Trash2 className="h-3.5 w-3.5" strokeWidth={1.5} />
@@ -290,6 +301,9 @@ function VariableRow({
           <span>敏感</span>
         </label>
       </div>
+      {usageCount > 0 && (
+        <p className="mt-1.5 text-[10px] text-slate-500">{usageCount} 个节点使用，改名会同步更新引用</p>
+      )}
       <VariableValuePreview variable={variable} />
     </div>
   );

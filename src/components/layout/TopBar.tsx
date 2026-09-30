@@ -4,8 +4,9 @@ import {
   CirclePause, Play, Save, Square, Trash2, Variable, Workflow, XCircle,
   CheckCircle2, Bug, Puzzle, Settings2,
 } from 'lucide-react';
+import type { Node } from '@xyflow/react';
 import type { KeyboardEvent, ReactElement } from 'react';
-import { useRef, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
 import { ROUTE_PATHS } from '../../app/routeConfig';
@@ -16,6 +17,7 @@ import { backend } from '../../lib/backendClient';
 import type { ElectronBridgeState } from '../../hooks/useElectronBridge';
 import type { FlowDraftAutosaveState } from '../../hooks/useFlowDraftAutosave';
 import { useFlowVariableStore } from '../../stores/useFlowVariableStore';
+import { countFlowVariableUsages } from '../../lib/flowVariableBindings';
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem,
   DropdownMenuSeparator, DropdownMenuTrigger,
@@ -23,12 +25,14 @@ import {
 import { FlowVariablesDialog } from './FlowVariablesDialog';
 import { RunConfigDialog } from './RunConfigDialog';
 import { VersionHistoryDialog } from './VersionHistoryDialog';
-import type { RpaNodeAction } from '../../types/rpa';
+import type { RpaNodeAction, RpaNodeData, RuntimeVariable } from '../../types/rpa';
 
 export function TopBar({
   visible = true,
   draftAutosave,
   electron,
+  flowNodes,
+  onRenameVariableReferences,
   selectedNodeAction,
   selectedNodeId,
   selectedNodeTitle,
@@ -36,6 +40,8 @@ export function TopBar({
   visible?: boolean;
   draftAutosave: FlowDraftAutosaveState;
   electron: ElectronBridgeState;
+  flowNodes: Node<RpaNodeData>[];
+  onRenameVariableReferences: (previousName: string, nextName: string) => void;
   selectedNodeAction?: RpaNodeAction;
   selectedNodeId: string;
   selectedNodeTitle: string;
@@ -50,6 +56,26 @@ export function TopBar({
   const addInputVariable = useFlowVariableStore((s) => s.addInputVariable);
   const removeInputVariable = useFlowVariableStore((s) => s.removeInputVariable);
   const updateInputVariable = useFlowVariableStore((s) => s.updateInputVariable);
+  const variableUsageCounts = useMemo(
+    () => countFlowVariableUsages(flowNodes, inputVariables.map((variable) => variable.name)),
+    [flowNodes, inputVariables]
+  );
+
+  const handleVariableUpdate = (name: string, patch: Partial<RuntimeVariable>): void => {
+    const updated = updateInputVariable(name, patch);
+    if (patch.name !== undefined && updated !== null && updated.name !== name) {
+      onRenameVariableReferences(name, updated.name);
+    }
+  };
+
+  const handleVariableRemove = (name: string): void => {
+    const usageCount = variableUsageCounts[name] ?? 0;
+    if (usageCount > 0) {
+      electron.pushToast('error', `变量 ${name} 正被 ${usageCount} 个节点使用，请先移除节点引用`);
+      return;
+    }
+    removeInputVariable(name);
+  };
 
   const running = electron.runtimeStatus === 'running';
   const activeFlowName = electron.currentFlow?.name ?? '未命名流程';
@@ -175,25 +201,23 @@ export function TopBar({
               {defaultBrowserExecutor === 'extension' ? 'Chrome 运行' : '运行'}
             </Button>
             <DropdownMenu onOpenChange={(open) => { if (open) void refreshExtensionAvailability(); }}>
-              <DropdownMenuTrigger asChild>
-                <Button
+              <DropdownMenuTrigger render={<Button
                   aria-label="选择运行方式"
                   className="h-7 w-7 rounded-l-none border-l border-white/20 px-0 shadow-none"
                   variant="primary"
-                >
+                />}>
                   <ChevronDown className="h-3.5 w-3.5" strokeWidth={1.5} />
-                </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="w-60">
                 <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-slate-500">流程默认运行方式</div>
-                <DropdownMenuItem onSelect={() => void electron.setDefaultBrowserExecutor('playwright')}>
+                <DropdownMenuItem onClick={() => void electron.setDefaultBrowserExecutor('playwright')}>
                   <Play className="mr-2 h-3.5 w-3.5 text-slate-400" strokeWidth={1.5} />
                   <span className="flex-1">独立浏览器</span>
                   {defaultBrowserExecutor === 'playwright' && <Check className="h-3.5 w-3.5 text-emerald-600" />}
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   disabled={extensionAvailability !== 'ready'}
-                  onSelect={() => void electron.setDefaultBrowserExecutor('extension')}
+                  onClick={() => void electron.setDefaultBrowserExecutor('extension')}
                 >
                   <Puzzle className="mr-2 h-3.5 w-3.5 text-slate-400" strokeWidth={1.5} />
                   <span className="flex-1">当前 Chrome</span>
@@ -202,13 +226,13 @@ export function TopBar({
                     : <span className="text-[10px] text-slate-400">{extensionAvailabilityLabel(extensionAvailability)}</span>}
                 </DropdownMenuItem>
                 {extensionAvailability !== 'ready' && extensionAvailability !== 'checking' && (
-                  <DropdownMenuItem onSelect={() => navigate(ROUTE_PATHS.settings, { state: { settingsSection: 'extension' } })}>
+                  <DropdownMenuItem onClick={() => navigate(ROUTE_PATHS.settings, { state: { settingsSection: 'extension' } })}>
                     <Puzzle className="mr-2 h-3.5 w-3.5 text-blue-500" strokeWidth={1.5} />
                     连接浏览器扩展…
                   </DropdownMenuItem>
                 )}
                 <DropdownMenuSeparator />
-                <DropdownMenuItem onSelect={() => setRunConfigOpen(true)}>
+                <DropdownMenuItem onClick={() => setRunConfigOpen(true)}>
                   <Settings2 className="mr-2 h-3.5 w-3.5 text-slate-400" strokeWidth={1.5} />
                   本次运行配置…
                 </DropdownMenuItem>
@@ -235,9 +259,10 @@ export function TopBar({
           setFlowVariablesOpen(open);
           if (!open && electron.currentFlow) void electron.saveFlow();
         }}
-        onRemove={removeInputVariable}
-        onUpdate={updateInputVariable}
+        onRemove={handleVariableRemove}
+        onUpdate={handleVariableUpdate}
         open={flowVariablesOpen}
+        usageCounts={variableUsageCounts}
         variables={inputVariables}
       />
       <VersionHistoryDialog
@@ -398,43 +423,41 @@ function FlowVersionMenu({
 }): ReactElement {
   return (
     <DropdownMenu onOpenChange={(open) => { if (open) void onLoadFlows(); }}>
-      <DropdownMenuTrigger asChild>
+      <DropdownMenuTrigger render={<Button
+        aria-label={`${label} · 版本与流程操作`}
+        className="flex h-7 shrink-0 items-center gap-2 rounded-lg border border-slate-200 bg-slate-50/60 px-2.5 text-[11px] text-slate-700 transition-[background-color,border-color,box-shadow] duration-150 hover:bg-white hover:border-slate-300 hover:shadow-xs"
+        title={`${label} · 版本与流程操作`}
+        variant="ghost"
+      />}>
         {/* 只承载版本与保存状态：流程名已在左侧面包屑里，重复一遍还得截断 */}
-        <Button
-          aria-label={`${label} · 版本与流程操作`}
-          className="flex h-7 shrink-0 items-center gap-2 rounded-lg border border-slate-200 bg-slate-50/60 px-2.5 text-[11px] text-slate-700 transition-[background-color,border-color,box-shadow] duration-150 hover:bg-white hover:border-slate-300 hover:shadow-xs"
-          title={`${label} · 版本与流程操作`}
-          variant="ghost"
-        >
           <Workflow className="h-3.5 w-3.5 shrink-0 text-accent" strokeWidth={1.5} />
           <Badge className="border-slate-200 bg-white font-mono text-slate-600 text-[9px]">{version}</Badge>
           {/* dirty 只用文字徽标表达，不再另配一个同义的琥珀圆点 */}
           {dirty && <Badge className="border-amber-100 bg-amber-50 text-amber-700 text-[9px]">未保存</Badge>}
           {activeStatus === 'archived' && <Badge className="border-slate-200 bg-slate-100 text-slate-600 text-[9px]">归档</Badge>}
           <ChevronDown className="h-3 w-3 shrink-0 text-slate-400" strokeWidth={1.5} />
-        </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="w-72">
-        <DropdownMenuItem onSelect={() => void onOpenPicker()}>
+        <DropdownMenuItem onClick={() => void onOpenPicker()}>
           <BookOpen className="mr-2 h-3.5 w-3.5 text-slate-400" strokeWidth={1.5} />
           打开流程文件…
         </DropdownMenuItem>
-        <DropdownMenuItem onSelect={onOpenVersionHistory}>
+        <DropdownMenuItem onClick={onOpenVersionHistory}>
           <History className="mr-2 h-3.5 w-3.5 text-slate-400" strokeWidth={1.5} />
           版本历史
         </DropdownMenuItem>
         <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={() => void onSave()}>
+        <DropdownMenuItem onClick={() => void onSave()}>
           <Save className="mr-2 h-3.5 w-3.5 text-accent" strokeWidth={1.5} />
           保存当前版本
         </DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => void onExport()}>
+        <DropdownMenuItem onClick={() => void onExport()}>
           <Download className="mr-2 h-3.5 w-3.5 text-slate-400" strokeWidth={1.5} />
           另存为 JSON…
         </DropdownMenuItem>
         <DropdownMenuItem
           disabled={activeFlowId === undefined}
-          onSelect={() => void onArchiveCurrent()}
+          onClick={() => void onArchiveCurrent()}
         >
           <Archive className="mr-2 h-3.5 w-3.5 text-amber-500" strokeWidth={1.5} />
           归档当前版本
@@ -442,7 +465,7 @@ function FlowVersionMenu({
         <DropdownMenuItem
           className="text-red-600 focus:text-red-600"
           disabled={activeFlowId === undefined}
-          onSelect={() => void onDeleteCurrent()}
+          onClick={() => void onDeleteCurrent()}
         >
           <Trash2 className="mr-2 h-3.5 w-3.5" strokeWidth={1.5} />
           删除当前版本

@@ -18,6 +18,7 @@ import {
   summarizeDeleteImpact,
   type ComponentDragPayload,
 } from '../lib/flowOperations';
+import { renameFlowVariableReferences } from '../lib/flowVariableBindings';
 import { usePropertyPanelStore } from '../stores/usePropertyPanelStore';
 import type { RpaNodeData } from '../types/rpa';
 
@@ -172,6 +173,13 @@ export function useFlowCanvas() {
     [setFlowNodes]
   );
 
+  const renameVariableReferences = useCallback(
+    (previousName: string, nextName: string): void => {
+      setFlowNodes((nodes) => renameFlowVariableReferences(nodes, previousName, nextName));
+    },
+    [setFlowNodes]
+  );
+
   const requestDeleteNode = useCallback(
     (nodeId: string): void => {
       if (nodeId === 'start' || nodeId === 'end') return;
@@ -208,7 +216,7 @@ export function useFlowCanvas() {
     focusNodeRequest,
     addNodeAtPosition, addNodeAfterSelection,
     connectNodes, deleteEdge, undoAction, redoAction, beginNodeDrag, endNodeDrag,
-    updateNodeData, focusNode, updateNodeBreakpoint,
+    updateNodeData, focusNode, updateNodeBreakpoint, renameVariableReferences,
     requestDeleteNode, confirmDeleteNode,
   };
 }

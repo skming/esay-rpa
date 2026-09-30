@@ -14,7 +14,7 @@ export function DataActionFields({ draft, electron, node, onDraftPatch }: Pick<A
       <>
         <Field label="输入值" mono onChange={(event) => onDraftPatch('inputValue', event.target.value)} placeholder="${var.input_text}" value={draft.inputValue} />
         <LabelLike text="转换方式">
-          <Select onValueChange={(value) => onDraftPatch('operation', value)} value={draft.operation}>
+          <Select onValueChange={(value) => { if (value !== null) onDraftPatch('operation', value); }} value={draft.operation}>
             <SelectTrigger className="font-mono text-[11px]">
               <SelectValue />
             </SelectTrigger>
@@ -38,7 +38,7 @@ export function DataActionFields({ draft, electron, node, onDraftPatch }: Pick<A
       <>
         <Field label="输入内容" mono onChange={(event) => onDraftPatch('inputValue', event.target.value)} placeholder="${var.input_text}" value={draft.inputValue} />
         <LabelLike text="加密方式">
-          <Select onValueChange={(value) => onDraftPatch('operation', value)} value={draft.operation}>
+          <Select onValueChange={(value) => { if (value !== null) onDraftPatch('operation', value); }} value={draft.operation}>
             <SelectTrigger className="font-mono text-[11px]">
               <SelectValue />
             </SelectTrigger>
@@ -64,7 +64,7 @@ export function DataActionFields({ draft, electron, node, onDraftPatch }: Pick<A
         <div className="grid grid-cols-[1fr_92px_1fr] gap-2">
           <Field label="左操作数" mono onChange={(event) => onDraftPatch('left', event.target.value)} placeholder="${var.left}" value={draft.left} />
           <LabelLike text="运算">
-            <Select onValueChange={(value) => onDraftPatch('operation', value)} value={draft.operation}>
+            <Select onValueChange={(value) => { if (value !== null) onDraftPatch('operation', value); }} value={draft.operation}>
               <SelectTrigger className="font-mono text-[11px]">
                 <SelectValue />
               </SelectTrigger>
@@ -110,7 +110,7 @@ function DataOperationSelect({
 }: Pick<ActionFieldsProps, 'draft' | 'onDraftPatch'> & { operations: string[] }): ReactElement {
   return (
     <LabelLike text="处理方式">
-      <Select onValueChange={(value) => onDraftPatch('operation', value)} value={draft.operation}>
+      <Select onValueChange={(value) => { if (value !== null) onDraftPatch('operation', value); }} value={draft.operation}>
         <SelectTrigger className="font-mono text-[11px]">
           <SelectValue />
         </SelectTrigger>
