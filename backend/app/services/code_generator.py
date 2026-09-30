@@ -43,7 +43,7 @@ class ScraplingCodeGenerator:
 
         return GeneratedScript(
             filename=filename,
-            dependencies=["scrapling[all]>=0.4.10"],
+            dependencies=["scrapling[fetchers]>=0.4.10"],
             content=content,
         )
 

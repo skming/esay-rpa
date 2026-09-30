@@ -77,7 +77,7 @@ class SiteAnalyzer:
                 )
                 self._scrapling_page = None
         except ModuleNotFoundError as exc:
-            raise RuntimeError('未安装 Scrapling，请执行 uv pip install "scrapling[all]"') from exc
+            raise RuntimeError('未安装 Scrapling，请执行 uv pip install "scrapling[fetchers]"') from exc
 
         return self.analyze_html(html_text=html_text, request=request)
 

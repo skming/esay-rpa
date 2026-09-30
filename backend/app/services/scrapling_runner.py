@@ -70,7 +70,7 @@ class ScraplingRunner:
                 f"Scrapling 采集超时：{request.timeout_ms}ms · {request.fetcher} · {request.target_url}"
             ) from exc
         except ModuleNotFoundError as exc:
-            raise RuntimeError('未安装 Scrapling，请执行 uv pip install "scrapling[all]"') from exc
+            raise RuntimeError('未安装 Scrapling，请执行 uv pip install "scrapling[fetchers]"') from exc
         except Exception as exc:
             raise RuntimeError(self._format_runtime_error(exc, request)) from exc
 

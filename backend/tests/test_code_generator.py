@@ -121,7 +121,7 @@ def test_generated_pure_scraping_flow_runs_as_a_standalone_function() -> None:
 
     assert result["variables"]["quotes"] == ["captured"]
     assert result["outputs"]["extract"] == ["captured"]
-    assert script.dependencies == ["scrapling[all]>=0.4.10"]
+    assert script.dependencies == ["scrapling[fetchers]>=0.4.10"]
 
 
 def test_credential_values_never_reach_the_exported_script() -> None:
