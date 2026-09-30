@@ -83,11 +83,11 @@ export function RunDetailDialog({
   const loading = loaded === null && error === null;
 
   const statusIcon = {
-    running: <Loader2 className="h-4 w-4 animate-spin text-blue-500" strokeWidth={1.5} />,
+    running: <Loader2 className="h-4 w-4 animate-spin text-live" strokeWidth={1.5} />,
     success: <CheckCircle2 className="h-4 w-4 text-emerald-500" strokeWidth={1.5} />,
     error: <XCircle className="h-4 w-4 text-red-500" strokeWidth={1.5} />,
     stopped: <XCircle className="h-4 w-4 text-amber-500" strokeWidth={1.5} />,
-    queued: <Loader2 className="h-4 w-4 text-slate-400" strokeWidth={1.5} />,
+    queued: <Loader2 className="h-4 w-4 text-ink-4" strokeWidth={1.5} />,
     awaiting_confirmation: <Loader2 className="h-4 w-4 text-amber-500" strokeWidth={1.5} />,
   }[run.status];
 
@@ -114,7 +114,7 @@ export function RunDetailDialog({
         </DialogHeader>
 
         <DialogBody className="min-h-0 flex-1 space-y-5 overflow-y-auto">
-          {loading && <p className="text-[11px] text-slate-500">正在读取完整执行记录…</p>}
+          {loading && <p className="text-[11px] text-ink-3">正在读取完整执行记录…</p>}
           {error && <p className="rounded-md bg-red-50 px-3 py-2 text-[11px] text-red-700">读取最新记录失败：{error}</p>}
           {run.error !== null && run.error !== undefined && (
             <div className="flex items-start gap-2 rounded-md border border-red-200 bg-red-50 px-3 py-2.5">
@@ -133,8 +133,8 @@ export function RunDetailDialog({
             </InfoRow>
             <InfoRow label="运行模式" value={run.mode === 'debug' ? '调试' : '正常运行'} />
             <InfoRow label="耗时">
-              <span className="inline-flex items-center gap-1 font-mono text-[11px] text-slate-700">
-                <Clock3 className="h-3 w-3 text-slate-400" strokeWidth={1.5} />
+              <span className="inline-flex items-center gap-1 font-mono text-[11px] text-ink-2">
+                <Clock3 className="h-3 w-3 text-ink-4" strokeWidth={1.5} />
                 {formatElapsedTime(run.progress.elapsedMs)}
               </span>
             </InfoRow>
@@ -144,15 +144,15 @@ export function RunDetailDialog({
 
           {(run.variables?.length ?? 0) > 0 && (
             <div>
-              <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold text-slate-600">
-                <DatabaseZap className="h-3.5 w-3.5 text-blue-500" strokeWidth={1.5} />
+              <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold text-ink-2">
+                <DatabaseZap className="h-3.5 w-3.5 text-ink-3" strokeWidth={1.5} />
                 变量快照（{run.variables?.length ?? 0} 个）
               </div>
-              <div className="max-h-35 space-y-1 overflow-auto rounded-md border border-slate-200 bg-slate-50 p-2">
+              <div className="max-h-35 space-y-1 overflow-auto rounded-md border border-rule bg-paper-sunk p-2">
                 {(run.variables ?? []).map((v) => (
                   <div className="flex items-center justify-between text-[11px]" key={v.name}>
-                    <span className="font-mono text-blue-700">{v.name}</span>
-                    <span className="ml-2 max-w-70 truncate font-mono text-slate-500">
+                    <span className="font-mono text-ink-2">{v.name}</span>
+                    <span className="ml-2 max-w-70 truncate font-mono text-ink-3">
                       {v.sensitive ? '••••••••' : v.value}
                     </span>
                   </div>
@@ -163,25 +163,25 @@ export function RunDetailDialog({
 
           {(run.artifacts?.length ?? 0) > 0 && (
             <div>
-              <div className="mb-1.5 flex items-center justify-between gap-2 text-[11px] font-semibold text-slate-600">
+              <div className="mb-1.5 flex items-center justify-between gap-2 text-[11px] font-semibold text-ink-2">
                 <div className="flex items-center gap-1.5">
                   <FileJson className="h-3.5 w-3.5 text-emerald-500" strokeWidth={1.5} />
                   产物（{run.artifacts?.length ?? 0} 个）
                 </div>
                 {/* 同一次运行的产物同处一个目录，只在标题栏给一个入口，不必每行都放 */}
                 {onOpenArtifact && (
-                  <button aria-label="打开产物目录" className="flex items-center gap-1 rounded px-1.5 py-0.5 font-normal text-slate-500 hover:text-slate-800" onClick={() => { const first = run.artifacts?.[0]; if (first) onOpenArtifact(first); }} type="button">
+                  <button aria-label="打开产物目录" className="flex items-center gap-1 rounded px-1.5 py-0.5 font-normal text-ink-3 hover:text-ink-2" onClick={() => { const first = run.artifacts?.[0]; if (first) onOpenArtifact(first); }} type="button">
                     <FolderOpen className="h-3.5 w-3.5" strokeWidth={1.5} />
                     打开目录
                   </button>
                 )}
               </div>
-              <div className="max-h-25 space-y-1 overflow-auto rounded-md border border-slate-200 bg-slate-50 p-2">
+              <div className="max-h-25 space-y-1 overflow-auto rounded-md border border-rule bg-paper-sunk p-2">
                 {(run.artifacts ?? []).map((a) => (
-                  <div className="group flex items-center justify-between gap-2 rounded px-1 py-0.5 text-[11px] transition-colors hover:bg-slate-100" key={a.artifactId}>
-                    <span className="min-w-0 flex-1 truncate font-mono text-slate-700">{a.filename}</span>
-                    <span className="shrink-0 text-slate-500">{formatBytes(a.sizeBytes)}</span>
-                    {onReadArtifact && <button aria-label={`预览 ${a.filename}`} className="rounded p-1 text-slate-500 hover:text-slate-800" onClick={() => handlePreview(a)} type="button"><Eye className="h-3.5 w-3.5" strokeWidth={1.5} /></button>}
+                  <div className="group flex items-center justify-between gap-2 rounded px-1 py-0.5 text-[11px] transition-colors hover:bg-surface" key={a.artifactId}>
+                    <span className="min-w-0 flex-1 truncate font-mono text-ink-2">{a.filename}</span>
+                    <span className="shrink-0 text-ink-3">{formatBytes(a.sizeBytes)}</span>
+                    {onReadArtifact && <button aria-label={`预览 ${a.filename}`} className="rounded p-1 text-ink-3 hover:text-ink-2" onClick={() => handlePreview(a)} type="button"><Eye className="h-3.5 w-3.5" strokeWidth={1.5} /></button>}
                   </div>
                 ))}
               </div>
@@ -189,14 +189,14 @@ export function RunDetailDialog({
           )}
 
           {loaded && <div>
-            <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold text-slate-600">
-              <ScrollText className="h-3.5 w-3.5 text-slate-500" strokeWidth={1.5} />
+            <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold text-ink-2">
+              <ScrollText className="h-3.5 w-3.5 text-ink-3" strokeWidth={1.5} />
               执行日志（{logs.length} 条{errorLogCount > 0 ? ` · ${errorLogCount} 错误` : ''}）
             </div>
             {logs.length === 0 ? (
-              <p className="rounded-md bg-slate-50 px-3 py-3 text-[11px] text-slate-500">没有日志记录</p>
+              <p className="rounded-md bg-paper-sunk px-3 py-3 text-[11px] text-ink-3">没有日志记录</p>
             ) : (
-              <div className="max-h-64 divide-y divide-slate-100 overflow-auto rounded-md border border-slate-200">
+              <div className="max-h-64 divide-y divide-rule overflow-auto rounded-md border border-rule">
                 {logs.map((log) => <RunLogRow key={log.id} log={log} />)}
               </div>
             )}
@@ -228,7 +228,7 @@ function RunLogRow({ log }: { log: BackendTaskLogEntry }): ReactElement {
   const fullText = hasDetail ? `${log.message}\n${log.detail}` : log.message;
   return (
     <div className={cn('grid grid-cols-[68px_56px_minmax(0,1fr)_auto] items-start gap-2 px-3 py-1.5 text-[11px]', tone.row)}>
-      <time className="font-mono tabular-nums text-slate-500">{formatDateTime(log.time).slice(11)}</time>
+      <time className="font-mono tabular-nums text-ink-3">{formatDateTime(log.time).slice(11)}</time>
       <span className={cn('flex items-center gap-1.5 font-medium', tone.text)}>
         <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', tone.dot)} />
         {logLevelLabel(log.level)}
@@ -239,17 +239,17 @@ function RunLogRow({ log }: { log: BackendTaskLogEntry }): ReactElement {
             <button
               aria-expanded={expanded}
               aria-label={expanded ? '收起日志详情' : '展开日志详情'}
-              className="flex w-full min-w-0 items-start gap-1 text-left text-slate-700"
+              className="flex w-full min-w-0 items-start gap-1 text-left text-ink-2"
               onClick={() => setExpanded((value) => !value)}
               type="button"
             >
-              <ChevronRight className={cn('mt-0.5 h-3 w-3 shrink-0 text-slate-400 transition-transform', expanded && 'rotate-90')} strokeWidth={1.5} />
+              <ChevronRight className={cn('mt-0.5 h-3 w-3 shrink-0 text-ink-4 transition-transform', expanded && 'rotate-90')} strokeWidth={1.5} />
               <span className="min-w-0 flex-1 break-words">{log.message}</span>
             </button>
-            {expanded && <pre className="mt-1 ml-4 whitespace-pre-wrap break-words font-mono text-[11px] text-slate-500">{log.detail}</pre>}
+            {expanded && <pre className="mt-1 ml-4 whitespace-pre-wrap break-words font-mono text-[11px] text-ink-3">{log.detail}</pre>}
           </>
         ) : (
-          <span className="block min-w-0 break-words text-slate-700">{log.message}</span>
+          <span className="block min-w-0 break-words text-ink-2">{log.message}</span>
         )}
       </div>
       <div className="flex items-start">{hasDetail && <CopyButton text={fullText} title="复制日志" />}</div>
@@ -264,10 +264,10 @@ function InfoRow({ children, label, mono, value }: {
   value?: string;
 }): ReactElement {
   return (
-    <div className="flex items-center justify-between rounded-md bg-slate-50 px-3 py-2 text-[11px]">
-      <span className="shrink-0 text-slate-500">{label}</span>
+    <div className="flex items-center justify-between rounded-md bg-paper-sunk px-3 py-2 text-[11px]">
+      <span className="shrink-0 text-ink-3">{label}</span>
       {children ?? (
-        <span className={mono ? 'max-w-40 truncate font-mono text-slate-700' : 'font-medium text-slate-800'}>{value ?? '--'}</span>
+        <span className={mono ? 'max-w-40 truncate font-mono text-ink-2' : 'font-medium text-ink-2'}>{value ?? '--'}</span>
       )}
     </div>
   );

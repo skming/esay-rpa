@@ -1,4 +1,4 @@
-import { Archive, Check, CirclePause, CirclePlay, Copy, Download, Hash, History, MoreHorizontal, Play, PowerOff, Square, SquarePen, TimerReset, Trash2 } from 'lucide-react';
+import { Archive, Check, CirclePause, CirclePlay, Copy, Download, Hash, History, MoreHorizontal, Play, PowerOff, Square, SquarePen, Trash2 } from 'lucide-react';
 import type { ReactElement } from 'react';
 import { useState } from 'react';
 
@@ -21,7 +21,6 @@ export function FlowListTable({
   onExport,
   onHistory,
   onRun,
-  onSchedule,
   onSetStatus,
   onStop,
 }: {
@@ -32,7 +31,6 @@ export function FlowListTable({
   onExport: (flowId: string) => void;
   onHistory: (flowId: string) => void;
   onRun: (flowId: string) => void;
-  onSchedule: (flowId: string) => void;
   onSetStatus: (flowId: string, status: FlowStatus) => void;
   onStop: () => void;
 }): ReactElement {
@@ -89,77 +87,63 @@ export function FlowListTable({
                 <div className="flex justify-end gap-1">
                   {item.state === 'running' ? (
                     <Tooltip>
-                      <TooltipTrigger asChild>
-                        <Button aria-label={`停止 ${item.flow.name}`} className="h-7 w-7 rounded-md px-0 text-red-600 hover:text-red-700" onClick={onStop} variant="subtle">
-                          <Square className="h-3 w-3" fill="currentColor" strokeWidth={1.5} />
-                        </Button>
+                      <TooltipTrigger render={<Button aria-label={`停止 ${item.flow.name}`} className="h-7 w-7 rounded-md px-0 text-red-600 hover:text-red-700" onClick={onStop} variant="subtle" />}>
+                        <Square className="h-3 w-3" fill="currentColor" strokeWidth={1.5} />
                       </TooltipTrigger>
                       <TooltipContent side="bottom">停止运行</TooltipContent>
                     </Tooltip>
                   ) : (
                     <Tooltip>
-                      <TooltipTrigger asChild>
-                        <Button
-                          aria-label={`运行 ${item.flow.name}`}
-                          className="h-7 w-7 rounded-md px-0"
-                          disabled={item.state === 'disabled' || item.state === 'paused'}
-                          onClick={() => onRun(item.flow.flowId)}
-                          variant="subtle"
-                        >
-                          <Play className="h-3.5 w-3.5" strokeWidth={1.5} />
-                        </Button>
+                      <TooltipTrigger
+                        render={
+                          <Button
+                            aria-label={`运行 ${item.flow.name}`}
+                            className="h-7 w-7 rounded-md px-0"
+                            disabled={item.state === 'disabled' || item.state === 'paused'}
+                            onClick={() => onRun(item.flow.flowId)}
+                            variant="subtle"
+                          />
+                        }
+                      >
+                        <Play className="h-3.5 w-3.5" strokeWidth={1.5} />
                       </TooltipTrigger>
                       <TooltipContent side="bottom">运行</TooltipContent>
                     </Tooltip>
                   )}
                   <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Button aria-label={`设置 ${item.flow.name} 的调度`} className="h-7 w-7 rounded-md px-0" onClick={() => onSchedule(item.flow.flowId)} variant="subtle">
-                        <TimerReset className="h-3.5 w-3.5" strokeWidth={1.5} />
-                      </Button>
-                    </TooltipTrigger>
-                    <TooltipContent side="bottom">调度设置</TooltipContent>
-                  </Tooltip>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Button aria-label={`编辑 ${item.flow.name}`} className="h-7 w-7 rounded-md px-0" onClick={() => onEdit(item.flow.flowId)} variant="primary">
-                        <SquarePen className="h-3.5 w-3.5" strokeWidth={1.5} />
-                      </Button>
+                    <TooltipTrigger render={<Button aria-label={`编辑 ${item.flow.name}`} className="h-7 w-7 rounded-md px-0" onClick={() => onEdit(item.flow.flowId)} variant="primary" />}>
+                      <SquarePen className="h-3.5 w-3.5" strokeWidth={1.5} />
                     </TooltipTrigger>
                     <TooltipContent side="bottom">编辑</TooltipContent>
                   </Tooltip>
                   <DropdownMenu>
                     <Tooltip>
-                      <TooltipTrigger asChild>
-                        <DropdownMenuTrigger asChild>
-                          <Button aria-label={`${item.flow.name} 的更多操作`} className="h-7 w-7 rounded-md px-0" variant="subtle">
-                            <MoreHorizontal className="h-3.5 w-3.5" strokeWidth={1.5} />
-                          </Button>
-                        </DropdownMenuTrigger>
+                      <TooltipTrigger render={<DropdownMenuTrigger render={<Button aria-label={`${item.flow.name} 的更多操作`} className="h-7 w-7 rounded-md px-0" variant="subtle" />} />}>
+                        <MoreHorizontal className="h-3.5 w-3.5" strokeWidth={1.5} />
                       </TooltipTrigger>
                       <TooltipContent side="bottom">更多操作</TooltipContent>
                     </Tooltip>
                     <DropdownMenuContent align="end" className="w-36">
-                      <DropdownMenuItem onSelect={() => onHistory(item.flow.flowId)}>
+                      <DropdownMenuItem onClick={() => onHistory(item.flow.flowId)}>
                         <History className="mr-2 h-3.5 w-3.5 text-ink-3" strokeWidth={1.5} />运行历史
                       </DropdownMenuItem>
-                      <DropdownMenuItem onSelect={() => onExport(item.flow.flowId)}>
+                      <DropdownMenuItem onClick={() => onExport(item.flow.flowId)}>
                         <Download className="mr-2 h-3.5 w-3.5 text-ink-3" strokeWidth={1.5} />导出 JSON
                       </DropdownMenuItem>
                       {item.state === 'running' && (
                         <>
                           <DropdownMenuSeparator />
-                          <DropdownMenuItem className="text-red-600 focus:text-red-600" onSelect={onStop}>
+                          <DropdownMenuItem className="text-red-600 focus:text-red-600" onClick={onStop}>
                             <Square className="mr-2 h-3.5 w-3.5" fill="currentColor" strokeWidth={1.5} />停止运行
                           </DropdownMenuItem>
                           <DropdownMenuSeparator />
                         </>
                       )}
                       <StatusActions flowId={item.flow.flowId} onSetStatus={onSetStatus} state={item.state} />
-                      <DropdownMenuItem onSelect={() => onArchive(item.flow.flowId)}>
+                      <DropdownMenuItem onClick={() => onArchive(item.flow.flowId)}>
                         <Archive className="mr-2 h-3.5 w-3.5 text-ink-3" strokeWidth={1.5} />归档
                       </DropdownMenuItem>
-                      <DropdownMenuItem className="text-red-600 focus:text-red-600" onSelect={() => onDelete(item.flow.flowId)}>
+                      <DropdownMenuItem className="text-red-600 focus:text-red-600" onClick={() => onDelete(item.flow.flowId)}>
                         <Trash2 className="mr-2 h-3.5 w-3.5" strokeWidth={1.5} />删除任务
                       </DropdownMenuItem>
                     </DropdownMenuContent>
@@ -191,21 +175,23 @@ export function FlowIdChip({ flowId, className }: { flowId: string; className?: 
       <Hash className="h-2.5 w-2.5 shrink-0 text-ink-4" strokeWidth={2} />
       <span className="min-w-0 flex-1 truncate font-mono text-[10px] tabular-nums text-ink-3">{display}</span>
       <Tooltip>
-        <TooltipTrigger asChild>
-          <button
-            aria-label={copied ? '已复制流程 ID' : '复制流程 ID'}
-            className={cn(
-              'shrink-0 rounded p-0.5 transition-colors',
-              copied ? 'text-emerald-600' : 'text-ink-4 opacity-0 group-hover:opacity-100 hover:text-ink-2',
-            )}
-            onClick={copy}
-            type="button"
-          >
-            {copied
-              ? <Check className="h-3 w-3" strokeWidth={2.5} />
-              : <Copy className="h-3 w-3" strokeWidth={2} />
-            }
-          </button>
+        <TooltipTrigger
+          render={
+            <button
+              aria-label={copied ? '已复制流程 ID' : '复制流程 ID'}
+              className={cn(
+                'shrink-0 rounded p-0.5 transition-colors',
+                copied ? 'text-emerald-600' : 'text-ink-4 opacity-0 group-hover:opacity-100 hover:text-ink-2',
+              )}
+              onClick={copy}
+              type="button"
+            />
+          }
+        >
+          {copied
+            ? <Check className="h-3 w-3" strokeWidth={2.5} />
+            : <Copy className="h-3 w-3" strokeWidth={2} />
+          }
         </TooltipTrigger>
         <TooltipContent side="bottom" className="font-mono text-[10px]">
           {copied ? '已复制' : '点击复制'}
@@ -229,18 +215,18 @@ function StatusActions({
     <>
       <DropdownMenuSeparator />
       {(state === 'draft' || state === 'disabled' || state === 'paused') && (
-        <DropdownMenuItem onSelect={() => onSetStatus(flowId, 'active')}>
+        <DropdownMenuItem onClick={() => onSetStatus(flowId, 'active')}>
           <CirclePlay className="mr-2 h-3.5 w-3.5 text-emerald-500" strokeWidth={1.5} />
           {state === 'draft' ? '发布启用' : '恢复启用'}
         </DropdownMenuItem>
       )}
       {(state === 'published' || state === 'scheduled' || state === 'failed') && (
-        <DropdownMenuItem onSelect={() => onSetStatus(flowId, 'paused')}>
+        <DropdownMenuItem onClick={() => onSetStatus(flowId, 'paused')}>
           <CirclePause className="mr-2 h-3.5 w-3.5 text-amber-500" strokeWidth={1.5} />暂停
         </DropdownMenuItem>
       )}
       {state !== 'disabled' && (
-        <DropdownMenuItem onSelect={() => onSetStatus(flowId, 'disabled')}>
+        <DropdownMenuItem onClick={() => onSetStatus(flowId, 'disabled')}>
           <PowerOff className="mr-2 h-3.5 w-3.5 text-slate-400" strokeWidth={1.5} />禁用
         </DropdownMenuItem>
       )}

@@ -153,20 +153,22 @@ export function ArtifactPreviewContent({ content, loading }: { content: Artifact
           <span className="ml-auto font-mono text-[10px] text-slate-500">{formatBytes(content.content.length)} chars</span>
         )}
         {!isImage && !ooxmlExt && (
-          <TooltipProvider delayDuration={300}>
+          <TooltipProvider delay={300}>
             <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  aria-label="复制内容"
-                  className="flex h-6 w-6 items-center justify-center rounded transition-colors hover:bg-white/10"
-                  onClick={handleCopy}
-                  type="button"
-                >
-                  {copied
-                    ? <Check className="h-3.5 w-3.5 text-emerald-400" strokeWidth={2} />
-                    : <Copy className="h-3.5 w-3.5 text-slate-400" strokeWidth={1.5} />
-                  }
-                </button>
+              <TooltipTrigger
+                render={
+                  <button
+                    aria-label="复制内容"
+                    className="flex h-6 w-6 items-center justify-center rounded transition-colors hover:bg-white/10"
+                    onClick={handleCopy}
+                    type="button"
+                  />
+                }
+              >
+                {copied
+                  ? <Check className="h-3.5 w-3.5 text-emerald-400" strokeWidth={2} />
+                  : <Copy className="h-3.5 w-3.5 text-slate-400" strokeWidth={1.5} />
+                }
               </TooltipTrigger>
               <TooltipContent side="bottom">{copied ? '已复制' : '复制内容'}</TooltipContent>
             </Tooltip>

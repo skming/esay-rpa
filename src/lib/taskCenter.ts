@@ -22,8 +22,8 @@ type FlowCompat = FlowSnapshot & {
   thumbnail_url?: string | null;
 };
 
-/** Excludes archived flows; `runningFlowId` overrides state to 'running'. */
-export function buildFlowListItems(flows: FlowSnapshot[], schedules: ScheduleSnapshot[], runningFlowId: string | null): FlowListItem[] {
+/** Excludes archived flows; flows in `runningFlowIds` are forced to 'running'. */
+export function buildFlowListItems(flows: FlowSnapshot[], schedules: ScheduleSnapshot[], runningFlowIds: Set<string>): FlowListItem[] {
   const nextRunByFlowId = new Map<string, string>();
   for (const schedule of schedules) {
     const flowId = schedule.task.flowId;
@@ -49,7 +49,7 @@ export function buildFlowListItems(flows: FlowSnapshot[], schedules: ScheduleSna
         lastRunStatus,
         nextRunAt,
         successRate,
-        state: resolveFlowState(flow, nextRunAt, lastRunStatus, runningFlowId)
+        state: resolveFlowState(flow, nextRunAt, lastRunStatus, runningFlowIds)
       };
     })
     .sort((left, right) => compareDate(right.flow.updatedAt, left.flow.updatedAt));
@@ -100,8 +100,8 @@ export function formatScheduleHint(value: string | null): string {
   return `下次 ${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
 }
 
-function resolveFlowState(flow: FlowSnapshot, nextRunAt: string | null, lastRunStatus: string | null, runningFlowId: string | null): FlowCardState {
-  if (runningFlowId === flow.flowId) {
+function resolveFlowState(flow: FlowSnapshot, nextRunAt: string | null, lastRunStatus: string | null, runningFlowIds: Set<string>): FlowCardState {
+  if (runningFlowIds.has(flow.flowId)) {
     return 'running';
   }
   if (flow.status === 'draft') {

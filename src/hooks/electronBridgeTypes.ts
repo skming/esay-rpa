@@ -110,7 +110,6 @@ export type ElectronBridgeState = {
   loadScheduleRunSummaries: (options?: BridgeCallOptions) => Promise<void>;
   previewSchedule: (cronExpression: string, timezone: string) => Promise<string[] | null>;
   createDefaultSchedule: (options?: CreateScheduleOptions) => Promise<boolean>;
-  createScheduleForFlow: (flowId: string, options?: CreateScheduleOptions) => Promise<boolean>;
   updateScheduleEnabled: (scheduleId: string, enabled: boolean) => Promise<void>;
   updateSchedule: (scheduleId: string, options: import('./useElectronBridgeActions').CreateScheduleOptions) => Promise<boolean>;
   deleteSchedule: (scheduleId: string) => Promise<void>;
@@ -123,5 +122,4 @@ export type ElectronBridgeState = {
   pushToast: (type: BridgeToast['type'], message: string) => number;
   dismissToast: (toastId: number) => void;
   clearToast: () => void;
-  clearRuns: () => void;
 };

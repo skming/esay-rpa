@@ -3,8 +3,7 @@ import type { ReactElement, ReactNode } from 'react';
 /* Desktop tool page frame. A compact header row — title, inline description,
    actions on the trailing edge — over a full-width content field. The register
    is Figma-panel / Linear, not a web page: no centered magazine column, no
-   oversized masthead. Wayfinding lives in the NavRail. The `icon`/`kicker`
-   props are accepted for caller compatibility but no longer rendered. */
+   oversized masthead. Wayfinding lives in the NavRail. */
 export function WorkspaceShell({
   actions,
   children,
@@ -17,8 +16,6 @@ export function WorkspaceShell({
   description?: string;
   /** 内容自己管滚动，避免出现两条滚动条。 */
   fill?: boolean;
-  icon?: ReactNode;
-  kicker?: string;
   title: string;
 }): ReactElement {
   return (

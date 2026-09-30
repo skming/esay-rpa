@@ -1,5 +1,5 @@
 import type { Node } from '@xyflow/react';
-import { ScrollText, Sparkles } from 'lucide-react';
+import { Loader2, ScrollText, Sparkles } from 'lucide-react';
 import type { PointerEvent, ReactElement } from 'react';
 import { useMemo } from 'react';
 
@@ -28,6 +28,7 @@ const LOG_LEVEL_LABELS: Record<RunLogLevel, string> = {
 };
 
 export function BottomPanel({
+  aiBusy = false,
   electron,
   flowNodes,
   onBreakpointChange,
@@ -35,6 +36,7 @@ export function BottomPanel({
   onSelectedNodeChange,
   onAiAnalyze
 }: {
+  aiBusy?: boolean;
   electron: ElectronBridgeState;
   flowNodes: Node<RpaNodeData>[];
   onBreakpointChange: (nodeId: string, enabled: boolean) => void;
@@ -75,6 +77,10 @@ export function BottomPanel({
   const buildLogContent = (): string =>
     logs.map((log) => `${log.time} [${log.level}] ${log.message}${log.detail !== undefined ? ` ${log.detail}` : ''}`).join('\n');
   const lastRunId = electron.lastRunId;
+  const canAnalyzeRun = onAiAnalyze !== undefined
+    && lastRunId !== null
+    && !lastRunId.startsWith('run-')
+    && errorRows.length > 0;
   const refreshArtifacts =
     lastRunId === null
       ? undefined
@@ -162,16 +168,21 @@ export function BottomPanel({
         )}
         {activeTab === 'errors' && (
           <div className="flex flex-col gap-2">
-            {onAiAnalyze && electron.lastRunId !== null && errorRows.length > 0 && (
-              <Button
-                className="self-start"
-                onClick={() => onAiAnalyze(electron.lastRunId!, buildErrorSummary(errorRows, nodeTitleById))}
-                size="sm"
-                variant="outline"
-              >
-                <Sparkles className="h-3.5 w-3.5" strokeWidth={1.5} />
-                AI 分析错误
-              </Button>
+            {canAnalyzeRun && (
+              <div className="flex items-center justify-between gap-3 border-b border-slate-100 pb-2">
+                <p className="text-[10px] text-slate-500">AI 将读取本次运行详情，定位失败节点并重新验证</p>
+                <Button
+                  disabled={aiBusy}
+                  onClick={() => onAiAnalyze(lastRunId, buildErrorSummary(errorRows, nodeTitleById))}
+                  size="sm"
+                  variant="soft"
+                >
+                  {aiBusy
+                    ? <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.5} />
+                    : <Sparkles className="h-3.5 w-3.5" strokeWidth={1.5} />}
+                  {aiBusy ? 'AI 正在处理' : 'AI 排查并修复'}
+                </Button>
+              </div>
             )}
             <ErrorRows onJumpToNode={onSelectedNodeChange} rows={errorRows} />
           </div>

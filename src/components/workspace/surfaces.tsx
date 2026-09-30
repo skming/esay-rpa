@@ -1,4 +1,4 @@
-import { Search, X } from 'lucide-react';
+import { Loader2, Search, X } from 'lucide-react';
 import type { ReactElement, ReactNode } from 'react';
 
 import { cn } from '../../lib/utils';
@@ -11,7 +11,7 @@ const STATE: Record<StatusTone, { dot: string; text: string; live?: boolean }> =
   success: { dot: 'bg-emerald-500', text: 'text-emerald-700' },
   warning: { dot: 'bg-amber-500', text: 'text-amber-700' },
   error: { dot: 'bg-red-500', text: 'text-red-600' },
-  idle: { dot: 'bg-slate-300', text: 'text-slate-500' },
+  idle: { dot: 'bg-ink-4', text: 'text-ink-3' },
 };
 
 /** Inline state marker: a small dot + label. The dot pulses only when live. */
@@ -34,7 +34,7 @@ export const SURFACE = 'rounded-xl border border-rule bg-surface shadow-xs';
 
 export function HealthRail({ children }: { children: ReactNode }): ReactElement {
   return (
-    <section className={cn('grid overflow-hidden divide-x divide-rule', SURFACE)} style={{ gridTemplateColumns: `repeat(${Array.isArray(children) ? children.length : 1}, minmax(0, 1fr))` }}>
+    <section className={cn('grid grid-cols-[repeat(auto-fit,minmax(180px,1fr))] overflow-hidden divide-x divide-rule', SURFACE)}>
       {children}
     </section>
   );
@@ -63,7 +63,7 @@ export function HealthSignal({
           <span className={cn('ml-auto h-1.5 w-1.5 shrink-0 rounded-full', cfg.dot, cfg.live && 'live-dot')} />
         )}
       </div>
-      <div className={cn('mt-2 truncate text-[16px] font-semibold leading-none tracking-[-0.02em] text-ink', cfg?.text)}>
+      <div className={cn('figure mt-2 truncate text-[17px] leading-none text-ink', cfg?.text)}>
         {value}
       </div>
       <div className="mt-1.5 truncate text-[10.5px] text-ink-3">{detail}</div>
@@ -163,6 +163,16 @@ export function SurfaceEmpty({
   );
 }
 
+/** 首屏加载态。与空态同尺寸，避免加载完成时布局跳动。 */
+export function SurfaceLoading({ label = '加载中…' }: { label?: string }): ReactElement {
+  return (
+    <div className="flex flex-col items-center justify-center gap-2 px-6 py-12 text-center" role="status" aria-live="polite">
+      <Loader2 className="h-5 w-5 animate-spin text-ink-4" strokeWidth={1.5} />
+      <p className="text-[12px] text-ink-3">{label}</p>
+    </div>
+  );
+}
+
 /** 独占一屏的空态（带外框）。 */
 export function EmptyPanel(props: {
   icon?: ReactElement;
@@ -172,6 +182,15 @@ export function EmptyPanel(props: {
   return (
     <div className={SURFACE}>
       <SurfaceEmpty {...props} />
+    </div>
+  );
+}
+
+/** 首屏加载态（带外框），与 EmptyPanel 同壳，数据到位前后不跳版。 */
+export function LoadingPanel({ label }: { label?: string }): ReactElement {
+  return (
+    <div className={SURFACE}>
+      <SurfaceLoading label={label} />
     </div>
   );
 }
@@ -228,6 +247,56 @@ export function SearchField({
           <X className="h-3.5 w-3.5" strokeWidth={1.5} />
         </button>
       )}
+    </div>
+  );
+}
+
+/** 分段筛选 + 搜索的横条。任务中心与调度中心共用同一套，勿再各写各的高度、间距与选中态。 */
+export function FilterBar<T extends string>({
+  counts, filters, onQueryChange, onValueChange, query, searchLabel, searchPlaceholder, value,
+}: {
+  counts: Record<T, number>;
+  filters: ReadonlyArray<{ label: string; value: T }>;
+  onQueryChange: (query: string) => void;
+  onValueChange: (value: T) => void;
+  query: string;
+  searchLabel: string;
+  searchPlaceholder: string;
+  value: T;
+}): ReactElement {
+  return (
+    <div className="flex flex-wrap items-center gap-2 rounded-xl border border-rule bg-surface p-2 shadow-xs">
+      <div className="no-scrollbar flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
+        {filters.map((item) => (
+          <button
+            aria-pressed={value === item.value}
+            className={cn(
+              'flex h-8 shrink-0 items-center gap-1.5 rounded-md px-2.5 text-[11px] font-medium transition-colors',
+              value === item.value
+                ? 'bg-accent-soft text-accent-strong'
+                : 'text-ink-3 hover:bg-paper-sunk hover:text-ink-2',
+            )}
+            key={item.value}
+            onClick={() => onValueChange(item.value)}
+            type="button"
+          >
+            {item.label}
+            <span className={cn(
+              'font-mono text-[10px] tabular-nums',
+              value === item.value ? 'text-accent-strong' : 'text-ink-3',
+            )}>
+              {counts[item.value]}
+            </span>
+          </button>
+        ))}
+      </div>
+      <SearchField
+        className="w-64 flex-none"
+        label={searchLabel}
+        onChange={onQueryChange}
+        placeholder={searchPlaceholder}
+        value={query}
+      />
     </div>
   );
 }

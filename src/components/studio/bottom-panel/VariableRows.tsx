@@ -88,11 +88,9 @@ export function VariableRows({ rows }: { rows: RuntimeVariableView[] }): ReactEl
       >
         <TableCell className="overflow-hidden pl-2 font-mono text-[11px] text-accent-strong">
           <Tooltip>
-            <TooltipTrigger asChild>
-              <span className="flex min-w-0 items-center gap-1.5 cursor-default">
+            <TooltipTrigger render={<span className="flex min-w-0 items-center gap-1.5 cursor-default" />}>
                 {watched && <Pin className="h-3 w-3 shrink-0 text-accent" strokeWidth={1.5} />}
                 <span className="block truncate">${`{${row.name}}`}</span>
-              </span>
             </TooltipTrigger>
             <TooltipContent className="font-mono text-[11px]" side="top">
               ${`{${row.name}}`}
@@ -119,10 +117,8 @@ export function VariableRows({ rows }: { rows: RuntimeVariableView[] }): ReactEl
           ) : (
             <div className="flex min-w-0 items-center gap-1.5">
               <Tooltip>
-                <TooltipTrigger asChild>
-                  <span className={cn('block min-w-0 truncate cursor-default font-mono text-[11px]', canEdit ? 'text-slate-700' : 'text-slate-500')}>
+                <TooltipTrigger render={<span className={cn('block min-w-0 truncate cursor-default font-mono text-[11px]', canEdit ? 'text-slate-700' : 'text-slate-500')} />}>
                     {displayVal !== '' ? displayVal : <span className="italic text-slate-500">空</span>}
-                  </span>
                 </TooltipTrigger>
                 {displayVal !== '' && (
                   <TooltipContent className="max-w-120 break-all font-mono text-[11px] leading-5" side="top">
@@ -188,7 +184,7 @@ export function VariableRows({ rows }: { rows: RuntimeVariableView[] }): ReactEl
   };
 
   return (
-    <TooltipProvider delayDuration={400}>
+    <TooltipProvider delay={400}>
       <Table className="table-fixed min-w-145">
         <TableHeader className="sticky top-0 z-(--z-sticky) bg-white">
           <TableRow>

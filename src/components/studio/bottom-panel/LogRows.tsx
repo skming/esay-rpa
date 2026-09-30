@@ -48,7 +48,7 @@ export function LogRows({
   }, [rows.length]);
 
   return (
-    <TooltipProvider delayDuration={300}>
+    <TooltipProvider delay={300}>
       <Table className="table-fixed">
         <TableBody>
           {rows.map((row) => (
@@ -104,11 +104,9 @@ function LogRow({
               </span>
             ) : (
               <Tooltip>
-                <TooltipTrigger asChild>
-                  <span className="block min-w-0 flex-1 truncate">
-                    {row.message}
-                    <span className="ml-2 text-slate-500">{row.detail}</span>
-                  </span>
+                <TooltipTrigger render={<span className="block min-w-0 flex-1 truncate" />}>
+                  {row.message}
+                  <span className="ml-2 text-slate-500">{row.detail}</span>
                 </TooltipTrigger>
                 <TooltipContent className="max-w-120 break-all leading-5" side="top">
                   {fullText}
@@ -126,18 +124,20 @@ function LogRow({
       <TableCell className="w-36 py-1 align-top">
         {canJump ? (
           <Tooltip>
-            <TooltipTrigger asChild>
+            <TooltipTrigger
+              render={
+                <button
+                  aria-label={`定位到节点 ${nodeTitle ?? row.nodeId}`}
+                  className="flex h-5 max-w-full items-center rounded-full border border-slate-200 bg-slate-100 px-1.5 text-[10px] font-medium text-slate-600 transition-colors hover:border-slate-300 hover:bg-slate-200/70 hover:text-slate-800"
+                  onClick={() => onJumpToNode(row.nodeId as string)}
+                  type="button"
+                />
+              }
+            >
               {/* h-5 = 20px，低于 24px 目标下限，靠 SC 2.5.8 的间距豁免成立：
-                  同行的 CopyButton 是 h-6，行高被撑到 32px，同列相邻行的
-                  24px 判定圆互不相交。改行距或去掉 CopyButton 时要重算。 */}
-              <button
-                aria-label={`定位到节点 ${nodeTitle ?? row.nodeId}`}
-                className="flex h-5 max-w-full items-center rounded-full border border-slate-200 bg-slate-100 px-1.5 text-[10px] font-medium text-slate-600 transition-colors hover:border-slate-300 hover:bg-slate-200/70 hover:text-slate-800"
-                onClick={() => onJumpToNode(row.nodeId as string)}
-                type="button"
-              >
-                <span className="truncate">{nodeTitle ?? `节点 ${row.nodeId}`}</span>
-              </button>
+                同行的 CopyButton 是 h-6，行高被撑到 32px，同列相邻行的
+                24px 判定圆互不相交。改行距或去掉 CopyButton 时要重算。 */}
+              <span className="truncate">{nodeTitle ?? `节点 ${row.nodeId}`}</span>
             </TooltipTrigger>
             <TooltipContent className="max-w-80" side="top">
               <div className="font-medium text-slate-800">{nodeTitle ?? '未知节点'}</div>

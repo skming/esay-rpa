@@ -15,7 +15,6 @@ import type { FlowSnapshot } from '../../types/electron';
 import { Button } from '../ui/button';
 import { RefreshButton } from '../ui/refresh-button';
 import { Table, TableBody, TableCell, TableRow } from '../ui/table';
-import { ScheduleCreateDialog } from '../studio/property-panel/ScheduleCreateDialog';
 import {
   AlertDialog,
   AlertDialogAction,
@@ -26,9 +25,11 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '../ui/alert-dialog';
-import { EmptyPanel, HealthRail, HealthSignal, SURFACE } from './surfaces';
+import { EmptyPanel, HealthRail, HealthSignal, LoadingPanel, SURFACE } from './surfaces';
 import { WorkspaceShell } from './WorkspaceShell';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '../ui/dropdown-menu';
+
+const HISTORY_PAGE_SIZE = 20;
 
 export function TaskCenterPage({
   electron,
@@ -39,9 +40,11 @@ export function TaskCenterPage({
 }): ReactElement {
   const [createOpen, setCreateOpen] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
+  const [firstLoad, setFirstLoad] = useState(true);
   const [deleteFlowId, setDeleteFlowId] = useState<string | null>(null);
   const [historyFlowId, setHistoryFlowId] = useState<string | null>(null);
-  const [scheduleFlowId, setScheduleFlowId] = useState<string | null>(null);
+  const [historyLimit, setHistoryLimit] = useState(HISTORY_PAGE_SIZE);
+  const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
   const [detailRun, setDetailRun] = useState<import('../../types/electron').TaskSnapshot | null>(null);
   const loadedRef = useRef(false);
   const [searchParams, setSearchParams] = useSearchParams();
@@ -52,16 +55,34 @@ export function TaskCenterPage({
   useEffect(() => {
     if (loadedRef.current) return;
     loadedRef.current = true;
-    void electron.loadFlows({ silent: true });
     void electron.loadSchedules({ silent: true });
     void electron.loadQueueStats({ silent: true });
+    // flows 与 runs 决定列表主体与「运行中」判定，等它们到位再撤加载态；schedules/queueStats 只喂指标条，缺一帧不影响主视觉。
+    void Promise.all([
+      electron.loadFlows({ silent: true }),
+      electron.loadRuns({ limit: 20, silent: true }),
+    ]).finally(() => setFirstLoad(false));
   }, [electron]);
 
-  const runningFlowId = electron.runtimeStatus === 'running' ? electron.activeRunFlowId ?? electron.currentFlow?.flowId ?? null : null;
+  // 运行中来自后端 runs（status==='running'）的 flowId 集合，而非"当前客户端正在跑哪个"；
+  // 否则卡片徽标、"运行中"页签与 KPI 会各说各话。本地刚发起、runs 尚未回读的先乐观并入，消除起跑空窗。
+  const runningFlowIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const run of electron.runs) {
+      if (run.status === 'running' && typeof run.flowId === 'string' && run.flowId !== '') {
+        ids.add(run.flowId);
+      }
+    }
+    if (electron.runtimeStatus === 'running') {
+      const localId = electron.activeRunFlowId ?? electron.currentFlow?.flowId ?? null;
+      if (localId !== null) ids.add(localId);
+    }
+    return ids;
+  }, [electron.runs, electron.runtimeStatus, electron.activeRunFlowId, electron.currentFlow?.flowId]);
 
   const items = useMemo(
-    () => buildFlowListItems(electron.flows, electron.schedules, runningFlowId),
-    [electron.flows, electron.schedules, runningFlowId],
+    () => buildFlowListItems(electron.flows, electron.schedules, runningFlowIds),
+    [electron.flows, electron.schedules, runningFlowIds],
   );
 
   const archivedFlows = useMemo(
@@ -130,7 +151,15 @@ export function TaskCenterPage({
   };
   const openHistory = (flowId: string): void => {
     setHistoryFlowId(flowId);
-    void electron.loadFlowRuns(flowId, { limit: 20, silent: true });
+    setHistoryLimit(HISTORY_PAGE_SIZE);
+    void electron.loadFlowRuns(flowId, { limit: HISTORY_PAGE_SIZE, silent: true });
+  };
+  const loadMoreHistory = (): void => {
+    if (historyFlowId === null) return;
+    const next = historyLimit + HISTORY_PAGE_SIZE;
+    setHistoryLimit(next);
+    setHistoryLoadingMore(true);
+    void electron.loadFlowRuns(historyFlowId, { limit: next, silent: true }).finally(() => setHistoryLoadingMore(false));
   };
   const exportFlow = (flowId: string): void => {
     void electron.exportFlowById(flowId);
@@ -149,7 +178,7 @@ export function TaskCenterPage({
         <>
           <RefreshButton
             variant="subtle"
-            onClick={() => { void electron.loadFlows(); void electron.loadSchedules(); }}
+            onClick={() => { void electron.loadFlows(); void electron.loadSchedules(); void electron.loadRuns({ limit: 20 }); }}
           >
             刷新
           </RefreshButton>
@@ -179,8 +208,8 @@ export function TaskCenterPage({
           detail={`队列 ${electron.queueStats?.queuedCount ?? 0} · 上限 ${electron.queueStats?.concurrency ?? 1}`}
           icon={<Activity className="h-3.5 w-3.5" strokeWidth={1.5} />}
           label="运行中"
-          state={(electron.queueStats?.activeCount ?? viewCounts.running) > 0 ? 'live' : 'idle'}
-          value={electron.queueStats?.activeCount ?? viewCounts.running}
+          state={viewCounts.running > 0 ? 'live' : 'idle'}
+          value={viewCounts.running}
         />
         <HealthSignal
           detail={viewCounts.failed > 0 ? '需要查看运行证据' : '没有失败流程'}
@@ -207,7 +236,9 @@ export function TaskCenterPage({
       />
 
       <div className="min-w-0">
-        {view === 'archived' ? (
+        {firstLoad && electron.flows.length === 0 ? (
+          <LoadingPanel label="加载流程…" />
+        ) : view === 'archived' ? (
           <ArchivedList
             flows={filteredArchivedFlows}
             onDelete={setDeleteFlowId}
@@ -224,7 +255,6 @@ export function TaskCenterPage({
             onExport={exportFlow}
             onHistory={openHistory}
             onRun={runFlow}
-            onSchedule={setScheduleFlowId}
             onSetStatus={setStatus}
             onStop={stopFlow}
           />
@@ -240,14 +270,6 @@ export function TaskCenterPage({
         }}
         onOpenChange={setCreateOpen}
         open={createOpen}
-      />
-      <ScheduleCreateDialog
-        flows={electron.flows}
-        initialFlowIds={scheduleFlowId === null ? undefined : [scheduleFlowId]}
-        onCreate={(options) => scheduleFlowId === null ? Promise.resolve(false) : electron.createScheduleForFlow(scheduleFlowId, options)}
-        onOpenChange={(open) => { if (!open) setScheduleFlowId(null); }}
-        onPreview={electron.previewSchedule}
-        open={scheduleFlowId !== null}
       />
       <AlertDialog onOpenChange={(open) => !open && setDeleteFlowId(null)} open={deleteFlowId !== null}>
         <AlertDialogContent>
@@ -280,11 +302,18 @@ export function TaskCenterPage({
       />
       <RunHistoryDrawer
         flowName={historyTarget?.flow.name ?? ''}
-        onClose={() => setHistoryFlowId(null)}
+        hasMore={electron.runs.length >= historyLimit}
+        loadingMore={historyLoadingMore}
+        onClose={() => {
+          setHistoryFlowId(null);
+          // 抽屉打开时 loadFlowRuns 把共享 runs 换成了单流程的记录；关回来要重新拉全量，否则「运行中」判定会残留在那一个流程上。
+          void electron.loadRuns({ limit: 20, silent: true });
+        }}
         onInspectRun={(run) => {
           setDetailRun(run);
         }}
-        onRefresh={() => { if (historyFlowId !== null) void electron.loadFlowRuns(historyFlowId, { limit: 20 }); }}
+        onLoadMore={loadMoreHistory}
+        onRefresh={() => { if (historyFlowId !== null) void electron.loadFlowRuns(historyFlowId, { limit: historyLimit }); }}
         open={historyFlowId !== null}
         runs={electron.runs}
       />
@@ -339,10 +368,8 @@ function ArchivedList({
               </TableCell>
               <TableCell className="pr-5 flex justify-end">
                 <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <Button aria-label="更多操作" className="h-7 rounded-md px-2.5 text-[11px]" variant="ghost">
-                      <MoreHorizontal className="h-3 w-3" strokeWidth={1.5} />
-                    </Button>
+                  <DropdownMenuTrigger render={<Button aria-label="更多操作" className="h-7 rounded-md px-2.5 text-[11px]" variant="ghost" />}>
+                    <MoreHorizontal className="h-3 w-3" strokeWidth={1.5} />
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end">
                     <DropdownMenuItem onClick={() => onRestore(flow.flowId)}>

@@ -3,7 +3,7 @@ import type { RunLogEntry, RunLogLevel, RuntimeVariable } from '../../../types/r
 const MAX_SUMMARY_ERRORS = 3;
 const MAX_SUMMARY_CHARS = 200;
 
-/** 把面板里可见的错误行浓缩成「AI 分析错误」触发消息的上下文，AI 无需先调工具就知道错在哪。 */
+/** 把可见错误行压缩成排查线索；完整运行证据仍由 AI 通过任务 ID 读取。 */
 export function buildErrorSummary(errorRows: RunLogEntry[], nodeTitleById: Record<string, string>): string {
   const lines = errorRows.slice(0, MAX_SUMMARY_ERRORS).map((row) => {
     const nodeLabel = row.nodeId ? `[节点「${nodeTitleById[row.nodeId] ?? row.nodeId}」] ` : '';

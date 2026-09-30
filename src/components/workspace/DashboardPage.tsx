@@ -11,15 +11,19 @@ import { formatRelativeTime } from '../../lib/taskCenter';
 import type { TaskSnapshot } from '../../types/electron';
 import { cn } from '../../lib/utils';
 import { RefreshIconButton } from '../ui/refresh-button';
-import { HealthRail, HealthSignal, Panel, SurfaceEmpty } from './surfaces';
+import { HealthRail, HealthSignal, LoadingPanel, Panel, SurfaceEmpty } from './surfaces';
 import { RunDetailDialog } from './RunDetailDialog';
 import { RunHistoryList } from './RunHistoryList';
 import { WorkspaceShell } from './WorkspaceShell';
 
 const UPCOMING_LIMIT = 5;
+const RUN_PAGE_SIZE = 20;
 
 export function DashboardPage({ electron }: { electron: ElectronBridgeState }): ReactElement {
   const loadedRef = useRef(false);
+  const [firstLoad, setFirstLoad] = useState(true);
+  const [runLimit, setRunLimit] = useState(RUN_PAGE_SIZE);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [detailRun, setDetailRun] = useState<TaskSnapshot | null>(null);
   const navigate = useNavigate();
 
@@ -28,8 +32,16 @@ export function DashboardPage({ electron }: { electron: ElectronBridgeState }): 
     loadedRef.current = true;
     void electron.loadSchedules({ silent: true });
     void electron.loadQueueStats({ silent: true });
-    void electron.loadRuns({ limit: 20, silent: true });
+    void electron.loadRuns({ limit: RUN_PAGE_SIZE, silent: true }).finally(() => setFirstLoad(false));
   }, [electron]);
+
+  const loadMoreRuns = (): void => {
+    const next = runLimit + RUN_PAGE_SIZE;
+    setRunLimit(next);
+    setLoadingMore(true);
+    // loadRuns 是整表替换而非追加，所以直接按更大的 limit 重取即可拿到下一页。
+    void electron.loadRuns({ limit: next, silent: true }).finally(() => setLoadingMore(false));
+  };
 
   const activeCount = electron.queueStats?.activeCount ?? 0;
   const queuedCount = electron.queueStats?.queuedCount ?? 0;
@@ -64,7 +76,7 @@ export function DashboardPage({ electron }: { electron: ElectronBridgeState }): 
           onClick={async () => {
             await electron.loadQueueStats();
             await electron.loadSchedules();
-            await electron.loadRuns({ limit: 20 });
+            await electron.loadRuns({ limit: runLimit });
           }}
         />
       }
@@ -80,7 +92,7 @@ export function DashboardPage({ electron }: { electron: ElectronBridgeState }): 
           value={activeCount > 0 ? `${activeCount} 个运行中` : '空闲'}
         />
         <HealthSignal
-          detail={health.attention.length > 0 ? '等待处理或查看证据' : '没有未恢复异常'}
+          detail={health.attention.length > 0 ? '等待处理' : '没有未恢复异常'}
           icon={<AlertTriangle className="h-3.5 w-3.5" strokeWidth={1.5} />}
           label="需关注"
           state={health.attention.length > 0 ? 'error' : 'success'}
@@ -97,7 +109,7 @@ export function DashboardPage({ electron }: { electron: ElectronBridgeState }): 
           detail={nextSchedule?.name ?? '没有启用调度'}
           icon={<CalendarClock className="h-3.5 w-3.5" strokeWidth={1.5} />}
           label="下一次触发"
-          value={nextSchedule === undefined ? '--' : formatScheduleDateTime(nextSchedule.nextRunAt)}
+          value={nextSchedule === undefined ? '--' : formatScheduleDateTime(nextSchedule.nextRunAt, nextSchedule.timezone)}
         />
       </HealthRail>
 
@@ -138,7 +150,7 @@ export function DashboardPage({ electron }: { electron: ElectronBridgeState }): 
                     <span className="mt-0.5 block truncate text-[10px] text-ink-3">{schedule.task.flowName}</span>
                   </span>
                   <span className="shrink-0 font-mono text-[10px] tabular-nums text-ink-3">
-                    {formatScheduleDateTime(schedule.nextRunAt)}
+                    {formatScheduleDateTime(schedule.nextRunAt, schedule.timezone)}
                   </span>
                 </button>
               ))}
@@ -147,13 +159,20 @@ export function DashboardPage({ electron }: { electron: ElectronBridgeState }): 
         </Panel>
       </div>
 
-      <RunHistoryList
-        onInspectRun={(run) => {
-          inspectRun(run);
-        }}
-        onRefresh={() => void electron.loadRuns({ limit: 20 })}
-        runs={electron.runs}
-      />
+      {firstLoad && electron.runs.length === 0 ? (
+        <LoadingPanel label="加载运行历史…" />
+      ) : (
+        <RunHistoryList
+          hasMore={electron.runs.length >= runLimit}
+          loadingMore={loadingMore}
+          onInspectRun={(run) => {
+            inspectRun(run);
+          }}
+          onLoadMore={loadMoreRuns}
+          onRefresh={() => void electron.loadRuns({ limit: runLimit })}
+          runs={electron.runs}
+        />
+      )}
 
       <RunDetailDialog
         onLoadDetail={electron.getRunDetail}
@@ -180,7 +199,7 @@ function AttentionPanel({
     <Panel
       bodyClassName="p-0"
       icon={<AlertTriangle className="h-3.5 w-3.5" strokeWidth={1.5} />}
-      label="需要关注"
+      label="需关注"
     >
       {items.length === 0 ? (
         <SurfaceEmpty

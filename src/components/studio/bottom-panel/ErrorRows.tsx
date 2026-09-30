@@ -13,7 +13,7 @@ export function ErrorRows({ onJumpToNode, rows }: { onJumpToNode: (nodeId: strin
   }
 
   return (
-    <TooltipProvider delayDuration={300}>
+    <TooltipProvider delay={300}>
       <div className="min-w-140 space-y-1.5">
         {rows.map((row) => (
           <ErrorRow key={row.id} onJumpToNode={onJumpToNode} row={row} />
@@ -49,29 +49,25 @@ function ErrorRow({ onJumpToNode, row }: { onJumpToNode: (nodeId: string) => voi
       </div>
       <div className="flex shrink-0 flex-col gap-1">
         <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
+          <TooltipTrigger render={<Button
               aria-label="复制错误"
               className="h-7 w-7 border-red-200 bg-white px-0 text-red-500 hover:bg-red-100"
               onClick={handleCopy}
               variant="outline"
-            >
+            />}>
               {copied ? <Check className="h-3.5 w-3.5" strokeWidth={2} /> : <Copy className="h-3.5 w-3.5" strokeWidth={1.5} />}
-            </Button>
           </TooltipTrigger>
           <TooltipContent side="top">{copied ? '已复制' : '复制错误'}</TooltipContent>
         </Tooltip>
         <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
+          <TooltipTrigger render={<Button
               aria-label="定位到节点"
               className="h-7 w-7 border-red-200 bg-white px-0 text-red-500 hover:bg-red-100"
               disabled={row.nodeId === undefined}
               onClick={() => { if (row.nodeId !== undefined) onJumpToNode(row.nodeId); }}
               variant="outline"
-            >
+            />}>
               <ExternalLink className="h-3.5 w-3.5" strokeWidth={1.5} />
-            </Button>
           </TooltipTrigger>
           <TooltipContent side="top">定位到节点</TooltipContent>
         </Tooltip>

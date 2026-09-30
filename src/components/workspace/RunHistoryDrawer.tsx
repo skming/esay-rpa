@@ -1,46 +1,39 @@
-import * as DialogPrimitive from '@radix-ui/react-dialog';
-import { CheckCircle2, Clock3, FileJson, History, Inbox, ScanSearch, XCircle, X } from 'lucide-react';
+import { Dialog as DialogPrimitive } from '@base-ui/react/dialog';
+import { CheckCircle2, Clock3, FileJson, History, Inbox, Loader2, ScanSearch, XCircle, X } from 'lucide-react';
 import type { ReactElement } from 'react';
 
-import { formatElapsedTime } from '../../lib/time';
-import { runOutputSummary } from '../../lib/runPresentation';
+import { formatDateTime, formatElapsedTime } from '../../lib/time';
+import { runOutputSummary, TASK_STATUS_META } from '../../lib/runPresentation';
 import type { TaskSnapshot } from '../../types/electron';
 import { IconButton } from '../ui/button';
 import { RefreshIconButton } from '../ui/refresh-button';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../ui/tooltip';
 import { StateTag } from './surfaces';
-import type { StatusTone } from './surfaces';
 
 type Props = {
   flowName: string;
+  hasMore?: boolean;
+  loadingMore?: boolean;
   onClose: () => void;
   onInspectRun: (run: TaskSnapshot) => void;
+  onLoadMore?: () => void;
   onRefresh: () => void;
   open: boolean;
   runs: TaskSnapshot[];
 };
 
-const RUN_STATE: Record<TaskSnapshot['status'], { state: StatusTone; label: string }> = {
-  success: { state: 'success', label: '成功' },
-  error: { state: 'error', label: '失败' },
-  running: { state: 'live', label: '运行中' },
-  queued: { state: 'warning', label: '排队' },
-  stopped: { state: 'idle', label: '已停止' },
-  awaiting_confirmation: { state: 'warning', label: '等待操作' },
-};
-
-export function RunHistoryDrawer({ flowName, onClose, onInspectRun, onRefresh, open, runs }: Props): ReactElement {
+export function RunHistoryDrawer({ flowName, hasMore, loadingMore, onClose, onInspectRun, onLoadMore, onRefresh, open, runs }: Props): ReactElement {
   const successCount = runs.filter((r) => r.status === 'success').length;
   const errorCount = runs.filter((r) => r.status === 'error').length;
 
   return (
     <DialogPrimitive.Root open={open} onOpenChange={(v) => { if (!v) onClose(); }}>
       <DialogPrimitive.Portal>
-        <DialogPrimitive.Overlay className="fixed inset-0 z-(--z-drawer-backdrop) bg-slate-950/20 data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:duration-200 data-[state=closed]:duration-150" />
+        <DialogPrimitive.Backdrop className="fixed inset-0 z-(--z-drawer-backdrop) bg-slate-950/20 data-open:animate-in data-open:fade-in-0 data-closed:animate-out data-closed:fade-out-0 data-open:duration-200 data-closed:duration-150" />
 
-        <DialogPrimitive.Content
+        <DialogPrimitive.Popup
           aria-describedby={undefined}
-          className="fixed right-0 top-0 z-(--z-drawer) flex h-full w-175 max-w-[95vw] flex-col bg-surface shadow-2xl outline-none border-l border-rule data-[state=open]:animate-in data-[state=open]:slide-in-from-right data-[state=open]:duration-300 data-[state=closed]:animate-out data-[state=closed]:slide-out-to-right data-[state=closed]:duration-200"
+          className="fixed right-0 top-0 z-(--z-drawer) flex h-full w-175 max-w-[95vw] flex-col bg-surface shadow-2xl outline-none border-l border-rule data-open:animate-in data-open:slide-in-from-right data-open:duration-300 data-closed:animate-out data-closed:slide-out-to-right data-closed:duration-200"
         >
           <div className="flex shrink-0 items-start justify-between gap-4 border-b border-rule px-5 py-4">
             <div className="flex min-w-0 items-center gap-3">
@@ -66,10 +59,8 @@ export function RunHistoryDrawer({ flowName, onClose, onInspectRun, onRefresh, o
                 </div>
               )}
               <RefreshIconButton label="刷新历史" onClick={onRefresh} />
-              <DialogPrimitive.Close asChild>
-                <IconButton label="关闭">
-                  <X className="h-3.5 w-3.5" strokeWidth={1.5} />
-                </IconButton>
+              <DialogPrimitive.Close render={<IconButton label="关闭" />}>
+                <X className="h-3.5 w-3.5" strokeWidth={1.5} />
               </DialogPrimitive.Close>
             </div>
           </div>
@@ -84,7 +75,7 @@ export function RunHistoryDrawer({ flowName, onClose, onInspectRun, onRefresh, o
                 </div>
               </div>
             ) : (
-              <TooltipProvider delayDuration={400}>
+              <TooltipProvider delay={400}>
                 <div className="sticky top-0 z-(--z-sticky) grid grid-cols-[56px_92px_80px_88px_minmax(0,1fr)_44px] items-center gap-3 border-b border-rule-2 bg-paper-sunk px-5 py-2.5 text-[11px] font-medium text-ink-3">
                   <span>状态</span>
                   <span>耗时</span>
@@ -95,13 +86,13 @@ export function RunHistoryDrawer({ flowName, onClose, onInspectRun, onRefresh, o
                 </div>
 
                 {runs.map((run) => {
-                  const s = RUN_STATE[run.status];
+                  const s = TASK_STATUS_META[run.status];
                   return (
                     <div
                       key={run.taskId}
                       className="grid grid-cols-[56px_92px_80px_88px_minmax(0,1fr)_44px] items-center gap-3 border-b border-rule px-5 py-3 transition-colors last:border-b-0 hover:bg-paper"
                     >
-                      <StateTag state={s.state} label={s.label} />
+                      <StateTag state={s.tone} label={s.label} />
 
                       <span className="inline-flex items-center gap-1.5 font-mono text-[11px] tabular-nums text-ink-3">
                         <Clock3 className="h-3 w-3 text-ink-4" strokeWidth={1.5} />
@@ -126,10 +117,8 @@ export function RunHistoryDrawer({ flowName, onClose, onInspectRun, onRefresh, o
 
                       <div className="flex justify-end">
                         <Tooltip>
-                          <TooltipTrigger asChild>
-                            <IconButton className="h-7 w-7" label="查看详情" onClick={() => onInspectRun(run)}>
-                              <ScanSearch className="h-3.5 w-3.5" strokeWidth={1.5} />
-                            </IconButton>
+                          <TooltipTrigger render={<IconButton className="h-7 w-7" label="查看详情" onClick={() => onInspectRun(run)} />}>
+                            <ScanSearch className="h-3.5 w-3.5" strokeWidth={1.5} />
                           </TooltipTrigger>
                           <TooltipContent side="left">查看运行详情</TooltipContent>
                         </Tooltip>
@@ -140,7 +129,21 @@ export function RunHistoryDrawer({ flowName, onClose, onInspectRun, onRefresh, o
               </TooltipProvider>
             )}
           </div>
-        </DialogPrimitive.Content>
+
+          {onLoadMore !== undefined && hasMore === true && (
+            <div className="shrink-0 border-t border-rule px-5 py-2.5">
+              <button
+                className="flex h-8 w-full items-center justify-center gap-1.5 rounded-md text-[11px] font-medium text-ink-3 transition-colors hover:bg-paper-sunk hover:text-ink-2 disabled:opacity-60"
+                disabled={loadingMore === true}
+                onClick={onLoadMore}
+                type="button"
+              >
+                {loadingMore === true && <Loader2 className="h-3 w-3 animate-spin" strokeWidth={1.5} />}
+                {loadingMore === true ? '加载中…' : '加载更多'}
+              </button>
+            </div>
+          )}
+        </DialogPrimitive.Popup>
       </DialogPrimitive.Portal>
     </DialogPrimitive.Root>
   );
@@ -154,11 +157,4 @@ function Stat({ icon, label, value }: { icon?: ReactElement; label: string; valu
       <span className="text-ink-4">{label}</span>
     </span>
   );
-}
-
-function formatDateTime(value: string): string {
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) return value;
-  const p = (n: number): string => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
