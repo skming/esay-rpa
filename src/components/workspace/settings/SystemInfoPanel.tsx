@@ -15,7 +15,7 @@ const UPDATE_ERROR_LABELS: Record<string, string> = {
 export function SystemInfoPanel({ electron }: { electron: ElectronBridgeState }): ReactElement {
   const [status, setStatus] = useState<AppUpdateStatus>({ status: 'idle' });
   const [checkedAt, setCheckedAt] = useState<Date | null>(null);
-  const [restarting, setRestarting] = useState(false);
+  const [refreshingService, setRefreshingService] = useState(false);
   const bridge = typeof window !== 'undefined' ? (window.rpaBridge ?? null) : null;
 
   useEffect(() => {
@@ -36,12 +36,20 @@ export function SystemInfoPanel({ electron }: { electron: ElectronBridgeState })
   const isDownloading = status.status === 'downloading';
   const isReady = status.status === 'ready';
   const isAvailable = status.status === 'available';
-  const restartBackend = async (): Promise<void> => {
-    setRestarting(true);
+  const desktopAvailable = bridge !== null;
+  const canRestartBackend = desktopAvailable && ['managed', 'missing'].includes(electron.backendStatus?.source ?? '');
+  const refreshOrRestartService = async (): Promise<void> => {
+    setRefreshingService(true);
     try {
-      await electron.restartBackend();
+      if (canRestartBackend) {
+        await electron.restartBackend();
+      } else {
+        await electron.refreshBackendStatus();
+      }
+    } catch (error) {
+      electron.pushToast('error', error instanceof Error ? error.message : '服务状态更新失败');
     } finally {
-      setRestarting(false);
+      setRefreshingService(false);
     }
   };
 
@@ -72,13 +80,15 @@ export function SystemInfoPanel({ electron }: { electron: ElectronBridgeState })
           <InfoRow label="系统架构" value={electron.appInfo?.arch ?? '--'} />
           <InfoRow label="应用版本" value={electron.appInfo?.version ?? '--'} mono />
           <InfoRow label="主机名称" value={electron.appInfo?.hostname ?? '--'} mono />
-          <DataDirRow appDataDir={electron.appInfo?.appDataDir ?? '~/.easy-rpa'} electron={electron} />
+          {desktopAvailable
+            ? <DataDirRow appDataDir={electron.appInfo?.appDataDir ?? '--'} electron={electron} />
+            : <InfoRow label="数据目录" value="仅桌面客户端可查看" />}
         </SystemGroup>
 
         <SystemGroup
           action={
-            <IconButton className="h-6 w-6 text-ink-4 hover:text-ink" disabled={restarting} label={restarting ? '正在重启后端服务' : '重启后端服务'} onClick={() => void restartBackend()}>
-              <RefreshCw className={cn('h-3.5 w-3.5', restarting && 'animate-spin')} strokeWidth={1.5} />
+            <IconButton className="h-6 w-6 text-ink-4 hover:text-ink" disabled={refreshingService} label={refreshingService ? '正在更新服务状态' : canRestartBackend ? '重启后端服务' : '刷新服务状态'} onClick={() => void refreshOrRestartService()}>
+              <RefreshCw className={cn('h-3.5 w-3.5', refreshingService && 'animate-spin')} strokeWidth={1.5} />
             </IconButton>
           }
           title="服务"
@@ -94,17 +104,17 @@ export function SystemInfoPanel({ electron }: { electron: ElectronBridgeState })
         <SystemGroup
           action={
             <>
-              {!isReady && (
+              {desktopAvailable && !isReady && (
                 <IconButton className="h-6 w-6 text-ink-4 hover:text-ink" disabled={isChecking || isDownloading} label={isChecking ? '检查中' : '检查更新'} onClick={check}>
                   {isChecking ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" strokeWidth={1.5} />}
                 </IconButton>
               )}
-              {isAvailable && (
+              {desktopAvailable && isAvailable && (
                 <IconButton className="h-6 w-6 text-accent-strong hover:text-accent-press" label="下载更新" onClick={download}>
                   <ArrowDownToLine className="h-3.5 w-3.5" strokeWidth={1.5} />
                 </IconButton>
               )}
-              {isReady && (
+              {desktopAvailable && isReady && (
                 <IconButton className="h-6 w-6 text-accent-strong hover:text-accent-press" label={`重启并安装 v${status.version}`} onClick={install}>
                   <ArrowDownToLine className="h-3.5 w-3.5" strokeWidth={1.5} />
                 </IconButton>
@@ -114,6 +124,7 @@ export function SystemInfoPanel({ electron }: { electron: ElectronBridgeState })
           title="更新"
         >
           <InfoRow label="当前版本" value={`v${electron.appInfo?.version ?? '…'}`} mono />
+          {!desktopAvailable && <InfoRow label="检查更新" value="仅桌面客户端可用" />}
           {checkedAt && (
             <InfoRow
               label="检查时间"
@@ -229,15 +240,10 @@ function InfoRow({
 function DataDirRow({ appDataDir, electron }: { appDataDir: string; electron: ElectronBridgeState }): ReactElement {
   const openDir = async (): Promise<void> => {
     try {
-      if (electron.available) {
-        const bridge = window.rpaBridge;
-        if (!bridge) throw new Error('桌面桥接服务不可用');
-        const result = await bridge.openDataDir();
-        if (!result.ok) throw new Error(result.error ?? '打开数据目录失败');
-        return;
-      }
-      await navigator.clipboard.writeText(appDataDir);
-      electron.pushToast('success', '数据目录已复制');
+      const bridge = window.rpaBridge;
+      if (!bridge) throw new Error('桌面桥接服务不可用');
+      const result = await bridge.openDataDir();
+      if (!result.ok) throw new Error(result.error ?? '打开数据目录失败');
     } catch (error) {
       electron.pushToast('error', error instanceof Error ? error.message : '数据目录操作失败');
     }
@@ -254,7 +260,7 @@ function DataDirRow({ appDataDir, electron }: { appDataDir: string; electron: El
         </span>
         <IconButton
           className="h-6 w-6 text-ink-4 hover:text-ink"
-          label={electron.available ? '打开目录' : '复制到剪贴板'}
+          label="打开目录"
           onClick={() => void openDir()}
           variant="ghost"
         >

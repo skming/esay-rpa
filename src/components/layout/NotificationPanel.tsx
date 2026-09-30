@@ -1,5 +1,5 @@
 import { AlertTriangle, Bell, CheckCheck, CheckCircle2, Info, Trash2, XCircle } from 'lucide-react';
-import type { ReactElement, ReactNode } from 'react';
+import type { ReactElement } from 'react';
 
 import { cn } from '../../lib/utils';
 import { useNotificationStore, type AppNotification, type NotificationKind } from '../../stores/useNotificationStore';
@@ -36,29 +36,25 @@ function NotificationContent(): ReactElement {
         {notifications.length > 0 && (
           <div className="flex items-center gap-1">
             <Tooltip>
-              <TooltipTrigger asChild>
-                <button
+              <TooltipTrigger render={<button
                   aria-label="全部标为已读"
                   className="grid h-6 w-6 place-items-center rounded-md text-ink-4 transition-colors hover:bg-paper-sunk hover:text-ink-2 disabled:pointer-events-none disabled:opacity-40"
                   disabled={unreadCount === 0}
                   onClick={markAllRead}
                   type="button"
-                >
+                />}>
                   <CheckCheck className="h-3.5 w-3.5" strokeWidth={1.5} />
-                </button>
               </TooltipTrigger>
               <TooltipContent side="bottom">全部标为已读</TooltipContent>
             </Tooltip>
             <Tooltip>
-              <TooltipTrigger asChild>
-                <button
+              <TooltipTrigger render={<button
                   aria-label="清空全部通知"
                   className="grid h-6 w-6 place-items-center rounded-md text-ink-4 transition-colors hover:bg-red-50 hover:text-red-500"
                   onClick={clear}
                   type="button"
-                >
+                />}>
                   <Trash2 className="h-3.5 w-3.5" strokeWidth={1.5} />
-                </button>
               </TooltipTrigger>
               <TooltipContent side="bottom">清空通知</TooltipContent>
             </Tooltip>
@@ -87,14 +83,23 @@ export function NotificationDropdown({
   align = 'end',
   side = 'bottom',
   children,
+  tooltip,
 }: {
   align?: 'start' | 'center' | 'end';
   side?: 'top' | 'right' | 'bottom' | 'left';
-  children: ReactNode;
+  children: ReactElement;
+  tooltip?: string;
 }): ReactElement {
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger asChild>{children}</DropdownMenuTrigger>
+      {tooltip === undefined ? (
+        <DropdownMenuTrigger render={children} />
+      ) : (
+        <Tooltip>
+          <TooltipTrigger render={<DropdownMenuTrigger render={children} />} />
+          <TooltipContent side={side}>{tooltip}</TooltipContent>
+        </Tooltip>
+      )}
       <DropdownMenuContent align={align} side={side} sideOffset={8} className="w-92 overflow-hidden p-0 shadow-panel">
         <NotificationContent />
       </DropdownMenuContent>
@@ -130,13 +135,8 @@ export function NotificationPanel({ collapsed }: { collapsed: boolean }): ReactE
 
   if (collapsed) {
     return (
-      <NotificationDropdown side="right">
-        <Tooltip>
-          <TooltipTrigger asChild>{btn}</TooltipTrigger>
-          <TooltipContent side="right">
-            通知{unreadCount > 0 ? `（${unreadCount} 条未读）` : ''}
-          </TooltipContent>
-        </Tooltip>
+      <NotificationDropdown side="right" tooltip={`通知${unreadCount > 0 ? `（${unreadCount} 条未读）` : ''}`}>
+        {btn}
       </NotificationDropdown>
     );
   }

@@ -405,9 +405,11 @@ export function useElectronBridge({
           return;
         }
         const result = await bridge.getBackendStatus();
-        if (result.ok && result.data !== undefined) {
-          setBackendStatus(result.data);
+        if (!result.ok || result.data === undefined) {
+          pushToast('error', result.error ?? '服务状态读取失败');
+          return;
         }
+        setBackendStatus(result.data);
       },
       restartBackend: async () => {
         if (bridge === undefined) {
@@ -431,7 +433,6 @@ export function useElectronBridge({
         }
       },
       clearToast: () => setToasts([]),
-      clearRuns: () => setRuns([])
     }),
     [
       actions,

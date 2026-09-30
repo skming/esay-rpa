@@ -31,6 +31,7 @@ export function NotificationConfigPanel({ electron }: { electron: ElectronBridge
       setEnabled(cfg.dingtalk_enabled);
       setWebhookUrl(cfg.dingtalk_webhook_url);
       setSecretDraft(null);
+      setSecretVisible(false);
       setLoadError(null);
     } catch (error) {
       setLoadError(error instanceof Error ? error.message : '通知配置读取失败');
@@ -44,18 +45,25 @@ export function NotificationConfigPanel({ electron }: { electron: ElectronBridge
   useEffect(() => { void load(); }, [load]);
 
   const handleSave = async (): Promise<void> => {
+    if (secretDraft?.includes('****')) {
+      electron.pushToast('error', '新密钥不能包含连续四个星号');
+      return;
+    }
     setSaving(true);
     try {
       const payload: Record<string, unknown> = {
         dingtalk_enabled: enabled,
         dingtalk_webhook_url: webhookUrl.trim(),
       };
-      if (secretDraft !== null && !secretDraft.includes('****')) {
+      if (secretDraft !== null) {
         payload.dingtalk_secret = secretDraft;
       }
       const updated = await backend.setNotificationConfig(payload);
       setConfig(updated);
+      setEnabled(updated.dingtalk_enabled);
+      setWebhookUrl(updated.dingtalk_webhook_url);
       setSecretDraft(null);
+      setSecretVisible(false);
       electron.pushToast('success', '通知配置已保存');
     } catch (error) {
       electron.pushToast('error', error instanceof Error ? error.message : '通知配置保存失败');
@@ -65,12 +73,17 @@ export function NotificationConfigPanel({ electron }: { electron: ElectronBridge
   };
 
   const handleTest = async (): Promise<void> => {
+    if (secretDraft?.includes('****')) {
+      electron.pushToast('error', '新密钥不能包含连续四个星号');
+      return;
+    }
     setTesting(true);
     try {
-      await backend.testNotification({
+      const payload: Record<string, unknown> = {
         dingtalk_webhook_url: webhookUrl.trim(),
-        dingtalk_secret: secretDraft ?? config?.dingtalk_secret ?? '',
-      });
+      };
+      if (secretDraft !== null) payload.dingtalk_secret = secretDraft;
+      await backend.testNotification(payload);
       electron.pushToast('success', '测试通知已发送');
     } catch (error) {
       electron.pushToast('error', error instanceof Error ? error.message : '测试通知发送失败');
@@ -79,12 +92,13 @@ export function NotificationConfigPanel({ electron }: { electron: ElectronBridge
     }
   };
 
-  const secretValue = secretDraft ?? config?.dingtalk_secret ?? '';
+  const hasStoredSecret = Boolean(config?.dingtalk_secret);
   const hasChanges = config !== null && (
     enabled !== config.dingtalk_enabled
-    || webhookUrl !== config.dingtalk_webhook_url
+    || webhookUrl.trim() !== config.dingtalk_webhook_url
     || secretDraft !== null
   );
+  const busy = saving || testing;
 
   return (
     <SettingsContent
@@ -103,8 +117,8 @@ export function NotificationConfigPanel({ electron }: { electron: ElectronBridge
             }}
           />
         )}
-        <Collapsible
-          badge={<NotificationStatusBadge configured={enabled && webhookUrl.trim() !== ''} />}
+        {config !== null && <Collapsible
+          badge={<NotificationStatusBadge configured={config.dingtalk_webhook_url !== ''} dirty={hasChanges} enabled={config.dingtalk_enabled} />}
           defaultOpen
           title={
             <span className="flex min-w-0 items-center gap-2">
@@ -117,7 +131,7 @@ export function NotificationConfigPanel({ electron }: { electron: ElectronBridge
               <p className="text-[11px] leading-snug text-ink-3">
                 配置钉钉机器人 Webhook，在钉钉群 → 群设置 → 智能群助手 → 添加机器人 中获取。
               </p>
-              <Switch aria-label="启用钉钉通知" checked={enabled} className="shrink-0" onCheckedChange={setEnabled} />
+              <Switch aria-label="启用钉钉通知" checked={enabled} className="shrink-0" disabled={busy} onCheckedChange={setEnabled} />
             </div>
 
             <div className="grid gap-1.5">
@@ -125,9 +139,10 @@ export function NotificationConfigPanel({ electron }: { electron: ElectronBridge
               <input
                 aria-label="Webhook URL"
                 className={monoFieldClass}
+                disabled={busy}
                 onChange={e => setWebhookUrl(e.target.value)}
                 placeholder="https://oapi.dingtalk.com/robot/send?access_token=…"
-                type="text"
+                type="url"
                 value={webhookUrl}
               />
             </div>
@@ -138,33 +153,37 @@ export function NotificationConfigPanel({ electron }: { electron: ElectronBridge
                 <input
                   aria-label="加签密钥"
                   className={cn(monoFieldClass, 'pr-8')}
+                  disabled={busy}
                   onChange={e => setSecretDraft(e.target.value)}
-                  onFocus={() => {
-                    // 聚焦即清掩码，否则用户在 **** 上编辑出的值会被保存逻辑静默忽略
-                    if (secretValue.includes('****')) setSecretDraft('');
-                  }}
-                  placeholder="SEC…"
+                  placeholder={hasStoredSecret && secretDraft === null ? `已配置 ${config.dingtalk_secret}` : 'SEC…'}
                   type={secretVisible ? 'text' : 'password'}
-                  value={secretValue}
+                  value={secretDraft ?? ''}
                 />
                 <button
                   className="absolute right-1.5 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-ink-4 transition-colors hover:bg-paper-sunk hover:text-ink"
+                  disabled={busy || !secretDraft}
                   onClick={() => setSecretVisible(v => !v)}
-                  title={secretVisible ? '隐藏密钥' : '显示密钥'}
+                  title={secretVisible ? '隐藏新密钥' : '显示新密钥'}
                   type="button"
                 >
                   {secretVisible ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
                 </button>
               </div>
+              {hasStoredSecret && secretDraft === null && (
+                <button className="w-fit text-[11px] text-ink-3 underline-offset-2 hover:text-ink-2 hover:underline" disabled={busy} onClick={() => setSecretDraft('')} type="button">
+                  清除已保存密钥
+                </button>
+              )}
+              {hasStoredSecret && secretDraft === '' && <p className="text-[11px] text-amber-800">保存后将移除加签密钥。</p>}
             </div>
           </div>
-        </Collapsible>
+        </Collapsible>}
       </div>
 
       <div className="flex items-center justify-end gap-3 pt-3">
         <Button
           className="h-8 rounded-md px-3 text-[11px]"
-          disabled={testing || loading || webhookUrl.trim() === ''}
+          disabled={busy || config === null || webhookUrl.trim() === ''}
           onClick={() => void handleTest()}
           variant="secondary"
         >
@@ -173,7 +192,7 @@ export function NotificationConfigPanel({ electron }: { electron: ElectronBridge
         </Button>
         <Button
           className="h-8 rounded-md px-4 text-[11px]"
-          disabled={saving || loading || !hasChanges}
+          disabled={busy || !hasChanges}
           onClick={() => void handleSave()}
           variant="subtle"
         >
@@ -185,17 +204,19 @@ export function NotificationConfigPanel({ electron }: { electron: ElectronBridge
   );
 }
 
-function NotificationStatusBadge({ configured }: { configured: boolean }): ReactElement {
+function NotificationStatusBadge({ configured, dirty, enabled }: { configured: boolean; dirty: boolean; enabled: boolean }): ReactElement {
   return (
     <span
       className={cn(
         'inline-flex h-4 shrink-0 items-center rounded px-1.5 text-[10px] font-medium',
-        configured
+        dirty
+          ? 'border border-amber-200 bg-amber-50 text-amber-800'
+          : configured && enabled
           ? 'bg-emerald-50 text-emerald-700'
           : 'border border-rule bg-paper-sunk text-ink-4',
       )}
     >
-      {configured ? '已启用' : '未配置'}
+      {dirty ? '未保存' : configured && enabled ? '已启用' : configured ? '已关闭' : '未配置'}
     </span>
   );
 }
