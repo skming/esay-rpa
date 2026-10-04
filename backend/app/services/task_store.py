@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Protocol
 
-from sqlalchemy import BigInteger, Index, Integer, String, Text, case, delete, func, select
+from sqlalchemy import BigInteger, Boolean, ForeignKey, Index, Integer, String, Text, case, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -30,6 +30,8 @@ class TaskStore(Protocol):
     async def list_logs(self, task_id: str) -> list[TaskLogEntry] | None: ...
 
     async def list_variables(self, task_id: str) -> list[RuntimeVariableSnapshot] | None: ...
+
+    async def delete_artifacts(self, task_ids: list[str]) -> None: ...
 
     async def list_unfinished_tasks(self) -> list[TaskSnapshot]: ...
 
@@ -100,6 +102,12 @@ class InMemoryTaskStore:
             return None
         return list(record.snapshot.variables)
 
+    async def delete_artifacts(self, task_ids: list[str]) -> None:
+        for task_id in task_ids:
+            record = self._tasks.get(task_id)
+            if record is not None:
+                record.snapshot = record.snapshot.model_copy(update={"artifacts": []})
+
     async def list_unfinished_tasks(self) -> list[TaskSnapshot]:
         return [record.snapshot for record in self._tasks.values() if record.snapshot.status in _UNFINISHED_TASK_STATUSES]
 
@@ -129,24 +137,25 @@ class InMemoryTaskStore:
 
 class TaskRow(Base):
     __tablename__ = "rpa_tasks"
-    __table_args__ = (Index("ix_rpa_tasks_rate", "status", "updated_at", "flow_id"),)
+    __table_args__ = (
+        Index("ix_rpa_tasks_updated_at", "updated_at"),
+        Index("ix_rpa_tasks_flow_updated", "flow_id", "updated_at"),
+        Index("ix_rpa_tasks_schedule_created", "schedule_id", "created_at"),
+        Index("ix_rpa_tasks_rate", "status", "updated_at", "flow_id"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     flow_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    schedule_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    schedule_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     flow_name: Mapped[str] = mapped_column(String(120), nullable=False)
     mode: Mapped[str] = mapped_column(String(16), nullable=False, default="run")
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="queued")
-    target_url: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    selector: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    fetcher: Mapped[str] = mapped_column(String(24), nullable=False, default="static")
-    extract_mode: Mapped[str] = mapped_column(String(24), nullable=False, default="text")
-    timeout_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=30000)
-    request_payload: Mapped[dict] = mapped_column(_json_type(), nullable=False)
+    flow_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    definition_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    acceptance_contract: Mapped[dict] = mapped_column(_json_type(), nullable=False, default=dict)
+    run_config: Mapped[dict] = mapped_column(_json_type(), nullable=False, default=dict)
     progress_payload: Mapped[dict] = mapped_column(_json_type(), nullable=False)
     result_payload: Mapped[dict | None] = mapped_column(_json_type(), nullable=True)
-    artifacts_payload: Mapped[list] = mapped_column(_json_type(), nullable=False)
-    variables_payload: Mapped[list] = mapped_column(_json_type(), nullable=False, default=list)
     execution_evidence_payload: Mapped[list] = mapped_column(_json_type(), nullable=False, default=list)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     confirmation_message: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -158,9 +167,10 @@ class TaskRow(Base):
 
 class TaskLogRow(Base):
     __tablename__ = "rpa_task_logs"
+    __table_args__ = (Index("ix_rpa_task_logs_task_created", "task_id", "created_at"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    task_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("rpa_tasks.id", ondelete="CASCADE"), nullable=False)
     level: Mapped[str] = mapped_column(String(16), nullable=False)
     message: Mapped[str] = mapped_column(Text, nullable=False)
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -170,11 +180,13 @@ class TaskLogRow(Base):
 
 class TaskVariableRow(Base):
     __tablename__ = "rpa_task_variables"
+    __table_args__ = (Index("ix_rpa_task_variables_task_name", "task_id", "name"),)
 
     id: Mapped[str] = mapped_column(String(180), primary_key=True)
-    task_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
-    flow_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
-    name: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("rpa_tasks.id", ondelete="CASCADE"), nullable=False)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    category: Mapped[str] = mapped_column(String(24), nullable=False, default="flow")
+    sensitive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     scope: Mapped[str] = mapped_column(String(16), nullable=False)
     type: Mapped[str] = mapped_column(String(24), nullable=False)
     value: Mapped[str] = mapped_column(Text, nullable=False)
@@ -185,8 +197,7 @@ class ArtifactRow(Base):
     __tablename__ = "rpa_artifacts"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    task_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
-    flow_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("rpa_tasks.id", ondelete="CASCADE"), nullable=False, index=True)
     artifact_type: Mapped[str] = mapped_column(String(32), nullable=False)
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     storage_url: Mapped[str] = mapped_column(Text, nullable=False)
@@ -230,7 +241,9 @@ class SqlAlchemyTaskStore:
     async def get_task(self, task_id: str) -> TaskSnapshot | None:
         async with self._session_factory() as session:
             row = await session.get(TaskRow, task_id)
-            return self._to_snapshot(row) if row is not None else None
+            if row is None:
+                return None
+            return (await self._load_snapshots(session, [row]))[0]
 
     async def list_tasks(self, *, flow_id: str | None = None, schedule_id: str | None = None, limit: int = 50) -> list[TaskSnapshot]:
         normalized_limit = _normalize_limit(limit)
@@ -241,7 +254,7 @@ class SqlAlchemyTaskStore:
             statement = statement.where(TaskRow.schedule_id == schedule_id)
         async with self._session_factory() as session:
             result = await session.scalars(statement)
-            return [self._to_snapshot(row) for row in result]
+            return await self._load_snapshots(session, list(result))
 
     async def success_rates_since(self, since: datetime) -> dict[str, int]:
         statement = select(
@@ -273,33 +286,37 @@ class SqlAlchemyTaskStore:
         return log
 
     async def list_logs(self, task_id: str) -> list[TaskLogEntry] | None:
-        if await self.get_task(task_id) is None:
-            return None
         async with self._session_factory() as session:
+            if await session.get(TaskRow, task_id) is None:
+                return None
             result = await session.scalars(select(TaskLogRow).where(TaskLogRow.task_id == task_id).order_by(TaskLogRow.created_at.asc()))
             return [self._to_log(row) for row in result]
 
     async def list_variables(self, task_id: str) -> list[RuntimeVariableSnapshot] | None:
-        if await self.get_task(task_id) is None:
-            return None
         async with self._session_factory() as session:
+            if await session.get(TaskRow, task_id) is None:
+                return None
             result = await session.scalars(select(TaskVariableRow).where(TaskVariableRow.task_id == task_id).order_by(TaskVariableRow.name.asc()))
             return [self._to_variable(row) for row in result]
 
     async def delete_task(self, task_id: str) -> bool:
         async with self._session_factory() as session:
-            await session.execute(delete(TaskLogRow).where(TaskLogRow.task_id == task_id))
-            await session.execute(delete(TaskVariableRow).where(TaskVariableRow.task_id == task_id))
-            await session.execute(delete(ArtifactRow).where(ArtifactRow.task_id == task_id))
             result = await session.execute(delete(TaskRow).where(TaskRow.id == task_id))
             await session.commit()
             return (result.rowcount or 0) > 0
+
+    async def delete_artifacts(self, task_ids: list[str]) -> None:
+        if not task_ids:
+            return
+        async with self._session_factory() as session:
+            await session.execute(delete(ArtifactRow).where(ArtifactRow.task_id.in_(task_ids)))
+            await session.commit()
 
     async def list_unfinished_tasks(self) -> list[TaskSnapshot]:
         statement = select(TaskRow).where(TaskRow.status.in_(_UNFINISHED_TASK_STATUSES))
         async with self._session_factory() as session:
             result = await session.scalars(statement)
-            return [self._to_snapshot(row) for row in result]
+            return await self._load_snapshots(session, list(result))
 
     async def has_unfinished_schedule_tasks(self, schedule_id: str) -> bool:
         statement = select(TaskRow.id).where(
@@ -316,7 +333,7 @@ class SqlAlchemyTaskStore:
         ).order_by(TaskRow.created_at.asc())
         async with self._session_factory() as session:
             result = await session.scalars(statement)
-            return [self._to_snapshot(row) for row in result]
+            return await self._load_snapshots(session, list(result))
 
     async def mark_interrupted_stopped(self, task_id: str, *, error: str, log: TaskLogEntry) -> TaskSnapshot | None:
         # 状态翻转与终止日志同一事务提交，避免对账中途崩溃留下「已停但无留痕」的半截状态
@@ -342,7 +359,7 @@ class SqlAlchemyTaskStore:
                 )
             )
             await session.commit()
-            return self._to_snapshot(row)
+            return (await self._load_snapshots(session, [row]))[0]
 
     @staticmethod
     def _apply_task(row: TaskRow, task: TaskSnapshot, request: RunTaskRequest) -> None:
@@ -351,16 +368,15 @@ class SqlAlchemyTaskStore:
         row.schedule_id = task.schedule_id
         row.mode = task.mode
         row.status = task.status
-        row.target_url = str(request.target_url) if request.target_url is not None else ""
-        row.selector = request.selector or ""
-        row.fetcher = request.fetcher
-        row.extract_mode = request.extract_mode
-        row.timeout_ms = request.timeout_ms
-        row.request_payload = request.model_dump(mode="json", by_alias=True)
+        row.flow_revision = task.flow_revision or request.flow_revision
+        row.definition_digest = task.definition_digest or request.definition_digest
+        contract = task.acceptance_contract
+        if not contract.requirements and not contract.deliverables:
+            contract = request.acceptance_contract
+        row.acceptance_contract = contract.model_dump(mode="json", by_alias=True)
+        row.run_config = task.run_config.model_dump(mode="json", by_alias=True)
         row.progress_payload = task.progress.model_dump(mode="json", by_alias=True)
         row.result_payload = task.result.model_dump(mode="json", by_alias=True) if task.result is not None else None
-        row.artifacts_payload = [artifact.model_dump(mode="json", by_alias=True) for artifact in task.artifacts]
-        row.variables_payload = [variable.model_dump(mode="json", by_alias=True) for variable in task.variables]
         row.execution_evidence_payload = [
             evidence.model_dump(mode="json", by_alias=True) for evidence in task.execution_evidence
         ]
@@ -374,7 +390,12 @@ class SqlAlchemyTaskStore:
         row.updated_at = task.updated_at
 
     @staticmethod
-    def _to_snapshot(row: TaskRow) -> TaskSnapshot:
+    def _to_snapshot(
+        row: TaskRow,
+        *,
+        variables: list[RuntimeVariableSnapshot],
+        artifacts: list[ArtifactSnapshot],
+    ) -> TaskSnapshot:
         return TaskSnapshot(
             task_id=row.id,
             flow_id=row.flow_id,
@@ -386,18 +407,16 @@ class SqlAlchemyTaskStore:
             created_at=row.created_at,
             updated_at=row.updated_at,
             result=ScrapeResult.model_validate(row.result_payload) if row.result_payload is not None else None,
-            artifacts=[ArtifactSnapshot.model_validate(artifact) for artifact in row.artifacts_payload],
-            variables=[RuntimeVariableSnapshot.model_validate(variable) for variable in row.variables_payload],
-            flow_revision=_payload_value(row.request_payload, "flowRevision", "flow_revision"),
-            definition_digest=_payload_value(row.request_payload, "definitionDigest", "definition_digest"),
-            acceptance_contract=FlowAcceptanceContract.model_validate(
-                _payload_value(row.request_payload, "acceptanceContract", "acceptance_contract") or {}
-            ),
+            artifacts=artifacts,
+            variables=variables,
+            flow_revision=row.flow_revision,
+            definition_digest=row.definition_digest,
+            acceptance_contract=FlowAcceptanceContract.model_validate(row.acceptance_contract or {}),
             execution_evidence=[
                 NodeExecutionEvidence.model_validate(evidence)
                 for evidence in (getattr(row, "execution_evidence_payload", None) or [])
             ],
-            run_config=_run_config_from_payload(row.request_payload),
+            run_config=RunConfigSnapshot.model_validate(row.run_config or {}),
             error=row.error_message,
             confirmation_message=row.confirmation_message,
         )
@@ -408,27 +427,35 @@ class SqlAlchemyTaskStore:
 
     @staticmethod
     def _to_variable_row(task: TaskSnapshot, variable: RuntimeVariableSnapshot) -> TaskVariableRow:
+        protected = variable.sensitive or variable.category == "credential"
         return TaskVariableRow(
             id=f"{task.task_id}:{variable.name}",
             task_id=task.task_id,
-            flow_id=task.flow_id,
             name=variable.name,
+            category=variable.category,
+            sensitive=protected,
             scope=variable.scope,
             type=variable.type,
-            value=variable.value,
+            value="" if protected else variable.value,
             updated_at=task.updated_at,
         )
 
     @staticmethod
     def _to_variable(row: TaskVariableRow) -> RuntimeVariableSnapshot:
-        return RuntimeVariableSnapshot(name=row.name, scope=row.scope, type=row.type, value=row.value)
+        return RuntimeVariableSnapshot(
+            name=row.name,
+            category=row.category,
+            sensitive=row.sensitive,
+            scope=row.scope,
+            type=row.type,
+            value=row.value,
+        )
 
     @staticmethod
     def _to_artifact_row(task: TaskSnapshot, artifact: ArtifactSnapshot) -> ArtifactRow:
         return ArtifactRow(
             id=artifact.artifact_id,
             task_id=artifact.task_id,
-            flow_id=task.flow_id,
             artifact_type=artifact.artifact_type,
             filename=artifact.filename,
             storage_url=artifact.storage_url,
@@ -438,30 +465,48 @@ class SqlAlchemyTaskStore:
             created_at=artifact.created_at,
         )
 
+    async def _load_snapshots(self, session, rows: list[TaskRow]) -> list[TaskSnapshot]:
+        if not rows:
+            return []
+        task_ids = [row.id for row in rows]
+        variable_rows = await session.scalars(
+            select(TaskVariableRow)
+            .where(TaskVariableRow.task_id.in_(task_ids))
+            .order_by(TaskVariableRow.task_id, TaskVariableRow.name)
+        )
+        artifact_rows = await session.scalars(
+            select(ArtifactRow)
+            .where(ArtifactRow.task_id.in_(task_ids))
+            .order_by(ArtifactRow.task_id, ArtifactRow.created_at)
+        )
+        variables: dict[str, list[RuntimeVariableSnapshot]] = {task_id: [] for task_id in task_ids}
+        artifacts: dict[str, list[ArtifactSnapshot]] = {task_id: [] for task_id in task_ids}
+        for variable in variable_rows:
+            variables[variable.task_id].append(self._to_variable(variable))
+        for artifact in artifact_rows:
+            artifacts[artifact.task_id].append(self._to_artifact(artifact))
+        return [
+            self._to_snapshot(row, variables=variables[row.id], artifacts=artifacts[row.id])
+            for row in rows
+        ]
+
+    @staticmethod
+    def _to_artifact(row: ArtifactRow) -> ArtifactSnapshot:
+        return ArtifactSnapshot(
+            artifactId=row.id,
+            taskId=row.task_id,
+            artifactType=row.artifact_type,
+            filename=row.filename,
+            storageUrl=row.storage_url,
+            contentType=row.content_type,
+            sizeBytes=row.size_bytes,
+            metadata=row.metadata_payload,
+            createdAt=row.created_at,
+        )
+
 
 
 def _normalize_limit(limit: int) -> int:
     if limit < 1:
         return 1
     return min(limit, 200)
-
-
-def _payload_value(payload: dict | None, camel: str, snake: str):
-    if not isinstance(payload, dict):
-        return None
-    return payload.get(camel, payload.get(snake))
-
-
-def _run_config_from_payload(payload: dict | None) -> RunConfigSnapshot:
-    if not isinstance(payload, dict):
-        return RunConfigSnapshot()
-    # 同时兼容 camelCase（当前）与 snake_case（历史存量 request_payload）两种字段名
-    return RunConfigSnapshot.model_validate(
-        {
-            "scope": payload.get("scope", "full"),
-            "startNodeId": payload.get("startNodeId") or payload.get("start_node_id"),
-            "failureStrategy": payload.get("failureStrategy", payload.get("failure_strategy", "stop")),
-            "screenshot": payload.get("screenshot", True),
-            "concurrency": payload.get("concurrency", 1),
-        }
-    )

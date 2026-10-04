@@ -107,6 +107,8 @@ async def test_flow_service_persists_crud_with_sqlalchemy(tmp_path) -> None:
     assert [item.sensitive for item in reloaded.input_variables] == [False, False]
     assert reloaded.revision == 2
     assert reloaded.snapshots[0].revision == 1
+    assert reloaded.snapshots[0].input_variables[1].name == "erp_password"
+    assert reloaded.snapshots[0].input_variables[1].value == ""
     assert reloaded.acceptance_contract.deliverables[0].id == "row-count"
     versions = await service.list_versions(created.flow_id)
     assert versions is not None

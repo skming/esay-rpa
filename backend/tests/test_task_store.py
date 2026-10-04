@@ -161,6 +161,23 @@ async def test_sqlalchemy_task_store_persists_task_logs_and_result(tmp_path) -> 
         ("result_count", "2"),
     ]
 
+    protected = updated.model_copy(update={
+        "variables": [
+            RuntimeVariableSnapshot(
+                name="api_token", category="credential", sensitive=True,
+                type="String", value="must-not-persist", scope="全局",
+            ),
+        ],
+        "updated_at": datetime.now(UTC),
+    })
+    await store.save_task(protected, request)
+    protected_variables = await store.list_variables(queued.task_id)
+    assert protected_variables is not None
+    assert protected_variables[0].name == "api_token"
+    assert protected_variables[0].sensitive is True
+    assert protected_variables[0].category == "credential"
+    assert protected_variables[0].value == ""
+
     second_request = build_task_request().model_copy(update={"flow_id": "00000000-0000-0000-0000-000000000202", "flow_name": "其他流程"})
     second = await store.save_task(build_task_snapshot("task-2").model_copy(update={"flow_id": second_request.flow_id, "flow_name": second_request.flow_name}), second_request)
     all_tasks = await store.list_tasks(limit=10)
@@ -176,6 +193,30 @@ async def test_sqlalchemy_task_store_persists_task_logs_and_result(tmp_path) -> 
     assert await store.list_variables(queued.task_id) is None
 
     await store.close()
+
+
+async def test_task_schema_has_single_sources_and_cascades_children(tmp_path) -> None:
+    engine = create_schedule_engine(f"sqlite+aiosqlite:///{tmp_path / 'tasks.db'}")
+    store = SqlAlchemyTaskStore(engine)
+    await store.create_schema()
+    try:
+        task = build_task_snapshot().model_copy(update={
+            "variables": [RuntimeVariableSnapshot(name="count", type="Integer", value="1")],
+        })
+        await store.save_task(task, build_task_request())
+        async with engine.begin() as connection:
+            column_result = await connection.exec_driver_sql("PRAGMA table_info(rpa_tasks)")
+            columns = {row[1] for row in column_result.all()}
+            assert "request_payload" not in columns
+            assert "variables_payload" not in columns
+            assert "artifacts_payload" not in columns
+            await connection.exec_driver_sql("DELETE FROM rpa_tasks WHERE id = 'task-1'")
+            remaining = (await connection.exec_driver_sql(
+                "SELECT count(*) FROM rpa_task_variables WHERE task_id = 'task-1'"
+            )).scalar_one()
+            assert remaining == 0
+    finally:
+        await store.close()
 
 
 async def test_sqlite_roundtrip_returns_timezone_aware_timestamps(tmp_path) -> None:

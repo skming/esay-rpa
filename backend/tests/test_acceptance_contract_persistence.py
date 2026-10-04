@@ -8,7 +8,7 @@ from sqlalchemy import update
 import app.main as main_module
 from app.models.schemas import FlowCreateRequest, FlowUpdateRequest, RunTaskRequest, RuntimeProgress, ScheduleSnapshot, ScheduleTaskRequest, TaskSnapshot
 from app.services.flow_service import FlowService
-from app.services.flow_store import FlowRow, SqlAlchemyFlowStore
+from app.services.flow_store import FlowRow, FlowVersionRow, SqlAlchemyFlowStore
 from app.services.schedule_store import ScheduleRow, SqlAlchemyScheduleStore, create_schedule_engine
 from app.services.task_store import SqlAlchemyTaskStore, TaskRow
 
@@ -102,18 +102,17 @@ async def test_current_contract_round_trips_through_all_stores(tmp_path) -> None
         nextRunAt=now + timedelta(minutes=1),
     ))
 
-    current_snapshot = updated_flow.snapshots[0].model_dump(mode="json", by_alias=True)
-    current_snapshot["acceptanceContract"] = _contract()
     current_task = _task_request().model_dump(mode="json", by_alias=True)
     current_task["acceptanceContract"] = _contract()
     async with engine.begin() as connection:
         await connection.execute(
-            update(FlowRow).where(FlowRow.id == created.flow_id).values(
-                acceptance_contract=_contract(), snapshots=[current_snapshot]
-            )
+            update(FlowRow).where(FlowRow.id == created.flow_id).values(acceptance_contract=_contract())
         )
         await connection.execute(
-            update(TaskRow).where(TaskRow.id == "task-current").values(request_payload=current_task)
+            update(FlowVersionRow).where(FlowVersionRow.flow_id == created.flow_id).values(acceptance_contract=_contract())
+        )
+        await connection.execute(
+            update(TaskRow).where(TaskRow.id == "task-current").values(acceptance_contract=_contract())
         )
         await connection.execute(
             update(ScheduleRow).where(ScheduleRow.id == "schedule-current").values(task_payload=current_task)
@@ -154,7 +153,7 @@ async def test_flow_and_task_list_apis_restore_current_contracts_from_isolated_d
             update(FlowRow).where(FlowRow.id == flow.flow_id).values(acceptance_contract=_contract())
         )
         await connection.execute(
-            update(TaskRow).where(TaskRow.id == "task-current").values(request_payload=current_task)
+            update(TaskRow).where(TaskRow.id == "task-current").values(acceptance_contract=_contract())
         )
 
     class IsolatedTaskManager:

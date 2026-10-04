@@ -136,27 +136,31 @@ describe('流程恢复的输入变量归属', () => {
 
   it('恢复快照时同时恢复定义、变量和验收契约', async () => {
     const updateFlow = vi.fn(async () => ({ ok: true as const, data: { ...savedFlow, revision: 3 } }));
+    const currentCredential: RuntimeVariable = {
+      category: 'credential', name: 'api_token', scope: '全局', sensitive: true, type: 'String', value: 'current-secret',
+    };
     const snapshot: FlowVersionSnapshot = {
       acceptanceContract: {
         requirements: [{ id: 'required', description: '必须有结果', sourceKind: 'user' }],
         deliverables: [{ id: 'rows', kind: 'table', requirementIds: ['required'], variable: 'rows' }],
       },
       definition: { nodes: [{ id: 'old' }], edges: [] },
-      inputVariables: savedVariables,
+      inputVariables: [...savedVariables, { ...currentCredential, value: '' }],
       revision: 1,
       savedAt: '2026-09-04T00:00:00.000Z',
       version: 'v1.0.0',
     };
+    const currentFlow = { ...savedFlow, inputVariables: [...savedVariables, currentCredential] };
     const { actions } = renderActions(async (action) => {
       const result = await action({ updateFlow } as unknown as import('../types/electron').RpaBridge);
       return result.ok ? result.data ?? null : null;
-    }, savedFlow);
+    }, currentFlow);
 
     expect(await actions.rollbackFlowSnapshot(snapshot)).toBe(true);
     expect(updateFlow).toHaveBeenCalledWith(savedFlow.flowId, expect.objectContaining({
       acceptanceContract: snapshot.acceptanceContract,
       definition: snapshot.definition,
-      inputVariables: snapshot.inputVariables,
+      inputVariables: [...savedVariables, currentCredential],
     }));
   });
 });

@@ -5,6 +5,7 @@ import json
 import threading
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -68,6 +69,44 @@ class FakeRunner:
         await on_log("running", "模拟采集中", request.selector)
         await asyncio.sleep(0)
         return ScrapeResult(url=str(request.target_url), selector=request.selector, count=1, values=["hello"])
+
+
+async def test_pruning_run_outputs_removes_matching_artifact_rows(tmp_path, monkeypatch) -> None:
+    class ObservedStore(InMemoryTaskStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.deleted_task_ids: list[str] = []
+
+        async def delete_artifacts(self, task_ids: list[str]) -> None:
+            self.deleted_task_ids.extend(task_ids)
+
+    store = ObservedStore()
+    manager = TaskManager(runner=FakeRunner(), broker=LogBroker(), task_store=store)
+    monkeypatch.setattr(
+        "app.services.task_manager.storage.prune_run_outputs",
+        lambda _flow_slug: [tmp_path / "task-old-1", tmp_path / "task-old-2"],
+    )
+    now = datetime.now(UTC)
+    old_snapshot = TaskSnapshot(
+        taskId="task-old-1",
+        flowName="旧任务",
+        status="success",
+        mode="run",
+        progress=RuntimeProgress(currentStep=1, totalSteps=1, percent=100, elapsedMs=1),
+        createdAt=now,
+        updatedAt=now,
+    )
+    manager._tasks[old_snapshot.task_id] = SimpleNamespace(  # type: ignore[assignment]
+        artifacts=[object()],
+        snapshot=old_snapshot.model_copy(update={"artifacts": [object()]}),
+    )
+
+    record = SimpleNamespace(request=RunTaskRequest(flowId="flow-1", flowName="保留策略测试"))
+    await manager._prune_run_outputs(record)  # type: ignore[arg-type]
+
+    assert store.deleted_task_ids == ["task-old-1", "task-old-2"]
+    assert manager._tasks["task-old-1"].artifacts == []
+    assert manager._tasks["task-old-1"].snapshot.artifacts == []
 
 
 class RecordingRunner:

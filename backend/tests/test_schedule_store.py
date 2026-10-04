@@ -89,3 +89,26 @@ async def test_sqlite_roundtrip_preserves_selected_flow_ids(tmp_path) -> None:
         assert reloaded.task.flow_ids == ["flow-a", "flow-b"]
     finally:
         await engine.dispose()
+
+
+async def test_schedule_store_does_not_persist_sensitive_overrides_or_flow_definition(tmp_path) -> None:
+    engine = create_schedule_engine(f"sqlite+aiosqlite:///{tmp_path / 'safe-schedule.db'}")
+    store = SqlAlchemyScheduleStore(engine)
+    await store.create_schema()
+    try:
+        schedule = build_schedule("safe-schedule")
+        schedule = schedule.model_copy(update={
+            "task": schedule.task.model_copy(update={
+                "flow_definition": {"nodes": [{"id": "secret-bearing-copy"}], "edges": []},
+                "sensitive_variables": ["api_token"],
+                "variables": {"api_token": "must-not-persist", "region": "cn"},
+            }),
+        })
+        await store.save(schedule)
+        reloaded = await store.get(schedule.schedule_id)
+        assert reloaded is not None
+        assert reloaded.task.flow_definition is None
+        assert reloaded.task.variables == {"region": "cn"}
+        assert reloaded.task.sensitive_variables == ["api_token"]
+    finally:
+        await engine.dispose()

@@ -1,126 +1,135 @@
--- Easy RPA 自动化平台 PostgreSQL 初始化脚本
+-- Easy RPA PostgreSQL 新库初始化脚本
 -- PostgreSQL 15+
 --
--- 当前应用未发布，不保留旧 schema 兼容逻辑；此脚本面向新库初始化。
--- SQLAlchemy 模型为了兼容 SQLite 使用 VARCHAR(36) 保存 ID，这里保持一致，
--- 避免 PostgreSQL UUID 类型和应用层字符串绑定出现驱动差异。
-
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
+-- 项目未发布，不提供旧 schema 迁移；本文件需与 SQLAlchemy 持久化模型保持一致。
 
 CREATE TABLE IF NOT EXISTS rpa_flows (
-  id VARCHAR(36) PRIMARY KEY DEFAULT gen_random_uuid()::text,
+  id VARCHAR(36) PRIMARY KEY,
   name VARCHAR(120) NOT NULL,
   version VARCHAR(32) NOT NULL DEFAULT 'v1.0.0',
   description TEXT,
-  definition JSONB NOT NULL DEFAULT '{}'::jsonb,
+  definition JSONB NOT NULL,
   input_variables JSONB NOT NULL DEFAULT '[]'::jsonb,
+  acceptance_contract JSONB NOT NULL DEFAULT '{}'::jsonb,
+  revision INTEGER NOT NULL DEFAULT 1,
   status VARCHAR(24) NOT NULL DEFAULT 'draft',
   folder_path VARCHAR(500) NOT NULL DEFAULT '默认目录',
+  default_browser_executor VARCHAR(24) NOT NULL DEFAULT 'playwright',
   last_run_status VARCHAR(24),
   last_run_at TIMESTAMPTZ,
-  snapshots JSONB NOT NULL DEFAULT '[]'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CONSTRAINT rpa_flows_status_check CHECK (status IN ('draft', 'active', 'paused', 'disabled', 'archived')),
-  CONSTRAINT rpa_flows_last_run_status_check CHECK (
-    last_run_status IS NULL OR last_run_status IN ('queued', 'running', 'success', 'stopped', 'error')
-  )
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS rpa_flow_versions (
+  flow_id VARCHAR(36) NOT NULL REFERENCES rpa_flows(id) ON DELETE CASCADE,
+  revision INTEGER NOT NULL,
+  version VARCHAR(32) NOT NULL,
+  description TEXT,
+  definition JSONB NOT NULL,
+  input_variables JSONB NOT NULL DEFAULT '[]'::jsonb,
+  acceptance_contract JSONB NOT NULL DEFAULT '{}'::jsonb,
+  saved_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (flow_id, revision)
 );
 
 CREATE TABLE IF NOT EXISTS rpa_tasks (
-  id VARCHAR(36) PRIMARY KEY DEFAULT gen_random_uuid()::text,
-  flow_id VARCHAR(36) REFERENCES rpa_flows(id) ON DELETE SET NULL,
+  id VARCHAR(36) PRIMARY KEY,
+  flow_id VARCHAR(36),
   schedule_id VARCHAR(36),
   flow_name VARCHAR(120) NOT NULL,
   mode VARCHAR(16) NOT NULL DEFAULT 'run',
   status VARCHAR(24) NOT NULL DEFAULT 'queued',
-  target_url TEXT NOT NULL DEFAULT '',
-  selector TEXT NOT NULL DEFAULT '',
-  fetcher VARCHAR(24) NOT NULL DEFAULT 'static',
-  extract_mode VARCHAR(24) NOT NULL DEFAULT 'text',
-  timeout_ms INTEGER NOT NULL DEFAULT 30000,
-  request_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-  progress_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  flow_revision INTEGER,
+  definition_digest VARCHAR(64),
+  acceptance_contract JSONB NOT NULL DEFAULT '{}'::jsonb,
+  run_config JSONB NOT NULL DEFAULT '{}'::jsonb,
+  progress_payload JSONB NOT NULL,
   result_payload JSONB,
-  artifacts_payload JSONB NOT NULL DEFAULT '[]'::jsonb,
-  variables_payload JSONB NOT NULL DEFAULT '[]'::jsonb,
+  execution_evidence_payload JSONB NOT NULL DEFAULT '[]'::jsonb,
   error_message TEXT,
-  input_prompt TEXT,
+  confirmation_message TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   started_at TIMESTAMPTZ,
   finished_at TIMESTAMPTZ,
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CONSTRAINT rpa_tasks_mode_check CHECK (mode IN ('run', 'debug')),
-  CONSTRAINT rpa_tasks_status_check CHECK (status IN ('queued', 'running', 'success', 'stopped', 'error')),
-  CONSTRAINT rpa_tasks_fetcher_check CHECK (fetcher IN ('static', 'dynamic', 'stealthy')),
-  CONSTRAINT rpa_tasks_extract_mode_check CHECK (extract_mode IN ('text', 'html', 'attribute', 'count', 'table', 'similar', 'by_text')),
-  CONSTRAINT rpa_tasks_timeout_check CHECK (timeout_ms BETWEEN 1000 AND 300000)
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS rpa_task_logs (
-  id VARCHAR(36) PRIMARY KEY DEFAULT gen_random_uuid()::text,
+  id VARCHAR(36) PRIMARY KEY,
   task_id VARCHAR(36) NOT NULL REFERENCES rpa_tasks(id) ON DELETE CASCADE,
   level VARCHAR(16) NOT NULL,
   message TEXT NOT NULL,
   detail TEXT,
   node_id VARCHAR(120),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CONSTRAINT rpa_task_logs_level_check CHECK (level IN ('info', 'success', 'running', 'warn', 'error', 'input'))
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS rpa_task_variables (
   id VARCHAR(180) PRIMARY KEY,
   task_id VARCHAR(36) NOT NULL REFERENCES rpa_tasks(id) ON DELETE CASCADE,
-  flow_id VARCHAR(36) REFERENCES rpa_flows(id) ON DELETE SET NULL,
   name VARCHAR(120) NOT NULL,
+  category VARCHAR(24) NOT NULL DEFAULT 'flow',
+  sensitive BOOLEAN NOT NULL DEFAULT false,
   scope VARCHAR(16) NOT NULL,
   type VARCHAR(24) NOT NULL,
   value TEXT NOT NULL,
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CONSTRAINT rpa_task_variables_scope_check CHECK (scope IN ('全局', '循环', '局部')),
-  CONSTRAINT rpa_task_variables_type_check CHECK (type IN ('String', 'Integer', 'Boolean', 'List', 'Dict'))
-);
-
-CREATE TABLE IF NOT EXISTS rpa_schedules (
-  id VARCHAR(36) PRIMARY KEY DEFAULT gen_random_uuid()::text,
-  name VARCHAR(120) NOT NULL,
-  cron_expression VARCHAR(120) NOT NULL,
-  timezone VARCHAR(64) NOT NULL DEFAULT 'Asia/Shanghai',
-  enabled BOOLEAN NOT NULL DEFAULT true,
-  task_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-  last_run_at TIMESTAMPTZ,
-  next_run_at TIMESTAMPTZ,
-  last_task_id VARCHAR(36) REFERENCES rpa_tasks(id) ON DELETE SET NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS rpa_artifacts (
-  id VARCHAR(36) PRIMARY KEY DEFAULT gen_random_uuid()::text,
+  id VARCHAR(36) PRIMARY KEY,
   task_id VARCHAR(36) NOT NULL REFERENCES rpa_tasks(id) ON DELETE CASCADE,
-  flow_id VARCHAR(36) REFERENCES rpa_flows(id) ON DELETE SET NULL,
   artifact_type VARCHAR(32) NOT NULL,
   filename VARCHAR(255) NOT NULL,
   storage_url TEXT NOT NULL,
-  content_type VARCHAR(120) NOT NULL DEFAULT 'application/octet-stream',
+  content_type VARCHAR(120) NOT NULL,
   size_bytes BIGINT NOT NULL DEFAULT 0,
   metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CONSTRAINT rpa_artifacts_type_check CHECK (artifact_type IN ('script', 'screenshot', 'report', 'dataset', 'log')),
-  CONSTRAINT rpa_artifacts_size_check CHECK (size_bytes >= 0)
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_rpa_flows_status ON rpa_flows(status);
-CREATE INDEX IF NOT EXISTS idx_rpa_flows_folder_path_updated_at ON rpa_flows(folder_path, updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_rpa_tasks_flow_id_created_at ON rpa_tasks(flow_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_rpa_tasks_schedule_id_created_at ON rpa_tasks(schedule_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_rpa_tasks_status_created_at ON rpa_tasks(status, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_rpa_task_logs_task_id_created_at ON rpa_task_logs(task_id, created_at ASC);
-CREATE INDEX IF NOT EXISTS idx_rpa_task_variables_task_id_name ON rpa_task_variables(task_id, name);
-CREATE INDEX IF NOT EXISTS idx_rpa_task_variables_flow_id_name ON rpa_task_variables(flow_id, name);
-CREATE INDEX IF NOT EXISTS idx_rpa_schedules_enabled_next_run_at ON rpa_schedules(enabled, next_run_at);
-CREATE INDEX IF NOT EXISTS idx_rpa_artifacts_task_id_created_at ON rpa_artifacts(task_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_rpa_artifacts_flow_id_created_at ON rpa_artifacts(flow_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS rpa_schedules (
+  id VARCHAR(36) PRIMARY KEY,
+  name VARCHAR(120) NOT NULL,
+  cron_expression VARCHAR(120) NOT NULL,
+  timezone VARCHAR(64) NOT NULL DEFAULT 'Asia/Shanghai',
+  enabled BOOLEAN NOT NULL DEFAULT true,
+  task_payload JSONB NOT NULL,
+  last_run_at TIMESTAMPTZ,
+  next_run_at TIMESTAMPTZ,
+  last_task_id VARCHAR(36),
+  last_error TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS rpa_model_catalog (
+  id VARCHAR(120) PRIMARY KEY,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  data JSONB NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_rpa_flows_updated_at
+  ON rpa_flows(updated_at);
+CREATE INDEX IF NOT EXISTS ix_rpa_flow_versions_flow_saved
+  ON rpa_flow_versions(flow_id, saved_at);
+CREATE INDEX IF NOT EXISTS ix_rpa_tasks_updated_at
+  ON rpa_tasks(updated_at);
+CREATE INDEX IF NOT EXISTS ix_rpa_tasks_flow_updated
+  ON rpa_tasks(flow_id, updated_at);
+CREATE INDEX IF NOT EXISTS ix_rpa_tasks_schedule_created
+  ON rpa_tasks(schedule_id, created_at);
+CREATE INDEX IF NOT EXISTS ix_rpa_tasks_rate
+  ON rpa_tasks(status, updated_at, flow_id);
+CREATE INDEX IF NOT EXISTS ix_rpa_task_logs_task_created
+  ON rpa_task_logs(task_id, created_at);
+CREATE INDEX IF NOT EXISTS ix_rpa_task_variables_task_name
+  ON rpa_task_variables(task_id, name);
+CREATE INDEX IF NOT EXISTS ix_rpa_artifacts_task_id
+  ON rpa_artifacts(task_id);
+CREATE INDEX IF NOT EXISTS ix_rpa_schedules_enabled_next
+  ON rpa_schedules(enabled, next_run_at);
 
 INSERT INTO rpa_flows (
   id,
@@ -129,8 +138,11 @@ INSERT INTO rpa_flows (
   description,
   definition,
   input_variables,
+  acceptance_contract,
+  revision,
   status,
-  folder_path
+  folder_path,
+  default_browser_executor
 )
 VALUES (
   '00000000-0000-0000-0000-000000000101',
@@ -140,7 +152,7 @@ VALUES (
   '{
     "nodes": [
       {"id": "start", "type": "start"},
-      {"id": "n1", "type": "browser.fetch", "targetUrl": "https://quotes.toscrape.com/", "selector": ".quote .text::text"},
+      {"id": "n1", "type": "browser.fetch", "targetUrl": "https://quotes.toscrape.com/", "selector": ".quote .text::text", "outputVariable": "quotes"},
       {"id": "end", "type": "end"}
     ],
     "edges": [
@@ -149,8 +161,18 @@ VALUES (
     ]
   }'::jsonb,
   '[]'::jsonb,
+  '{
+    "requirements": [
+      {"id": "quotes-required", "description": "采集页面中的名言文本", "sourceKind": "product_default"}
+    ],
+    "deliverables": [
+      {"id": "quotes", "variable": "quotes", "kind": "scalar", "requirementIds": ["quotes-required"]}
+    ]
+  }'::jsonb,
+  1,
   'active',
-  '默认目录'
+  '默认目录',
+  'playwright'
 )
 ON CONFLICT (id) DO UPDATE
 SET
@@ -159,8 +181,11 @@ SET
   description = EXCLUDED.description,
   definition = EXCLUDED.definition,
   input_variables = EXCLUDED.input_variables,
+  acceptance_contract = EXCLUDED.acceptance_contract,
+  revision = EXCLUDED.revision,
   status = EXCLUDED.status,
   folder_path = EXCLUDED.folder_path,
+  default_browser_executor = EXCLUDED.default_browser_executor,
   updated_at = now();
 
 INSERT INTO rpa_schedules (id, name, cron_expression, timezone, enabled, task_payload)
@@ -173,11 +198,23 @@ VALUES (
   '{
     "flowName": "订单自动处理",
     "flowId": "00000000-0000-0000-0000-000000000101",
-    "targetUrl": "https://quotes.toscrape.com/",
-    "selector": ".quote .text::text",
-    "fetcher": "static",
-    "extractMode": "text",
-    "timeoutMs": 30000
+    "flowRevision": 1,
+    "acceptanceContract": {
+      "requirements": [
+        {"id": "quotes-required", "description": "采集页面中的名言文本", "sourceKind": "product_default"}
+      ],
+      "deliverables": [
+        {"id": "quotes", "variable": "quotes", "kind": "scalar", "requirementIds": ["quotes-required"]}
+      ]
+    },
+    "variables": {},
+    "sensitiveVariables": [],
+    "timeoutMs": 30000,
+    "scope": "full",
+    "failureStrategy": "stop",
+    "screenshot": true,
+    "concurrency": 1,
+    "browserExecutor": "playwright"
   }'::jsonb
 )
 ON CONFLICT (id) DO NOTHING;

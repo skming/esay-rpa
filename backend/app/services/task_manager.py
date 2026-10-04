@@ -602,7 +602,7 @@ class TaskManager:
                     # 就会走到这里：真正的节点报错会被改写成"插件已关闭"，用户照着去开开关也修不好。
                     # 清理失败要留痕（上下文可能泄漏），但不能替换根因，也不能跳过下面的产物清理。
                     await self._append_log(record, "warn", "浏览器上下文清理失败", str(exc), node_id=record.active_node_id or "end")
-                self._prune_run_outputs(record)
+                await self._prune_run_outputs(record)
 
         if state.results:
             return _merge_scrape_results(state.results)
@@ -612,11 +612,18 @@ class TaskManager:
             return ScrapeResult(url="", selector="", count=0, values=[])
         raise RuntimeError("流程定义未找到可执行节点")
 
-    def _prune_run_outputs(self, record: TaskRecord) -> None:
+    async def _prune_run_outputs(self, record: TaskRecord) -> None:
         """Enforce per-flow output retention after a run finishes (best-effort)."""
         try:
             flow_slug = _resolve_output_slug(record.request)
-            storage.prune_run_outputs(flow_slug)
+            removed = storage.prune_run_outputs(flow_slug)
+            removed_task_ids = [path.name for path in removed]
+            await self._task_store.delete_artifacts(removed_task_ids)
+            for task_id in removed_task_ids:
+                removed_record = self._tasks.get(task_id)
+                if removed_record is not None:
+                    removed_record.artifacts.clear()
+                    removed_record.snapshot = removed_record.snapshot.model_copy(update={"artifacts": []})
         except Exception:  # retention must never fail a run
             pass
 

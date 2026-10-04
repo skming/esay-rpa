@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 
-from sqlalchemy import Boolean, DateTime, String, Text, delete, select
+from sqlalchemy import Boolean, DateTime, Index, String, Text, delete, event, select
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -85,6 +85,7 @@ class UTCDateTime(TypeDecorator):
 
 class ScheduleRow(Base):
     __tablename__ = "rpa_schedules"
+    __table_args__ = (Index("ix_rpa_schedules_enabled_next", "enabled", "next_run_at"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     name: Mapped[str] = mapped_column(String(120), nullable=False)
@@ -153,7 +154,13 @@ class SqlAlchemyScheduleStore:
         row.cron_expression = schedule.cron_expression
         row.timezone = schedule.timezone
         row.enabled = schedule.status == "enabled"
-        row.task_payload = schedule.task.model_dump(mode="json", by_alias=True)
+        task_payload = schedule.task.model_dump(mode="json", by_alias=True)
+        task_payload["flowDefinition"] = None
+        variables = dict(task_payload.get("variables") or {})
+        for name in task_payload.get("sensitiveVariables") or []:
+            variables.pop(name, None)
+        task_payload["variables"] = variables
+        row.task_payload = task_payload
         row.last_run_at = schedule.last_run_at
         row.next_run_at = schedule.next_run_at
         row.last_task_id = schedule.last_task_id
@@ -180,4 +187,11 @@ class SqlAlchemyScheduleStore:
 
 
 def create_schedule_engine(database_url: str) -> AsyncEngine:
-    return create_async_engine(database_url, future=True)
+    engine = create_async_engine(database_url, future=True)
+    if engine.url.get_backend_name() == "sqlite":
+        @event.listens_for(engine.sync_engine, "connect")
+        def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
+    return engine

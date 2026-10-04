@@ -362,11 +362,17 @@ export function useElectronBridgeActions({
       },
       rollbackFlowSnapshot: async (snapshot: FlowVersionSnapshot) => {
         if (currentFlow === null) return false;
+        const currentVariables = new Map(currentFlow.inputVariables.map((variable) => [variable.name, variable]));
+        const restoredVariables = snapshot.inputVariables.map((variable) => {
+          if (variable.category !== 'credential' && variable.sensitive !== true) return variable;
+          const current = currentVariables.get(variable.name);
+          return current === undefined ? variable : { ...variable, value: current.value };
+        });
         const updated = await callBridge((api) => api.updateFlow(currentFlow.flowId, {
           acceptanceContract: snapshot.acceptanceContract,
           description: snapshot.description ?? undefined,
           definition: snapshot.definition,
-          inputVariables: snapshot.inputVariables,
+          inputVariables: restoredVariables,
         }));
         if (updated === null) return false;
         clearDraftStorage();
