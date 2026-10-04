@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Literal
+
 from app.models.schemas import RunScope, RunTaskRequest
 from app.services.browser_action_runner import is_browser_action_node
 from app.services.control_action_runner import is_control_action_node, is_subprocess_node
@@ -13,6 +16,10 @@ from app.services.variable_action_runner import is_variable_action_node
 
 type FlowNode = dict[str, object]
 type FlowEdge = dict[str, object]
+type NodeExecutionKind = Literal[
+    "fetch", "variable", "condition", "http", "browser", "subprocess", "control",
+    "file", "script", "data", "loop", "repeat_until",
+]
 
 
 class FlowDefinitionSelector:
@@ -208,23 +215,29 @@ class FlowDefinitionSelector:
 
 # 判据一律转发给各执行器自己的谓词，不在这里另抄一份类型清单：抄漏一个类型不会报错，
 # 只会让该节点悄悄从 executable_nodes 里消失——进度条少算一步，流程还可能错误地报成功。
-_NODE_PREDICATES = (
-    is_variable_action_node,
-    is_http_action_node,
-    is_script_action_node,
-    is_data_action_node,
-    is_browser_action_node,
-    is_control_action_node,
-    is_subprocess_node,
-    is_file_action_node,
-    is_loop_node,
-    is_repeat_until_node,
-    is_condition_node,
+_NODE_EXECUTION_KINDS: tuple[tuple[NodeExecutionKind, Callable[[FlowNode], bool]], ...] = (
+    ("variable", is_variable_action_node),
+    ("condition", is_condition_node),
+    ("http", is_http_action_node),
+    ("browser", is_browser_action_node),
+    ("subprocess", is_subprocess_node),
+    ("control", is_control_action_node),
+    ("file", is_file_action_node),
+    ("script", is_script_action_node),
+    ("data", is_data_action_node),
+    ("loop", is_loop_node),
+    ("repeat_until", is_repeat_until_node),
 )
 
 
+def node_execution_kind(node: FlowNode) -> NodeExecutionKind | None:
+    if node.get("type") == "browser.fetch":
+        return "fetch"
+    return next((kind for kind, predicate in _NODE_EXECUTION_KINDS if predicate(node)), None)
+
+
 def is_executable_node(node: FlowNode) -> bool:
-    return node.get("type") == "browser.fetch" or any(predicate(node) for predicate in _NODE_PREDICATES)
+    return node_execution_kind(node) is not None
 
 
 def _read_edge_target(edge: FlowEdge) -> str | None:

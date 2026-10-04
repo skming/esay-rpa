@@ -18,7 +18,7 @@ from app.models.schemas import (
 )
 from app.services.flow_control import evaluate_condition
 from app.services.ai_tools.catalog import NODE_TYPE_CATALOG
-from app.services.flow_definition import FlowDefinitionSelector, is_executable_node
+from app.services.flow_definition import FlowDefinitionSelector, is_executable_node, node_execution_kind
 from app.services.flow_runner import FlowRunService
 from app.services.log_broker import LogBroker
 from app.services.runtime_variables import RuntimeVariableStore
@@ -133,6 +133,25 @@ def test_flow_template_action_types_are_backend_executable() -> None:
     unsupported = sorted(action_type for action_type in template_action_types if not is_executable_node({"type": action_type}))
 
     assert unsupported == []
+
+
+@pytest.mark.parametrize(("node_type", "kind"), [
+    ("browser.fetch", "fetch"), ("browser.open", "browser"), ("ui.click", "browser"),
+    ("variable.set", "variable"), ("control.condition", "condition"), ("http.request", "http"),
+    ("control.subprocess", "subprocess"), ("control.delay", "control"), ("file.write", "file"),
+    ("script.python", "script"), ("data.json.parse", "data"), ("control.foreach", "loop"),
+    ("control.repeat_until", "repeat_until"),
+])
+def test_executable_node_classification_matches_runtime_route(node_type, kind):
+    node = {"type": node_type, "condition": "ready"}
+    assert node_execution_kind(node) == kind
+    assert is_executable_node(node)
+
+
+def test_metadata_and_unknown_nodes_have_no_execution_route():
+    for node in [{"type": "start"}, {"type": "end"}, {"type": "unknown"}, {"type": "control.condition"}]:
+        assert node_execution_kind(node) is None
+        assert not is_executable_node(node)
 
 
 def test_flow_runner_protects_credential_category_without_sensitive_flag() -> None:

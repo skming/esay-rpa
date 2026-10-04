@@ -15,7 +15,7 @@ from app.services.schedule_store import SqlAlchemyScheduleStore, create_schedule
 from app.services.scrapling_runner import ScraplingRunner
 from app.services.scheduler_service import ScheduleService
 from app.services.task_manager import TaskManager
-from app.services.task_queue import RedisTaskQueue
+from app.services.task_queue import RedisTaskQueue, TaskRunner
 from app.services.task_store import SqlAlchemyTaskStore, TaskStore
 
 
@@ -56,33 +56,15 @@ def create_runtime_services(settings: Settings, broker: LogBroker) -> RuntimeSer
     flow_store = _create_flow_store(settings)
     flow_service = FlowService(store=flow_store)
     task_store = _create_task_store(settings)
-    if settings.task_queue_backend == "redis":
-        redis = Redis.from_url(settings.redis_url, decode_responses=True)
-        manager = TaskManager(
-            runner=ScraplingRunner(storage_dir=str(storage.resolve_scrapling_storage_dir())),
-            broker=broker,
-            artifact_store=_create_artifact_store(settings),
-            task_store=task_store,
-            flow_service=flow_service,
-            concurrency=settings.task_concurrency,
-            queue_factory=lambda runner: RedisTaskQueue(
-                runner=runner,
-                redis=redis,
-                queue_name=settings.task_queue_name,
-                concurrency=settings.task_concurrency,
-            ),
-        )
-        flow_run_service = FlowRunService(task_manager=manager)
-        schedule_service, schedule_store = _create_schedule_service(settings, manager, flow_service, flow_run_service)
-        return RuntimeServices(
-            task_manager=manager,
-            schedule_service=schedule_service,
-            flow_service=flow_service,
-            flow_run_service=flow_run_service,
-            schedule_store=schedule_store,
-            task_store=task_store if isinstance(task_store, SqlAlchemyTaskStore) else None,
-            flow_store=flow_store if isinstance(flow_store, SqlAlchemyFlowStore) else None,
+    redis = Redis.from_url(settings.redis_url, decode_responses=True) if settings.task_queue_backend == "redis" else None
+
+    def create_redis_queue(runner: TaskRunner) -> RedisTaskQueue:
+        assert redis is not None
+        return RedisTaskQueue(
+            runner=runner,
             redis=redis,
+            queue_name=settings.task_queue_name,
+            concurrency=settings.task_concurrency,
         )
 
     manager = TaskManager(
@@ -92,6 +74,7 @@ def create_runtime_services(settings: Settings, broker: LogBroker) -> RuntimeSer
         task_store=task_store,
         flow_service=flow_service,
         concurrency=settings.task_concurrency,
+        queue_factory=create_redis_queue if redis is not None else None,
     )
     flow_run_service = FlowRunService(task_manager=manager)
     schedule_service, schedule_store = _create_schedule_service(settings, manager, flow_service, flow_run_service)
@@ -103,6 +86,7 @@ def create_runtime_services(settings: Settings, broker: LogBroker) -> RuntimeSer
         schedule_store=schedule_store,
         task_store=task_store if isinstance(task_store, SqlAlchemyTaskStore) else None,
         flow_store=flow_store if isinstance(flow_store, SqlAlchemyFlowStore) else None,
+        redis=redis,
     )
 
 
