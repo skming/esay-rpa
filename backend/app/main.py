@@ -158,7 +158,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         await ai_config_service.close_catalog()
 
 
-app = FastAPI(title="Easy RPA Backend", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Easy RPA Backend", version="1.0.0", lifespan=lifespan)
 # WebSocket router 经 app.state 复用这些单例，避免拆分路由后重复创建
 app.state.log_broker = broker
 app.state.task_manager = task_manager

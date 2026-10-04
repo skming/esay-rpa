@@ -396,7 +396,7 @@ export function createBrowserBridge({ backendClient = new BackendClient() }: Bro
         arch: navigator.userAgent.includes('arm64') ? 'arm64' : 'browser',
         hostname: location.hostname,
         platform: navigator.platform,
-        version: '0.1.0'
+        version: '1.0.0'
       }),
     openDataDir: async (subDir?: string) => {
       const base = '~/.easy-rpa';
