@@ -190,8 +190,6 @@ export function BottomPanel({
         {activeTab === 'artifacts' && (
           <ArtifactRows
             artifactContent={electron.artifactContent}
-            // 'run-' 前缀是本地模拟运行 id 的约定，用来和后端真实 task_id 区分
-            isMockRun={electron.lastRunId !== null && electron.lastRunId.startsWith('run-')}
             lastRunId={electron.lastRunId}
             onReadArtifact={electron.readArtifact}
             rows={electron.artifacts}

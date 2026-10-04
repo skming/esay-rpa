@@ -13,12 +13,11 @@ import { PanelEmptyState } from './PanelEmptyState';
 type ArtifactRowsProps = {
   artifactContent: ArtifactContent | null;
   lastRunId: string | null;
-  isMockRun?: boolean;
   rows: ArtifactSnapshot[];
   onReadArtifact: (taskId: string, artifactId: string) => void;
 };
 
-export function ArtifactRows({ artifactContent, isMockRun, lastRunId, rows, onReadArtifact }: ArtifactRowsProps): ReactElement {
+export function ArtifactRows({ artifactContent, lastRunId, rows, onReadArtifact }: ArtifactRowsProps): ReactElement {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [previewingId, setPreviewingId] = useState<string | null>(null);
 
@@ -38,9 +37,7 @@ export function ArtifactRows({ artifactContent, isMockRun, lastRunId, rows, onRe
     const emptyText =
       lastRunId === null
         ? '运行流程后显示采集结果'
-        : isMockRun
-          ? '当前为模拟运行，无真实采集结果。请确认后端服务已启动后重新运行。'
-          : '当前运行未产生采集结果。如流程有截图或文件写入节点，请确认后端服务正常。';
+        : '当前运行未产生采集结果。如流程有截图或文件写入节点，请确认后端服务正常。';
     return <PanelEmptyState icon={Database} text={emptyText} />;
   }
 

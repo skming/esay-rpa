@@ -11,7 +11,7 @@ module.exports = {
   // Only renderer + Electron main process go into the asar.
   // Python runtime and venv live in extraResources (outside asar) so native
   // extensions and interpreter symlinks are never broken by asar path rewriting.
-  files: ['dist/**/*', 'electron/**/*', 'package.json'],
+  files: ['dist/**/*', 'electron/**/*', 'shared/**/*.cjs', 'package.json'],
   asar: true,
   compression: 'maximum',
   npmRebuild: false,

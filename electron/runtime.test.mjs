@@ -1,8 +1,21 @@
 import { createRequire } from 'node:module';
-import { expect, it } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 
 const require = createRequire(import.meta.url);
 const { createRuntimeController, generateScraplingScript } = require('./runtime.cjs');
+let cleanupRun = async () => {};
+
+beforeEach(() => {
+  vi.useFakeTimers();
+  vi.stubGlobal('WebSocket', undefined);
+});
+
+afterEach(async () => {
+  await cleanupRun();
+  cleanupRun = async () => {};
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
 
 function createFakeWindow() {
   const events = [];
@@ -36,17 +49,107 @@ it('后端拒绝这次请求时不回落本地模拟', async () => {
   expect(win.events).toEqual([]);
 });
 
-it('后端不可用时仍回落本地模拟', async () => {
+it('后端不可用时返回原始错误且不产生模拟运行事件', async () => {
   const controller = controllerRejectingWith(new Error('fetch failed'));
   const win = createFakeWindow();
 
-  const started = await controller.startRun(win, { flowId: 'flow-1' });
+  await expect(controller.startRun(win, { flowId: 'flow-1' })).rejects.toThrow('fetch failed');
 
-  expect(started.status).toBe('running');
-  expect(win.events.some((event) => event.type === 'run:start')).toBe(true);
+  expect(win.events).toEqual([]);
+});
 
-  // activeRun 是模块级状态，模拟运行留下的定时器会跨用例存活。
-  await controller.stopRun();
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+function task(taskId, status = 'running') {
+  return { taskId, status, progress: { currentStep: 1, totalSteps: 4, percent: 25 } };
+}
+
+function watchingController(overrides = {}) {
+  const backend = {
+    runFlow: vi.fn(async () => task('new')),
+    getTask: vi.fn(async (id) => task(id)),
+    getLogs: vi.fn(async () => []),
+    stopTask: vi.fn(async (id) => task(id, 'stopped')),
+    ...overrides,
+  };
+  const controller = createRuntimeController({ backendClient: backend });
+  cleanupRun = async () => {
+    backend.stopTask.mockResolvedValue(task('cleanup', 'stopped'));
+    await controller.stopRun();
+  };
+  return { backend, controller, win: createFakeWindow() };
+}
+
+it.each(['success', 'error'])('旧轮询的 %s 结果不能覆盖新运行', async (outcome) => {
+  const old = deferred();
+  const { backend, controller, win } = watchingController({ getTask: vi.fn(() => old.promise) });
+  controller.watchBackendRun(win, task('old'));
+  vi.advanceTimersByTime(250);
+  expect(backend.getTask).toHaveBeenCalledWith('old');
+  controller.watchBackendRun(win, task('new'));
+  const eventCount = win.events.length;
+  if (outcome === 'success') old.resolve(task('old', 'success'));
+  else old.reject(new Error('old poll failed'));
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+
+  expect(win.events).toHaveLength(eventCount);
+  expect(await controller.stopRun('new')).toMatchObject({ stopped: true, runId: 'new' });
+});
+
+it('轮询期间停止后，迟到响应不再派发事件', async () => {
+  const old = deferred();
+  const { controller, win } = watchingController({ getTask: vi.fn(() => old.promise) });
+  controller.watchBackendRun(win, task('old'));
+  vi.advanceTimersByTime(250);
+  await controller.stopRun('old');
+  const eventCount = win.events.length;
+  old.resolve(task('old', 'success'));
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+
+  expect(win.events).toHaveLength(eventCount);
+});
+
+it('启动新运行前等待后端确认旧任务已停止', async () => {
+  const stopped = deferred();
+  const { backend, controller, win } = watchingController({ stopTask: vi.fn(() => stopped.promise) });
+  controller.watchBackendRun(win, task('old'));
+  const starting = controller.startRun(win, { flowId: 'flow-new' });
+  expect(backend.stopTask).toHaveBeenCalledWith('old');
+  expect(backend.runFlow).not.toHaveBeenCalled();
+  stopped.resolve(task('old', 'stopped'));
+  expect(await starting).toMatchObject({ runId: 'new' });
+});
+
+it('停止请求失败时保留运行，不报告停止成功，也不启动新任务', async () => {
+  const { backend, controller, win } = watchingController({ stopTask: vi.fn().mockRejectedValue(new Error('stop failed')) });
+  controller.watchBackendRun(win, task('old'));
+  const eventCount = win.events.length;
+  await expect(controller.startRun(win, { flowId: 'flow-new' })).rejects.toThrow('stop failed');
+  expect(backend.runFlow).not.toHaveBeenCalled();
+  expect(win.events).toHaveLength(eventCount);
+});
+
+it('旧停止请求的迟到结果不能停止新观察任务', async () => {
+  const stopped = deferred();
+  const { backend, controller, win } = watchingController({ stopTask: vi.fn(() => stopped.promise) });
+  controller.watchBackendRun(win, task('old'));
+  const stopping = controller.stopRun('old');
+  controller.watchBackendRun(win, task('new'));
+  const eventCount = win.events.length;
+  stopped.resolve(task('old', 'stopped'));
+  expect(await stopping).toMatchObject({ runId: 'old' });
+  expect(win.events).toHaveLength(eventCount);
+  backend.stopTask.mockResolvedValue(task('new', 'stopped'));
+  expect(await controller.stopRun('new')).toMatchObject({ runId: 'new', stopped: true });
 });
 
 function failingBackend(message = 'fetch failed') {
@@ -79,7 +182,7 @@ it('离线模板的 run() 直接报错而不是返回流程定义', async () => 
   // 老模板 return {"flow": ...} 并退出 0：重定向到文件就是一份看起来正常的 JSON，
   // 「一条数据都没抓到」被报成了成功。
   const script = await generateScraplingScript(
-    { backend: 'mock', flowName: '门店合约抓取', flowDefinition: { nodes: [] } },
+    { flowName: '门店合约抓取', flowDefinition: { nodes: [] } },
     failingBackend(),
   );
 

@@ -1,3 +1,13 @@
+import {
+  normalizeAnalyzePayload,
+  normalizeDebugCommand,
+  normalizeFlowPayload,
+  normalizeFlowRunPayload,
+  normalizeLimit,
+  normalizeRunPayload,
+  normalizeSchedulePayload,
+  normalizeScriptPayload
+} from '@shared/backendPayloads.cjs';
 import type {
   AiConfig,
   AiConfigPatch,
@@ -190,21 +200,11 @@ export class BackendClient {
 
   async runFlow(
     flowId: string,
-    payload: Pick<RunStartPayload, 'browserExecutor' | 'concurrency' | 'failureStrategy' | 'mode' | 'scope' | 'screenshot' | 'startNodeId' | 'variables'>
+    payload: Pick<RunStartPayload, 'browserExecutor' | 'concurrency' | 'failureStrategy' | 'mode' | 'scope' | 'screenshot' | 'startNodeId' | 'timeoutMs' | 'variables'>
   ): Promise<TaskSnapshot> {
     assertId(flowId, 'flowId');
     return await this.request<TaskSnapshot>(`/api/flows/${encodeURIComponent(flowId)}/run`, {
-      body: {
-        mode: payload.mode === 'debug' ? 'debug' : 'run',
-        browserExecutor: payload.browserExecutor === 'extension' ? 'extension' : 'playwright',
-        variables: normalizeVariables(payload.variables),
-        timeoutMs: 30_000,
-        scope: normalizeRunScope(payload.scope),
-        screenshot: payload.screenshot !== false,
-        startNodeId: normalizeOptionalString(payload.startNodeId),
-        failureStrategy: normalizeFailureStrategy(payload.failureStrategy),
-        concurrency: normalizeConcurrency(payload.concurrency)
-      },
+      body: normalizeFlowRunPayload(payload),
       method: 'POST',
       timeoutMs: 5000
     });
@@ -467,7 +467,11 @@ export class BackendClient {
       timedOut = true;
       controller.abort();
     }, timeoutMs);
-    signal?.addEventListener('abort', () => controller.abort(), { once: true });
+    const abort = (): void => controller.abort();
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) {
+      abort();
+    }
 
     try {
       const response = await fetch(`${this.baseUrl}${path}`, {
@@ -491,6 +495,7 @@ export class BackendClient {
       throw error;
     } finally {
       globalThis.clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
     }
   }
 }
@@ -527,131 +532,10 @@ export type BackendTaskLogEntry = {
   nodeId?: string | null;
 };
 
-function normalizeScriptPayload(payload: Partial<GenerateScriptPayload>): GenerateScriptPayload {
-  return {
-    adaptive: payload.adaptive ?? false,
-    attribute: normalizeOptionalString(payload.attribute),
-    autoSave: payload.autoSave ?? false,
-    extractMode: payload.extractMode ?? 'text',
-    fetcher: payload.fetcher ?? 'static',
-    flowDefinition: normalizeFlowDefinition(payload.flowDefinition) ?? {},
-    flowName: normalizeString(payload.flowName, '未命名流程'),
-    selector: normalizeOptionalString(payload.selector),
-    targetUrl: normalizeOptionalString(payload.targetUrl)
-  };
-}
-
-function normalizeRunPayload(payload: RunStartPayload): Record<string, unknown> {
-  const scriptPayload = normalizeScriptPayload(payload);
-  return {
-    ...scriptPayload,
-    browserExecutor: payload.browserExecutor === 'extension' ? 'extension' : 'playwright',
-    concurrency: normalizeConcurrency(payload.concurrency),
-    failureStrategy: normalizeFailureStrategy(payload.failureStrategy),
-    flowDefinition: normalizeFlowDefinition(payload.flowDefinition),
-    flowId: normalizeOptionalString(payload.flowId),
-    mode: payload.mode === 'debug' ? 'debug' : 'run',
-    scope: normalizeRunScope(payload.scope),
-    screenshot: payload.screenshot !== false,
-    startNodeId: normalizeOptionalString(payload.startNodeId),
-    timeoutMs: Number.isInteger(payload.timeoutMs) ? payload.timeoutMs : 30_000,
-    variables: normalizeVariables(payload.variables)
-  };
-}
-
-function normalizeAnalyzePayload(payload: Partial<AnalyzeSitePayload>): Record<string, string | number | undefined> {
-  return {
-    fetcher: payload.fetcher ?? 'static',
-    maxCandidates: Number.isInteger(payload.maxCandidates) ? payload.maxCandidates : 8,
-    selector: normalizeOptionalString(payload.selector),
-    targetUrl: normalizeString(payload.targetUrl, ''),
-    timeoutMs: Number.isInteger(payload.timeoutMs) ? payload.timeoutMs : 30_000
-  };
-}
-
-function normalizeFlowPayload(payload: FlowSavePayload): FlowSavePayload {
-  return {
-    acceptanceContract: payload.acceptanceContract,
-    definition: payload.definition && typeof payload.definition === 'object' ? payload.definition : {},
-    description: normalizeOptionalString(payload.description),
-    inputVariables: Array.isArray(payload.inputVariables) ? payload.inputVariables : [],
-    name: normalizeString(payload.name, '未命名流程'),
-    status: (['active', 'paused', 'disabled', 'archived'] as const).includes(payload.status as never) ? payload.status as import('../types/electron').FlowStatus : 'draft',
-    version: normalizeString(payload.version, 'v1.0.0'),
-    defaultBrowserExecutor: payload.defaultBrowserExecutor === 'extension' ? 'extension' : undefined
-  };
-}
-
-function normalizeSchedulePayload(payload: ScheduleCreatePayload): ScheduleCreatePayload {
-  return {
-    enabled: payload.enabled !== false,
-    cronExpression: normalizeString(payload.cronExpression, '0 9 * * *'),
-    name: normalizeString(payload.name, '未命名计划'),
-    task: {
-      ...payload.task,
-      adaptive: payload.task.adaptive ?? true,
-      autoSave: payload.task.autoSave ?? true,
-      flowName: normalizeString(payload.task.flowName, '未命名流程'),
-      mode: payload.task.mode === 'debug' ? 'debug' : 'run',
-      selector: normalizeString(payload.task.selector, ''),
-      targetUrl: normalizeString(payload.task.targetUrl, ''),
-      timeoutMs: Number.isInteger(payload.task.timeoutMs) ? payload.task.timeoutMs : 30_000
-    },
-    timezone: normalizeString(payload.timezone, 'Asia/Shanghai')
-  };
-}
-
 function assertId(value: string, label: string): void {
   if (typeof value !== 'string' || value.trim().length === 0) {
     throw new Error(`${label} 不能为空`);
   }
-}
-
-function normalizeString(value: string | undefined, fallback: string): string {
-  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : fallback;
-}
-
-function normalizeOptionalString(value: string | undefined): string | undefined {
-  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
-}
-
-/** 并发上限硬编码为 20，防止误配置打满后端浏览器实例池。 */
-function normalizeConcurrency(value: number | undefined): number {
-  if (value === undefined || !Number.isFinite(value)) {
-    return 1;
-  }
-  return Math.min(20, Math.max(1, Math.round(value)));
-}
-
-/** 分页上限硬编码为 200，避免一次性拉取过多历史记录拖慢列表页。 */
-function normalizeLimit(value: number | undefined): number {
-  if (value === undefined || !Number.isFinite(value)) {
-    return 50;
-  }
-  return Math.min(200, Math.max(1, Math.round(value)));
-}
-
-function normalizeRunScope(value: RunStartPayload['scope']): NonNullable<RunStartPayload['scope']> {
-  return value === 'from-selection' || value === 'selected-only' ? value : 'full';
-}
-
-function normalizeFailureStrategy(value: RunStartPayload['failureStrategy']): NonNullable<RunStartPayload['failureStrategy']> {
-  return value === 'continue' || value === 'retry' ? value : 'stop';
-}
-
-function normalizeDebugCommand(value: DebugControlCommand): DebugControlCommand {
-  if (value === 'continue' || value === 'step-into' || value === 'step-over') {
-    return value;
-  }
-  throw new Error('调试命令不合法');
-}
-
-function normalizeFlowDefinition(value: RunStartPayload['flowDefinition']): Record<string, unknown> | undefined {
-  return value !== undefined && value !== null && typeof value === 'object' && !Array.isArray(value) ? value : undefined;
-}
-
-function normalizeVariables(value: RunStartPayload['variables']): Record<string, unknown> {
-  return value !== undefined && value !== null && typeof value === 'object' && !Array.isArray(value) ? value : {};
 }
 
 function parseJson(text: string): unknown {

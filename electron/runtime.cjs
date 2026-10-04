@@ -1,28 +1,10 @@
+const {
+  normalizeRuntimeStatus, normalizeLogLevel, resolveBackendLogNodeId, collectKnownNodeIds,
+  readBackendTotalSteps, formatLogTime, applyBackendNodeState, finalizeLastActiveNode
+} = require('../shared/runtimeEvents.cjs');
+const { normalizeConcurrency } = require('../shared/backendPayloads.cjs');
 const { BackendClient } = require('./backendClient.cjs');
 const { IPC_CHANNELS } = require('./ipcChannels.cjs');
-
-const runtimeNodeIds = ['start', 'n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7', 'n8', 'n9', 'n10', 'n11', 'end'];
-
-const nodeLogMessages = {
-  start: ['info', '流程启动 · 初始化执行上下文'],
-  n1: ['running', '执行节点 n1'],
-  n2: ['running', '执行节点 n2'],
-  n3: ['running', '执行节点 n3'],
-  n4: ['running', '执行节点 n4'],
-  n5: ['info', '执行节点 n5'],
-  n6: ['running', '执行节点 n6'],
-  n7: ['success', '节点执行完成 · n7'],
-  n8: ['running', '执行节点 n8'],
-  n9: ['info', '已跳过节点 n9 · 条件未命中'],
-  n10: ['success', '节点执行完成 · n10'],
-  n11: ['success', '节点执行完成 · n11'],
-  end: ['success', '流程执行完成 · 状态 success']
-};
-
-const nodeBadges = {
-  n6: '循环',
-  n9: '跳过'
-};
 
 const runScopeLabels = {
   full: '完整运行',
@@ -38,7 +20,7 @@ const failureStrategyLabels = {
 
 let activeRun = null;
 
-function createRuntimeController({ backendClient = new BackendClient(), sendEvent } = {}) {
+function createRuntimeController({ backendClient = new BackendClient() } = {}) {
   function emit(win, event) {
     if (win !== null && !win.isDestroyed()) {
       win.webContents.send(IPC_CHANNELS.run.event, event);
@@ -50,12 +32,9 @@ function createRuntimeController({ backendClient = new BackendClient(), sendEven
       return { stopped: false, status: 'ready' };
     }
 
-    const { runId, timers, win } = activeRun;
-    timers.forEach((timer) => clearTimeout(timer));
-    if (activeRun.logSocket !== undefined) {
-      activeRun.logSocket.close();
-    }
-    activeRun = null;
+    const { runId, win } = activeRun;
+    finalizeLastActiveNode(activeRun, event => emit(win, event), 'skipped');
+    clearActiveRun();
     emit(win, {
       type: 'run:finish',
       payload: {
@@ -66,6 +45,16 @@ function createRuntimeController({ backendClient = new BackendClient(), sendEven
       }
     });
     return { stopped: true, runId, status };
+  }
+
+  function clearActiveRun() {
+    if (activeRun === null) {
+      return;
+    }
+    const run = activeRun;
+    activeRun = null;
+    run.timers.forEach(timer => clearTimeout(timer));
+    run.logSocket?.close();
   }
 
   function schedule(win, runId, callback, delayMs) {
@@ -82,125 +71,10 @@ function createRuntimeController({ backendClient = new BackendClient(), sendEven
     if (win === null) {
       throw new Error('Window is unavailable.');
     }
-
     if (activeRun !== null) {
-      stopActiveRun('stopped', '上一次运行已被新的运行请求停止');
+      await stopRun(activeRun.runId);
     }
-
-    if (payload.backend !== 'mock') {
-      try {
-        return await startBackendRun(win, payload);
-      } catch (error) {
-        // 后端答复过（带 status）就说明请求是被业务规则拒绝的，这时改跑本地模拟等于把拒绝理由换成一次假的成功运行：
-        // 模拟用的是内置演示节点 id，真实流程的节点一个都对不上，面板既没有状态更新也没有产物，结束时却报 success。
-        if (typeof error?.status === 'number') {
-          throw error;
-        }
-        return startMockRun(win, payload, `后端不可用，切换到本地模拟运行 · ${error.message}`);
-      }
-    }
-
-    return startMockRun(win, payload);
-  }
-
-  function startMockRun(win, payload = {}, fallbackReason) {
-    if (win === null) {
-      throw new Error('Window is unavailable.');
-    }
-
-    const runId = `run-${Date.now()}`;
-    const startedAt = Date.now();
-    activeRun = { runId, timers: [], win };
-    const startPayload = {
-      runId,
-      flowId: payload.flowId ?? null,
-      status: 'running',
-      totalSteps: runtimeNodeIds.length,
-      startedAt: new Date(startedAt).toISOString(),
-      flowName: payload.flowName ?? '未命名流程',
-    };
-
-    emit(win, { type: 'run:start', payload: startPayload });
-    emitRunConfigState(win, runId, payload);
-    emitLog(win, runId, 'info', `流程启动 · ${payload.flowName ?? '未命名流程'} · ${payload.mode === 'debug' ? '调试模式' : '运行模式'}`, 'start');
-    if (typeof fallbackReason === 'string') {
-      emitLog(win, runId, 'warn', fallbackReason, 'start');
-    }
-
-    runtimeNodeIds.forEach((nodeId, index) => {
-      const delayMs = 320 + index * 420;
-      schedule(
-        win,
-        runId,
-        () => {
-          const elapsedMs = Date.now() - startedAt;
-          const runningStatus = nodeId === 'n9' ? 'skipped' : 'running';
-          emit(win, {
-            type: 'node:update',
-            payload: {
-              runId,
-              nodeId,
-              status: runningStatus,
-              badge: runningStatus === 'skipped' ? nodeBadges[nodeId] : nodeBadges[nodeId]
-            }
-          });
-
-          const [level, message] = nodeLogMessages[nodeId] ?? ['info', `执行节点 ${nodeId}`];
-          emitLog(win, runId, level, message, nodeId);
-
-
-          emit(win, {
-            type: 'run:progress',
-            payload: {
-              runId,
-              currentStep: index + 1,
-              totalSteps: runtimeNodeIds.length,
-              percent: Math.round(((index + 1) / runtimeNodeIds.length) * 100),
-              elapsedMs
-            }
-          });
-
-          schedule(
-            win,
-            runId,
-            () => {
-              if (nodeId !== 'n9') {
-                emit(win, {
-                  type: 'node:update',
-                  payload: { runId, nodeId, status: 'done', badge: nodeBadges[nodeId] }
-                });
-              }
-            },
-            260
-          );
-        },
-        delayMs
-      );
-    });
-
-    schedule(
-      win,
-      runId,
-      () => {
-        activeRun = null;
-        emit(win, {
-          type: 'run:finish',
-          payload: {
-            runId,
-            status: 'success',
-            finishedAt: new Date().toISOString(),
-            message: '流程执行完成'
-          }
-        });
-      },
-      320 + runtimeNodeIds.length * 420 + 520
-    );
-
-    if (typeof sendEvent === 'function') {
-      sendEvent({ runId, status: 'running' });
-    }
-
-    return startPayload;
+    return startBackendRun(win, payload);
   }
 
   async function startBackendRun(win, payload = {}) {
@@ -243,14 +117,11 @@ function createRuntimeController({ backendClient = new BackendClient(), sendEven
       throw new Error('Window is unavailable.');
     }
 
-    if (activeRun !== null) {
-      stopActiveRun('stopped', '上一次运行已被新的运行请求停止');
-    }
+    clearActiveRun();
 
     const runId = backendTask.taskId;
     const startedAt = Date.now();
     activeRun = {
-      backend: true,
       knownNodeIds: collectKnownNodeIds(payload.flowDefinition),
       lastActiveNodeId: null,
       artifactIds: new Set(),
@@ -288,14 +159,18 @@ function createRuntimeController({ backendClient = new BackendClient(), sendEven
   }
 
   async function pollBackendRun(runId, startedAt) {
-    if (activeRun === null || activeRun.runId !== runId || activeRun.backend !== true) {
+    if (activeRun === null || activeRun.runId !== runId) {
       return;
     }
 
+    const run = activeRun;
     try {
       const [snapshot, logs] = await Promise.all([backendClient.getTask(runId), backendClient.getLogs(runId)]);
+      if (activeRun !== run) {
+        return;
+      }
       const elapsedMs = Date.now() - startedAt;
-      const status = normalizeBackendStatus(snapshot.status);
+      const status = normalizeRuntimeStatus(snapshot.status);
       // When task is complete, always deliver HTTP logs to catch entries the WebSocket may have missed.
       // During active runs, skip HTTP logs when WebSocket is active to avoid ordering issues.
       if (activeRun.usingWebSocket !== true || status !== 'running') {
@@ -318,7 +193,7 @@ function createRuntimeController({ backendClient = new BackendClient(), sendEven
               time: formatLogTime(new Date()),
               level: 'input',
               message: snapshot.confirmationMessage,
-              nodeId: activeRun.lastActiveNodeId ?? 'n1'
+              nodeId: activeRun.lastActiveNodeId ?? 'start'
             }
           });
         }
@@ -354,11 +229,7 @@ function createRuntimeController({ backendClient = new BackendClient(), sendEven
       if (activeRun.logSocket !== undefined) {
         activeRun.logSocket.close();
       }
-      if (snapshot.status === 'error' && typeof snapshot.progress?.currentStep === 'number') {
-        finalizeLastActiveNode(win, runId, 'error');
-      } else if (snapshot.status === 'success') {
-        finalizeLastActiveNode(win, runId, 'done');
-      }
+      finalizeLastActiveNode(activeRun, event => emit(win, event), status === 'error' ? 'error' : status === 'stopped' ? 'skipped' : 'done');
       emit(win, {
         type: 'node:update',
         payload: {
@@ -381,11 +252,14 @@ function createRuntimeController({ backendClient = new BackendClient(), sendEven
       });
       activeRun = null;
     } catch (error) {
-      const win = activeRun.win;
+      if (activeRun !== run) {
+        return;
+      }
+      const win = run.win;
       if (activeRun.logSocket !== undefined) {
         activeRun.logSocket.close();
       }
-      finalizeLastActiveNode(win, runId, 'error');
+      finalizeLastActiveNode(activeRun, event => emit(win, event), 'error');
       emitLog(win, runId, 'error', `后端任务轮询失败 · ${error.message}`, 'end');
       emit(win, {
         type: 'run:finish',
@@ -405,17 +279,11 @@ function createRuntimeController({ backendClient = new BackendClient(), sendEven
       return { stopped: false, runId, status: 'ready' };
     }
 
-    if (activeRun.backend === true) {
-      const backendRunId = activeRun.runId;
-      try {
-        await backendClient.stopTask(backendRunId);
-      } catch (error) {
-        emitLog(activeRun.win, backendRunId, 'warn', `后端停止请求失败 · ${error.message}`, 'end');
-      }
-      return stopActiveRun('stopped', '流程已停止');
+    const run = activeRun;
+    await backendClient.stopTask(run.runId);
+    if (activeRun !== run) {
+      return { stopped: true, runId: run.runId, status: 'stopped' };
     }
-
-    emitLog(activeRun.win, activeRun.runId, 'warn', '用户请求停止运行 · 清理待执行任务', 'end');
     return stopActiveRun('stopped', '流程已停止');
   }
 
@@ -424,14 +292,8 @@ function createRuntimeController({ backendClient = new BackendClient(), sendEven
       throw new Error('当前没有匹配的运行任务');
     }
 
-    if (activeRun.backend !== true) {
-      emitLog(activeRun.win, activeRun.runId, 'running', `调试控制 · ${getDebugCommandLabel(command)}`, 'n1');
-      emitVariable(activeRun.win, activeRun.runId, { name: 'debug_command', type: 'String', value: getDebugCommandLabel(command), scope: '局部' });
-      return { runId: activeRun.runId, status: 'running' };
-    }
-
     const snapshot = await backendClient.debugTask(activeRun.runId, command);
-    return { runId: snapshot.taskId, status: normalizeBackendStatus(snapshot.status) };
+    return { runId: snapshot.taskId, status: normalizeRuntimeStatus(snapshot.status) };
   }
 
   function attachBackendLogSocket(runId) {
@@ -493,7 +355,9 @@ function createRuntimeController({ backendClient = new BackendClient(), sendEven
       activeRun.lastLogIds.add(`${runId}:poll-confirmation`);
     }
     const nodeId = resolveBackendLogNodeId(log, activeRun?.lastActiveNodeId);
-    applyBackendNodeState(win, runId, nodeId, log);
+    if (activeRun?.runId === runId) {
+      applyBackendNodeState(activeRun, event => emit(win, event), nodeId, log);
+    }
     emit(win, {
       type: 'log:append',
       payload: {
@@ -510,30 +374,6 @@ function createRuntimeController({ backendClient = new BackendClient(), sendEven
   return { debugRun, startRun, stopRun, watchBackendRun };
 }
 
-function normalizeBackendStatus(status) {
-  if (status === 'success') return 'success';
-  if (status === 'stopped') return 'stopped';
-  if (status === 'error') return 'error';
-  return 'running';
-}
-
-function normalizeLogLevel(level) {
-  if (level === 'success' || level === 'running' || level === 'warn' || level === 'error' || level === 'input') {
-    return level;
-  }
-  return 'info';
-}
-
-function resolveBackendLogNodeId(log, lastActiveNodeId) {
-  if (typeof log?.nodeId === 'string' && log.nodeId.length > 0) {
-    return log.nodeId;
-  }
-  const message = typeof log?.message === 'string' ? log.message : '';
-  if (message.includes('任务启动')) return 'start';
-  if (message.includes('任务完成') || message.includes('任务失败') || message.includes('任务已停止')) return 'end';
-  return lastActiveNodeId ?? 'start';
-}
-
 function emitRunConfigState(win, runId, payload = {}) {
   emitLog(win, runId, 'info', buildRunConfigLogMessage(payload), 'start');
   for (const variable of buildRunConfigVariables(payload)) {
@@ -544,7 +384,7 @@ function emitRunConfigState(win, runId, payload = {}) {
 function buildRunConfigLogMessage(payload = {}) {
   const scopeLabel = getRunScopeLabel(payload.scope);
   const failureLabel = getFailureStrategyLabel(payload.failureStrategy);
-  const concurrency = normalizeRunConcurrency(payload.concurrency);
+  const concurrency = normalizeConcurrency(payload.concurrency);
   const screenshotLabel = payload.screenshot === false ? '关闭' : '开启';
   const startNodeText = typeof payload.startNodeId === 'string' && payload.startNodeId.length > 0 ? ` · 起点 ${payload.startNodeId}` : '';
 
@@ -554,7 +394,7 @@ function buildRunConfigLogMessage(payload = {}) {
 function buildRunConfigVariables(payload = {}) {
   const variables = [
     { name: 'run_scope', type: 'String', value: getRunScopeLabel(payload.scope), scope: '全局' },
-    { name: 'run_concurrency', type: 'Integer', value: String(normalizeRunConcurrency(payload.concurrency)), scope: '全局' },
+    { name: 'run_concurrency', type: 'Integer', value: String(normalizeConcurrency(payload.concurrency)), scope: '全局' },
     { name: 'failure_strategy', type: 'String', value: getFailureStrategyLabel(payload.failureStrategy), scope: '全局' },
     { name: 'screenshot_enabled', type: 'Boolean', value: payload.screenshot === false ? 'false' : 'true', scope: '全局' }
   ];
@@ -572,22 +412,6 @@ function getRunScopeLabel(scope) {
 
 function getFailureStrategyLabel(strategy) {
   return failureStrategyLabels[strategy] ?? failureStrategyLabels.stop;
-}
-
-function normalizeRunConcurrency(value) {
-  if (!Number.isFinite(value)) {
-    return 1;
-  }
-  return Math.min(20, Math.max(1, Math.round(value)));
-}
-
-function getDebugCommandLabel(command) {
-  const labels = {
-    continue: '继续执行',
-    'step-over': '单步越过',
-    'step-into': '单步进入'
-  };
-  return labels[command] ?? '未知调试命令';
 }
 
 function emitLog(win, runId, level, message, nodeId) {
@@ -609,108 +433,6 @@ function emitVariable(win, runId, variable) {
     type: 'variable:set',
     payload: { runId, ...variable }
   });
-}
-
-function collectKnownNodeIds(flowDefinition) {
-  const nodes = flowDefinition?.nodes;
-  if (!Array.isArray(nodes)) {
-    return new Set(['start', 'end']);
-  }
-  return new Set(
-    nodes
-      .map((node) => (node !== null && typeof node === 'object' && typeof node.id === 'string' ? node.id : null))
-      .filter((value) => typeof value === 'string')
-      .concat(['start', 'end'])
-  );
-}
-
-function readBackendTotalSteps(progress) {
-  if (typeof progress?.totalStep === 'number' && Number.isFinite(progress.totalStep)) {
-    return Math.max(1, progress.totalStep);
-  }
-  if (typeof progress?.totalSteps === 'number' && Number.isFinite(progress.totalSteps)) {
-    return Math.max(1, progress.totalSteps);
-  }
-  return runtimeNodeIds.length;
-}
-
-function applyBackendNodeState(win, runId, nodeId, log) {
-  if (activeRun === null || activeRun.runId !== runId) {
-    return;
-  }
-  if (typeof nodeId !== 'string' || nodeId.length === 0) {
-    return;
-  }
-  if (activeRun.knownNodeIds instanceof Set && !activeRun.knownNodeIds.has(nodeId)) {
-    return;
-  }
-
-  const nextStatus = mapBackendLogLevelToNodeStatus(log?.level);
-  if (nextStatus === null) {
-    return;
-  }
-
-  if ((nodeId === 'start' || nodeId === 'end') && nextStatus === 'running') {
-    return;
-  }
-
-  if (nextStatus === 'running') {
-    finalizeLastActiveNode(win, runId, 'done', nodeId);
-    activeRun.lastActiveNodeId = nodeId;
-  } else if (activeRun.lastActiveNodeId === nodeId) {
-    activeRun.lastActiveNodeId = null;
-  }
-
-  const currentStatus = activeRun.nodeStates.get(nodeId);
-  if (currentStatus === nextStatus || isTerminalNodeStatus(currentStatus)) {
-    return;
-  }
-  activeRun.nodeStates.set(nodeId, nextStatus);
-  emitRuntimeEvent(win, {
-    type: 'node:update',
-    payload: {
-      runId,
-      nodeId,
-      status: nextStatus
-    }
-  });
-}
-
-function finalizeLastActiveNode(win, runId, status, exceptNodeId) {
-  if (activeRun === null || activeRun.runId !== runId) {
-    return;
-  }
-  const nodeId = activeRun.lastActiveNodeId;
-  if (typeof nodeId !== 'string' || nodeId.length === 0 || nodeId === exceptNodeId) {
-    return;
-  }
-  activeRun.lastActiveNodeId = null;
-  activeRun.nodeStates.set(nodeId, status);
-  emitRuntimeEvent(win, {
-    type: 'node:update',
-    payload: {
-      runId,
-      nodeId,
-      status
-    }
-  });
-}
-
-function mapBackendLogLevelToNodeStatus(level) {
-  if (level === 'running' || level === 'info') {
-    return 'running';
-  }
-  if (level === 'success') {
-    return 'done';
-  }
-  if (level === 'error') {
-    return 'error';
-  }
-  return null;
-}
-
-function isTerminalNodeStatus(status) {
-  return status === 'done' || status === 'error' || status === 'skipped';
 }
 
 function emitBackendVariables(win, runId, variables) {
@@ -746,42 +468,30 @@ function emitRuntimeEvent(win, event) {
   }
 }
 
-function formatLogTime(date) {
-  return [
-    String(date.getHours()).padStart(2, '0'),
-    String(date.getMinutes()).padStart(2, '0'),
-    String(date.getSeconds()).padStart(2, '0')
-  ].join(':') + `.${String(date.getMilliseconds()).padStart(3, '0')}`;
-}
-
 async function generateScraplingScript(payload = {}, backendClient = new BackendClient()) {
-  let degradedReason = '';
-  if (payload.backend !== 'mock') {
-    try {
-      return await backendClient.generateScript(payload);
-    } catch (error) {
-      // 离线模板只带流程定义、一个页面都不抓。静默换掉真脚本，UI 会照常报「已生成」，
-      // 于是失败原因必须跟着结果回到调用方，由它换成告警提示。
-      degradedReason = error instanceof Error ? error.message : String(error);
-    }
+  let degradedReason;
+  try {
+    return await backendClient.generateScript(payload);
+  } catch (error) {
+    // 离线模板不能执行抓取，失败原因必须回到调用方以显示降级提示。
+    degradedReason = (error instanceof Error ? error.message : String(error)) || '后端脚本生成失败';
   }
 
   const flowName = sanitizeComment(payload.flowName ?? '未命名流程');
   const flowDefinition = JSON.stringify(payload.flowDefinition && typeof payload.flowDefinition === 'object' ? payload.flowDefinition : {}, null, 2);
-  const degradedHeader = degradedReason === ''
-    ? []
-    : [
-      '# 后端不可用，这是离线模板：只保留流程定义，不含任何抓取逻辑。',
-      `# 失败原因：${sanitizeComment(degradedReason)}`,
-      '# 连上 Easy RPA 后端重新生成，才能得到可运行的脚本。',
-      ''
-    ];
+  const degradedHeader = [
+    '# 后端不可用，这是离线模板：只保留流程定义，不含任何抓取逻辑。',
+    `# 失败原因：${sanitizeComment(degradedReason)}`,
+    '# 连上 Easy RPA 后端重新生成，才能得到可运行的脚本。',
+    ''
+  ];
 
   return {
     filename: `${slugify(flowName)}.py`,
     language: 'python',
     dependencies: ['scrapling[fetchers]>=0.4.10'],
-    ...(degradedReason === '' ? {} : { degraded: true, degradedReason }),
+    degraded: true,
+    degradedReason,
     content: [
       ...degradedHeader,
       'from __future__ import annotations',
@@ -805,10 +515,6 @@ async function generateScraplingScript(payload = {}, backendClient = new Backend
   };
 }
 
-function sanitizePythonString(value) {
-  return String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r?\n/g, ' ');
-}
-
 function sanitizeComment(value) {
   return String(value).replace(/\r?\n/g, ' ').trim() || '未命名流程';
 }
@@ -827,6 +533,5 @@ function slugify(value) {
 
 module.exports = {
   createRuntimeController,
-  generateScraplingScript,
-  runtimeNodeIds
+  generateScraplingScript
 };

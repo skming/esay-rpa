@@ -10,6 +10,7 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url)),
+      '@shared': fileURLToPath(new URL('./shared', import.meta.url)),
     },
     dedupe: ['react', 'react-dom'],
   },
@@ -18,6 +19,8 @@ export default defineConfig({
     plugins: () => [wasm()],
   },
   optimizeDeps: {
+    // Browser imports need ESM prebundles; Electron requires the original CommonJS files.
+    include: ['@shared/backendPayloads.cjs', '@shared/runtimeEvents.cjs'],
     exclude: ['@silurus/ooxml', 'react-syntax-highlighter'],
   },
   server: {

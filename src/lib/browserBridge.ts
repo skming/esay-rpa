@@ -1,3 +1,14 @@
+import {
+  applyBackendNodeState,
+  collectKnownNodeIds,
+  finalizeLastActiveNode,
+  formatLogTime,
+  normalizeLogLevel,
+  normalizeRuntimeStatus,
+  readBackendTotalSteps,
+  resolveBackendLogNodeId,
+  type BackendNodeState
+} from '@shared/runtimeEvents.cjs';
 import type {
   AiConfig,
   AiConfigPatch,
@@ -29,7 +40,7 @@ import type {
   TaskSnapshot,
   WindowStateResult
 } from '../types/electron';
-import type { RunLogLevel, RuntimeStatus, RuntimeVariable } from '../types/rpa';
+import type { RuntimeStatus, RuntimeVariable } from '../types/rpa';
 import { BackendClient, type BackendTaskLogEntry } from './backendClient';
 import { buildRunConfigVariables as _buildRunConfigVariables } from './runConfigPresentation';
 
@@ -37,7 +48,7 @@ type BrowserBridgeOptions = {
   backendClient?: BackendClient;
 };
 
-type ActiveBrowserRun = {
+type ActiveBrowserRun = BackendNodeState & {
   artifactIds: Set<string>;
   lastConfirmationMessage: string | null;
   lastLogIds: Set<string>;
@@ -85,6 +96,9 @@ export function createBrowserBridge({ backendClient = new BackendClient() }: Bro
     clearActiveRun();
     const runId = task.taskId;
     activeRun = {
+      knownNodeIds: collectKnownNodeIds(payload.flowDefinition),
+      lastActiveNodeId: null,
+      nodeStates: new Map(),
       artifactIds: new Set<string>(),
       lastConfirmationMessage: null,
       lastLogIds: new Set<string>(),
@@ -100,12 +114,11 @@ export function createBrowserBridge({ backendClient = new BackendClient() }: Bro
       flowId: task.flowId ?? payload.flowId ?? null,
       startedAt: new Date(activeRun.startedAt).toISOString(),
       status: 'running',
-      totalSteps: 0,
+      totalSteps: readBackendTotalSteps(task.progress),
       flowName: payload.flowName ?? '',
     };
     emitRunEvent({ payload: startPayload, type: 'run:start' });
     emitRunEvent({ payload: { nodeId: 'start', runId, status: 'done' }, type: 'node:update' });
-    emitRunEvent({ payload: { nodeId: 'n1', runId, status: 'running', badge: 'Scrapling' }, type: 'node:update' });
     attachLogSocket(runId);
     activeRun.pollTimer = window.setTimeout(() => void pollBackendTask(runId), 250);
     return startPayload;
@@ -116,14 +129,16 @@ export function createBrowserBridge({ backendClient = new BackendClient() }: Bro
       return;
     }
 
+    const run = activeRun;
     try {
       const [snapshot, logs] = await Promise.all([backendClient.getTask(runId), backendClient.getLogs(runId)]);
-      if (activeRun === null || activeRun.runId !== runId) {
+      if (activeRun !== run) {
         return;
       }
       const currentRun = activeRun;
 
-      if (!currentRun.usingWebSocket) {
+      const status = normalizeRuntimeStatus(snapshot.status);
+      if (!currentRun.usingWebSocket || status !== 'running') {
         logs.forEach((log) => emitBackendLog(currentRun, emitRunEvent, log));
       }
 
@@ -138,7 +153,7 @@ export function createBrowserBridge({ backendClient = new BackendClient() }: Bro
               id: syntheticId,
               level: 'input',
               message: snapshot.confirmationMessage,
-              nodeId: 'n1',
+              nodeId: currentRun.lastActiveNodeId ?? 'start',
               runId,
               time: formatLogTime(new Date())
             },
@@ -151,35 +166,36 @@ export function createBrowserBridge({ backendClient = new BackendClient() }: Bro
         emitRunEvent({ payload: { message: null, runId }, type: 'run:confirmation' });
       }
 
-      const status = normalizeRuntimeStatus(snapshot.status);
       const elapsedMs = Date.now() - currentRun.startedAt;
       emitBackendVariables(emitRunEvent, runId, snapshot.variables);
       emitBackendArtifacts(currentRun, emitRunEvent, runId, snapshot.artifacts);
       emitRunEvent({
         payload: {
-          currentStep: 0,
+          currentStep: snapshot.progress.currentStep,
           elapsedMs,
-          percent: status === 'running' ? Math.max(snapshot.progress.percent, 20) : 100,
+          percent: status === 'running' ? Math.max(snapshot.progress.percent, 10) : 100,
           runId,
-          totalSteps: 0
+          totalSteps: readBackendTotalSteps(snapshot.progress)
         },
         type: 'run:progress'
       });
 
       if (status === 'running') {
-        emitRunEvent({ payload: { nodeId: 'n1', runId, status: 'running', badge: 'Scrapling' }, type: 'node:update' });
         currentRun.pollTimer = window.setTimeout(() => void pollBackendTask(runId), 700);
         return;
       }
 
       finishBackendRun(runId, status, status === 'success' ? '任务执行完成' : snapshot.error ?? '任务执行结束');
     } catch (error) {
+      if (activeRun !== run) {
+        return;
+      }
       emitRunEvent({
         payload: {
           id: `${runId}-poll-error`,
           level: 'error',
           message: `后端任务轮询失败 · ${error instanceof Error ? error.message : String(error)}`,
-          nodeId: 'n1',
+          nodeId: activeRun.lastActiveNodeId ?? 'start',
           runId,
           time: formatLogTime(new Date())
         },
@@ -195,13 +211,13 @@ export function createBrowserBridge({ backendClient = new BackendClient() }: Bro
     }
 
     const finishedAt = new Date().toISOString();
+    finalizeLastActiveNode(activeRun, emitRunEvent, status === 'error' ? 'error' : status === 'stopped' ? 'skipped' : 'done');
     activeRun.socket?.close();
     if (activeRun.pollTimer !== null) {
       window.clearTimeout(activeRun.pollTimer);
     }
     activeRun = null;
 
-    emitRunEvent({ payload: { nodeId: 'n1', runId, status: status === 'error' ? 'error' : 'done', badge: 'Scrapling' }, type: 'node:update' });
     emitRunEvent({
       payload: {
         nodeId: 'end',
@@ -211,6 +227,18 @@ export function createBrowserBridge({ backendClient = new BackendClient() }: Bro
       type: 'node:update'
     });
     emitRunEvent({ payload: { finishedAt, message, runId, status }, type: 'run:finish' });
+  };
+
+  const stopCurrentRun = async (): Promise<RunStopResult> => {
+    const run = activeRun;
+    if (run === null) {
+      return { status: 'ready', stopped: false };
+    }
+    await backendClient.stopTask(run.runId);
+    if (activeRun === run) {
+      finishBackendRun(run.runId, 'stopped', '流程已停止');
+    }
+    return { runId: run.runId, status: 'stopped', stopped: true };
   };
 
   const attachLogSocket = (runId: string): void => {
@@ -532,14 +560,7 @@ export function createBrowserBridge({ backendClient = new BackendClient() }: Bro
     },
     testAiModel: async (payload: AiModelTestPayload): Promise<BridgeResult<AiModelTestResult>> => {
       try {
-        const res = await fetch(`${backendClient.baseUrl}/api/ai/test-model`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(payload),
-        });
-        const data = await res.json() as AiModelTestResult & { detail?: string };
-        if (!res.ok) throw new Error(data.detail ?? '模型测试失败');
-        return success(data);
+        return success(await backendClient.testAiModel(payload));
       } catch (error) {
         return failure(error);
       }
@@ -639,6 +660,7 @@ export function createBrowserBridge({ backendClient = new BackendClient() }: Bro
     },
     startRun: async (payload: RunStartPayload): Promise<BridgeResult<RunStartResult>> => {
       try {
+        await stopCurrentRun();
         // overrideVariables 仅供前端 UI 展示来源标记，后端接口不识别该字段，需剔除后再发送
         const { overrideVariables: _overrideVariables, ...backendPayload } = payload;
         const task =
@@ -651,12 +673,12 @@ export function createBrowserBridge({ backendClient = new BackendClient() }: Bro
               scope: payload.scope,
               screenshot: payload.screenshot,
               startNodeId: payload.startNodeId,
+              timeoutMs: payload.timeoutMs,
               variables: payload.variables
             })
             : await backendClient.startTask(backendPayload);
         return success(watchBackendTask(task, payload));
       } catch (error) {
-        clearActiveRun();
         return failure(error);
       }
     },
@@ -664,14 +686,11 @@ export function createBrowserBridge({ backendClient = new BackendClient() }: Bro
       if (activeRun === null || (typeof runId === 'string' && runId.length > 0 && activeRun.runId !== runId)) {
         return success({ runId, status: 'ready', stopped: false });
       }
-      const activeRunId = activeRun.runId;
       try {
-        await backendClient.stopTask(activeRunId);
-      } catch {
-        // 任务可能已结束，仍需完成本地清理
+        return success(await stopCurrentRun());
+      } catch (error) {
+        return failure(error);
       }
-      finishBackendRun(activeRunId, 'stopped', '流程已停止');
-      return success({ runId: activeRunId, status: 'stopped', stopped: true });
     },
     resumeConfirmation: async (runId: string): Promise<BridgeResult<void>> => {
       try {
@@ -729,21 +748,19 @@ function emitBackendLog(activeRun: ActiveBrowserRun, emitRunEvent: (event: RunEv
     activeRun.lastConfirmationMessage = log.detail ?? log.message;
     activeRun.lastLogIds.add(`${activeRun.runId}:poll-confirmation`);
   }
+  const nodeId = resolveBackendLogNodeId(log, activeRun.lastActiveNodeId);
+  applyBackendNodeState(activeRun, emitRunEvent, nodeId, log);
   emitRunEvent({
     payload: {
       id: log.id,
       level,
       message: log.detail ? `${log.message} · ${log.detail}` : log.message,
-      nodeId: log.nodeId ?? resolveBackendLogNodeId(log.level),
+      nodeId,
       runId: activeRun.runId,
       time: formatLogTime(new Date(log.time))
     },
     type: 'log:append'
   });
-}
-
-function resolveBackendLogNodeId(level: string): string {
-  return level === 'success' ? 'end' : 'n1';
 }
 
 function emitVariable(emitRunEvent: (event: RunEvent) => void, runId: string, variable: RuntimeVariable): void {
@@ -768,24 +785,6 @@ function emitBackendArtifacts(activeRun: ActiveBrowserRun, emitRunEvent: (event:
   }
   activeRun.artifactIds = nextIds;
   emitRunEvent({ payload: { artifacts, runId }, type: 'artifacts:update' });
-}
-
-function normalizeRuntimeStatus(status: string): RuntimeStatus {
-  if (status === 'success') return 'success';
-  if (status === 'stopped') return 'stopped';
-  if (status === 'error') return 'error';
-  return 'running';
-}
-
-function normalizeLogLevel(level: string): RunLogLevel {
-  if (level === 'success' || level === 'running' || level === 'warn' || level === 'error' || level === 'input') {
-    return level;
-  }
-  return 'info';
-}
-
-function formatLogTime(date: Date): string {
-  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}:${String(date.getSeconds()).padStart(2, '0')}.${String(date.getMilliseconds()).padStart(3, '0')}`;
 }
 
 function readFlowName(definition: Record<string, unknown>): string {
