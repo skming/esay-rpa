@@ -6,6 +6,7 @@ import { initialProgress } from './electronBridgeConstants';
 import type { BridgeCallOptions, BridgeToast, DebugControlCommand, ElectronBridgeState } from './electronBridgeTypes';
 import { useElectronBridgeActions } from './useElectronBridgeActions';
 import { useRunEventHandler } from './useRunEventHandler';
+import { useRecentRun } from './useRecentRun';
 import { createBrowserBridge } from '../lib/browserBridge';
 import { buildRuntimeVariableViews } from '../lib/runtimeVariables';
 import { useFlowVariableStore } from '../stores/useFlowVariableStore';
@@ -205,7 +206,13 @@ export function useElectronBridge({
     setBottomPanelOpen(true);
   }, [setBottomPanelOpen]);
 
+  const { cancelRestore, restoreRecentRun } = useRecentRun({
+    activeRunIdRef, lastRunIdRef, callBridge, setLastRunId, setLogs, setNodeStates,
+    setProgress, setRuntimeStatus, setVariables, setArtifacts,
+  });
+
   const resetRunView = useCallback((): void => {
+    cancelRestore();
     activeRunIdRef.current = null;
     lastRunIdRef.current = null;
     setActiveRunId(null);
@@ -220,7 +227,7 @@ export function useElectronBridge({
     setProgress(initialProgress);
     setRuntimeStatus('ready');
     setVariables([]);
-  }, []);
+  }, [cancelRestore]);
 
   // startRun 前由 useElectronBridgeActions 写入，结束时供 useRunEventHandler 读取
   const activeFlowNameRef = useRef<string>('');
@@ -262,6 +269,7 @@ export function useElectronBridge({
     inputVariables,
     runtimeVariables: variables,
     resetRunView,
+    restoreRecentRun,
     setLastRunOverrides,
     setCurrentFlow,
     setFlowEdges: setEdges,

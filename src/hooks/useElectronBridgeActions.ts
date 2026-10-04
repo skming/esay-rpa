@@ -54,6 +54,7 @@ type UseElectronBridgeActionsParams = {
   inputVariables: RuntimeVariable[];
   runtimeVariables: RuntimeVariable[];
   resetRunView: () => void;
+  restoreRecentRun: (flowId: string) => Promise<void>;
   setLastRunOverrides: (flowKey: string | null, variables: RuntimeVariable[]) => void;
   setCurrentFlow: Dispatch<SetStateAction<FlowSnapshot | null>>;
   setFlowEdges: Dispatch<SetStateAction<Edge[]>>;
@@ -178,6 +179,7 @@ export function useElectronBridgeActions({
   dismissToast,
   inputVariables,
   resetRunView,
+  restoreRecentRun,
   setLastRunOverrides,
   setCurrentFlow,
   setFlowEdges,
@@ -324,11 +326,13 @@ export function useElectronBridgeActions({
           setFlows(upsertFlow(target));
         }
 
-        if (!(activeRunId !== null && activeRunFlowId === flowId)) {
+        const preserveActiveRun = activeRunId !== null && activeRunFlowId === flowId;
+        if (!preserveActiveRun) {
           resetRunView();
         }
         clearDraftStorage();
         openFlowSnapshot(target, { pushToast, setCurrentFlow, setFlowEdges, setFlowNodes, setInputVariables });
+        if (!preserveActiveRun) await restoreRecentRun(flowId);
       },
       silentlyRestoreCurrentFlow: async (flowId: string, options?: { restoreCanvas?: boolean }) => {
         const fetched = await fetchFlowSnapshot(flowId);
@@ -346,6 +350,7 @@ export function useElectronBridgeActions({
           setInputVariables(flow.inputVariables);
           setCanvasFitVersion((v) => v + 1);
         }
+        await restoreRecentRun(flowId);
       },
       applyAiFlowUpdate: async (flowId: string) => {
         const fetched = await fetchFlowSnapshot(flowId);
@@ -635,6 +640,7 @@ export function useElectronBridgeActions({
         });
         const blockingIssue = getBlockingRunIssue(validation);
         if (blockingIssue !== null) {
+          resetRunView();
           if (typeof setSelectedNodeId === 'function') {
             setSelectedNodeId(blockingIssue.nodeId);
           }
@@ -971,6 +977,7 @@ export function useElectronBridgeActions({
       inputVariables,
           pushToast,
       resetRunView,
+      restoreRecentRun,
       setLastRunOverrides,
       setCurrentFlow,
       setFlowEdges,
