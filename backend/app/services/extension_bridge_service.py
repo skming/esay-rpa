@@ -19,6 +19,7 @@ from uuid import uuid4
 from fastapi import WebSocket, WebSocketDisconnect
 
 from app.core import storage
+from app.core.logging import redact_log_text, write_audit_line
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,8 @@ def audit_scope(*, run_label: str | None, node_id: str | None) -> Iterator[None]
 
 
 def _clip_audit_value(value: Any) -> Any:
+    if isinstance(value, str):
+        value = redact_log_text(value)
     if isinstance(value, str) and len(value) > _MAX_AUDIT_FIELD_CHARS:
         return f"{value[:_MAX_AUDIT_FIELD_CHARS]}…（截断，原长 {len(value)}）"
     return value
@@ -76,9 +79,7 @@ def _clip_audit_value(value: Any) -> Any:
 def _write_audit_record(record: dict[str, Any]) -> None:
     try:
         path = storage.resolve_logs_dir() / _AUDIT_LOG_FILENAME
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({key: _clip_audit_value(value) for key, value in record.items()}, ensure_ascii=False) + "\n")
+        write_audit_line(path, json.dumps({key: _clip_audit_value(value) for key, value in record.items()}, ensure_ascii=False))
     except Exception:
         logger.exception("写入插件执行器审计日志失败")
 

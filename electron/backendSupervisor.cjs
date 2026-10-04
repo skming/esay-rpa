@@ -4,6 +4,7 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 
 const { BackendClient, DEFAULT_BACKEND_URL } = require('./backendClient.cjs');
+const { createFileLogger, captureProcessOutput, redactLogText } = require('./logger.cjs');
 
 const DEFAULT_HOST = '127.0.0.1';
 const DEFAULT_PORT = 8765;
@@ -55,6 +56,7 @@ class BackendSupervisor {
     this.workspaceRoot = path.join(appDataDir, 'workspace');
     this.runRoot = path.join(this.workspaceRoot, 'runs');
     this.logDir = path.join(appDataDir, 'logs');
+    this.logger = createFileLogger(path.join(this.logDir, 'backend-process.log'));
     this.cacheDir = path.join(appDataDir, 'cache');
 
     this.child = null;
@@ -205,6 +207,7 @@ class BackendSupervisor {
       source: 'managed',
       status: 'starting'
     });
+    this.logger.write('INFO', 'Starting backend');
 
     const child = spawn(
       pythonExecutable,
@@ -233,20 +236,30 @@ class BackendSupervisor {
     let processExited = false;
 
     const appendOutput = (chunk) => {
-      outputBuffer = `${outputBuffer}${String(chunk)}`.slice(-4000);
+      outputBuffer = `${outputBuffer}${String(chunk)}`.slice(-16000);
     };
 
-    child.stdout?.on('data', appendOutput);
-    child.stderr?.on('data', appendOutput);
+    captureProcessOutput(child, this.logger, 'backend', appendOutput);
+
+    child.on('error', (error) => {
+      processExited = true;
+      if (this.child === child) this.child = null;
+      const message = redactLogText(error.message);
+      outputBuffer = message;
+      this.logger.write('ERROR', `Backend spawn failed: ${message}`);
+      this.#setStatus({ error: message, managed: false, pid: null, source: 'managed', status: 'error' });
+    });
 
     child.on('exit', (code, signal) => {
       processExited = true;
+      this.logger.write(code === 0 || signal === 'SIGTERM' ? 'INFO' : 'ERROR', `Backend exited (code=${code}, signal=${signal})`);
+      if (this.child !== child) return;
       this.child = null;
       if (this.status.status === 'stopped') {
         return;
       }
       this.#setStatus({
-        error: outputBuffer.trim() || `Backend 进程已退出 (code=${code ?? 'null'}, signal=${signal ?? 'null'})`,
+        error: redactLogText(outputBuffer.trim()) || `Backend 进程已退出 (code=${code ?? 'null'}, signal=${signal ?? 'null'})`,
         managed: false,
         pid: null,
         source: 'managed',
@@ -266,6 +279,7 @@ class BackendSupervisor {
           source: 'managed',
           status: 'ready'
         });
+        this.logger.write('INFO', 'Backend ready');
         return this.getStatus();
       }
       // Process exited — stop polling immediately instead of waiting the full timeout.
@@ -276,7 +290,7 @@ class BackendSupervisor {
     }
 
     this.#setStatus({
-      error: outputBuffer.trim() || '后端启动超时，健康检查未通过',
+      error: redactLogText(outputBuffer.trim()) || '后端启动超时，健康检查未通过',
       managed: !processExited,
       pid: processExited ? null : child.pid ?? null,
       source: 'managed',
@@ -324,7 +338,7 @@ class BackendSupervisor {
         if (timer !== null) clearTimeout(timer);
         timer = setTimeout(() => {
           child.kill('SIGKILL');
-          resolve(`浏览器组件下载已停滞超过 90 秒，请检查网络后点击重试\n${output.trim()}`);
+          resolve(`浏览器组件下载已停滞超过 90 秒，请检查网络后点击重试\n${redactLogText(output.trim())}`);
         }, STALL_TIMEOUT_MS);
       };
 
@@ -377,14 +391,14 @@ class BackendSupervisor {
           }
         }
       };
-      child.stdout?.on('data', onChunk);
-      child.stderr?.on('data', onChunk);
+      captureProcessOutput(child, this.logger, 'browser-install', onChunk);
 
       resetTimer();
 
       child.on('error', (err) => {
         clearTimeout(timer);
-        resolve(`浏览器组件安装失败：${err.message}`);
+        this.logger.write('ERROR', `Browser install failed: ${err.message}`);
+        resolve(`浏览器组件安装失败：${redactLogText(err.message)}`);
       });
 
       child.on('exit', (code) => {
@@ -393,7 +407,7 @@ class BackendSupervisor {
           resolve(null);
           return;
         }
-        resolve(output.trim() || `浏览器组件安装失败 (code=${code ?? 'null'})`);
+        resolve(redactLogText(output.trim()) || `浏览器组件安装失败 (code=${code ?? 'null'})`);
       });
     });
   }

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, TypeVar
 from app.core import storage
+from app.core.logging import LOG_BACKUP_COUNT, LOG_RETENTION_DAYS
 
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 
@@ -36,7 +37,8 @@ class Settings:
     cache_dir: str = ""
     workspace_root: str = ""
     log_level: str = "INFO"
-    log_backup_count: int = 30  # 单位：天
+    log_backup_count: int = LOG_BACKUP_COUNT
+    log_retention_days: int = LOG_RETENTION_DAYS
     log_module_levels: dict[str, str] = field(default_factory=dict)
 
 
@@ -66,7 +68,8 @@ def load_settings() -> Settings:
         cache_dir=cache_dir,
         workspace_root=workspace_root,
         log_level=_read_log_level("RPA_LOG_LEVEL", default="INFO"),
-        log_backup_count=_read_positive_int("RPA_LOG_BACKUP_COUNT", default=30),
+        log_backup_count=_read_positive_int("RPA_LOG_BACKUP_COUNT", default=LOG_BACKUP_COUNT),
+        log_retention_days=_read_positive_int("RPA_LOG_RETENTION_DAYS", default=LOG_RETENTION_DAYS),
         log_module_levels=_read_module_levels("RPA_LOG_LEVELS"),
     )
 
@@ -90,6 +93,8 @@ def _read_module_levels(name: str) -> dict[str, str]:
         if ":" not in entry:
             raise ValueError(f"{name} 格式错误：每项须为 module:LEVEL，实际得到 '{entry}'")
         module, level = entry.split(":", 1)
+        if not module.strip():
+            raise ValueError(f"{name} 中模块名不能为空")
         level = level.strip().upper()
         if level not in _VALID_LOG_LEVELS:
             raise ValueError(f"{name} 中模块 '{module}' 的级别 '{level}' 无效，只能是 {', '.join(sorted(_VALID_LOG_LEVELS))}")

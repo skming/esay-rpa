@@ -98,7 +98,11 @@ lsof -nP -iTCP:8765 -sTCP:LISTEN
 - `runtime/browser/`：浏览器 Profile 与 Cookie。
 - `workspace/runs/`：流程运行产物。
 - `cache/`：内联脚本落盘等可重建的中间文件，删掉不丢数据。
-- `logs/`：后端日志。
+- `logs/`：后端、桌面端诊断和扩展操作审计日志，按天归档并清理过期文件。
+
+`backend.log` 记录应用异常与服务日志；`backend-process.log` 记录桌面端启动后端、安装浏览器时的进程输出；`electron.log` 记录桌面端启动与渲染进程异常；`extension_bridge_audit.jsonl` 记录扩展动作的归属、耗时和结果，不保存动作输入值或提取结果。流程执行日志仍在任务记录中查看。
+
+日志按 UTC 日期归档，默认保留 30 天，不限制单个文件大小。归档在启动或轮转时清理，后端可用 `RPA_LOG_BACKUP_COUNT`、`RPA_LOG_RETENTION_DAYS` 调整归档数量与天数；日志级别使用 `RPA_LOG_LEVEL` 与 `RPA_LOG_LEVELS`。
 
 ## 项目文档
 

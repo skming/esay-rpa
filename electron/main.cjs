@@ -9,6 +9,12 @@ const { registerIpcHandlers } = require('./ipcHandlers.cjs');
 const { createPickerService } = require('./pickerService.cjs');
 const { createRuntimeController, generateScraplingScript } = require('./runtime.cjs');
 const { initUpdater } = require('./updater.cjs');
+const { createFileLogger, redactLogText } = require('./logger.cjs');
+
+const appLogger = createFileLogger(path.join(DEFAULT_APP_DATA_DIR, 'logs', 'electron.log'));
+process.on('uncaughtExceptionMonitor', (error) => {
+  appLogger.write('ERROR', error.stack || error.message);
+});
 
 const DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL || 'http://127.0.0.1:19174/rpa-studio/';
 // 托盘「在浏览器中打开」的目标：与主窗口加载的是同一个界面。开发态直连 dev server；
@@ -118,6 +124,12 @@ function createMainWindow() {
   win.webContents.on('devtools-closed', () => {
     win.focus();
   });
+  win.webContents.on('render-process-gone', (_event, details) => {
+    appLogger.write('ERROR', `Renderer exited (reason=${details.reason}, code=${details.exitCode})`);
+  });
+  win.webContents.on('did-fail-load', (_event, code, description, _url, isMainFrame) => {
+    if (isMainFrame && code !== -3) appLogger.write('ERROR', `Window load failed (code=${code}): ${description}`);
+  });
 
   // Closing the window only hides it to the tray so background jobs (scheduled flows, etc.)
   // keep running. Real quit only happens via the tray menu or Cmd+Q, both of which set
@@ -140,6 +152,7 @@ function createMainWindow() {
 }
 
 app.whenReady().then(() => {
+  appLogger.write('INFO', `Application ready (version=${app.getVersion()}, platform=${process.platform}, arch=${process.arch})`);
   // 只禁 index.html 的缓存：不禁则更新后仍加载旧入口。其余资源带 content hash，
   // URL 必变不会串版本，且禁掉会让 V8 每次冷启重新解析整包而非复用 bytecode cache。
   if (app.isPackaged) {
@@ -222,7 +235,10 @@ app.whenReady().then(() => {
   const runtimeController = createRuntimeController({ backendClient });
 
   setImmediate(() => {
-    void backendSupervisor.ensureStarted().then(broadcastBackendStatus);
+    void backendSupervisor.ensureStarted().then(broadcastBackendStatus).catch((error) => {
+      appLogger.write('ERROR', error.stack || error.message);
+      broadcastBackendStatus({ ...backendSupervisor.getStatus(), status: 'error', error: redactLogText(error.message) });
+    });
   });
 
   const updater = initUpdater();
@@ -257,6 +273,9 @@ app.whenReady().then(() => {
       app.exit(0);
     });
   });
+}).catch((error) => {
+  appLogger.write('ERROR', error.stack || error.message);
+  app.quit();
 });
 
 // No window-all-closed handler: the window's own 'close' listener always hides rather than

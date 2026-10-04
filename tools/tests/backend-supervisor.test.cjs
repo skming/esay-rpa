@@ -44,6 +44,7 @@ test('backend that exits during health check is not reported ready', async () =>
       backendClient: {
         health: async () => {
           if (++checks === 1) throw new Error('not running');
+          backendChild.stderr.write('ERROR Authorization: Bearer sample-credential\n');
           backendChild.emit('exit', 1, null);
           return { status: 'ok' };
         }
@@ -55,6 +56,11 @@ test('backend that exits during health check is not reported ready', async () =>
     assert.equal(status.status, 'error');
     assert.equal(status.pid, null);
     assert.equal(spawnCount, 2);
+    assert.ok(!status.error.includes('sample-credential'));
+    const diagnosticLog = fs.readFileSync(path.join(appDataDir, 'logs', 'backend-process.log'), 'utf8');
+    assert.ok(diagnosticLog.includes('Backend exited'));
+    assert.ok(diagnosticLog.includes('[REDACTED]'));
+    assert.ok(!diagnosticLog.includes('sample-credential'));
   } finally {
     fs.rmSync(appDataDir, { recursive: true, force: true });
   }
