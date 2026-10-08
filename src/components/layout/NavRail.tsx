@@ -5,7 +5,7 @@ import appIcon from '../../assets/app-icon.png';
 import { cn } from '../../lib/utils';
 import { useWorkspaceStore } from '../../stores/useWorkspaceStore';
 
-export type AppPage = 'dashboard' | 'permissions' | 'scheduler' | 'settings' | 'studio' | 'tasks';
+export type AppPage = 'dashboard' | 'scheduler' | 'settings' | 'studio' | 'tasks';
 
 const NAV_ITEMS = [
   { label: '概览', icon: BarChart2, page: 'dashboard' as AppPage },

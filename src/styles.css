@@ -700,14 +700,6 @@ button[aria-hidden="true"] .ai-assistant-blob-blink {
   animation: breath-glow 2s ease-out infinite;
 }
 
-/* Hairline that reads as an editorial column divider on the stat band. */
-.rule-v {
-  background-image: linear-gradient(var(--color-rule-2), var(--color-rule-2));
-  background-repeat: no-repeat;
-  background-position: left top;
-  background-size: 1px 100%;
-}
-
 /* ── Reduced motion ──────────────────────────────────────────────────────────
    The design system promised this; honor it for every animated affordance. */
 @media (prefers-reduced-motion: reduce) {

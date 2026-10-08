@@ -55,10 +55,9 @@ export function TaskCenterPage({
   useEffect(() => {
     if (loadedRef.current) return;
     loadedRef.current = true;
-    void electron.loadSchedules({ silent: true });
-    void electron.loadQueueStats({ silent: true });
-    // flows 与 runs 决定列表主体与「运行中」判定，等它们到位再撤加载态；schedules/queueStats 只喂指标条，缺一帧不影响主视觉。
     void Promise.all([
+      electron.loadSchedules({ silent: true }),
+      electron.loadQueueStats({ silent: true }),
       electron.loadFlows({ silent: true }),
       electron.loadRuns({ limit: 20, silent: true }),
     ]).finally(() => setFirstLoad(false));
@@ -178,7 +177,14 @@ export function TaskCenterPage({
         <>
           <RefreshButton
             variant="subtle"
-            onClick={() => { void electron.loadFlows(); void electron.loadSchedules(); void electron.loadRuns({ limit: 20 }); }}
+            onClick={async () => {
+              await Promise.all([
+                electron.loadFlows(),
+                electron.loadSchedules(),
+                electron.loadQueueStats(),
+                electron.loadRuns({ limit: 20 }),
+              ]);
+            }}
           >
             刷新
           </RefreshButton>
@@ -199,12 +205,18 @@ export function TaskCenterPage({
     >
       <HealthRail>
         <HealthSignal
-          detail="可运行与草稿流程"
+          loading={firstLoad}
+          onClick={() => updateSearch({ view: 'all', query: '' })}
+          selected={view === 'all' && flowQuery === ''}
+          detail="全部未归档流程"
           icon={<ListTodo className="h-3.5 w-3.5" strokeWidth={1.5} />}
           label="流程总数"
           value={items.length}
         />
         <HealthSignal
+          loading={firstLoad}
+          onClick={() => updateSearch({ view: 'running', query: '' })}
+          selected={view === 'running' && flowQuery === ''}
           detail={`队列 ${electron.queueStats?.queuedCount ?? 0} · 上限 ${electron.queueStats?.concurrency ?? 1}`}
           icon={<Activity className="h-3.5 w-3.5" strokeWidth={1.5} />}
           label="运行中"
@@ -212,6 +224,9 @@ export function TaskCenterPage({
           value={viewCounts.running}
         />
         <HealthSignal
+          loading={firstLoad}
+          onClick={() => updateSearch({ view: 'failed', query: '' })}
+          selected={view === 'failed' && flowQuery === ''}
           detail={viewCounts.failed > 0 ? '需要查看运行证据' : '没有失败流程'}
           icon={<AlertTriangle className="h-3.5 w-3.5" strokeWidth={1.5} />}
           label="失败待处理"
@@ -219,7 +234,10 @@ export function TaskCenterPage({
           value={viewCounts.failed}
         />
         <HealthSignal
-          detail={viewCounts.scheduled > 0 ? `${viewCounts.scheduled} 个流程存在启用调度` : '没有启用调度'}
+          loading={firstLoad}
+          onClick={() => updateSearch({ view: 'scheduled', query: '' })}
+          selected={view === 'scheduled' && flowQuery === ''}
+          detail="当前标记为已调度的流程"
           icon={<CalendarCheck2 className="h-3.5 w-3.5" strokeWidth={1.5} />}
           label="已调度"
           state={viewCounts.scheduled > 0 ? 'success' : 'idle'}
@@ -235,9 +253,21 @@ export function TaskCenterPage({
         view={view}
       />
 
+      <div className="flex items-center justify-between gap-3 text-[11px] text-ink-3">
+        <p aria-live="polite" role="status">{firstLoad ? '正在读取流程…' : `显示 ${view === 'archived' ? filteredArchivedFlows.length : visibleItems.length} / ${view === 'archived' ? archivedFlows.length : items.length} 个流程${view === 'archived' ? ' · 已归档' : ''}`}</p>
+        {(view !== 'all' || flowQuery !== '') && <Button onClick={() => updateSearch({ view: 'all', query: '' })} size="sm" variant="ghost">清除筛选</Button>}
+      </div>
+
       <div className="min-w-0">
         {firstLoad && electron.flows.length === 0 ? (
           <LoadingPanel label="加载流程…" />
+        ) : view === 'archived' && filteredArchivedFlows.length === 0 ? (
+          <EmptyPanel
+            action={<Button onClick={() => updateSearch({ query: '', view: flowQuery.trim() === '' ? 'all' : 'archived' })} size="sm" variant="secondary">{flowQuery.trim() === '' ? '查看全部流程' : '清除搜索'}</Button>}
+            icon={<Archive className="h-6 w-6" strokeWidth={1.25} />}
+            title={flowQuery.trim() === '' ? '暂无归档流程' : '没有匹配的归档流程'}
+            hint={flowQuery.trim() === '' ? '将不再需要的流程归档后，可在此处恢复或彻底删除。' : '尝试其他名称或版本，或清除搜索查看全部归档流程。'}
+          />
         ) : view === 'archived' ? (
           <ArchivedList
             flows={filteredArchivedFlows}
@@ -245,7 +275,11 @@ export function TaskCenterPage({
             onRestore={restoreFlow}
           />
         ) : visibleItems.length === 0 ? (
-          <EmptyActiveState />
+          <EmptyActiveState
+            filtered={view !== 'all' || flowQuery.trim() !== ''}
+            onCreate={() => setCreateOpen(true)}
+            onReset={() => updateSearch({ view: 'all', query: '' })}
+          />
         ) : (
           <FlowListTable
             items={visibleItems}
@@ -313,7 +347,7 @@ export function TaskCenterPage({
           setDetailRun(run);
         }}
         onLoadMore={loadMoreHistory}
-        onRefresh={() => { if (historyFlowId !== null) void electron.loadFlowRuns(historyFlowId, { limit: historyLimit }); }}
+        onRefresh={() => historyFlowId === null ? undefined : electron.loadFlowRuns(historyFlowId, { limit: historyLimit })}
         open={historyFlowId !== null}
         runs={electron.runs}
       />
@@ -326,12 +360,13 @@ function normalizeTaskCenterView(value: string | null): TaskCenterView {
   return views.includes(value as TaskCenterView) ? value as TaskCenterView : 'all';
 }
 
-function EmptyActiveState(): ReactElement {
+function EmptyActiveState({ filtered, onCreate, onReset }: { filtered: boolean; onCreate: () => void; onReset: () => void }): ReactElement {
   return (
     <EmptyPanel
       icon={<ListTodo className="h-6 w-6" strokeWidth={1.25} />}
-      title="暂无匹配流程"
-      hint="点击上方「新建流程」开始创建第一个自动化任务，或导入已有的 .rpa.json。"
+      action={<Button onClick={filtered ? onReset : onCreate} size="sm" variant={filtered ? 'secondary' : 'primary'}>{filtered ? '清除筛选' : '新建流程'}</Button>}
+      title={filtered ? '没有匹配的流程' : '暂无流程'}
+      hint={filtered ? '尝试其他状态或关键词，或清除筛选查看全部流程。' : '创建自动化流程，或通过上方「导入流程」导入已有的 .rpa.json。'}
     />
   );
 }
@@ -345,15 +380,6 @@ function ArchivedList({
   onDelete: (flowId: string) => void;
   onRestore: (flowId: string) => void;
 }): ReactElement {
-  if (flows.length === 0) {
-    return (
-      <EmptyPanel
-        icon={<Archive className="h-6 w-6" strokeWidth={1.25} />}
-        title="暂无归档流程"
-        hint="将不再需要的流程归档后，可在此处恢复或彻底删除。"
-      />
-    );
-  }
   return (
     <div className={cn('overflow-hidden', SURFACE)}>
       <Table>

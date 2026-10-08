@@ -77,7 +77,7 @@ type ModelDialogState =
   | { mode: 'add'; provider: ProviderGroup }
   | { mode: 'edit'; model: AiModelMeta; provider: ProviderGroup };
 
-export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState }): ReactElement {
+export function AiModelConfigPanel({ active, electron }: { active: boolean; electron: ElectronBridgeState }): ReactElement {
   const [config, setConfig] = useState<AiConfig | null>(null);
   const [modelCatalog, setModelCatalog] = useState<AiModelMeta[]>([]);
   const [providerMeta, setProviderMeta] = useState<AiProviderGroupMeta[]>([]);
@@ -564,7 +564,8 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
         </div>
       </div>
 
-      <div className="flex items-center justify-end gap-3 pt-3">
+      <div className="sticky bottom-0 z-(--z-sticky) mt-4 flex flex-wrap items-center justify-end gap-3 border-t border-rule bg-surface py-3">
+        <span className="mr-auto text-[11px] text-ink-3" role="status">{loading || config === null || loadError !== null ? '配置未就绪' : hasChanges ? '有未保存的更改' : '配置已同步'}</span>
         <Button
           className="h-8 rounded-md px-4 text-[11px]"
           disabled={saving || loading || !hasChanges}
@@ -577,7 +578,7 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
       </div>
       <DeleteModelConfirmDialog
         busy={deleteTarget !== null && catalogBusy === `delete:${deleteTarget.id}`}
-        model={deleteTarget}
+        model={active ? deleteTarget : null}
         onConfirm={() => {
           if (deleteTarget !== null) void handleDeleteModel(deleteTarget);
         }}
@@ -592,7 +593,7 @@ export function AiModelConfigPanel({ electron }: { electron: ElectronBridgeState
             ? catalogBusy === `add:${modelDialog.provider.key}`
             : catalogBusy === `edit:${modelDialog.model.id}`)
         }
-        dialogState={modelDialog}
+        dialogState={active ? modelDialog : null}
         draft={draftCatalogModel}
         onChange={setDraftCatalogModel}
         onOpenChange={(open) => { if (!open) setModelDialog(null); }}

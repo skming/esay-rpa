@@ -1,4 +1,4 @@
-import { Loader2, Search, X } from 'lucide-react';
+import { ArrowUpRight, Loader2, Search, X } from 'lucide-react';
 import type { ReactElement, ReactNode } from 'react';
 
 import { cn } from '../../lib/utils';
@@ -34,8 +34,8 @@ export const SURFACE = 'rounded-xl border border-rule bg-surface shadow-xs';
 
 export function HealthRail({ children }: { children: ReactNode }): ReactElement {
   return (
-    <section className={cn('grid grid-cols-[repeat(auto-fit,minmax(180px,1fr))] overflow-hidden divide-x divide-rule', SURFACE)}>
-      {children}
+    <section className={cn('@container p-1', SURFACE)}>
+      <div className="grid grid-cols-1 gap-px bg-rule @min-sm:grid-cols-2 @min-3xl:grid-cols-4">{children}</div>
     </section>
   );
 }
@@ -44,69 +44,51 @@ export function HealthSignal({
   detail,
   icon,
   label,
+  loading = false,
+  onClick,
+  selected,
   state,
   value,
 }: {
   detail: ReactNode;
   icon: ReactElement;
   label: string;
+  loading?: boolean;
+  onClick?: () => void;
+  selected?: boolean;
   state?: StatusTone;
   value: ReactNode;
 }): ReactElement {
-  const cfg = state === undefined ? null : STATE[state];
+  const cfg = loading || state === undefined ? null : STATE[state];
+  const Container = onClick === undefined ? 'div' : 'button';
   return (
-    <div className="min-w-0 px-4 py-3.5">
-      <div className="flex items-center gap-2 text-[11px] font-medium text-ink-3">
-        <span className={cn('text-ink-4', cfg?.text)}>{icon}</span>
-        <span className="truncate">{label}</span>
+    <Container
+      aria-busy={loading || undefined}
+      aria-pressed={onClick === undefined ? undefined : selected}
+      className={cn('group flex min-w-0 flex-col items-stretch justify-start bg-surface px-3 py-2.5 text-left @min-sm:px-4', onClick !== undefined && 'disabled:cursor-wait')}
+      disabled={onClick === undefined ? undefined : loading}
+      onClick={onClick}
+      type={onClick === undefined ? undefined : 'button'}
+    >
+      <div className="flex min-w-0 items-center gap-2 text-[11px] font-medium leading-4 text-ink-3">
+        <span aria-hidden="true" className={cn('shrink-0 text-ink-4', cfg?.text)}>{icon}</span>
+        <span className={cn('min-w-0 flex-1 truncate', onClick !== undefined && 'transition-colors group-hover:text-ink group-focus-visible:text-ink')}>{label}</span>
         {cfg !== null && (
-          <span className={cn('ml-auto h-1.5 w-1.5 shrink-0 rounded-full', cfg.dot, cfg.live && 'live-dot')} />
+          <span aria-hidden="true" className={cn('h-1.5 w-1.5 shrink-0 rounded-full', cfg.dot, cfg.live && 'live-dot')} />
+        )}
+        {onClick !== undefined && (
+          <ArrowUpRight
+            aria-hidden="true"
+            className={cn('h-3 w-3 shrink-0 text-ink-4 transition-opacity motion-reduce:transition-none', loading ? 'opacity-0' : 'opacity-60 group-hover:opacity-100 group-focus-visible:opacity-100')}
+            strokeWidth={1.5}
+          />
         )}
       </div>
-      <div className={cn('figure mt-2 truncate text-[17px] leading-none text-ink', cfg?.text)}>
-        {value}
+      <div className={cn('figure mt-1.5 min-h-5 wrap-break-word text-[17px] leading-5 text-ink', state !== 'idle' && cfg?.text)}>
+        {loading ? '…' : value}
       </div>
-      <div className="mt-1.5 truncate text-[10.5px] text-ink-3">{detail}</div>
-    </div>
-  );
-}
-
-// 单行状态条而非 KPI 卡片网格：桌面工具的指标是随时瞥一眼的参考值，不该占据首屏主视觉
-export function StatBand({ children }: { children: ReactNode }): ReactElement {
-  return (
-    <section className={cn('flex min-h-11 flex-wrap items-stretch overflow-hidden', SURFACE)}>
-      {children}
-    </section>
-  );
-}
-
-/** One inline figure in the strip. `tone` lets the running figure carry the live blue. */
-export function Figure({
-  label, value, note, tone = 'ink', state, first,
-}: {
-  label: string;
-  value: ReactNode;
-  note?: ReactNode;
-  tone?: 'ink' | 'live';
-  state?: ReactElement;
-  first?: boolean;
-}): ReactElement {
-  return (
-    <div className={cn('flex items-center gap-2 px-4 py-2.5', !first && 'rule-v')}>
-      <span className="text-[11px] font-medium leading-none text-ink-3">{label}</span>
-      <span
-        className={cn(
-          'figure text-[15px] leading-none',
-          tone === 'live' ? 'text-live' : 'text-ink',
-        )}
-      >
-        {value}
-      </span>
-      {note !== undefined && (
-        <span className="font-mono text-[10px] leading-none tabular-nums text-ink-3">{note}</span>
-      )}
-      {state !== undefined && state}
-    </div>
+      <div className="mt-1 min-h-3.5 line-clamp-2 wrap-break-word text-[10.5px] leading-3.5 text-ink-3">{loading ? '正在读取状态' : detail}</div>
+    </Container>
   );
 }
 
@@ -136,29 +118,16 @@ export function Panel({
   );
 }
 
-/** Key/value row — the line item inside a panel. */
-export function KeyRow({
-  label, value, mono, last,
-}: { label: string; value: ReactNode; mono?: boolean; last?: boolean }): ReactElement {
-  return (
-    <div className={cn('flex items-center justify-between py-2.5', !last && 'border-b border-rule')}>
-      <span className="text-[12px] text-ink-3">{label}</span>
-      <span className={cn('text-[12.5px] font-medium text-ink-2', mono && 'font-mono text-[11.5px] tabular-nums')}>
-        {value}
-      </span>
-    </div>
-  );
-}
-
 /** Empty state — teaches the surface, never just "nothing here". */
 export function SurfaceEmpty({
-  icon, title, hint,
-}: { icon?: ReactElement; title: string; hint?: string }): ReactElement {
+  action, icon, title, hint,
+}: { action?: ReactNode; icon?: ReactElement; title: string; hint?: string }): ReactElement {
   return (
     <div className="flex flex-col items-center justify-center gap-2 px-6 py-12 text-center">
       {icon !== undefined && <span className="text-ink-4">{icon}</span>}
       <p className="text-[12.5px] font-medium text-ink-2">{title}</p>
       {hint !== undefined && <p className="max-w-[42ch] text-[11.5px] leading-relaxed text-ink-3">{hint}</p>}
+      {action !== undefined && <div className="mt-2 flex flex-wrap justify-center gap-2">{action}</div>}
     </div>
   );
 }
@@ -175,6 +144,7 @@ export function SurfaceLoading({ label = '加载中…' }: { label?: string }): 
 
 /** 独占一屏的空态（带外框）。 */
 export function EmptyPanel(props: {
+  action?: ReactNode;
   icon?: ReactElement;
   title: string;
   hint?: string;
@@ -266,7 +236,7 @@ export function FilterBar<T extends string>({
 }): ReactElement {
   return (
     <div className="flex flex-wrap items-center gap-2 rounded-xl border border-rule bg-surface p-2 shadow-xs">
-      <div className="no-scrollbar flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
+      <div className="flex min-w-0 flex-[1_1_520px] flex-wrap items-center gap-1" aria-label="状态筛选" role="group">
         {filters.map((item) => (
           <button
             aria-pressed={value === item.value}
@@ -291,7 +261,7 @@ export function FilterBar<T extends string>({
         ))}
       </div>
       <SearchField
-        className="w-64 flex-none"
+        className="max-w-none flex-[1_1_220px]"
         label={searchLabel}
         onChange={onQueryChange}
         placeholder={searchPlaceholder}

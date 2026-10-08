@@ -1,4 +1,5 @@
-import type { ScheduleSnapshot, TaskSnapshot } from '../types/electron';
+import type { ScheduleRunSummary, ScheduleSnapshot, TaskSnapshot } from '../types/electron';
+import { hasScheduleError } from './schedulePresentation';
 
 export type OperationalAttentionItem = {
   detail: string;
@@ -22,6 +23,7 @@ export type OperationalHealthSnapshot = {
 export function buildOperationalHealthSnapshot(
   runs: TaskSnapshot[],
   schedules: ScheduleSnapshot[],
+  runSummaries: Record<string, ScheduleRunSummary> = {},
 ): OperationalHealthSnapshot {
   const latestRuns = selectLatestRunPerFlow(runs);
   const confirmationItems = latestRuns
@@ -45,9 +47,9 @@ export function buildOperationalHealthSnapshot(
       updatedAt: run.updatedAt,
     }));
   const scheduleItems = schedules
-    .filter((schedule) => schedule.status === 'enabled' && schedule.lastError?.trim())
+    .filter((schedule) => schedule.status === 'enabled' && hasScheduleError(schedule, runSummaries[schedule.scheduleId]))
     .map((schedule): OperationalAttentionItem => ({
-      detail: schedule.lastError?.trim() || '调度异常',
+      detail: schedule.lastError?.trim() || '最近一批运行未全部成功，查看调度运行结果',
       id: `schedule-error:${schedule.scheduleId}`,
       kind: 'schedule-error',
       schedule,

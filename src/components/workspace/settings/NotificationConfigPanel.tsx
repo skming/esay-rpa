@@ -180,7 +180,8 @@ export function NotificationConfigPanel({ electron }: { electron: ElectronBridge
         </Collapsible>}
       </div>
 
-      <div className="flex items-center justify-end gap-3 pt-3">
+      <div className="sticky bottom-0 z-(--z-sticky) mt-4 flex flex-wrap items-center justify-end gap-3 border-t border-rule bg-surface py-3">
+        <span className="mr-auto text-[11px] text-ink-3" role="status">{config === null ? '等待配置加载' : hasChanges ? '有未保存的更改' : '配置已同步'}</span>
         <Button
           className="h-8 rounded-md px-3 text-[11px]"
           disabled={busy || config === null || webhookUrl.trim() === ''}

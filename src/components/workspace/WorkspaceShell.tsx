@@ -19,8 +19,8 @@ export function WorkspaceShell({
   title: string;
 }): ReactElement {
   return (
-    <main className="flex min-h-0 flex-1 flex-col overflow-hidden bg-paper">
-      <header className="flex h-12 shrink-0 items-center justify-between gap-6 border-b border-rule bg-surface px-6">
+    <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-paper">
+      <header className="flex min-h-12 shrink-0 flex-wrap items-center justify-between gap-x-6 gap-y-2 border-b border-rule bg-surface px-4 py-2 sm:px-6">
         <div className="flex min-w-0 items-baseline gap-3">
           <h1 className="shrink-0 text-[14px] font-semibold leading-none tracking-[-0.01em] text-ink">
             {title}
@@ -32,15 +32,15 @@ export function WorkspaceShell({
           )}
         </div>
         {actions !== undefined && (
-          <div className="flex shrink-0 items-center gap-2">{actions}</div>
+          <div className="flex flex-wrap items-center gap-2">{actions}</div>
         )}
       </header>
 
       {fill ? (
-        <div className="flex min-h-0 min-w-0 flex-1 flex-col px-6 pb-6 pt-5">{children}</div>
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col px-4 pb-6 pt-5 sm:px-6">{children}</div>
       ) : (
         <div className="no-scrollbar min-h-0 flex-1 overflow-auto">
-          <div className="grid w-full gap-5 px-6 pb-10 pt-5">
+          <div className="grid min-w-0 w-full gap-5 px-4 pb-10 pt-5 sm:px-6">
             {children}
           </div>
         </div>

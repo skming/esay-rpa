@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import type { ScheduleSnapshot, TaskSnapshot } from '../types/electron';
+import type { ScheduleRunSummary, ScheduleSnapshot, TaskSnapshot } from '../types/electron';
 import { buildOperationalHealthSnapshot } from './operationalHealth';
 
 function buildRun(overrides: Partial<TaskSnapshot>): TaskSnapshot {
@@ -32,6 +32,31 @@ function buildSchedule(overrides: Partial<ScheduleSnapshot>): ScheduleSnapshot {
 }
 
 describe('buildOperationalHealthSnapshot', () => {
+  it.each(['failed', 'partial', 'stopped'] as const)('最近批次 %s 且没有 lastError 时也展示调度待处理', (status) => {
+    const summary: ScheduleRunSummary = {
+      scheduleId: 'schedule-1', total: 2, running: 0, success: 1, failed: 1, stopped: 0, status, taskIds: ['run-1', 'run-2'],
+    };
+    const snapshot = buildOperationalHealthSnapshot([], [buildSchedule({ lastError: null })], { 'schedule-1': summary });
+    expect(snapshot.attention).toHaveLength(1);
+    expect(snapshot.attention[0].kind).toBe('schedule-error');
+    expect(snapshot.attention[0].schedule?.scheduleId).toBe('schedule-1');
+    expect(snapshot.attention[0].detail).toContain('最近一批运行');
+  });
+
+  it.each(['success', 'running', 'empty'] as const)('批次 %s 不被误列为待处理', (status) => {
+    const summary: ScheduleRunSummary = {
+      scheduleId: 'schedule-1', total: 1, running: 0, success: 0, failed: 0, stopped: 0, status, taskIds: ['run-1'],
+    };
+    expect(buildOperationalHealthSnapshot([], [buildSchedule({ lastError: null })], { 'schedule-1': summary }).attention).toEqual([]);
+  });
+
+  it('停用调度不展示历史批次错误', () => {
+    const summary: ScheduleRunSummary = {
+      scheduleId: 'schedule-1', total: 1, running: 0, success: 0, failed: 1, stopped: 0, status: 'failed', taskIds: ['run-1'],
+    };
+    expect(buildOperationalHealthSnapshot([], [buildSchedule({ status: 'disabled' })], { 'schedule-1': summary }).attention).toEqual([]);
+  });
+
   it('优先返回等待确认、运行失败与仍启用的调度错误', () => {
     const runs = [
       buildRun({ flowName: '失败流程', status: 'error', taskId: 'run-error' }),

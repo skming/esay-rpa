@@ -354,7 +354,7 @@ Easy RPA uses **soft, layered shadows + a 1px hairline border** for elevation. C
 
 Values are normative in the frontmatter `shadows:` block and defined once in `src/styles.css` `@theme`. Name the token here, never restate the value.
 
-- **`--shadow-xs`**: `Panel` / `StatBand` on operational surfaces. This is the ceiling off-canvas.
+- **`--shadow-xs`**: `Panel` / `HealthRail` on operational surfaces. This is the ceiling off-canvas.
 - **`--shadow-sm`** = **`--shadow-card`** = **`--shadow-node`**: same value under three role names. Flow nodes at rest.
 - **`--shadow-md`**: hover escalation, flow nodes only.
 - **`--shadow-lg`** / **`--shadow-panel`**: overlays — dialogs, popovers, dropdown menus, the floating AI panel.
@@ -377,13 +377,13 @@ Values are normative in the frontmatter `shadows:` block and defined once in `sr
 
 The sticky header bar anchors every workspace page. It signals desktop-app chrome, not web content.
 
-- **Height:** 48px (`h-12`), fixed — never grows with content; aligns with the NavRail brand row rule
+- **Height:** at least 48px (`min-h-12`); title and actions wrap when space is limited
 - **Background:** `bg-surface` with `border-b border-rule`
 - **Title:** 14px, Semibold, `text-ink`, leading-none — tight, authoritative
 - **Description:** 12px, `text-ink-3`, leading-none — one line, inline after the title on the same baseline
-- **Actions:** trailing edge of the header row (refresh, primary page actions)
-- **Content field:** full width, `px-6 pt-5 pb-10`, vertical rhythm `gap-5` — no centered max-width column
-- **Stat strip (StatBand):** one slim row (`min-h-11`) of inline figures — 11px label + 15px tabular value + mono note, hairline-divided; never a tile grid of hero metrics
+- **Actions:** trailing edge of the header row (refresh, primary page actions), with wrapping to keep controls accessible
+- **Content field:** full width, `px-4 sm:px-6 pt-5 pb-10`, vertical rhythm `gap-5` — no centered max-width column. With `fill`, the content owns scrolling and uses `pb-6`.
+- **Status strip (`HealthRail`):** one shared surface with compact `HealthSignal` entries, one column by default, two from `@min-sm`, and four from `@min-3xl`; container breakpoints, 1px separators, no individual metric cards
 
 ### Buttons
 
@@ -407,7 +407,7 @@ The sticky header bar anchors every workspace page. It signals desktop-app chrom
 - **Border:** `border border-slate-200/70` at rest
 - **Internal Padding:** `p-5` (20px)
 - **Hover:** `hover:bg-slate-50/60` — no translate, no shadow escalation
-- **Semantic variants:** none. Runtime state is reported by `StateTag` and `Figure tone="live"` inside the `StatBand`, not by recoloring a card.
+- **Semantic variants:** none. Runtime state is reported by `StateTag` and the dot/value of `HealthSignal` inside `HealthRail`, not by recoloring a card.
 
 ### Inputs / Fields
 
@@ -428,7 +428,7 @@ The sticky header bar anchors every workspace page. It signals desktop-app chrom
 
 ### Section Labels (PanelSection)
 
-Scoped to the Studio property panel — this is the one surface that still carries the mono-uppercase label voice. Operational pages label with Inter 11px instead (see `Figure` / `Panel` below).
+Scoped to the Studio property panel — this is the one surface that still carries the mono-uppercase label voice. Operational pages use Inter: 11px for `HealthSignal` labels and 12px semibold for `Panel` headers.
 
 - Always: `font-mono text-[9.5px] uppercase tracking-widest text-slate-500`
 - Always preceded by a small icon: Lucide, 14px, `strokeWidth={1.5}`, `text-slate-400`（图标是装饰性重复，可用更浅的一档）
@@ -437,15 +437,17 @@ Scoped to the Studio property panel — this is the one surface that still carri
 
 ### Operational surface primitives (`workspace/surfaces.tsx`)
 
-One small set of primitives carries every non-canvas page (Dashboard, Task Center, Scheduler, Statistics, Permissions). All of them share one class constant — `SURFACE` (`rounded-xl border border-rule bg-surface shadow-xs`); operational elevation changes there, not per component. There is deliberately **no hero-metric tile** — a desktop tool reports state in a status strip, not a KPI grid.
+One small set of primitives serves the operational pages (Dashboard, Task Center, Scheduler, Settings). Containers such as `Panel`, `HealthRail`, `EmptyPanel`, and `LoadingPanel` share one class constant — `SURFACE` (`rounded-xl border border-rule bg-surface shadow-xs`); operational elevation changes there, not per component. There is deliberately **no hero-metric tile** — a desktop tool reports state in a status strip, not a KPI grid.
 
-- **`StatBand`:** one slim row (`min-h-11`), hairline-divided. Wraps `Figure` children.
-- **`Figure`:** 11px label + 15px `.figure` value (Inter Bold, `tabular-nums`, `tracking -0.02em`) + optional 10px mono note. `tone="live"` colors a non-zero value with the live blue.
+- **`HealthRail`:** shared status-strip container with one column by default, two from `@min-sm`, and four from `@min-3xl`, using container width rather than viewport width. Wraps `HealthSignal` children with 1px separators and a 4px outer inset; do not clip the global focus outline.
+- **`HealthSignal`:** 11px label + 17px `.figure` value + 10.5px detail, with an optional semantic status dot. Values can wrap; details use at most two lines. An `onClick` turns the entry into a button with an arrow affordance; hover and selection keep the surface background unchanged. `selected` exposes `aria-pressed`. Loading exposes `aria-busy`, shows a waiting label, and disables interactive entries. Idle values retain the primary ink color for readability.
 - **`Panel`:** white card, icon + section label header. Never nested inside another Panel.
-- **`KeyRow`:** label / value pair on one hairline-separated row. `mono` prop switches the value to JetBrains Mono.
+- **`Fact`:** compact label / value pair without its own border or background. `mono` switches the value to JetBrains Mono.
 - **`StateTag`:** semantic dot + label. Color is **always** paired with the text label (colorblind-safe). States: `live` (breathing dot) / `success` / `warning` / `error` / `idle`.
-- **`SurfaceEmpty`:** centered 11px `text-ink-3` empty state.
-- **`SearchField`:** the list-filter input (leading search glyph, trailing clear button, `aria-label` required). It keeps `Input`'s own `focus-visible` accent ring — pages must not restyle the focus state per toolbar.
+- **`SurfaceEmpty` / `EmptyPanel`:** centered 12.5px title, optional 11.5px hint and action controls. `EmptyPanel` adds the shared surface. Distinguish an empty dataset from filters with no matches and offer the corresponding next action.
+- **`SurfaceLoading` / `LoadingPanel`:** waiting label and spinner with `role="status"` and `aria-live="polite"`; `LoadingPanel` adds the shared surface.
+- **`SearchField`:** the list-filter input (leading search glyph, trailing clear button, `aria-label` required). It uses the global focus indicator above — pages must not restyle the focus state per toolbar.
+- **`FilterBar`:** shared status filters with counts and a search field. Filter buttons wrap when space is limited and expose selection through `aria-pressed`.
 
 ### Flow Node Status (Canvas — Signature)
 
@@ -467,7 +469,7 @@ The canvas is the product's hero surface; node state must read at a glance from 
 - **Do** use JetBrains Mono + `tabular-nums` for every number that can change dynamically.
 - **Do** use `font-mono text-[9.5px] uppercase tracking-widest text-slate-500` for `PanelSection` labels in the Studio property panel. Every time — and only there.
 - **Do** apply `running-glow` to a flow node when its status is `running`. The animated border IS the live signal.
-- **Do** report runtime state off-canvas through `StateTag` (dot + label) and `Figure tone="live"`. Recoloring a whole card is not the pattern here — the status strip is.
+- **Do** report runtime state off-canvas through `StateTag` (dot + label) and `HealthSignal` with a semantic `state`. Recoloring a whole card is not the pattern here — the status strip is.
 - **Do** keep the brand indigo (`#6366f1`) rare: primary buttons, active nav items, focus rings. Running state uses the live blue (`#3b82f6`), never the brand; canvas selection uses the selected node's own kind accent.
 - **Do** give every semantic state a non-color differentiator — icon and label alongside color.
 - **Do** use `rounded-xl` (12px) for content panels and `rounded-lg` (8px) for controls.
@@ -478,7 +480,7 @@ The canvas is the product's hero surface; node state must read at a glance from 
 ### Don't:
 
 - **Don't** use `rounded-2xl` on content panels. `rounded-xl` for panels, `rounded-lg` for controls.
-- **Don't** escalate elevation on content panels. `shadow-xs` on `Panel` / `StatBand` is the ceiling; deeper shadows are reserved for overlays (dialog, dropdown, floating AI panel).
+- **Don't** escalate elevation on content panels. `shadow-xs` on `Panel` / `HealthRail` is the ceiling; deeper shadows are reserved for overlays (dialog, dropdown, floating AI panel).
 - **Don't** animate cards with `hover:-translate-y-0.5`. Cards don't levitate. Hover = background shift only.
 - **Don't** use `font-semibold text-[12px] text-slate-600` for section panel labels.
 - **Don't** scatter the brand indigo decoratively. If it's not active, selected, brand, or a primary action — it is the wrong color.

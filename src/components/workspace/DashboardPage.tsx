@@ -6,12 +6,13 @@ import { useNavigate } from 'react-router-dom';
 import { ROUTE_PATHS } from '../../app/routeConfig';
 import type { ElectronBridgeState } from '../../hooks/useElectronBridge';
 import { buildOperationalHealthSnapshot, type OperationalAttentionItem } from '../../lib/operationalHealth';
-import { formatScheduleDateTime, selectUpcomingSchedules } from '../../lib/schedulePresentation';
+import { countEnabledSchedules, formatScheduleDateTime, selectUpcomingSchedules } from '../../lib/schedulePresentation';
 import { formatRelativeTime } from '../../lib/taskCenter';
 import type { TaskSnapshot } from '../../types/electron';
 import { cn } from '../../lib/utils';
 import { RefreshIconButton } from '../ui/refresh-button';
-import { HealthRail, HealthSignal, LoadingPanel, Panel, SurfaceEmpty } from './surfaces';
+import { Button } from '../ui/button';
+import { HealthRail, HealthSignal, LoadingPanel, Panel, SurfaceEmpty, SurfaceLoading } from './surfaces';
 import { RunDetailDialog } from './RunDetailDialog';
 import { RunHistoryList } from './RunHistoryList';
 import { WorkspaceShell } from './WorkspaceShell';
@@ -25,17 +26,22 @@ export function DashboardPage({ electron }: { electron: ElectronBridgeState }): 
   const [runLimit, setRunLimit] = useState(RUN_PAGE_SIZE);
   const [loadingMore, setLoadingMore] = useState(false);
   const [detailRun, setDetailRun] = useState<TaskSnapshot | null>(null);
+  const [showAllAttention, setShowAllAttention] = useState(false);
   const navigate = useNavigate();
 
   useEffect(() => {
     if (loadedRef.current) return;
     loadedRef.current = true;
-    void electron.loadSchedules({ silent: true });
-    void electron.loadQueueStats({ silent: true });
-    void electron.loadRuns({ limit: RUN_PAGE_SIZE, silent: true }).finally(() => setFirstLoad(false));
+    void Promise.all([
+      electron.loadSchedules({ silent: true }),
+      electron.loadScheduleRunSummaries({ silent: true }),
+      electron.loadQueueStats({ silent: true }),
+      electron.loadRuns({ limit: RUN_PAGE_SIZE, silent: true }),
+    ]).finally(() => setFirstLoad(false));
   }, [electron]);
 
   const loadMoreRuns = (): void => {
+    if (loadingMore) return;
     const next = runLimit + RUN_PAGE_SIZE;
     setRunLimit(next);
     setLoadingMore(true);
@@ -52,10 +58,11 @@ export function DashboardPage({ electron }: { electron: ElectronBridgeState }): 
     [electron.schedules],
   );
   const health = useMemo(
-    () => buildOperationalHealthSnapshot(electron.runs, electron.schedules),
-    [electron.runs, electron.schedules],
+    () => buildOperationalHealthSnapshot(electron.runs, electron.schedules, electron.scheduleRunSummaries),
+    [electron.runs, electron.schedules, electron.scheduleRunSummaries],
   );
   const nextSchedule = upcoming[0];
+  const enabledScheduleCount = countEnabledSchedules(electron.schedules);
 
   const inspectRun = (run: TaskSnapshot): void => {
     setDetailRun(run);
@@ -74,9 +81,12 @@ export function DashboardPage({ electron }: { electron: ElectronBridgeState }): 
         <RefreshIconButton
           label="刷新概览"
           onClick={async () => {
-            await electron.loadQueueStats();
-            await electron.loadSchedules();
-            await electron.loadRuns({ limit: runLimit });
+            await Promise.all([
+              electron.loadQueueStats(),
+              electron.loadSchedules(),
+              electron.loadScheduleRunSummaries(),
+              electron.loadRuns({ limit: runLimit }),
+            ]);
           }}
         />
       }
@@ -85,6 +95,8 @@ export function DashboardPage({ electron }: { electron: ElectronBridgeState }): 
     >
       <HealthRail>
         <HealthSignal
+          loading={firstLoad}
+          onClick={() => navigate(`${ROUTE_PATHS.tasks}?view=running`)}
           detail={queuedCount > 0 ? `排队 ${queuedCount} · 并发上限 ${concurrency}` : `并发上限 ${concurrency}`}
           icon={<Activity className="h-3.5 w-3.5" strokeWidth={1.5} />}
           label="当前执行"
@@ -92,6 +104,11 @@ export function DashboardPage({ electron }: { electron: ElectronBridgeState }): 
           value={activeCount > 0 ? `${activeCount} 个运行中` : '空闲'}
         />
         <HealthSignal
+          loading={firstLoad}
+          onClick={() => {
+            setShowAllAttention(true);
+            document.getElementById('dashboard-attention')?.scrollIntoView({ block: 'start' });
+          }}
           detail={health.attention.length > 0 ? '等待处理' : '没有未恢复异常'}
           icon={<AlertTriangle className="h-3.5 w-3.5" strokeWidth={1.5} />}
           label="需关注"
@@ -99,64 +116,77 @@ export function DashboardPage({ electron }: { electron: ElectronBridgeState }): 
           value={health.attention.length}
         />
         <HealthSignal
+          loading={firstLoad}
           detail={`失败 ${health.recentResult.failed} · 样本 ${health.recentResult.sampleSize}`}
           icon={<CheckCircle2 className="h-3.5 w-3.5" strokeWidth={1.5} />}
           label="最近运行成功"
-          state={health.recentResult.failed > 0 ? 'warning' : 'success'}
+          state={health.recentResult.sampleSize === 0 ? 'idle' : health.recentResult.failed > 0 ? 'warning' : 'success'}
           value={health.recentResult.succeeded}
         />
         <HealthSignal
-          detail={nextSchedule?.name ?? '没有启用调度'}
+          loading={firstLoad}
+          onClick={() => openSchedule()}
+          detail={nextSchedule?.name ?? (enabledScheduleCount > 0 ? '启用调度尚无下一次排期，请检查触发规则' : '没有启用调度')}
           icon={<CalendarClock className="h-3.5 w-3.5" strokeWidth={1.5} />}
           label="下一次触发"
           value={nextSchedule === undefined ? '--' : formatScheduleDateTime(nextSchedule.nextRunAt, nextSchedule.timezone)}
         />
       </HealthRail>
 
-      <div className="grid min-w-0 gap-5 lg:grid-cols-[minmax(0,1.35fr)_minmax(320px,0.65fr)]">
-        <AttentionPanel
-          items={health.attention.slice(0, 6)}
-          onInspectRun={inspectRun}
-          onOpenSchedule={(name) => openSchedule(name, true)}
-        />
-
-        <Panel
-          action={upcoming.length > 0 ? (
-            <button className="inline-flex items-center gap-1 text-[11px] font-medium text-accent-strong hover:text-accent-press" onClick={() => openSchedule()} type="button">
-              查看全部
-              <ArrowUpRight className="h-3 w-3" strokeWidth={1.5} />
-            </button>
-          ) : undefined}
-          bodyClassName="p-0"
-          icon={<CalendarClock className="h-3.5 w-3.5" strokeWidth={1.5} />}
-          label="即将触发"
-        >
-          {upcoming.length === 0 ? (
-            <SurfaceEmpty
-              title="没有待触发的调度"
-              hint="在调度中心新建并启用触发器后，这里会显示最近计划。"
+      <div className="@container min-w-0">
+        <div className="grid min-w-0 items-start gap-5 @min-4xl:grid-cols-[minmax(0,1.35fr)_minmax(320px,0.65fr)]">
+          <div id="dashboard-attention" className="min-w-0 scroll-mt-5">
+            <AttentionPanel
+              items={showAllAttention ? health.attention : health.attention.slice(0, 6)}
+              loading={firstLoad}
+              total={health.attention.length}
+              showAll={showAllAttention}
+              onToggleAll={() => setShowAllAttention((current) => !current)}
+              onInspectRun={inspectRun}
+              onOpenSchedule={(name) => openSchedule(name, true)}
             />
-          ) : (
-            <div>
-              {upcoming.map((schedule) => (
-                <button
-                  className="flex w-full items-center justify-between gap-4 border-b border-rule px-5 py-3 text-left transition-colors last:border-b-0 hover:bg-paper"
-                  key={schedule.scheduleId}
-                  onClick={() => openSchedule(schedule.name)}
-                  type="button"
-                >
-                  <span className="min-w-0">
-                    <span className="block truncate text-[12px] font-medium text-ink-2">{schedule.name}</span>
-                    <span className="mt-0.5 block truncate text-[10px] text-ink-3">{schedule.task.flowName}</span>
-                  </span>
-                  <span className="shrink-0 font-mono text-[10px] tabular-nums text-ink-3">
-                    {formatScheduleDateTime(schedule.nextRunAt, schedule.timezone)}
-                  </span>
-                </button>
-              ))}
-            </div>
-          )}
-        </Panel>
+          </div>
+
+          <Panel
+            action={upcoming.length > 0 ? (
+              <button className="inline-flex items-center gap-1 text-[11px] font-medium text-accent-strong hover:text-accent-press" onClick={() => openSchedule()} type="button">
+                查看全部
+                <ArrowUpRight className="h-3 w-3" strokeWidth={1.5} />
+              </button>
+            ) : undefined}
+            bodyClassName="p-0"
+            icon={<CalendarClock className="h-3.5 w-3.5" strokeWidth={1.5} />}
+            label="即将触发"
+          >
+            {firstLoad ? <SurfaceLoading label="读取调度计划…" /> : upcoming.length === 0 ? (
+              <SurfaceEmpty
+                action={<Button onClick={() => openSchedule()} size="sm" variant="secondary">前往调度中心</Button>}
+                title="没有待触发的调度"
+                hint="在调度中心新建并启用触发器后，这里会显示最近计划。"
+              />
+            ) : (
+              <div>
+                {upcoming.map((schedule) => (
+                  <button
+                    className="flex w-full items-center justify-between gap-4 border-b border-rule px-5 py-3 text-left transition-colors last:border-b-0 hover:bg-paper"
+                    key={schedule.scheduleId}
+                    onClick={() => openSchedule(schedule.name)}
+                    type="button"
+                  >
+                    <span className="min-w-0">
+                      <span className="block truncate text-[12px] font-medium text-ink-2">{schedule.name}</span>
+                      <span className="mt-0.5 block truncate text-[10px] text-ink-3">{schedule.task.flowName}</span>
+                    </span>
+                    <span className="shrink-0 text-right font-mono text-[10px] tabular-nums text-ink-3">
+                      <span className="block">{formatScheduleDateTime(schedule.nextRunAt, schedule.timezone)}</span>
+                      <span className="mt-0.5 block text-ink-4">{schedule.timezone}</span>
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </Panel>
+        </div>
       </div>
 
       {firstLoad && electron.runs.length === 0 ? (
@@ -169,7 +199,7 @@ export function DashboardPage({ electron }: { electron: ElectronBridgeState }): 
             inspectRun(run);
           }}
           onLoadMore={loadMoreRuns}
-          onRefresh={() => void electron.loadRuns({ limit: runLimit })}
+          onRefresh={() => electron.loadRuns({ limit: runLimit })}
           runs={electron.runs}
         />
       )}
@@ -188,10 +218,18 @@ export function DashboardPage({ electron }: { electron: ElectronBridgeState }): 
 
 function AttentionPanel({
   items,
+  loading,
+  total,
+  showAll,
+  onToggleAll,
   onInspectRun,
   onOpenSchedule,
 }: {
   items: OperationalAttentionItem[];
+  loading: boolean;
+  total: number;
+  showAll: boolean;
+  onToggleAll: () => void;
   onInspectRun: (run: TaskSnapshot) => void;
   onOpenSchedule: (scheduleName: string) => void;
 }): ReactElement {
@@ -200,8 +238,9 @@ function AttentionPanel({
       bodyClassName="p-0"
       icon={<AlertTriangle className="h-3.5 w-3.5" strokeWidth={1.5} />}
       label="需关注"
+      action={total > 6 ? <Button onClick={onToggleAll} size="sm" variant="ghost">{showAll ? '收起' : `查看全部 ${total} 项`}</Button> : undefined}
     >
-      {items.length === 0 ? (
+      {loading ? <SurfaceLoading label="读取待处理事项…" /> : items.length === 0 ? (
         <SurfaceEmpty
           icon={<CheckCircle2 className="h-5 w-5 text-emerald-500" strokeWidth={1.5} />}
           title="当前没有未恢复异常"

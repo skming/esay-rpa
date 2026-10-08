@@ -15,10 +15,10 @@ export function SettingsContent({
 }): ReactElement {
   return (
     <section className="min-h-full">
-      <header className="flex h-11 items-center justify-between border-b border-rule px-5 sticky top-0 bg-surface">
+      <header className="sticky top-0 z-(--z-sticky) flex min-h-11 flex-wrap items-center justify-between gap-2 border-b border-rule bg-surface px-5 py-2">
         <div className="flex items-center gap-2 text-ink-3">
           {icon}
-          <span className="text-[12px] font-semibold text-ink-2">{title}</span>
+          <h2 className="text-[12px] font-semibold text-ink-2">{title}</h2>
         </div>
         {action}
       </header>

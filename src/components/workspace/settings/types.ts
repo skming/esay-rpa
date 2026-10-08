@@ -7,6 +7,11 @@ export const SETTINGS_SECTIONS: { section: SettingsSection; label: string }[] = 
   { section: 'extension', label: '浏览器扩展' },
 ];
 
+export function resolveSettingsSection(query: string | null, state: unknown): SettingsSection {
+  const requested = query ?? (state !== null && typeof state === 'object' && 'settingsSection' in state ? state.settingsSection : null);
+  return SETTINGS_SECTIONS.find(({ section }) => section === requested)?.section ?? 'system';
+}
+
 export function settingsTabId(section: SettingsSection): string {
   return `settings-tab-${section}`;
 }
@@ -19,9 +24,9 @@ export function settingsPanelId(section: SettingsSection): string {
 export function nextSettingsSection(active: SettingsSection, key: string): SettingsSection | null {
   const index = SETTINGS_SECTIONS.findIndex((item) => item.section === active);
   const last = SETTINGS_SECTIONS.length - 1;
-  const target = key === 'ArrowDown'
+  const target = key === 'ArrowDown' || key === 'ArrowRight'
     ? (index + 1) % SETTINGS_SECTIONS.length
-    : key === 'ArrowUp'
+    : key === 'ArrowUp' || key === 'ArrowLeft'
       ? (index + last) % SETTINGS_SECTIONS.length
       : key === 'Home'
         ? 0

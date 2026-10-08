@@ -1,8 +1,18 @@
 import type { KeyboardEvent, ReactElement } from 'react';
+import { useSyncExternalStore } from 'react';
+import { Bell, Bot, Cpu, Puzzle } from 'lucide-react';
 
 import { cn } from '../../../lib/utils';
 import type { SettingsSection } from './types';
 import { SETTINGS_SECTIONS, nextSettingsSection, settingsPanelId, settingsTabId } from './types';
+
+const ICONS = { system: Cpu, ai: Bot, notifications: Bell, extension: Puzzle };
+const VERTICAL_QUERY = '(min-width: 64rem)';
+function subscribeLayout(onChange: () => void): () => void {
+  const query = window.matchMedia(VERTICAL_QUERY);
+  query.addEventListener('change', onChange);
+  return () => query.removeEventListener('change', onChange);
+}
 
 export function SettingsSideTabs({
   active,
@@ -11,6 +21,7 @@ export function SettingsSideTabs({
   active: SettingsSection;
   onChange: (section: SettingsSection) => void;
 }): ReactElement {
+  const vertical = useSyncExternalStore(subscribeLayout, () => window.matchMedia(VERTICAL_QUERY).matches, () => true);
   // tablist 的键盘约定是方向键换页、Tab 键跳出整组，所以只有选中项留在 Tab 序列里。
   const moveFocus = (event: KeyboardEvent<HTMLDivElement>): void => {
     const next = nextSettingsSection(active, event.key);
@@ -22,7 +33,7 @@ export function SettingsSideTabs({
 
   return (
     <aside aria-label="设置分类" className="bg-paper-sunk/45 p-2">
-      <div className="grid gap-1" onKeyDown={moveFocus} role="tablist" aria-orientation="vertical">
+      <div className="grid grid-cols-2 gap-1 sm:grid-cols-4 lg:grid-cols-1" onKeyDown={moveFocus} role="tablist" aria-orientation={vertical ? 'vertical' : 'horizontal'}>
         {SETTINGS_SECTIONS.map(({ section, label }) => (
           <SettingsTabButton
             active={section === active}
@@ -48,6 +59,7 @@ function SettingsTabButton({
   onClick: () => void;
   section: SettingsSection;
 }): ReactElement {
+  const Icon = ICONS[section];
   return (
     <button
       aria-controls={settingsPanelId(section)}
@@ -66,6 +78,7 @@ function SettingsTabButton({
     >
       {/* 选中标记，占位常驻以免文字跳动 */}
       <span className={cn('h-4 w-0.5 shrink-0 rounded-full', active ? 'bg-accent' : 'bg-transparent')} />
+      <Icon aria-hidden="true" className="h-3.5 w-3.5 shrink-0" strokeWidth={1.5} />
       {label}
     </button>
   );

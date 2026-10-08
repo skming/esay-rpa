@@ -4,7 +4,6 @@ export const DEFAULT_ROUTE: AppPage = 'dashboard';
 
 export const ROUTE_PATHS = {
   dashboard: '/',
-  permissions: '/permissions',
   scheduler: '/scheduler',
   settings: '/settings',
   studio: '/studio',
