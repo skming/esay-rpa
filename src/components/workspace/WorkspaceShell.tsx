@@ -20,8 +20,8 @@ export function WorkspaceShell({
 }): ReactElement {
   return (
     <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-paper">
-      <header className="flex min-h-12 shrink-0 flex-wrap items-center justify-between gap-x-6 gap-y-2 border-b border-rule bg-surface px-4 py-2 sm:px-6">
-        <div className="flex min-w-0 items-baseline gap-3">
+      <header className="flex h-12 shrink-0 items-center justify-between gap-x-6 border-b border-rule bg-surface px-4 sm:px-6">
+        <div className="flex min-w-0 shrink-0 items-baseline gap-3">
           <h1 className="shrink-0 text-[14px] font-semibold leading-none tracking-[-0.01em] text-ink">
             {title}
           </h1>
@@ -32,7 +32,7 @@ export function WorkspaceShell({
           )}
         </div>
         {actions !== undefined && (
-          <div className="flex flex-wrap items-center gap-2">{actions}</div>
+          <div className="no-scrollbar flex min-w-0 items-center gap-2 overflow-x-auto">{actions}</div>
         )}
       </header>
 
