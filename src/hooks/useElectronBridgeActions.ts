@@ -54,7 +54,6 @@ type UseElectronBridgeActionsParams = {
   inputVariables: RuntimeVariable[];
   runtimeVariables: RuntimeVariable[];
   resetRunView: () => void;
-  restoreRecentRun: (flowId: string) => Promise<void>;
   setLastRunOverrides: (flowKey: string | null, variables: RuntimeVariable[]) => void;
   setCurrentFlow: Dispatch<SetStateAction<FlowSnapshot | null>>;
   setFlowEdges: Dispatch<SetStateAction<Edge[]>>;
@@ -179,7 +178,6 @@ export function useElectronBridgeActions({
   dismissToast,
   inputVariables,
   resetRunView,
-  restoreRecentRun,
   setLastRunOverrides,
   setCurrentFlow,
   setFlowEdges,
@@ -326,13 +324,11 @@ export function useElectronBridgeActions({
           setFlows(upsertFlow(target));
         }
 
-        const preserveActiveRun = activeRunId !== null && activeRunFlowId === flowId;
-        if (!preserveActiveRun) {
+        if (!(activeRunId !== null && activeRunFlowId === flowId)) {
           resetRunView();
         }
         clearDraftStorage();
         openFlowSnapshot(target, { pushToast, setCurrentFlow, setFlowEdges, setFlowNodes, setInputVariables });
-        if (!preserveActiveRun) await restoreRecentRun(flowId);
       },
       silentlyRestoreCurrentFlow: async (flowId: string, options?: { restoreCanvas?: boolean }) => {
         const fetched = await fetchFlowSnapshot(flowId);
@@ -350,7 +346,6 @@ export function useElectronBridgeActions({
           setInputVariables(flow.inputVariables);
           setCanvasFitVersion((v) => v + 1);
         }
-        await restoreRecentRun(flowId);
       },
       applyAiFlowUpdate: async (flowId: string) => {
         const fetched = await fetchFlowSnapshot(flowId);
@@ -367,17 +362,11 @@ export function useElectronBridgeActions({
       },
       rollbackFlowSnapshot: async (snapshot: FlowVersionSnapshot) => {
         if (currentFlow === null) return false;
-        const currentVariables = new Map(currentFlow.inputVariables.map((variable) => [variable.name, variable]));
-        const restoredVariables = snapshot.inputVariables.map((variable) => {
-          if (variable.category !== 'credential' && variable.sensitive !== true) return variable;
-          const current = currentVariables.get(variable.name);
-          return current === undefined ? variable : { ...variable, value: current.value };
-        });
         const updated = await callBridge((api) => api.updateFlow(currentFlow.flowId, {
           acceptanceContract: snapshot.acceptanceContract,
           description: snapshot.description ?? undefined,
           definition: snapshot.definition,
-          inputVariables: restoredVariables,
+          inputVariables: snapshot.inputVariables,
         }));
         if (updated === null) return false;
         clearDraftStorage();
@@ -640,7 +629,6 @@ export function useElectronBridgeActions({
         });
         const blockingIssue = getBlockingRunIssue(validation);
         if (blockingIssue !== null) {
-          resetRunView();
           if (typeof setSelectedNodeId === 'function') {
             setSelectedNodeId(blockingIssue.nodeId);
           }
@@ -977,7 +965,6 @@ export function useElectronBridgeActions({
       inputVariables,
           pushToast,
       resetRunView,
-      restoreRecentRun,
       setLastRunOverrides,
       setCurrentFlow,
       setFlowEdges,

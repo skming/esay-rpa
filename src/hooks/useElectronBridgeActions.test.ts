@@ -30,7 +30,6 @@ const savedFlow: FlowSnapshot = {
 function renderActions(
   callBridge: Parameters<typeof useElectronBridgeActions>[0]['callBridge'] = async () => null,
   currentFlow: FlowSnapshot | null = null,
-  overrides: Partial<Parameters<typeof useElectronBridgeActions>[0]> = {},
 ) {
   let variables = draftVariables;
   const params: Parameters<typeof useElectronBridgeActions>[0] = {
@@ -47,7 +46,6 @@ function renderActions(
     inputVariables: draftVariables,
     runtimeVariables: [],
     resetRunView: vi.fn(),
-    restoreRecentRun: vi.fn(async () => undefined),
     setLastRunOverrides: vi.fn(),
     setCurrentFlow: vi.fn(),
     setFlowEdges: vi.fn(),
@@ -70,7 +68,6 @@ function renderActions(
     setConfirmationMessage: vi.fn(),
     setActivePickerRequest: vi.fn(),
     setCanvasFitVersion: vi.fn(),
-    ...overrides,
   };
   let actions!: ElectronBridgeActions;
   function Probe() {
@@ -97,7 +94,6 @@ describe('流程恢复的输入变量归属', () => {
     expect(params.setInputVariables).not.toHaveBeenCalled();
     expect(params.setFlowNodes).not.toHaveBeenCalled();
     expect(params.setFlowEdges).not.toHaveBeenCalled();
-    expect(params.restoreRecentRun).toHaveBeenCalledWith(savedFlow.flowId);
   });
 
   it('无草稿时完整恢复画布并替换为保存的输入变量', async () => {
@@ -109,33 +105,6 @@ describe('流程恢复的输入变量归属', () => {
     expect(readVariables()).toEqual(savedVariables);
     expect(params.setFlowNodes).toHaveBeenCalledOnce();
     expect(params.setFlowEdges).toHaveBeenCalledOnce();
-    expect(params.restoreRecentRun).toHaveBeenCalledWith(savedFlow.flowId);
-  });
-
-  it('打开流程时清空旧运行并读取该流程最近一次运行', async () => {
-    const { actions, params } = renderActions();
-    await actions.openFlowById(savedFlow.flowId);
-    expect(params.resetRunView).toHaveBeenCalledOnce();
-    expect(params.restoreRecentRun).toHaveBeenCalledWith(savedFlow.flowId);
-  });
-
-  it('重新打开正在运行的流程时保留现场，不加载历史覆盖实时结果', async () => {
-    const { actions, params } = renderActions(undefined, null, { activeRunId: 'active-task', activeRunFlowId: savedFlow.flowId });
-    await actions.openFlowById(savedFlow.flowId);
-    expect(params.resetRunView).not.toHaveBeenCalled();
-    expect(params.restoreRecentRun).not.toHaveBeenCalled();
-  });
-
-  it('本地校验失败先清除历史任务归属，避免 AI 排查上一轮任务', async () => {
-    const callBridge = vi.fn(async () => null);
-    const { actions, params } = renderActions(callBridge, savedFlow, {
-      flowCanvas: { nodes: initialNodes.filter((node) => node.id === 'start' || node.id === 'end'), edges: [] },
-    });
-    await actions.startRun();
-    expect(params.resetRunView).toHaveBeenCalledOnce();
-    expect(params.setLogs).toHaveBeenCalledWith([expect.objectContaining({ level: 'error', id: expect.stringMatching(/^validation-/) })]);
-    expect(vi.mocked(params.resetRunView).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(params.setLogs).mock.invocationCallOrder[0]);
-    expect(callBridge).not.toHaveBeenCalled();
   });
 
   it('新建流程清空上一个流程的变量', async () => {
@@ -167,31 +136,27 @@ describe('流程恢复的输入变量归属', () => {
 
   it('恢复快照时同时恢复定义、变量和验收契约', async () => {
     const updateFlow = vi.fn(async () => ({ ok: true as const, data: { ...savedFlow, revision: 3 } }));
-    const currentCredential: RuntimeVariable = {
-      category: 'credential', name: 'api_token', scope: '全局', sensitive: true, type: 'String', value: 'current-secret',
-    };
     const snapshot: FlowVersionSnapshot = {
       acceptanceContract: {
         requirements: [{ id: 'required', description: '必须有结果', sourceKind: 'user' }],
         deliverables: [{ id: 'rows', kind: 'table', requirementIds: ['required'], variable: 'rows' }],
       },
       definition: { nodes: [{ id: 'old' }], edges: [] },
-      inputVariables: [...savedVariables, { ...currentCredential, value: '' }],
+      inputVariables: savedVariables,
       revision: 1,
       savedAt: '2026-09-04T00:00:00.000Z',
       version: 'v1.0.0',
     };
-    const currentFlow = { ...savedFlow, inputVariables: [...savedVariables, currentCredential] };
     const { actions } = renderActions(async (action) => {
       const result = await action({ updateFlow } as unknown as import('../types/electron').RpaBridge);
       return result.ok ? result.data ?? null : null;
-    }, currentFlow);
+    }, savedFlow);
 
     expect(await actions.rollbackFlowSnapshot(snapshot)).toBe(true);
     expect(updateFlow).toHaveBeenCalledWith(savedFlow.flowId, expect.objectContaining({
       acceptanceContract: snapshot.acceptanceContract,
       definition: snapshot.definition,
-      inputVariables: [...savedVariables, currentCredential],
+      inputVariables: snapshot.inputVariables,
     }));
   });
 });
