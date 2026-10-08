@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import os
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,7 +18,46 @@ from pydantic import BaseModel
 from app.api.websockets import router as websocket_router
 from app.core import storage
 from app.core.config import load_settings
-from app.core.logging import setup_logging
+
+
+# Third-party loggers that flood backend.log at INFO/DEBUG; pin them to WARNING.
+_NOISY_LOGGERS = ("httpx", "httpcore", "litellm", "LiteLLM", "openai", "urllib3", "asyncio", "playwright", "watchfiles")
+
+
+def _setup_file_logging(
+    log_dir: str,
+    *,
+    level: str = "INFO",
+    backup_count: int = 30,
+    module_levels: dict[str, str] | None = None,
+) -> None:
+    if not log_dir:
+        return
+    import re
+    log_path = Path(log_dir)
+    log_path.mkdir(parents=True, exist_ok=True)
+    handler = logging.handlers.TimedRotatingFileHandler(
+        log_path / "backend.log",
+        when="midnight",
+        backupCount=backup_count,
+        encoding="utf-8",
+    )
+    # Rename rotated files: backend.log.2026-06-21 → backend-2026-06-21.log
+    handler.namer = lambda name: re.sub(
+        r"(.+[/\\])backend\.log\.(\d{4}-\d{2}-\d{2})$", r"\1backend-\2.log", name
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-8s %(name)s  %(message)s"))
+    resolved_level = getattr(logging, level.upper(), logging.INFO)
+    handler.setLevel(resolved_level)
+    root = logging.getLogger()
+    # root 默认 WARNING 会挡住到达 file handler 的 INFO，需要抬高
+    if root.level == logging.NOTSET or root.level > resolved_level:
+        root.setLevel(resolved_level)
+    root.addHandler(handler)
+    for name in _NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+    for module, lvl in (module_levels or {}).items():
+        logging.getLogger(module).setLevel(getattr(logging, lvl))
 
 
 from app.models.schemas import (
@@ -73,11 +114,10 @@ ai_chat_store = AiChatStore()
 _browser_session_dir = str(storage.resolve_browser_profile_dir())
 extension_config_service = ExtensionConfigService()
 extension_bridge_service = ExtensionBridgeService(extension_config_service.trusted_extension_id)
-setup_logging(
+_setup_file_logging(
     settings.log_dir,
     level=settings.log_level,
     backup_count=settings.log_backup_count,
-    retention_days=settings.log_retention_days,
     module_levels=settings.log_module_levels,
 )
 runtime_services = create_runtime_services(settings=settings, broker=broker)
@@ -158,7 +198,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         await ai_config_service.close_catalog()
 
 
-app = FastAPI(title="Easy RPA Backend", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Easy RPA Backend", version="0.1.0", lifespan=lifespan)
 # WebSocket router 经 app.state 复用这些单例，避免拆分路由后重复创建
 app.state.log_broker = broker
 app.state.task_manager = task_manager
