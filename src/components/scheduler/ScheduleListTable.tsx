@@ -1,4 +1,4 @@
-import { AlertTriangle, Eye, MoreHorizontal, Pencil, Power, PowerOff, Trash2, Zap } from 'lucide-react';
+import { AlertTriangle, Eye, Loader2, MoreHorizontal, Pencil, Power, PowerOff, Trash2, Zap } from 'lucide-react';
 import type { ReactElement } from 'react';
 import { useRef, useState } from 'react';
 
@@ -49,9 +49,29 @@ export function ScheduleListTable({
   const [detailRun, setDetailRun] = useState<TaskSnapshot | null>(null);
   const [batch, setBatch] = useState<{ schedule: ScheduleSnapshot; tasks: TaskSnapshot[] } | null>(null);
   const [batchLoading, setBatchLoading] = useState(false);
+  const [pendingScheduleIds, setPendingScheduleIds] = useState(new Set<string>());
+  const pendingRef = useRef(new Set<string>());
   // 关闭批次弹窗或再次触发查看时作废在途请求，避免旧请求回来把已关闭的弹窗重新撑开。
   const batchReqRef = useRef(0);
   const detailReqRef = useRef(0);
+
+  const runAction = async (scheduleId: string, action: () => Promise<void>): Promise<void> => {
+    if (pendingRef.current.has(scheduleId)) return;
+    pendingRef.current.add(scheduleId);
+    setPendingScheduleIds((current) => new Set(current).add(scheduleId));
+    try {
+      await action();
+    } catch (error) {
+      electron.pushToast('error', error instanceof Error ? error.message : '调度操作失败，请重试');
+    } finally {
+      pendingRef.current.delete(scheduleId);
+      setPendingScheduleIds((current) => {
+        const next = new Set(current);
+        next.delete(scheduleId);
+        return next;
+      });
+    }
+  };
 
   // 调度只落 lastTaskId 与聚合摘要，没有直挂的任务快照。优先用摘要里有序的 taskIds
   //（「所有流程」批次是多条），拿不到再退到 lastTaskId。
@@ -91,21 +111,22 @@ export function ScheduleListTable({
   return (
     <>
       <div className={cn('overflow-hidden', SURFACE)}>
-        <Table className="w-full min-w-0 table-fixed">
+        <Table aria-label="调度列表" className="w-full min-w-[900px] table-fixed">
           <TableHeader className="bg-paper-sunk">
             <TableRow className="border-rule-2 hover:bg-transparent">
-              <TableHead className="w-[48%] pl-5 text-[11px] font-medium text-ink-2">调度</TableHead>
-              <TableHead className="w-[20%] text-[11px] font-medium text-ink-2">绑定流程</TableHead>
-              <TableHead className="w-[20%] text-[11px] font-medium text-ink-2">触发规则</TableHead>
-              <TableHead className="w-[20%] text-[11px] font-medium text-ink-2">下次触发</TableHead>
-              <TableHead className="hidden w-[22%] text-[11px] font-medium text-ink-2 xl:table-cell">最近运行</TableHead>
-              <TableHead className="w-[20%] text-[11px] font-medium text-ink-2">状态</TableHead>
-              <TableHead className="w-[11%] pr-5 text-right text-[11px] font-medium text-ink-2">操作</TableHead>
+              <TableHead className="w-[28%] pl-5 text-[11px] font-medium text-ink-2 xl:w-[22%]">调度</TableHead>
+              <TableHead className="w-[16%] text-[11px] font-medium text-ink-2 xl:w-[14%]">绑定流程</TableHead>
+              <TableHead className="w-[18%] text-[11px] font-medium text-ink-2 xl:w-[14%]">触发规则</TableHead>
+              <TableHead className="w-[18%] text-[11px] font-medium text-ink-2 xl:w-[16%]">下次触发</TableHead>
+              <TableHead className="hidden w-[14%] text-[11px] font-medium text-ink-2 xl:table-cell">最近运行</TableHead>
+              <TableHead className="w-[10%] text-[11px] font-medium text-ink-2">状态</TableHead>
+              <TableHead className="w-[10%] pr-5 text-right text-[11px] font-medium text-ink-2">操作</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {schedules.map((schedule) => {
               const enabled = schedule.status === 'enabled';
+              const pending = pendingScheduleIds.has(schedule.scheduleId);
               const attention = hasScheduleError(schedule, runSummaries[schedule.scheduleId]);
               const cronDescription = describeCronExpression(schedule.cronExpression);
               const runResult = runSummaries[schedule.scheduleId];
@@ -179,9 +200,16 @@ export function ScheduleListTable({
                     />
                   </TableCell>
                   <TableCell className="pr-5">
-                    <div className="flex justify-end">
+                    <div className="flex justify-end gap-1" aria-busy={pending}>
+                      <IconButton
+                        disabled={pending}
+                        label={pending ? `正在更新 ${schedule.name}` : `${enabled ? '停用' : '启用'} ${schedule.name}`}
+                        onClick={() => void runAction(schedule.scheduleId, () => electron.updateScheduleEnabled(schedule.scheduleId, !enabled))}
+                      >
+                        {pending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : enabled ? <PowerOff className="h-3.5 w-3.5" strokeWidth={1.5} /> : <Power className="h-3.5 w-3.5" strokeWidth={1.5} />}
+                      </IconButton>
                       <DropdownMenu>
-                        <DropdownMenuTrigger render={<IconButton label="更多操作" />}>
+                        <DropdownMenuTrigger disabled={pending} render={<IconButton label={`${schedule.name} 的更多操作`} />}>
                           <MoreHorizontal className="h-3.5 w-3.5" strokeWidth={1.5} />
                         </DropdownMenuTrigger>
                         <DropdownMenuContent align="end" className="w-40">
@@ -194,14 +222,15 @@ export function ScheduleListTable({
                           </DropdownMenuItem>
                           <DropdownMenuSeparator />
                           <DropdownMenuItem
-                            onClick={() => void electron.updateScheduleEnabled(schedule.scheduleId, !enabled)}
+                            disabled={pending}
+                            onClick={() => void runAction(schedule.scheduleId, () => electron.updateScheduleEnabled(schedule.scheduleId, !enabled))}
                           >
                             {enabled
                               ? <PowerOff className="mr-2 h-3.5 w-3.5 text-ink-3" strokeWidth={1.5} />
                               : <Power className="mr-2 h-3.5 w-3.5 text-emerald-600" strokeWidth={1.5} />}
                             {enabled ? '停用调度' : '启用调度'}
                           </DropdownMenuItem>
-                          <DropdownMenuItem onClick={() => void electron.triggerSchedule(schedule.scheduleId)}>
+                          <DropdownMenuItem disabled={pending} onClick={() => void runAction(schedule.scheduleId, () => electron.triggerSchedule(schedule.scheduleId))}>
                             <Zap className="mr-2 h-3.5 w-3.5 text-ink-3" strokeWidth={1.5} />
                             立即触发
                           </DropdownMenuItem>

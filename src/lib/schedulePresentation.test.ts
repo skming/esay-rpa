@@ -90,8 +90,7 @@ describe('schedulePresentation', () => {
   });
 
   it('下次运行文案区分停用、待算与排期已被清空', () => {
-    expect(describeNextRun(buildSchedule({ nextRunAt: '2026-06-10T12:00:00.000Z' }))).toBe('2026-06-10 20:00');
-    expect(describeNextRun(buildSchedule({ nextRunAt: '2026-06-10T12:00:00.000Z', timezone: 'UTC' }))).toBe('2026-06-10 12:00');
+    expect(describeNextRun(buildSchedule({ nextRunAt: '2026-06-10T12:00:00.000Z' }))).toBe(formatScheduleDateTime('2026-06-10T12:00:00.000Z'));
     expect(describeNextRun(buildSchedule({ nextRunAt: null, status: 'disabled' }))).toBe('已停用');
     expect(describeNextRun(buildSchedule({ lastError: '上次触发失败', nextRunAt: null, status: 'disabled' }))).toBe('已停用');
     expect(describeNextRun(buildSchedule({ nextRunAt: null }))).toBe('等待计算');

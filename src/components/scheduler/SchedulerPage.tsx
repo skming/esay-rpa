@@ -29,8 +29,8 @@ export function SchedulerPage({ electron }: { electron: ElectronBridgeState }): 
   useEffect(() => {
     if (loadedRef.current) return;
     loadedRef.current = true;
-    void electron.loadFlows({ silent: true });
     void Promise.all([
+      electron.loadFlows({ silent: true }),
       electron.loadSchedules({ silent: true }),
       electron.loadScheduleRunSummaries({ silent: true }),
     ]).finally(() => setFirstLoad(false));
@@ -74,7 +74,9 @@ export function SchedulerPage({ electron }: { electron: ElectronBridgeState }): 
     <WorkspaceShell
       actions={
         <>
-          <RefreshButton variant="subtle" onClick={() => { void electron.loadSchedules(); void electron.loadScheduleRunSummaries(); }}>刷新</RefreshButton>
+          <RefreshButton variant="subtle" onClick={async () => {
+            await Promise.all([electron.loadFlows(), electron.loadSchedules(), electron.loadScheduleRunSummaries()]);
+          }}>刷新</RefreshButton>
           <Button onClick={() => setCreateOpen(true)} variant="primary" className="h-8 rounded-md px-3.5">
             <Plus className="h-3.5 w-3.5" strokeWidth={1.75} />
             新建调度
@@ -84,7 +86,13 @@ export function SchedulerPage({ electron }: { electron: ElectronBridgeState }): 
       description="Cron 触发器与手动调度"
       title="调度中心"
     >
-      <SchedulerMetrics schedules={electron.schedules} runSummaries={electron.scheduleRunSummaries} />
+      <SchedulerMetrics
+        schedules={electron.schedules}
+        runSummaries={electron.scheduleRunSummaries}
+        loading={firstLoad}
+        filter={query === '' ? filter : undefined}
+        onFilter={(nextFilter) => updateSearch({ filter: nextFilter, query: '' })}
+      />
 
       <FilterBar
         counts={counts}
@@ -97,13 +105,22 @@ export function SchedulerPage({ electron }: { electron: ElectronBridgeState }): 
         value={filter}
       />
 
+      <div className="flex items-center justify-between gap-3 text-[11px] text-ink-3">
+        <p aria-live="polite" role="status">{firstLoad ? '正在读取调度…' : `显示 ${schedules.length} / ${electron.schedules.length} 个调度`}</p>
+        {(filter !== 'all' || query !== '') && <Button onClick={() => updateSearch({ filter: 'all', query: '' })} size="sm" variant="ghost">清除筛选</Button>}
+      </div>
+
       {firstLoad && electron.schedules.length === 0 ? (
         <LoadingPanel label="加载调度…" />
       ) : schedules.length === 0 ? (
         <EmptyPanel
+          action={<Button onClick={() => {
+            if (filter !== 'all' || query.trim() !== '') updateSearch({ filter: 'all', query: '' });
+            else setCreateOpen(true);
+          }} size="sm" variant={filter !== 'all' || query.trim() !== '' ? 'secondary' : 'primary'}>{filter !== 'all' || query.trim() !== '' ? '清除筛选' : '新建调度'}</Button>}
           icon={<CalendarClock className="h-6 w-6" strokeWidth={1.25} />}
-          title="暂无匹配调度"
-          hint="新建调度后可在这里启停、手动触发与删除。"
+          title={filter !== 'all' || query.trim() !== '' ? '没有匹配的调度' : '暂无调度'}
+          hint={filter !== 'all' || query.trim() !== '' ? '尝试其他状态或关键词，或清除筛选查看全部调度。' : '为流程设置触发时间，之后可在这里启停、手动触发与查看结果。'}
         />
       ) : (
         <ScheduleListTable electron={electron} runSummaries={electron.scheduleRunSummaries} schedules={schedules} />
