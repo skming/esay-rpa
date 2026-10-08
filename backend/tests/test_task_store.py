@@ -219,6 +219,56 @@ async def test_task_schema_has_single_sources_and_cascades_children(tmp_path) ->
         await store.close()
 
 
+async def test_existing_task_schema_supports_startup_reconciliation(tmp_path) -> None:
+    engine = create_schedule_engine(f"sqlite+aiosqlite:///{tmp_path / 'existing-tasks.db'}")
+    store = SqlAlchemyTaskStore(engine)
+    try:
+        async with engine.begin() as connection:
+            await connection.exec_driver_sql("""
+                CREATE TABLE rpa_tasks (
+                    id VARCHAR(36) PRIMARY KEY,
+                    flow_id VARCHAR(36), schedule_id VARCHAR(36),
+                    flow_name VARCHAR(120) NOT NULL,
+                    mode VARCHAR(16) NOT NULL, status VARCHAR(24) NOT NULL,
+                    flow_revision INTEGER, definition_digest VARCHAR(64),
+                    acceptance_contract JSON NOT NULL, run_config JSON NOT NULL,
+                    progress_payload JSON NOT NULL, result_payload JSON,
+                    execution_evidence_payload JSON NOT NULL,
+                    error_message TEXT, confirmation_message TEXT,
+                    created_at DATETIME NOT NULL, started_at DATETIME,
+                    finished_at DATETIME, updated_at DATETIME NOT NULL
+                )
+            """)
+            await connection.exec_driver_sql("""
+                INSERT INTO rpa_tasks (
+                    id, flow_name, mode, status, acceptance_contract, run_config,
+                    progress_payload, execution_evidence_payload, created_at, updated_at
+                ) VALUES (
+                    'interrupted-task', '待对账任务', 'run', 'queued', '{}', '{}',
+                    '{"currentStep":0,"totalSteps":1,"percent":0,"elapsedMs":0}', '[]',
+                    '2026-10-08 00:00:00', '2026-10-08 00:00:00'
+                )
+            """)
+
+        await store.create_schema()
+        manager = TaskManager(runner=FakeRunner(), broker=LogBroker(), task_store=store)
+        assert await manager.reconcile_interrupted_tasks() == 1
+        stopped = await store.get_task("interrupted-task")
+        assert stopped is not None
+        assert stopped.status == "stopped"
+        assert await store.list_unfinished_tasks() == []
+        assert await manager.reconcile_interrupted_tasks() == 0
+        logs = await store.list_logs("interrupted-task")
+        assert logs is not None and len(logs) == 1
+        await store.save_task(build_task_snapshot(), build_task_request())
+        assert [task.task_id for task in await store.list_unfinished_tasks()] == ["task-1"]
+        async with engine.connect() as connection:
+            columns = {row[1] for row in (await connection.exec_driver_sql("PRAGMA table_info(rpa_tasks)")).all()}
+        assert not columns & {"target_url", "selector", "fetcher", "extract_mode", "timeout_ms", "request_payload", "artifacts_payload", "variables_payload"}
+    finally:
+        await store.close()
+
+
 async def test_sqlite_roundtrip_returns_timezone_aware_timestamps(tmp_path) -> None:
     """SQLite 不保存时区；读回的时间戳必须补齐 UTC，否则下游与 aware cutoff
     比较（如 30 天成功率统计）会抛 TypeError。"""

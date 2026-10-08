@@ -12,17 +12,19 @@ from app.core import storage
 from app.models.schemas import ArtifactContent, ArtifactSnapshot, DebugControlCommand, QueueStats, RunConfigSnapshot, RunTaskRequest, RuntimeProgress, RuntimeVariableSnapshot, ScrapeResult, TaskLogEntry, TaskSnapshot, TaskStatus
 from app.services.artifact_store import ArtifactStore, LocalArtifactStore
 from app.services.acceptance_audit import freeze_contract_inputs
-from app.services.browser_action_runner import BrowserActionContext, BrowserActionResult, BrowserActionRunner, OverlayInfo, apply_browser_result_variables, detect_blocking_overlay, try_auto_dismiss_overlay
+from app.services.browser_action_runner import BrowserActionContext, BrowserActionResult, BrowserActionRunner, OverlayInfo, apply_browser_result_variables, detect_blocking_overlay, is_browser_action_node, try_auto_dismiss_overlay
 from app.services.browser_executor import BrowserExecutor
-from app.services.control_action_runner import BreakLoopSignal, ControlActionRunner, apply_control_result_variables
+from app.services.control_action_runner import BreakLoopSignal, ControlActionRunner, apply_control_result_variables, is_control_action_node, is_subprocess_node
 from app.services.extension_bridge_service import ExtensionActionOutcomeUnknown, ExtensionBridgeService
 from app.services.extension_executor import ExtensionExecutor
 from app.services.execution_evidence import build_node_execution_evidence, definition_digest
-from app.services.data_action_runner import DataActionRunner, apply_data_result_variables
+from app.services.data_action_runner import DataActionRunner, apply_data_result_variables, is_data_action_node
 from app.services.log_broker import LogBroker
-from app.services.flow_definition import FlowDefinitionSelector, node_execution_kind
-from app.services.flow_control import evaluate_condition_detail, read_condition_expression, select_branch_edges
+from app.services.flow_definition import FlowDefinitionSelector
+from app.services.flow_control import evaluate_condition_detail, is_condition_node, read_condition_expression, select_branch_edges
 from app.services.flow_loop import (
+    is_loop_node,
+    is_repeat_until_node,
     materialize_loop_item,
     read_edge_target,
     read_loop_config,
@@ -30,14 +32,14 @@ from app.services.flow_loop import (
     read_repeat_until_expression,
     split_loop_edges,
 )
-from app.services.file_action_runner import FileActionRunner, apply_file_result_variables
-from app.services.http_action_runner import HttpActionRunner, apply_http_result_variables
+from app.services.file_action_runner import FileActionRunner, apply_file_result_variables, is_file_action_node
+from app.services.http_action_runner import HttpActionRunner, apply_http_result_variables, is_http_action_node
 from app.services.runtime_variables import RuntimeVariableStore, apply_fetch_result_variables
 from app.services.scrapling_runner import RunnerProtocol
-from app.services.script_action_runner import ScriptActionRunner, apply_script_result_variables
+from app.services.script_action_runner import ScriptActionRunner, apply_script_result_variables, is_script_action_node
 from app.services.task_store import InMemoryTaskStore, TaskStore
 from app.services.task_queue import InMemoryTaskQueue, TaskQueue, TaskRunner
-from app.services.variable_action_runner import VariableActionRunner, apply_variable_result_variables
+from app.services.variable_action_runner import VariableActionRunner, apply_variable_result_variables, is_variable_action_node
 
 
 def _timestamp_sort_key(value: datetime) -> float:
@@ -600,7 +602,7 @@ class TaskManager:
                     # 就会走到这里：真正的节点报错会被改写成"插件已关闭"，用户照着去开开关也修不好。
                     # 清理失败要留痕（上下文可能泄漏），但不能替换根因，也不能跳过下面的产物清理。
                     await self._append_log(record, "warn", "浏览器上下文清理失败", str(exc), node_id=record.active_node_id or "end")
-                await self._prune_run_outputs(record)
+                self._prune_run_outputs(record)
 
         if state.results:
             return _merge_scrape_results(state.results)
@@ -610,18 +612,11 @@ class TaskManager:
             return ScrapeResult(url="", selector="", count=0, values=[])
         raise RuntimeError("流程定义未找到可执行节点")
 
-    async def _prune_run_outputs(self, record: TaskRecord) -> None:
+    def _prune_run_outputs(self, record: TaskRecord) -> None:
         """Enforce per-flow output retention after a run finishes (best-effort)."""
         try:
             flow_slug = _resolve_output_slug(record.request)
-            removed = storage.prune_run_outputs(flow_slug)
-            removed_task_ids = [path.name for path in removed]
-            await self._task_store.delete_artifacts(removed_task_ids)
-            for task_id in removed_task_ids:
-                removed_record = self._tasks.get(task_id)
-                if removed_record is not None:
-                    removed_record.artifacts.clear()
-                    removed_record.snapshot = removed_record.snapshot.model_copy(update={"artifacts": []})
+            storage.prune_run_outputs(flow_slug)
         except Exception:  # retention must never fail a run
             pass
 
@@ -657,8 +652,7 @@ class TaskManager:
                 _push_edge_targets(stack, outgoing_edges, visited, stop_node_ids=stops)
                 continue
 
-            kind = node_execution_kind(node)
-            if kind == "repeat_until":
+            if is_repeat_until_node(node):
                 next_edges = await self._run_repeat_until_node(
                     record,
                     state,
@@ -668,7 +662,7 @@ class TaskManager:
                     node_by_id=node_by_id,
                     adjacency=adjacency,
                 )
-            elif kind == "loop":
+            elif is_loop_node(node):
                 next_edges = await self._run_loop_node(
                     record,
                     state,
@@ -682,11 +676,6 @@ class TaskManager:
                 next_edges = await self._execute_flow_node(record, state, node, outgoing_edges=outgoing_edges, should_follow_edges=True)
 
             _push_edge_targets(stack, next_edges, visited, stop_node_ids=stops)
-
-    async def _begin_flow_node(self, record: TaskRecord, state: FlowRunState, *, node_title: str) -> None:
-        await self._pause_for_debug_if_needed(record, node_id=record.active_node_id, node_title=node_title)
-        state.executable_steps += 1
-        await self._update_step_progress(record, state.started, current_step=state.executable_steps, total_steps=state.total_steps)
 
     async def _run_repeat_until_node(
         self,
@@ -706,7 +695,9 @@ class TaskManager:
         """
         record.active_node_id = _read_node_id(node, fallback=loop_node_id)
         node_title = _read_node_title(node, fallback="重复直到")
-        await self._begin_flow_node(record, state, node_title=node_title)
+        await self._pause_for_debug_if_needed(record, node_id=record.active_node_id, node_title=node_title)
+        state.executable_steps += 1
+        await self._update_step_progress(record, state.started, current_step=state.executable_steps, total_steps=state.total_steps)
 
         config = read_repeat_until_config(node)
         expression = read_repeat_until_expression(node)
@@ -789,7 +780,9 @@ class TaskManager:
     ) -> list[dict[str, object]]:
         record.active_node_id = _read_node_id(node, fallback=loop_node_id)
         node_title = _read_node_title(node, fallback="循环节点")
-        await self._begin_flow_node(record, state, node_title=node_title)
+        await self._pause_for_debug_if_needed(record, node_id=record.active_node_id, node_title=node_title)
+        state.executable_steps += 1
+        await self._update_step_progress(record, state.started, current_step=state.executable_steps, total_steps=state.total_steps)
 
         config = read_loop_config(node, record.variables)
         body_edges, exit_edges = split_loop_edges(
@@ -860,25 +853,21 @@ class TaskManager:
         before_variables = record.variables.raw_values()
         result_count_before = len(state.results)
         node_started = time.monotonic()
-        kind = node_execution_kind(node)
+        node_type = node.get("type")
         record.active_node_id = _read_node_id(node, fallback="node")
         next_edges = outgoing_edges
 
-        fallback_titles = {
-            "variable": "变量步骤", "condition": "条件节点", "fetch": "采集步骤",
-            "http": "HTTP 请求", "browser": "浏览器动作", "subprocess": "子流程",
-            "control": "控制动作", "file": "文件节点", "script": "脚本节点", "data": "数据处理",
-        }
-        if kind in fallback_titles:
-            fallback = fallback_titles[kind]
-            if kind not in {"variable", "condition"}:
-                fallback = f"{fallback} {state.executable_steps + 1}"
-            node_title = _read_node_title(node, fallback=fallback)
-            await self._begin_flow_node(record, state, node_title=node_title)
-
-        if kind == "variable":
+        if _is_variable_node(node):
+            node_title = _read_node_title(node, fallback="变量步骤")
+            await self._pause_for_debug_if_needed(record, node_id=record.active_node_id, node_title=node_title)
+            state.executable_steps += 1
+            await self._update_step_progress(record, state.started, current_step=state.executable_steps, total_steps=state.total_steps)
             await self._run_variable_action_node(record, node, node_id=record.active_node_id, node_title=node_title)
-        elif kind == "condition":
+        elif is_condition_node(node):
+            node_title = _read_node_title(node, fallback="条件节点")
+            await self._pause_for_debug_if_needed(record, node_id=record.active_node_id, node_title=node_title)
+            state.executable_steps += 1
+            await self._update_step_progress(record, state.started, current_step=state.executable_steps, total_steps=state.total_steps)
             evaluation = evaluate_condition_detail(node, record.variables)
             condition_result = evaluation.result
             next_edges = select_branch_edges(outgoing_edges, condition_result)
@@ -887,8 +876,12 @@ class TaskManager:
             await self._append_log(record, "success", f"条件判断 · {node_title} → {result_label}", evaluation.detail or expression, node_id=record.active_node_id)
             if should_follow_edges and outgoing_edges and not next_edges:
                 await self._append_log(record, "warn", "条件分支未匹配，流程在此节点停止", expression, node_id=record.active_node_id)
-        elif kind == "fetch":
+        elif node_type == "browser.fetch":
+            node_title = _read_node_title(node, fallback=f"采集步骤 {state.executable_steps + 1}")
+            await self._pause_for_debug_if_needed(record, node_id=record.active_node_id, node_title=node_title)
+            state.executable_steps += 1
             state.fetch_attempts += 1
+            await self._update_step_progress(record, state.started, current_step=state.executable_steps, total_steps=state.total_steps)
             step_request = FlowDefinitionSelector.build_request_for_fetch_node(record.request, _resolve_node_variables(node, record.variables))
             await self._append_log(record, "running", f"执行节点 · {node_title}", step_request.selector, node_id=record.active_node_id)
             if record.request.browser_executor == "extension":
@@ -907,28 +900,58 @@ class TaskManager:
             if result is not None:
                 state.results.append(result)
                 saved_names = apply_fetch_result_variables(node, result, record.variables)
-                await self._publish_output_variables(record, saved_names, message="输出变量已更新", node_id=record.active_node_id)
-        elif kind == "http":
+                if saved_names:
+                    await self._append_log(record, "success", f"输出变量已更新 · {', '.join(saved_names)}", None, node_id=record.active_node_id)
+                    await self._update_snapshot(record, variables=record.variables.snapshots())
+        elif is_http_action_node(node):
+            node_title = _read_node_title(node, fallback=f"HTTP 请求 {state.executable_steps + 1}")
+            await self._pause_for_debug_if_needed(record, node_id=record.active_node_id, node_title=node_title)
+            state.executable_steps += 1
+            await self._update_step_progress(record, state.started, current_step=state.executable_steps, total_steps=state.total_steps)
             http_result = await self._run_http_node(record, node, node_id=record.active_node_id, node_title=node_title)
             if http_result is not None:
                 state.results.append(http_result)
-        elif kind == "browser":
+        elif is_browser_action_node(node):
+            node_title = _read_node_title(node, fallback=f"浏览器动作 {state.executable_steps + 1}")
+            await self._pause_for_debug_if_needed(record, node_id=record.active_node_id, node_title=node_title)
+            state.executable_steps += 1
+            await self._update_step_progress(record, state.started, current_step=state.executable_steps, total_steps=state.total_steps)
             if state.browser_context is None:
                 state.browser_context = await self._resolve_browser_executor(record).create_context(headless=True, owner=_profile_owner_label(record))
             browser_result = await self._run_browser_action_node(record, node, state.browser_context, node_id=record.active_node_id, node_title=node_title)
             if browser_result is not None and _is_collectable_result_node(node):
                 state.results.append(browser_result)
-        elif kind == "subprocess":
+        elif is_subprocess_node(node):
+            node_title = _read_node_title(node, fallback=f"子流程 {state.executable_steps + 1}")
+            await self._pause_for_debug_if_needed(record, node_id=record.active_node_id, node_title=node_title)
+            state.executable_steps += 1
+            await self._update_step_progress(record, state.started, current_step=state.executable_steps, total_steps=state.total_steps)
             await self._run_subprocess_node(record, state, node, node_id=record.active_node_id, node_title=node_title)
-        elif kind == "control":
+        elif is_control_action_node(node):
+            node_title = _read_node_title(node, fallback=f"控制动作 {state.executable_steps + 1}")
+            await self._pause_for_debug_if_needed(record, node_id=record.active_node_id, node_title=node_title)
+            state.executable_steps += 1
+            await self._update_step_progress(record, state.started, current_step=state.executable_steps, total_steps=state.total_steps)
             control_result = await self._run_control_action_node(record, node, node_id=record.active_node_id, node_title=node_title)
             if control_result is not None:
                 state.results.append(control_result)
-        elif kind == "file":
+        elif is_file_action_node(node):
+            node_title = _read_node_title(node, fallback=f"文件节点 {state.executable_steps + 1}")
+            await self._pause_for_debug_if_needed(record, node_id=record.active_node_id, node_title=node_title)
+            state.executable_steps += 1
+            await self._update_step_progress(record, state.started, current_step=state.executable_steps, total_steps=state.total_steps)
             await self._run_file_action_node(record, node, node_id=record.active_node_id, node_title=node_title)
-        elif kind == "script":
+        elif is_script_action_node(node):
+            node_title = _read_node_title(node, fallback=f"脚本节点 {state.executable_steps + 1}")
+            await self._pause_for_debug_if_needed(record, node_id=record.active_node_id, node_title=node_title)
+            state.executable_steps += 1
+            await self._update_step_progress(record, state.started, current_step=state.executable_steps, total_steps=state.total_steps)
             await self._run_script_action_node(record, node, node_id=record.active_node_id, node_title=node_title)
-        elif kind == "data":
+        elif is_data_action_node(node):
+            node_title = _read_node_title(node, fallback=f"数据处理 {state.executable_steps + 1}")
+            await self._pause_for_debug_if_needed(record, node_id=record.active_node_id, node_title=node_title)
+            state.executable_steps += 1
+            await self._update_step_progress(record, state.started, current_step=state.executable_steps, total_steps=state.total_steps)
             data_result = await self._run_data_action_node(record, node, node_id=record.active_node_id, node_title=node_title)
             if data_result is not None:
                 state.results.append(data_result)
@@ -1076,13 +1099,6 @@ class TaskManager:
             ),
         )
 
-    async def _publish_output_variables(
-        self, record: TaskRecord, saved_names: list[str], *, message: str, node_id: str,
-    ) -> None:
-        if saved_names:
-            await self._append_log(record, "success", f"{message} · {', '.join(saved_names)}", None, node_id=node_id)
-            await self._update_snapshot(record, variables=record.variables.snapshots())
-
     async def _run_with_retry(
         self,
         record: TaskRecord,
@@ -1210,7 +1226,9 @@ class TaskManager:
                 raise
             await self._append_log(record, "success", f"控制动作完成 · {node_title}", control_result.detail, node_id=node_id)
             saved_names = apply_control_result_variables(node, control_result, record.variables)
-            await self._publish_output_variables(record, saved_names, message="控制输出变量已更新", node_id=node_id)
+            if saved_names:
+                await self._append_log(record, "success", f"控制输出变量已更新 · {', '.join(saved_names)}", None, node_id=node_id)
+                await self._update_snapshot(record, variables=record.variables.snapshots())
             return control_result.to_scrape_result()
 
         return await self._run_with_retry(record, node, node_id=node_id, node_title=node_title, label="控制动作", execute=_execute, extra_reraise=(BreakLoopSignal,))
@@ -1242,7 +1260,9 @@ class TaskManager:
             message = _build_variable_result_message(variable_result.action_type, node_title)
             await self._append_log(record, variable_result.log_level, message, variable_result.detail, node_id=node_id)
             saved_names = apply_variable_result_variables(node, variable_result, record.variables)
-            await self._publish_output_variables(record, saved_names, message="变量输出已更新", node_id=node_id)
+            if saved_names:
+                await self._append_log(record, "success", f"变量输出已更新 · {', '.join(saved_names)}", None, node_id=node_id)
+                await self._update_snapshot(record, variables=record.variables.snapshots())
             return variable_result.to_scrape_result()
 
         return await self._run_with_retry(record, node, node_id=node_id, node_title=node_title, label="变量 / 消息", execute=_execute)
@@ -1268,7 +1288,9 @@ class TaskManager:
             http_result = await self._http_runner.run(resolved_node, record.variables, timeout_ms=_read_node_timeout(resolved_node, default=record.request.timeout_ms))
             await self._append_log(record, "success", f"HTTP 请求完成 · {http_result.status_code}", http_result.url, node_id=node_id)
             saved_names = apply_http_result_variables(node, http_result, record.variables)
-            await self._publish_output_variables(record, saved_names, message="HTTP 输出变量已更新", node_id=node_id)
+            if saved_names:
+                await self._append_log(record, "success", f"HTTP 输出变量已更新 · {', '.join(saved_names)}", None, node_id=node_id)
+                await self._update_snapshot(record, variables=record.variables.snapshots())
             return http_result.to_scrape_result()
 
         return await self._run_with_retry(record, node, node_id=node_id, node_title=node_title, label="HTTP 节点", execute=_execute)
@@ -1301,7 +1323,9 @@ class TaskManager:
             browser_result = await self._resolve_browser_executor(record).run(resolved_node, record.variables, context, timeout_ms=_read_node_timeout(resolved_node, default=record.request.timeout_ms))
             await self._append_log(record, "success", f"浏览器动作完成 · {node_title}", browser_result.detail, node_id=node_id)
             saved_names = apply_browser_result_variables(node, browser_result, record.variables)
-            await self._publish_output_variables(record, saved_names, message="浏览器输出变量已更新", node_id=node_id)
+            if saved_names:
+                await self._append_log(record, "success", f"浏览器输出变量已更新 · {', '.join(saved_names)}", None, node_id=node_id)
+                await self._update_snapshot(record, variables=record.variables.snapshots())
             await self._save_browser_screenshot(record, context, node_id=node_id, node_title=node_title)
             return browser_result.to_scrape_result()
 
@@ -1466,7 +1490,9 @@ class TaskManager:
             file_result = await self._file_action_runner.run(resolved_node, record.variables, timeout_ms=_read_node_timeout(resolved_node, default=record.request.timeout_ms))
             await self._append_log(record, "success", f"文件节点完成 · {node_title}", file_result.path, node_id=node_id)
             saved_names = apply_file_result_variables(node, file_result, record.variables)
-            await self._publish_output_variables(record, saved_names, message="文件输出变量已更新", node_id=node_id)
+            if saved_names:
+                await self._append_log(record, "success", f"文件输出变量已更新 · {', '.join(saved_names)}", None, node_id=node_id)
+                await self._update_snapshot(record, variables=record.variables.snapshots())
             # excel.addrow 常在循环中执行，避免每行重复注册；由 excel.save 统一登记最终工作簿。
             action_type = resolved_node.get("type", "")
             if action_type in ("file.write", "excel.write", "excel.save", "file.copy", "file.move", "file.rename", "file.compress") and file_result.path:
@@ -1499,7 +1525,9 @@ class TaskManager:
                 raise RuntimeError(f"脚本退出码 {script_result.exit_code}: {script_result.stderr or script_result.stdout}")
             await self._append_log(record, "success", f"脚本节点完成 · {node_title}", script_result.stdout or detail, node_id=node_id)
             saved_names = apply_script_result_variables(node, script_result, record.variables)
-            await self._publish_output_variables(record, saved_names, message="脚本输出变量已更新", node_id=node_id)
+            if saved_names:
+                await self._append_log(record, "success", f"脚本输出变量已更新 · {', '.join(saved_names)}", None, node_id=node_id)
+                await self._update_snapshot(record, variables=record.variables.snapshots())
             # 若脚本 stdout 是工作区内存在的文件路径，注册为采集结果 artifact
             stdout_path = (script_result.stdout or "").strip()
             # 512 字符是启发式上限：真实文件路径不会这么长，用它快速排除脚本
@@ -1538,7 +1566,9 @@ class TaskManager:
             data_result = await self._data_action_runner.run(resolved_node, record.variables, timeout_ms=_read_node_timeout(resolved_node, default=record.request.timeout_ms))
             await self._append_log(record, "success", f"数据处理完成 · {node_title}", f"{data_result.count} 条", node_id=node_id)
             saved_names = apply_data_result_variables(node, data_result, record.variables)
-            await self._publish_output_variables(record, saved_names, message="数据输出变量已更新", node_id=node_id)
+            if saved_names:
+                await self._append_log(record, "success", f"数据输出变量已更新 · {', '.join(saved_names)}", None, node_id=node_id)
+                await self._update_snapshot(record, variables=record.variables.snapshots())
             return data_result.to_scrape_result()
 
         return await self._run_with_retry(record, node, node_id=node_id, node_title=node_title, label="数据处理", execute=_execute)
@@ -1774,6 +1804,10 @@ def _read_node_id(node: dict[str, object], *, fallback: str) -> str:
 def _read_node_title(node: dict[str, object], *, fallback: str) -> str:
     value = node.get("title")
     return value.strip() if isinstance(value, str) and value.strip() else fallback
+
+
+def _is_variable_node(node: dict[str, object]) -> bool:
+    return is_variable_action_node(node)
 
 
 def _has_breakpoint(record: TaskRecord, node_id: str) -> bool:

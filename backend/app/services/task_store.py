@@ -31,8 +31,6 @@ class TaskStore(Protocol):
 
     async def list_variables(self, task_id: str) -> list[RuntimeVariableSnapshot] | None: ...
 
-    async def delete_artifacts(self, task_ids: list[str]) -> None: ...
-
     async def list_unfinished_tasks(self) -> list[TaskSnapshot]: ...
 
     async def mark_interrupted_stopped(self, task_id: str, *, error: str, log: TaskLogEntry) -> TaskSnapshot | None: ...
@@ -101,12 +99,6 @@ class InMemoryTaskStore:
         if record is None:
             return None
         return list(record.snapshot.variables)
-
-    async def delete_artifacts(self, task_ids: list[str]) -> None:
-        for task_id in task_ids:
-            record = self._tasks.get(task_id)
-            if record is not None:
-                record.snapshot = record.snapshot.model_copy(update={"artifacts": []})
 
     async def list_unfinished_tasks(self) -> list[TaskSnapshot]:
         return [record.snapshot for record in self._tasks.values() if record.snapshot.status in _UNFINISHED_TASK_STATUSES]
@@ -286,31 +278,27 @@ class SqlAlchemyTaskStore:
         return log
 
     async def list_logs(self, task_id: str) -> list[TaskLogEntry] | None:
+        if await self.get_task(task_id) is None:
+            return None
         async with self._session_factory() as session:
-            if await session.get(TaskRow, task_id) is None:
-                return None
             result = await session.scalars(select(TaskLogRow).where(TaskLogRow.task_id == task_id).order_by(TaskLogRow.created_at.asc()))
             return [self._to_log(row) for row in result]
 
     async def list_variables(self, task_id: str) -> list[RuntimeVariableSnapshot] | None:
+        if await self.get_task(task_id) is None:
+            return None
         async with self._session_factory() as session:
-            if await session.get(TaskRow, task_id) is None:
-                return None
             result = await session.scalars(select(TaskVariableRow).where(TaskVariableRow.task_id == task_id).order_by(TaskVariableRow.name.asc()))
             return [self._to_variable(row) for row in result]
 
     async def delete_task(self, task_id: str) -> bool:
         async with self._session_factory() as session:
+            await session.execute(delete(TaskLogRow).where(TaskLogRow.task_id == task_id))
+            await session.execute(delete(TaskVariableRow).where(TaskVariableRow.task_id == task_id))
+            await session.execute(delete(ArtifactRow).where(ArtifactRow.task_id == task_id))
             result = await session.execute(delete(TaskRow).where(TaskRow.id == task_id))
             await session.commit()
             return (result.rowcount or 0) > 0
-
-    async def delete_artifacts(self, task_ids: list[str]) -> None:
-        if not task_ids:
-            return
-        async with self._session_factory() as session:
-            await session.execute(delete(ArtifactRow).where(ArtifactRow.task_id.in_(task_ids)))
-            await session.commit()
 
     async def list_unfinished_tasks(self) -> list[TaskSnapshot]:
         statement = select(TaskRow).where(TaskRow.status.in_(_UNFINISHED_TASK_STATUSES))

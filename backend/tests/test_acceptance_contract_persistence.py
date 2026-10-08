@@ -146,8 +146,6 @@ async def test_flow_and_task_list_apis_restore_current_contracts_from_isolated_d
     ))
     await task_store.save_task(_task_snapshot(), _task_request())
 
-    current_task = _task_request().model_dump(mode="json", by_alias=True)
-    current_task["acceptanceContract"] = _contract()
     async with engine.begin() as connection:
         await connection.execute(
             update(FlowRow).where(FlowRow.id == flow.flow_id).values(acceptance_contract=_contract())
