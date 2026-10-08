@@ -507,28 +507,31 @@ select {
   }
 }
 
-.ai-assistant-blob-body {
+/* 眼睛位于 SVG mask 内，统一使用整个 viewBox 作为变换坐标，避免形变时视线偏移。 */
+.ai-assistant-blob-body,
+.ai-assistant-blob-gaze,
+.ai-assistant-blob-blink,
+.ai-assistant-blob-sleepy-eyes,
+.ai-assistant-blob-wide-eyes {
   transform-box: view-box;
+  transform-origin: 50% 47%;
+}
+
+.ai-assistant-blob-body {
   transform-origin: 50% 55%;
   animation: ai-assistant-idle 12s linear infinite;
 }
 
 .ai-assistant-blob-gaze {
-  transform-box: view-box;
-  transform-origin: 50% 47%;
   animation: ai-assistant-gaze 9.6s ease-in-out infinite;
 }
 
 .ai-assistant-blob-blink {
-  transform-box: view-box;
-  transform-origin: 50% 47%;
   animation: ai-assistant-blink 10.8s linear infinite;
 }
 
 .ai-assistant-blob-sleepy-eyes,
 .ai-assistant-blob-wide-eyes {
-  transform-box: view-box;
-  transform-origin: 50% 47%;
   transition:
     opacity 140ms cubic-bezier(0.16, 1, 0.3, 1),
     transform 220ms cubic-bezier(0.16, 1, 0.3, 1);
@@ -544,21 +547,13 @@ select {
   transform: translateY(0.35px) scale(0.72, 0.34);
 }
 
-.group:is(:hover, :focus-visible) .ai-assistant-blob-sleepy-eyes {
-  opacity: 0;
-  transform: translateY(0.35px) scale(1, 0.55);
-}
-
-.group:is(:hover, :focus-visible) .ai-assistant-blob-wide-eyes {
-  opacity: 1;
-  transform: scale(1);
-}
-
+.group:is(:hover, :focus-visible) .ai-assistant-blob-sleepy-eyes,
 .ai-assistant-blob-busy .ai-assistant-blob-sleepy-eyes {
   opacity: 0;
   transform: translateY(0.35px) scale(1, 0.55);
 }
 
+.group:is(:hover, :focus-visible) .ai-assistant-blob-wide-eyes,
 .ai-assistant-blob-busy .ai-assistant-blob-wide-eyes {
   opacity: 1;
   transform: scale(1);
@@ -573,12 +568,8 @@ select {
   transition-property: color, opacity, transform;
 }
 
-.ai-assistant-fab-dragging .ai-assistant-blob-body,
-.ai-assistant-fab-dragging .ai-assistant-blob-gaze,
-.ai-assistant-fab-dragging .ai-assistant-blob-blink,
-button[aria-hidden="true"] .ai-assistant-blob-body,
-button[aria-hidden="true"] .ai-assistant-blob-gaze,
-button[aria-hidden="true"] .ai-assistant-blob-blink {
+button:is(.ai-assistant-fab-dragging, [aria-hidden="true"])
+  :is(.ai-assistant-blob-body, .ai-assistant-blob-gaze, .ai-assistant-blob-blink) {
   animation-play-state: paused;
 }
 
@@ -729,6 +720,11 @@ button[aria-hidden="true"] .ai-assistant-blob-blink {
   .ai-assistant-blob-blink {
     animation: none !important;
     transform: none;
+  }
+
+  .ai-assistant-blob-sleepy-eyes,
+  .ai-assistant-blob-wide-eyes {
+    transition: none;
   }
 
   /* The .edge-running rule above is !important (it has to beat React Flow's own
