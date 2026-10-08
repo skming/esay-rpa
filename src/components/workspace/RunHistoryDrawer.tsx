@@ -5,7 +5,7 @@ import type { ReactElement } from 'react';
 import { formatDateTime, formatElapsedTime } from '../../lib/time';
 import { runOutputSummary, TASK_STATUS_META } from '../../lib/runPresentation';
 import type { TaskSnapshot } from '../../types/electron';
-import { IconButton } from '../ui/button';
+import { Button, IconButton } from '../ui/button';
 import { RefreshIconButton } from '../ui/refresh-button';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../ui/tooltip';
 import { StateTag } from './surfaces';
@@ -17,7 +17,7 @@ type Props = {
   onClose: () => void;
   onInspectRun: (run: TaskSnapshot) => void;
   onLoadMore?: () => void;
-  onRefresh: () => void;
+  onRefresh: () => void | Promise<void>;
   open: boolean;
   runs: TaskSnapshot[];
 };
@@ -117,7 +117,7 @@ export function RunHistoryDrawer({ flowName, hasMore, loadingMore, onClose, onIn
 
                       <div className="flex justify-end">
                         <Tooltip>
-                          <TooltipTrigger render={<IconButton className="h-7 w-7" label="查看详情" onClick={() => onInspectRun(run)} />}>
+                          <TooltipTrigger render={<Button aria-label="查看详情" className="h-7 w-7 text-slate-500 hover:bg-slate-100 hover:text-slate-700" onClick={() => onInspectRun(run)} size="icon" variant="ghost" />}>
                             <ScanSearch className="h-3.5 w-3.5" strokeWidth={1.5} />
                           </TooltipTrigger>
                           <TooltipContent side="left">查看运行详情</TooltipContent>

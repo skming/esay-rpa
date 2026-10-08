@@ -1,285 +1,549 @@
-import { AlertCircle, CheckCircle2, ChevronRight, Clock3, DatabaseZap, Eye, FileJson, FolderOpen, Loader2, ScrollText, XCircle } from 'lucide-react';
+import {
+  AlertCircle,
+  ChevronRight,
+  Eye,
+  FileJson,
+  FolderOpen,
+  Loader2,
+  LocateFixed,
+  LockKeyhole,
+  RefreshCcw,
+} from 'lucide-react';
 import type { ReactElement } from 'react';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
-import { formatElapsedTime } from '../../lib/time';
+import { TASK_STATUS_META } from '../../lib/runPresentation';
+import { formatDateTime, formatElapsedTime } from '../../lib/time';
 import { cn } from '../../lib/utils';
-import type { ArtifactContent, ArtifactSnapshot, BackendTaskLogEntry, RunDetail, TaskSnapshot } from '../../types/electron';
-import type { RunLogLevel } from '../../types/rpa';
+import type {
+  ArtifactContent,
+  ArtifactSnapshot,
+  BackendTaskLogEntry,
+  RunDetail,
+  TaskSnapshot,
+} from '../../types/electron';
+import type { RunLogLevel, RuntimeVariable } from '../../types/rpa';
 import { ArtifactPreviewDialog } from '../studio/bottom-panel/ArtifactPreviewDialog';
 import { getLogTone } from '../studio/bottom-panel/bottomPanelUtils';
-import { Badge } from '../ui/badge';
-import { Button } from '../ui/button';
+import { Button, IconButton } from '../ui/button';
 import { CopyButton } from '../ui/copy-button';
 import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '../ui/dialog';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '../ui/tabs';
+import { SearchField, StateTag, SurfaceEmpty } from './surfaces';
 
-// 复用底部面板的日志配色；后端 level 是自由字符串，未知值退到 info 的中性色但标签原样展示，不替它编中文名
 const LOG_LEVEL_LABELS: Record<RunLogLevel, string> = {
-  error: '错误', warn: '警告', input: '输入', success: '成功', running: '执行', info: '信息',
+  error: '错误',
+  warn: '警告',
+  input: '输入',
+  success: '成功',
+  running: '执行',
+  info: '信息',
 };
-function logLevelTone(level: string): ReturnType<typeof getLogTone> {
-  return getLogTone((level in LOG_LEVEL_LABELS ? level : 'info') as RunLogLevel);
-}
-function logLevelLabel(level: string): string {
-  return LOG_LEVEL_LABELS[level as RunLogLevel] ?? level;
-}
-
-export function RunDetailDialog({
-  onOpenArtifact,
-  onReadArtifact,
-  onOpenChange,
-  onLoadDetail,
-  open,
-  run: listedRun,
-}: {
+const LOG_FILTERS = [
+  { value: 'all', label: '全部' },
+  { value: 'error', label: '错误' },
+  { value: 'warn', label: '警告' },
+] as const;
+type DetailTab = 'result' | 'logs' | 'variables';
+type LogFilter = (typeof LOG_FILTERS)[number]['value'];
+type RunDetailDialogProps = {
   onOpenArtifact?: (artifact: ArtifactSnapshot) => void;
   onReadArtifact?: (taskId: string, artifactId: string) => Promise<ArtifactContent | null>;
   onOpenChange: (open: boolean) => void;
   onLoadDetail: (taskId: string) => Promise<RunDetail>;
   open: boolean;
   run: TaskSnapshot | null;
-}): ReactElement | null {
-  const [detail, setDetail] = useState<{ taskId: string; run: TaskSnapshot; logs: BackendTaskLogEntry[] } | null>(null);
-  const [loadError, setLoadError] = useState<{ taskId: string; message: string } | null>(null);
-  const [reloadKey, setReloadKey] = useState(0);
-  const [preview, setPreview] = useState<{ artifact: ArtifactSnapshot; content: ArtifactContent | null } | null>(null);
-  const taskId = listedRun?.taskId;
+};
 
-  // 预览按需读取内容，只保留仍指向当前产物的结果；读取失败（返回 null，callBridge 已弹 toast）则关闭预览
-  const handlePreview = (artifact: ArtifactSnapshot): void => {
-    if (onReadArtifact === undefined) return;
-    setPreview({ artifact, content: null });
-    void onReadArtifact(artifact.taskId, artifact.artifactId).then((content) => {
-      setPreview((current) => {
-        if (current === null || current.artifact.artifactId !== artifact.artifactId) return current;
-        return content === null ? null : { ...current, content };
-      });
-    });
-  };
+export function RunDetailDialog(props: RunDetailDialogProps): ReactElement | null {
+  if (props.run === null) return null;
+  return <RunDetailContent key={props.run.taskId} {...props} run={props.run} />;
+}
+
+function RunDetailContent({
+  onOpenArtifact,
+  onReadArtifact,
+  onOpenChange,
+  onLoadDetail,
+  open,
+  run: listedRun,
+}: Omit<RunDetailDialogProps, 'run'> & { run: TaskSnapshot }): ReactElement {
+  const [detail, setDetail] = useState<RunDetail | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [reloadKey, setReloadKey] = useState(0);
+  const [tab, setTab] = useState<DetailTab>(() =>
+    listedRun.status === 'error' || listedRun.status === 'running' ? 'logs' : 'result',
+  );
+  const [filter, setFilter] = useState<LogFilter>('all');
+  const [query, setQuery] = useState('');
+  const [locateKey, setLocateKey] = useState(0);
+  const [preview, setPreview] = useState<{ artifact: ArtifactSnapshot; content: ArtifactContent | null } | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const previewRequestRef = useRef(0);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const errorRef = useRef<HTMLDivElement>(null);
+  const locatedRef = useRef<number | null>(null);
+  const taskId = listedRun.taskId;
 
   useEffect(() => {
-    if (!open || taskId === undefined) return;
+    if (!open) return;
     let current = true;
-    void onLoadDetail(taskId).then(({ run, logs }) => {
-      if (current) {
-        setDetail({ taskId, run, logs });
-        setLoadError(null);
-      }
-    }).catch((error: unknown) => {
-      if (current) {
-        setDetail(null);
-        setLoadError({ taskId, message: error instanceof Error ? error.message : String(error) });
-      }
-    });
-    return () => { current = false; };
+    void onLoadDetail(taskId)
+      .then((next) => {
+        if (current) {
+          setDetail(next);
+          setLoadError(null);
+          setLoading(false);
+        }
+      })
+      .catch((error: unknown) => {
+        if (current) {
+          setLoadError(error instanceof Error ? error.message : String(error));
+          setLoading(false);
+        }
+      });
+    return () => {
+      current = false;
+    };
   }, [open, taskId, reloadKey, onLoadDetail]);
 
-  if (listedRun === null) return null;
-  const loaded = detail?.taskId === listedRun.taskId ? detail : null;
-  const run = loaded?.run ?? listedRun;
-  const logs = loaded?.logs ?? [];
-  const errorLogCount = logs.reduce((count, log) => (log.level === 'error' ? count + 1 : count), 0);
-  const error = loadError?.taskId === listedRun.taskId ? loadError.message : null;
-  const loading = loaded === null && error === null;
+  const run = detail?.run ?? listedRun;
+  const logs = detail?.logs ?? [];
+  const variables = run.variables ?? [];
+  const artifacts = run.artifacts ?? [];
+  const status = TASK_STATUS_META[run.status];
+  const errorLogs = logs.filter((log) => log.level === 'error');
+  const errorCount = errorLogs.length;
+  const warningCount = logs.filter((log) => log.level === 'warn').length;
+  const lastErrorId = errorLogs.at(-1)?.id;
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const visibleLogs = logs.filter(
+    (log) =>
+      (filter === 'all' || log.level === filter) &&
+      (!normalizedQuery ||
+        `${log.message} ${log.detail ?? ''} ${log.nodeId ?? ''}`.toLocaleLowerCase().includes(normalizedQuery)),
+  );
 
-  const statusIcon = {
-    running: <Loader2 className="h-4 w-4 animate-spin text-live" strokeWidth={1.5} />,
-    success: <CheckCircle2 className="h-4 w-4 text-emerald-500" strokeWidth={1.5} />,
-    error: <XCircle className="h-4 w-4 text-red-500" strokeWidth={1.5} />,
-    stopped: <XCircle className="h-4 w-4 text-amber-500" strokeWidth={1.5} />,
-    queued: <Loader2 className="h-4 w-4 text-ink-4" strokeWidth={1.5} />,
-    awaiting_confirmation: <Loader2 className="h-4 w-4 text-amber-500" strokeWidth={1.5} />,
-  }[run.status];
+  useEffect(() => {
+    if (!open || loading || tab !== 'logs' || locatedRef.current === locateKey) return;
+    const body = bodyRef.current;
+    const target = errorRef.current;
+    if (body !== null && target !== null) {
+      body.scrollTop = Math.max(0, target.offsetTop - 12);
+      locatedRef.current = locateKey;
+    }
+  }, [open, loading, tab, detail, locateKey]);
 
-  const statusLabel = { running: '运行中', success: '成功', error: '失败', stopped: '已停止', queued: '排队', awaiting_confirmation: '等待操作' }[run.status];
-  const statusVariant = { success: 'emerald', error: 'red', running: 'blue', queued: 'amber', stopped: 'default', awaiting_confirmation: 'amber' }[run.status] as 'emerald' | 'red' | 'blue' | 'amber' | 'default';
+  const refresh = (): void => {
+    setLoading(true);
+    setLoadError(null);
+    setReloadKey((key) => key + 1);
+  };
+  const locateError = (): void => {
+    setFilter('all');
+    setQuery('');
+    setLocateKey((key) => key + 1);
+  };
+  const closePreview = (): void => {
+    previewRequestRef.current += 1;
+    setPreview(null);
+  };
   const handleOpenChange = (nextOpen: boolean): void => {
     if (!nextOpen) {
-      setDetail(null);
-      setLoadError(null);
-      setPreview(null);
+      closePreview();
+      setPreviewError(null);
     }
     onOpenChange(nextOpen);
+  };
+  const handlePreview = (artifact: ArtifactSnapshot): void => {
+    if (onReadArtifact === undefined) return;
+    const request = ++previewRequestRef.current;
+    setPreviewError(null);
+    setPreview({ artifact, content: null });
+    void onReadArtifact(artifact.taskId, artifact.artifactId)
+      .then((content) => {
+        if (previewRequestRef.current !== request) return;
+        setPreview(content === null ? null : { artifact, content });
+        if (content === null) setPreviewError('读取产物失败，请重试。');
+      })
+      .catch(() => {
+        if (previewRequestRef.current !== request) return;
+        setPreview(null);
+        setPreviewError('读取产物失败，请重试。');
+      });
   };
 
   return (
     <>
-    <Dialog onOpenChange={handleOpenChange} open={open}>
-      <DialogContent className="flex max-h-[min(82vh,700px)] w-200 max-w-[calc(100vw-32px)] flex-col overflow-hidden">
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
-            {statusIcon}
-            运行详情 · {run.flowName}
-          </DialogTitle>
-        </DialogHeader>
-
-        <DialogBody className="min-h-0 flex-1 space-y-5 overflow-y-auto">
-          {loading && <p className="text-[11px] text-ink-3">正在读取完整执行记录…</p>}
-          {error && <p className="rounded-md bg-red-50 px-3 py-2 text-[11px] text-red-700">读取最新记录失败：{error}</p>}
-          {run.error !== null && run.error !== undefined && (
-            <div className="flex items-start gap-2 rounded-md border border-red-200 bg-red-50 px-3 py-2.5">
-              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-500" strokeWidth={1.5} />
-              <div className="min-w-0 flex-1">
-                <div className="text-[11px] font-semibold text-red-700">执行失败</div>
-                <p className="mt-0.5 whitespace-pre-wrap break-words text-[11px] text-red-700">{run.error}</p>
-              </div>
-              <CopyButton className="shrink-0 text-red-400 hover:text-red-700" text={run.error} title="复制错误" />
-            </div>
-          )}
-          <div className="grid grid-cols-2 gap-2">
-            <InfoRow label="任务 ID" value={run.taskId} mono />
-            <InfoRow label="状态">
-              <Badge variant={statusVariant}>{statusLabel}</Badge>
-            </InfoRow>
-            <InfoRow label="运行模式" value={run.mode === 'debug' ? '调试' : '正常运行'} />
-            <InfoRow label="耗时">
-              <span className="inline-flex items-center gap-1 font-mono text-[11px] text-ink-2">
-                <Clock3 className="h-3 w-3 text-ink-4" strokeWidth={1.5} />
-                {formatElapsedTime(run.progress.elapsedMs)}
+      <Dialog onOpenChange={handleOpenChange} open={open}>
+        <DialogContent className="h-[min(82dvh,720px)] max-h-[calc(100dvh-32px)] w-225 max-w-[calc(100vw-24px)]">
+          <DialogHeader className="gap-3 px-4 pb-3 pt-4 pr-12 sm:px-5 sm:pr-12">
+            <DialogTitle className="min-w-0 truncate text-[14px] font-semibold leading-5" title={run.flowName}>
+              运行详情 · {run.flowName}
+            </DialogTitle>
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[11px] text-ink-3">
+              <StateTag state={status.tone} label={status.label} />
+              <span>{run.mode === 'debug' ? '调试' : '正常运行'}</span>
+              <span>
+                耗时{' '}
+                <span className="font-mono tabular-nums text-ink-2">{formatElapsedTime(run.progress.elapsedMs)}</span>
               </span>
-            </InfoRow>
-            <InfoRow label="进度" value={`${run.progress.currentStep} / ${run.progress.totalSteps} 步（${run.progress.percent}%）`} />
-            <InfoRow label="更新时间" value={formatDateTime(run.updatedAt)} />
-          </div>
-
-          {(run.variables?.length ?? 0) > 0 && (
-            <div>
-              <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold text-ink-2">
-                <DatabaseZap className="h-3.5 w-3.5 text-ink-3" strokeWidth={1.5} />
-                变量快照（{run.variables?.length ?? 0} 个）
-              </div>
-              <div className="max-h-35 space-y-1 overflow-auto rounded-md border border-rule bg-paper-sunk p-2">
-                {(run.variables ?? []).map((v) => (
-                  <div className="flex items-center justify-between text-[11px]" key={v.name}>
-                    <span className="font-mono text-ink-2">{v.name}</span>
-                    <span className="ml-2 max-w-70 truncate font-mono text-ink-3">
-                      {v.sensitive ? '••••••••' : v.value}
-                    </span>
-                  </div>
-                ))}
-              </div>
+              <span>
+                进度{' '}
+                <span className="tabular-nums text-ink-2">
+                  {run.progress.currentStep} / {run.progress.totalSteps} 步（{run.progress.percent}%）
+                </span>
+              </span>
             </div>
-          )}
+            <div className="flex min-w-0 items-center gap-1.5 text-[10px] text-ink-3">
+              <span className="shrink-0">任务 ID</span>
+              <span className="truncate font-mono" title={taskId}>
+                {taskId}
+              </span>
+              <CopyButton className="shrink-0" text={taskId} title="复制任务 ID" />
+            </div>
+          </DialogHeader>
 
-          {(run.artifacts?.length ?? 0) > 0 && (
-            <div>
-              <div className="mb-1.5 flex items-center justify-between gap-2 text-[11px] font-semibold text-ink-2">
-                <div className="flex items-center gap-1.5">
-                  <FileJson className="h-3.5 w-3.5 text-emerald-500" strokeWidth={1.5} />
-                  产物（{run.artifacts?.length ?? 0} 个）
+          <Tabs
+            className="flex min-h-0 flex-1 flex-col"
+            value={tab}
+            onValueChange={(value) => {
+              setTab(value as DetailTab);
+              if (bodyRef.current) bodyRef.current.scrollTop = 0;
+            }}
+          >
+            <TabsList aria-label="运行详情内容" className="shrink-0 gap-5 border-y border-rule px-4 sm:px-5">
+              <TabsTrigger className="h-10" value="result">
+                结果
+              </TabsTrigger>
+              <TabsTrigger className="h-10 gap-1.5" value="logs">
+                日志<span className="tabular-nums text-ink-3">{detail === null ? '—' : logs.length}</span>
+              </TabsTrigger>
+              <TabsTrigger className="h-10 gap-1.5" value="variables">
+                变量<span className="tabular-nums text-ink-3">{variables.length}</span>
+              </TabsTrigger>
+            </TabsList>
+            {tab === 'logs' && (
+              <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-rule px-4 py-2.5 sm:px-5">
+                <div className="flex items-center gap-1" aria-label="日志级别">
+                  {LOG_FILTERS.map((item) => (
+                    <Button
+                      key={item.value}
+                      aria-pressed={filter === item.value}
+                      className={cn('h-7 px-2', filter === item.value && 'bg-accent-soft text-accent-strong')}
+                      onClick={() => setFilter(item.value)}
+                    >
+                      {item.label}
+                      <span className="tabular-nums">
+                        {item.value === 'all' ? logs.length : item.value === 'error' ? errorCount : warningCount}
+                      </span>
+                    </Button>
+                  ))}
                 </div>
-                {/* 同一次运行的产物同处一个目录，只在标题栏给一个入口，不必每行都放 */}
-                {onOpenArtifact && (
-                  <button aria-label="打开产物目录" className="flex items-center gap-1 rounded px-1.5 py-0.5 font-normal text-ink-3 hover:text-ink-2" onClick={() => { const first = run.artifacts?.[0]; if (first) onOpenArtifact(first); }} type="button">
-                    <FolderOpen className="h-3.5 w-3.5" strokeWidth={1.5} />
-                    打开目录
-                  </button>
-                )}
-              </div>
-              <div className="max-h-25 space-y-1 overflow-auto rounded-md border border-rule bg-paper-sunk p-2">
-                {(run.artifacts ?? []).map((a) => (
-                  <div className="group flex items-center justify-between gap-2 rounded px-1 py-0.5 text-[11px] transition-colors hover:bg-surface" key={a.artifactId}>
-                    <span className="min-w-0 flex-1 truncate font-mono text-ink-2">{a.filename}</span>
-                    <span className="shrink-0 text-ink-3">{formatBytes(a.sizeBytes)}</span>
-                    {onReadArtifact && <button aria-label={`预览 ${a.filename}`} className="rounded p-1 text-ink-3 hover:text-ink-2" onClick={() => handlePreview(a)} type="button"><Eye className="h-3.5 w-3.5" strokeWidth={1.5} /></button>}
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {loaded && <div>
-            <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold text-ink-2">
-              <ScrollText className="h-3.5 w-3.5 text-ink-3" strokeWidth={1.5} />
-              执行日志（{logs.length} 条{errorLogCount > 0 ? ` · ${errorLogCount} 错误` : ''}）
-            </div>
-            {logs.length === 0 ? (
-              <p className="rounded-md bg-paper-sunk px-3 py-3 text-[11px] text-ink-3">没有日志记录</p>
-            ) : (
-              <div className="max-h-64 divide-y divide-rule overflow-auto rounded-md border border-rule">
-                {logs.map((log) => <RunLogRow key={log.id} log={log} />)}
+                <SearchField
+                  className="order-3 min-w-0 max-w-none basis-full sm:order-none sm:min-w-36 sm:basis-auto"
+                  label="搜索执行日志"
+                  placeholder="搜索消息、详情或节点 ID"
+                  value={query}
+                  onChange={setQuery}
+                />
+                <IconButton
+                  className="ml-auto sm:ml-0"
+                  disabled={errorCount === 0}
+                  label="定位最后一条错误"
+                  onClick={locateError}
+                >
+                  <LocateFixed className="h-3.5 w-3.5" strokeWidth={1.5} />
+                </IconButton>
               </div>
             )}
-          </div>}
-        </DialogBody>
-
-        <DialogFooter>
-          <Button onClick={() => { setDetail(null); setLoadError(null); setReloadKey((value) => value + 1); }} variant="outline">刷新记录</Button>
-          <Button onClick={() => handleOpenChange(false)} variant="primary">关闭</Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-    <ArtifactPreviewDialog
-      artifact={preview?.artifact ?? null}
-      content={preview?.content ?? null}
-      loading={preview !== null && preview.content === null}
-      onOpenChange={(nextOpen) => { if (!nextOpen) setPreview(null); }}
-      open={preview !== null}
-    />
+            <DialogBody className="relative overscroll-contain px-4 sm:px-5" ref={bodyRef} aria-busy={loading}>
+              {loading && (
+                <p className="mb-3 flex items-center gap-2 text-[11px] text-ink-3" role="status">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin motion-reduce:animate-none" strokeWidth={1.5} />
+                  {detail === null ? '正在读取完整执行记录…' : '正在刷新执行记录…'}
+                </p>
+              )}
+              {loadError !== null && (
+                <div
+                  className="mb-3 flex items-start gap-2 rounded-md bg-red-50 px-3 py-2 text-[11px] text-red-700"
+                  role="alert"
+                >
+                  <span className="min-w-0 flex-1 break-words">
+                    读取最新记录失败：{loadError}
+                    {detail !== null && '。当前显示上次加载的记录。'}
+                  </span>
+                  <Button className="shrink-0 text-red-700" disabled={loading} onClick={refresh}>
+                    重试
+                  </Button>
+                </div>
+              )}
+              <TabsContent className="space-y-5" value="result">
+                {run.status === 'error' && run.error && <RunNotice title="执行失败" message={run.error} />}
+                {run.status === 'awaiting_confirmation' && (
+                  <RunNotice title="等待操作" message={run.confirmationMessage || '此任务正在等待操作确认。'} warning />
+                )}
+                {previewError !== null && (
+                  <p className="text-[11px] text-red-700" role="alert">
+                    {previewError}
+                  </p>
+                )}
+                {run.result != null && (
+                  <section>
+                    <div className="mb-2 flex items-center justify-between">
+                      <h3 className="text-[12px] font-semibold text-ink-2">提取结果 · {run.result.count} 条</h3>
+                      <CopyButton text={JSON.stringify(run.result.values, null, 2)} title="复制提取结果" />
+                    </div>
+                    <details className="rounded-md border border-rule bg-paper">
+                      <summary className="cursor-pointer px-3 py-2 text-[11px] text-ink-2">查看提取数据</summary>
+                      <pre className="border-t border-rule p-3 whitespace-pre-wrap font-mono text-[11px] leading-5 text-ink-2 [overflow-wrap:anywhere]">
+                        {JSON.stringify(run.result.values, null, 2)}
+                      </pre>
+                    </details>
+                  </section>
+                )}
+                {artifacts.length > 0 && (
+                  <section>
+                    <div className="mb-2 flex items-center justify-between gap-2">
+                      <h3 className="text-[12px] font-semibold text-ink-2">产物 · {artifacts.length} 个</h3>
+                      {onOpenArtifact && (
+                        <Button onClick={() => onOpenArtifact(artifacts[0])}>
+                          <FolderOpen className="h-3.5 w-3.5" strokeWidth={1.5} />
+                          打开目录
+                        </Button>
+                      )}
+                    </div>
+                    <div className="divide-y divide-rule rounded-md border border-rule">
+                      {artifacts.map((artifact) => (
+                        <div className="flex items-center gap-2 px-3 py-2.5" key={artifact.artifactId}>
+                          <FileJson className="h-3.5 w-3.5 shrink-0 text-ink-3" strokeWidth={1.5} />
+                          <span className="min-w-0 flex-1 truncate text-[11px] text-ink-2" title={artifact.filename}>
+                            {artifact.filename}
+                          </span>
+                          <span className="shrink-0 text-[10px] tabular-nums text-ink-3">
+                            {formatBytes(artifact.sizeBytes)}
+                          </span>
+                          {onReadArtifact && (
+                            <IconButton label={`预览 ${artifact.filename}`} onClick={() => handlePreview(artifact)}>
+                              <Eye className="h-3.5 w-3.5" strokeWidth={1.5} />
+                            </IconButton>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                )}
+                {!loading && run.result == null && artifacts.length === 0 && (
+                  <SurfaceEmpty
+                    title="暂无输出数据"
+                    hint={
+                      run.status === 'queued' || run.status === 'running' || run.status === 'awaiting_confirmation'
+                        ? '任务尚未产生提取结果或产物，可在日志中查看执行情况。'
+                        : '本次运行没有提取数据或生成产物，可在日志中查看执行过程。'
+                    }
+                  />
+                )}
+              </TabsContent>
+              <TabsContent value="logs">
+                {run.status === 'error' && run.error && (
+                  <div className="mb-3">
+                    <RunNotice title="执行失败" message={run.error} />
+                  </div>
+                )}
+                {detail !== null && (
+                  <p className="mb-2 text-[10px] tabular-nums text-ink-3" role="status">
+                    显示 {visibleLogs.length} / {logs.length} 条日志
+                  </p>
+                )}
+                {detail !== null && visibleLogs.length === 0 ? (
+                  <SurfaceEmpty
+                    title={logs.length === 0 ? '没有日志记录' : '没有匹配的日志'}
+                    hint={logs.length === 0 ? '此运行尚未记录执行日志。' : '试试其他关键词，或切换到全部级别。'}
+                  />
+                ) : (
+                  <div className="divide-y divide-rule">
+                    {visibleLogs.map((log) => (
+                      <div ref={log.id === lastErrorId ? errorRef : undefined} key={log.id}>
+                        <RunLogRow log={log} />
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </TabsContent>
+              <TabsContent value="variables">
+                {variables.length === 0 ? (
+                  !loading && <SurfaceEmpty title="没有变量快照" hint="此运行没有记录变量值。" />
+                ) : (
+                  <div className="divide-y divide-rule">
+                    {variables.map((variable) => (
+                      <VariableRow
+                        key={`${variable.category ?? ''}:${variable.scope}:${variable.name}`}
+                        variable={variable}
+                      />
+                    ))}
+                  </div>
+                )}
+              </TabsContent>
+            </DialogBody>
+          </Tabs>
+          <DialogFooter className="flex-wrap px-4 sm:px-5">
+            <time
+              className="mr-auto text-[10px] tabular-nums text-ink-3"
+              dateTime={run.updatedAt}
+              title={run.updatedAt}
+            >
+              更新于 {formatDateTime(run.updatedAt)}
+            </time>
+            <Button disabled={loading} onClick={refresh} variant="outline">
+              <RefreshCcw
+                className={cn('h-3.5 w-3.5', loading && 'animate-spin motion-reduce:animate-none')}
+                strokeWidth={1.5}
+              />
+              {loading ? '读取中…' : '刷新记录'}
+            </Button>
+            <Button onClick={() => handleOpenChange(false)} variant="primary">
+              关闭
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <ArtifactPreviewDialog
+        artifact={preview?.artifact ?? null}
+        content={preview?.content ?? null}
+        loading={preview !== null && preview.content === null}
+        onOpenChange={(next) => {
+          if (!next) closePreview();
+        }}
+        open={preview !== null}
+      />
     </>
   );
 }
 
-// 长 detail（多为完整异常栈）默认折叠，避免和顶部错误摘要重复刷屏；点击就地展开看全文，右侧可整条复制。
+function RunNotice({
+  title,
+  message,
+  warning = false,
+}: {
+  title: string;
+  message: string;
+  warning?: boolean;
+}): ReactElement {
+  return (
+    <div
+      className={cn(
+        'flex items-start gap-2 rounded-md px-3 py-2.5',
+        warning ? 'bg-amber-50 text-amber-800' : 'bg-red-50 text-red-700',
+      )}
+    >
+      <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" strokeWidth={1.5} />
+      <div className="min-w-0 flex-1">
+        <div className="text-[11px] font-semibold">{title}</div>
+        <p className="mt-1 whitespace-pre-wrap text-[11px] leading-5 [overflow-wrap:anywhere]">{message}</p>
+      </div>
+      <CopyButton
+        className={warning ? 'text-amber-800' : 'text-red-700'}
+        text={message}
+        title={warning ? '复制操作提示' : '复制错误'}
+      />
+    </div>
+  );
+}
+
 function RunLogRow({ log }: { log: BackendTaskLogEntry }): ReactElement {
   const [expanded, setExpanded] = useState(false);
-  const tone = logLevelTone(log.level);
-  const hasDetail = log.detail !== null && log.detail !== undefined && log.detail.length > 0;
-  const fullText = hasDetail ? `${log.message}\n${log.detail}` : log.message;
+  const tone = getLogTone((Object.hasOwn(LOG_LEVEL_LABELS, log.level) ? log.level : 'info') as RunLogLevel);
+  const hasDetail = Boolean(log.detail);
   return (
-    <div className={cn('grid grid-cols-[68px_56px_minmax(0,1fr)_auto] items-start gap-2 px-3 py-1.5 text-[11px]', tone.row)}>
-      <time className="font-mono tabular-nums text-ink-3">{formatDateTime(log.time).slice(11)}</time>
-      <span className={cn('flex items-center gap-1.5 font-medium', tone.text)}>
-        <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', tone.dot)} />
-        {logLevelLabel(log.level)}
+    <div
+      className={cn(
+        'grid grid-cols-[minmax(0,1fr)_24px] gap-1 rounded-md px-2 py-2.5 text-[11px] sm:grid-cols-[64px_56px_minmax(0,1fr)_24px] sm:gap-2',
+        tone.row,
+      )}
+    >
+      <time className="hidden font-mono tabular-nums text-ink-3 sm:block" title={log.time}>
+        {formatLogTime(log.time)}
+      </time>
+      <span className={cn('hidden font-medium sm:block', tone.text)}>
+        {LOG_LEVEL_LABELS[log.level as RunLogLevel] ?? log.level}
       </span>
       <div className="min-w-0">
+        <div className="mb-1 flex flex-wrap gap-x-2 gap-y-0.5 text-[10px] text-ink-3">
+          <span className="sm:hidden">
+            {formatLogTime(log.time)} · {LOG_LEVEL_LABELS[log.level as RunLogLevel] ?? log.level}
+          </span>
+          {log.nodeId && <span className="break-all font-mono">节点 {log.nodeId}</span>}
+        </div>
         {hasDetail ? (
           <>
             <button
               aria-expanded={expanded}
               aria-label={expanded ? '收起日志详情' : '展开日志详情'}
-              className="flex w-full min-w-0 items-start gap-1 text-left text-ink-2"
+              className="flex w-full min-w-0 items-start gap-1 rounded-sm text-left text-ink-2"
               onClick={() => setExpanded((value) => !value)}
               type="button"
             >
-              <ChevronRight className={cn('mt-0.5 h-3 w-3 shrink-0 text-ink-4 transition-transform', expanded && 'rotate-90')} strokeWidth={1.5} />
-              <span className="min-w-0 flex-1 break-words">{log.message}</span>
+              <ChevronRight
+                className={cn(
+                  'mt-0.5 h-3 w-3 shrink-0 text-ink-3 transition-transform motion-reduce:transition-none',
+                  expanded && 'rotate-90',
+                )}
+                strokeWidth={1.5}
+              />
+              <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">{log.message}</span>
             </button>
-            {expanded && <pre className="mt-1 ml-4 whitespace-pre-wrap break-words font-mono text-[11px] text-ink-3">{log.detail}</pre>}
+            {expanded && (
+              <pre className="mt-2 whitespace-pre-wrap font-mono text-[11px] leading-5 text-ink-2 [overflow-wrap:anywhere]">
+                {log.detail}
+              </pre>
+            )}
           </>
         ) : (
-          <span className="block min-w-0 break-words text-ink-2">{log.message}</span>
+          <p className="text-ink-2 [overflow-wrap:anywhere]">{log.message}</p>
         )}
       </div>
-      <div className="flex items-start">{hasDetail && <CopyButton text={fullText} title="复制日志" />}</div>
+      <CopyButton text={hasDetail ? `${log.message}\n${log.detail}` : log.message} title="复制日志" />
     </div>
   );
 }
 
-function InfoRow({ children, label, mono, value }: {
-  children?: ReactElement;
-  label: string;
-  mono?: boolean;
-  value?: string;
-}): ReactElement {
+function VariableRow({ variable }: { variable: RuntimeVariable }): ReactElement {
+  const protectedValue = variable.sensitive || variable.category === 'credential';
   return (
-    <div className="flex items-center justify-between rounded-md bg-paper-sunk px-3 py-2 text-[11px]">
-      <span className="shrink-0 text-ink-3">{label}</span>
-      {children ?? (
-        <span className={mono ? 'max-w-40 truncate font-mono text-ink-2' : 'font-medium text-ink-2'}>{value ?? '--'}</span>
+    <div className="py-3">
+      <div className="mb-1.5 flex flex-wrap items-center gap-2">
+        <span className="break-all font-mono text-[11px] font-medium text-ink-2">{variable.name}</span>
+        <span className="text-[10px] text-ink-3">
+          {variable.type} · {variable.scope}
+        </span>
+      </div>
+      {protectedValue ? (
+        <span className="inline-flex items-center gap-1.5 text-[11px] text-ink-3">
+          <LockKeyhole className="h-3 w-3" strokeWidth={1.5} />
+          •••••••• · 敏感值已隐藏
+        </span>
+      ) : (
+        <details className="rounded-md bg-paper px-3 py-2">
+          <summary className="cursor-pointer truncate font-mono text-[11px] text-ink-3" title="展开查看完整变量值">
+            {variable.value.length > 120 ? `${variable.value.slice(0, 120)}…` : variable.value || '（空值）'}
+          </summary>
+          <div className="mt-2 flex items-start gap-2 border-t border-rule pt-2">
+            <pre className="min-w-0 flex-1 whitespace-pre-wrap font-mono text-[11px] leading-5 text-ink-2 [overflow-wrap:anywhere]">
+              {variable.value}
+            </pre>
+            <CopyButton text={variable.value} title={`复制变量 ${variable.name}`} />
+          </div>
+        </details>
       )}
     </div>
   );
 }
 
-function formatDateTime(value: string): string {
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) return value;
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+function formatLogTime(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleTimeString('zh-CN', { hour12: false });
 }
-
-function p(n: number): string { return String(n).padStart(2, '0'); }
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
