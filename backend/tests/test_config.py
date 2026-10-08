@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.core.config import load_settings
+from app.core.config import Settings, load_settings
 
 
 def test_load_settings_supports_redis_queue(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -48,6 +48,16 @@ def test_load_settings_creates_default_sqlite_parent_dir(monkeypatch: pytest.Mon
 
     assert settings.database_url == f"sqlite+aiosqlite:///{app_data_dir / 'db' / 'rpa.sqlite3'}"
     assert (app_data_dir / "db").is_dir()
+    defaults = Settings()
+    assert defaults.database_url == settings.database_url
+    assert defaults.flow_store_backend == defaults.task_store_backend == defaults.schedule_store_backend == "sqlalchemy"
+
+
+@pytest.mark.parametrize("name", ["RPA_FLOW_STORE_BACKEND", "RPA_TASK_STORE_BACKEND", "RPA_SCHEDULE_STORE_BACKEND"])
+def test_load_settings_rejects_memory_storage(name, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(name, "memory")
+    with pytest.raises(ValueError, match=name):
+        load_settings()
 
 
 def test_load_settings_rejects_invalid_queue_backend(monkeypatch: pytest.MonkeyPatch) -> None:

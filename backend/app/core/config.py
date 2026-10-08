@@ -13,6 +13,12 @@ _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 BackendName = TypeVar("BackendName", bound=str)
 
 
+def _default_sqlite_database_url() -> str:
+    database_path = storage.resolve_database_path()
+    Path(database_path).parent.mkdir(parents=True, exist_ok=True)
+    return f"sqlite+aiosqlite:///{database_path}"
+
+
 @dataclass(frozen=True)
 class Settings:
     """所有路径默认在 ~/.easy-rpa 下，可用 RPA_* 环境变量覆盖。"""
@@ -21,10 +27,10 @@ class Settings:
     task_queue_backend: Literal["memory", "redis"] = "memory"
     redis_url: str = "redis://127.0.0.1:6379/0"
     task_queue_name: str = "rpa:tasks"
-    flow_store_backend: Literal["memory", "sqlalchemy"] = "memory"
-    task_store_backend: Literal["memory", "sqlalchemy"] = "memory"
-    schedule_store_backend: Literal["memory", "sqlalchemy"] = "memory"
-    database_url: str = "postgresql+asyncpg://rpa:rpa@127.0.0.1:5432/rpa"
+    flow_store_backend: Literal["sqlalchemy"] = "sqlalchemy"
+    task_store_backend: Literal["sqlalchemy"] = "sqlalchemy"
+    schedule_store_backend: Literal["sqlalchemy"] = "sqlalchemy"
+    database_url: str = field(default_factory=_default_sqlite_database_url)
     artifact_store_backend: Literal["local", "minio"] = "local"
     artifact_minio_endpoint: str = "127.0.0.1:9000"
     artifact_minio_access_key: str = "minioadmin"
@@ -53,9 +59,9 @@ def load_settings() -> Settings:
         task_queue_backend=_read_queue_backend("RPA_TASK_QUEUE_BACKEND", default="memory"),
         redis_url=os.getenv("RPA_REDIS_URL", "redis://127.0.0.1:6379/0"),
         task_queue_name=os.getenv("RPA_TASK_QUEUE_NAME", "rpa:tasks").strip() or "rpa:tasks",
-        flow_store_backend=_read_backend("RPA_FLOW_STORE_BACKEND", default="sqlalchemy", allowed={"memory", "sqlalchemy"}),
-        task_store_backend=_read_backend("RPA_TASK_STORE_BACKEND", default="sqlalchemy", allowed={"memory", "sqlalchemy"}),
-        schedule_store_backend=_read_backend("RPA_SCHEDULE_STORE_BACKEND", default="sqlalchemy", allowed={"memory", "sqlalchemy"}),
+        flow_store_backend=_read_backend("RPA_FLOW_STORE_BACKEND", default="sqlalchemy", allowed={"sqlalchemy"}),
+        task_store_backend=_read_backend("RPA_TASK_STORE_BACKEND", default="sqlalchemy", allowed={"sqlalchemy"}),
+        schedule_store_backend=_read_backend("RPA_SCHEDULE_STORE_BACKEND", default="sqlalchemy", allowed={"sqlalchemy"}),
         database_url=database_url,
         artifact_store_backend=_read_backend("RPA_ARTIFACT_STORE_BACKEND", default="local", allowed={"local", "minio"}),
         artifact_minio_endpoint=os.getenv("RPA_MINIO_ENDPOINT", "127.0.0.1:9000"),
@@ -72,12 +78,6 @@ def load_settings() -> Settings:
         log_retention_days=_read_positive_int("RPA_LOG_RETENTION_DAYS", default=LOG_RETENTION_DAYS),
         log_module_levels=_read_module_levels("RPA_LOG_LEVELS"),
     )
-
-
-def _default_sqlite_database_url() -> str:
-    database_path = storage.resolve_database_path()
-    Path(database_path).parent.mkdir(parents=True, exist_ok=True)
-    return f"sqlite+aiosqlite:///{database_path}"
 
 
 def _read_module_levels(name: str) -> dict[str, str]:
