@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from sqlalchemy import BigInteger, Boolean, ForeignKey, Index, Integer, String, Text, case, delete, func, select
@@ -17,7 +17,7 @@ _UNFINISHED_TASK_STATUSES = ("queued", "running", "awaiting_confirmation")
 
 
 class TaskStore(Protocol):
-    async def save_task(self, task: TaskSnapshot, request: RunTaskRequest) -> TaskSnapshot: ...
+    async def save_task(self, task: TaskSnapshot, request: RunTaskRequest, *, replace_variables: bool = True, replace_artifacts: bool = True) -> TaskSnapshot: ...
 
     async def get_task(self, task_id: str) -> TaskSnapshot | None: ...
 
@@ -30,6 +30,8 @@ class TaskStore(Protocol):
     async def list_logs(self, task_id: str) -> list[TaskLogEntry] | None: ...
 
     async def list_variables(self, task_id: str) -> list[RuntimeVariableSnapshot] | None: ...
+
+    async def delete_artifacts(self, task_ids: list[str]) -> None: ...
 
     async def list_unfinished_tasks(self) -> list[TaskSnapshot]: ...
 
@@ -48,13 +50,33 @@ class TaskStoreRecord:
 
 
 class InMemoryTaskStore:
-    def __init__(self) -> None:
+    def __init__(self, *, history_limit: int = 200) -> None:
+        if history_limit < 1:
+            raise ValueError("history_limit 必须大于等于 1")
         self._tasks: dict[str, TaskStoreRecord] = {}
+        self._history_limit = history_limit
+        self._rate_samples: dict[str, tuple[str, str, datetime]] = {}
 
-    async def save_task(self, task: TaskSnapshot, request: RunTaskRequest) -> TaskSnapshot:
-        record = self._tasks.get(task.task_id)
+    async def save_task(self, task: TaskSnapshot, request: RunTaskRequest, *, replace_variables: bool = True, replace_artifacts: bool = True) -> TaskSnapshot:
+        record = self._tasks.pop(task.task_id, None)
         logs = record.logs if record is not None else []
         self._tasks[task.task_id] = TaskStoreRecord(request=request, snapshot=task, logs=logs)
+        if task.flow_id and task.status in {"success", "error", "stopped"}:
+            updated = task.updated_at if task.updated_at.tzinfo else task.updated_at.replace(tzinfo=UTC)
+            self._rate_samples[task.task_id] = (task.flow_id, task.status, updated)
+        else:
+            self._rate_samples.pop(task.task_id, None)
+        cutoff = datetime.now(UTC) - timedelta(days=30)
+        self._rate_samples = {task_id: sample for task_id, sample in self._rate_samples.items() if sample[2] >= cutoff}
+        if task.status not in _UNFINISHED_TASK_STATUSES:
+            # 普通终态详情按数量淘汰；调度记录保留，避免截断整批运行统计。
+            history = sorted(
+                (record.snapshot for record in reversed(self._tasks.values())
+                 if record.snapshot.status not in _UNFINISHED_TASK_STATUSES and record.snapshot.schedule_id is None),
+                key=lambda snapshot: snapshot.updated_at, reverse=True,
+            )
+            for expired in history[self._history_limit:]:
+                self._tasks.pop(expired.task_id)
         return task
 
     async def get_task(self, task_id: str) -> TaskSnapshot | None:
@@ -71,14 +93,11 @@ class InMemoryTaskStore:
 
     async def success_rates_since(self, since: datetime) -> dict[str, int]:
         counts: dict[str, list[int]] = {}
-        for record in self._tasks.values():
-            task = record.snapshot
-            updated = task.updated_at
-            if updated.tzinfo is None:
-                updated = updated.replace(tzinfo=UTC)
-            if task.flow_id and updated >= since and task.status in {"success", "error", "stopped"}:
-                totals = counts.setdefault(task.flow_id, [0, 0])
-                totals[0] += task.status == "success"
+        # 30 天成功率独立于详情保留数量，历史快照淘汰后仍计入统计。
+        for flow_id, status, updated in self._rate_samples.values():
+            if updated >= since:
+                totals = counts.setdefault(flow_id, [0, 0])
+                totals[0] += status == "success"
                 totals[1] += 1
         return {flow_id: round(successes / total * 100) for flow_id, (successes, total) in counts.items()}
 
@@ -99,6 +118,12 @@ class InMemoryTaskStore:
         if record is None:
             return None
         return list(record.snapshot.variables)
+
+    async def delete_artifacts(self, task_ids: list[str]) -> None:
+        for task_id in task_ids:
+            record = self._tasks.get(task_id)
+            if record is not None:
+                record.snapshot = record.snapshot.model_copy(update={"artifacts": []})
 
     async def list_unfinished_tasks(self) -> list[TaskSnapshot]:
         return [record.snapshot for record in self._tasks.values() if record.snapshot.status in _UNFINISHED_TASK_STATUSES]
@@ -124,7 +149,7 @@ class InMemoryTaskStore:
             update={"status": "stopped", "error": error, "confirmation_message": None, "updated_at": datetime.now(UTC)}
         )
         record.logs.append(log)
-        return record.snapshot
+        return await self.save_task(record.snapshot, record.request)
 
 
 class TaskRow(Base):
@@ -213,20 +238,23 @@ class SqlAlchemyTaskStore:
     async def close(self) -> None:
         await self._engine.dispose()
 
-    async def save_task(self, task: TaskSnapshot, request: RunTaskRequest) -> TaskSnapshot:
+    async def save_task(self, task: TaskSnapshot, request: RunTaskRequest, *, replace_variables: bool = True, replace_artifacts: bool = True) -> TaskSnapshot:
         async with self._session_factory() as session:
             row = await session.get(TaskRow, task.task_id)
             if row is None:
                 row = TaskRow(id=task.task_id)
                 session.add(row)
+                replace_variables = replace_artifacts = True
             self._apply_task(row, task, request)
-            # variables/artifacts 按整份快照全量替换而非增量 diff，避免节点重跑后残留旧值
-            await session.execute(delete(TaskVariableRow).where(TaskVariableRow.task_id == task.task_id))
-            for variable in task.variables:
-                session.add(self._to_variable_row(task, variable))
-            await session.execute(delete(ArtifactRow).where(ArtifactRow.task_id == task.task_id))
-            for artifact in task.artifacts:
-                session.add(self._to_artifact_row(task, artifact))
+            # 变化的集合仍整份替换，确保重跑或清空集合时不残留旧值。
+            if replace_variables:
+                await session.execute(delete(TaskVariableRow).where(TaskVariableRow.task_id == task.task_id))
+                for variable in task.variables:
+                    session.add(self._to_variable_row(task, variable))
+            if replace_artifacts:
+                await session.execute(delete(ArtifactRow).where(ArtifactRow.task_id == task.task_id))
+                for artifact in task.artifacts:
+                    session.add(self._to_artifact_row(task, artifact))
             await session.commit()
         return task
 
@@ -299,6 +327,13 @@ class SqlAlchemyTaskStore:
             result = await session.execute(delete(TaskRow).where(TaskRow.id == task_id))
             await session.commit()
             return (result.rowcount or 0) > 0
+
+    async def delete_artifacts(self, task_ids: list[str]) -> None:
+        if not task_ids:
+            return
+        async with self._session_factory() as session:
+            await session.execute(delete(ArtifactRow).where(ArtifactRow.task_id.in_(task_ids)))
+            await session.commit()
 
     async def list_unfinished_tasks(self) -> list[TaskSnapshot]:
         statement = select(TaskRow).where(TaskRow.status.in_(_UNFINISHED_TASK_STATUSES))

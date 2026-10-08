@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import json
 from typing import TYPE_CHECKING
 
 from app.models.schemas import FlowRunRequest, FlowSnapshot, RunMode, RunTaskRequest, TaskSnapshot
 from app.services.flow_definition import FlowDefinitionSelector
 from app.services.execution_evidence import definition_digest
-from app.services.runtime_variables import protected_variable_names
+from app.services.runtime_variables import build_input_variables, protected_variable_names
 from app.services.acceptance_contract import (
     contract_validation_errors,
     definition_variable_names,
@@ -79,6 +78,7 @@ class FlowRunService:
             definitionDigest=definition_digest(flow.definition),
             acceptanceContract=flow.acceptance_contract,
             sensitiveVariables=protected_variable_names(flow.input_variables),
+            inputVariables=flow.input_variables,
             mode=run_request.mode if run_request is not None else mode,
             # 调度触发时 run_request 实为携带 schedule_id 的 RunTaskRequest；重建请求时若不带过来，
             # 启动的 task 就与调度失联，批次终态无从聚合、非重叠也判不出。手动运行的 FlowRunRequest
@@ -88,7 +88,7 @@ class FlowRunService:
             # 这里填占位默认值，若存在 browser.fetch 节点会在下方被 build_request_for_fetch_node 覆盖。
             targetUrl="https://quotes.toscrape.com/",
             selector=".quote .text::text",
-            variables={**_build_initial_variables(flow), **overrides},
+            variables=build_input_variables(list(flow.input_variables), overrides),
             timeoutMs=run_request.timeout_ms if run_request is not None else 30_000,
             scope=scope,
             startNodeId=start_node_id,
@@ -101,37 +101,3 @@ class FlowRunService:
         if fetch_node is None:
             return base_request
         return FlowDefinitionSelector.build_request_for_fetch_node(base_request, fetch_node)
-
-
-def _build_initial_variables(flow: FlowSnapshot) -> dict[str, object]:
-    variables: dict[str, object] = {}
-    for variable in flow.input_variables:
-        if isinstance(variable, dict):
-            name = variable.get("name")
-            variable_type = variable.get("type")
-            value = variable.get("value")
-        else:
-            name = variable.name
-            variable_type = variable.type
-            value = variable.value
-
-        if not isinstance(name, str) or not isinstance(variable_type, str) or not isinstance(value, str):
-            continue
-        variables[name] = _parse_variable_value(variable_type, value)
-    return variables
-
-
-def _parse_variable_value(variable_type: str, value: str) -> object:
-    if variable_type == "Integer":
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return 0
-    if variable_type == "Boolean":
-        return value.strip().lower() == "true"
-    if variable_type in {"List", "Dict"}:
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError:
-            return value
-    return value

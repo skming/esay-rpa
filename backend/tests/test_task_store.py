@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+from sqlalchemy import event
+
 from app.models.schemas import ArtifactSnapshot, NodeExecutionEvidence, RunTaskRequest, RuntimeProgress, RuntimeVariableSnapshot, ScrapeResult, TaskLogEntry, TaskSnapshot
 from app.services.schedule_store import create_schedule_engine
 from app.services.log_broker import LogBroker
-from app.services.task_manager import TaskManager
-from app.services.task_store import SqlAlchemyTaskStore
+from app.services.task_manager import TaskManager, TaskRecord
+from app.services.task_store import InMemoryTaskStore, SqlAlchemyTaskStore
+from app.services.runtime_variables import RuntimeVariableStore
 from tests.test_task_manager import FakeRunner
 
 
@@ -49,6 +53,108 @@ def build_task_snapshot(task_id: str = "task-1") -> TaskSnapshot:
         createdAt=now,
         updatedAt=now,
     )
+
+
+async def test_progress_updates_do_not_rewrite_variable_or_artifact_rows(tmp_path) -> None:
+    engine = create_schedule_engine(f"sqlite+aiosqlite:///{tmp_path / 'partial.db'}")
+    store = SqlAlchemyTaskStore(engine)
+    await store.create_schema()
+    request = build_task_request()
+    artifact = ArtifactSnapshot(
+        artifactId="artifact-1", taskId="task-1", artifactType="dataset", filename="result.json",
+        storageUrl="file:///tmp/result.json", contentType="application/json", sizeBytes=2, createdAt=datetime.now(UTC),
+    )
+    snapshot = build_task_snapshot().model_copy(update={
+        "variables": [RuntimeVariableSnapshot(name="count", type="Integer", value="1", scope="全局")], "artifacts": [artifact],
+    })
+    statements = []
+    def capture(connection, cursor, statement, parameters, context, executemany):
+        statements.append(statement.lower())
+    try:
+        await store.save_task(snapshot, request, replace_variables=False, replace_artifacts=False)
+        record = TaskRecord(request=request, snapshot=snapshot, persisted_snapshot=snapshot, variables=RuntimeVariableStore.from_initial({"count": 1}))
+        manager = TaskManager(FakeRunner(), LogBroker(), task_store=store)
+        event.listen(engine.sync_engine, "before_cursor_execute", capture)
+        await manager._update_snapshot(record, progress=RuntimeProgress(currentStep=1, totalSteps=3, percent=10, elapsedMs=1))
+        assert not any("rpa_task_variables" in sql or "rpa_artifacts" in sql for sql in statements)
+        statements.clear()
+        record.variables.set("count", 2, scope="全局")
+        await manager._update_snapshot(record)
+        assert any(sql.startswith("delete from rpa_task_variables") for sql in statements)
+        assert not any("rpa_artifacts" in sql for sql in statements)
+        statements.clear()
+        await manager._update_snapshot(record, artifacts=[])
+        assert any(sql.startswith("delete from rpa_artifacts") for sql in statements)
+        assert not any("rpa_task_variables" in sql for sql in statements)
+        restored = await store.get_task(snapshot.task_id)
+        assert restored is not None
+        assert restored.variables[0].value == "2"
+        assert restored.artifacts == []
+        assert restored.progress.percent == 10
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", capture)
+        await engine.dispose()
+
+
+async def test_memory_history_is_bounded_without_dropping_active_tasks_or_success_rates() -> None:
+    store = InMemoryTaskStore(history_limit=2)
+    request = build_task_request()
+    await store.save_task(build_task_snapshot("active"), request)
+    updated = datetime.now(UTC)
+    for index in range(4):
+        await store.save_task(build_task_snapshot(str(index)).model_copy(update={"status": "success" if index == 0 else "error", "updated_at": updated}), request)
+    assert await store.get_task("active") is not None
+    assert await store.get_task("0") is None
+    assert await store.get_task("1") is None
+    assert await store.get_task("2") is not None
+    assert await store.get_task("3") is not None
+    assert len(await store.list_tasks()) == 3
+    from datetime import timedelta
+    assert await store.success_rates_since(datetime.now(UTC) - timedelta(days=30)) == {request.flow_id: 25}
+    with pytest.raises(ValueError):
+        InMemoryTaskStore(history_limit=0)
+
+
+async def test_memory_history_eviction_preserves_complete_schedule_batches() -> None:
+    store = InMemoryTaskStore(history_limit=1)
+    request = build_task_request().model_copy(update={"schedule_id": "schedule-1"})
+    since = datetime.now(UTC)
+    for index in range(3):
+        task = build_task_snapshot(f"scheduled-{index}").model_copy(update={
+            "schedule_id": request.schedule_id, "status": "error" if index == 0 else "success",
+        })
+        await store.save_task(task, request)
+    await store.save_task(build_task_snapshot("manual").model_copy(update={"status": "success"}), build_task_request())
+    batch = await store.list_schedule_batch_tasks(request.schedule_id, since)
+    assert len(batch) == 3
+    assert sum(task.status == "error" for task in batch) == 1
+
+
+async def test_snapshot_tracking_keeps_changes_made_during_persistence(tmp_path, monkeypatch) -> None:
+    engine = create_schedule_engine(f"sqlite+aiosqlite:///{tmp_path / 'interleaved.db'}")
+    store = SqlAlchemyTaskStore(engine)
+    await store.create_schema()
+    request = build_task_request()
+    variables = RuntimeVariableStore.from_initial({"count": 1})
+    snapshot = build_task_snapshot().model_copy(update={"variables": variables.snapshots()})
+    record = TaskRecord(request=request, snapshot=snapshot, persisted_snapshot=snapshot, variables=variables)
+    manager = TaskManager(FakeRunner(), LogBroker(), task_store=store)
+    save = store.save_task
+    async def interleaved_save(task, request, **options):
+        record.variables.set("count", 2)
+        record.snapshot = record.snapshot.model_copy(update={"variables": record.variables.snapshots()})
+        return await save(task, request, **options)
+    try:
+        await save(snapshot, request)
+        monkeypatch.setattr(store, "save_task", interleaved_save)
+        await manager._update_snapshot(record)
+        assert record.persisted_snapshot.variables[0].value == "1"
+        monkeypatch.setattr(store, "save_task", save)
+        await manager._update_snapshot(record)
+        restored = await store.get_task(snapshot.task_id)
+        assert restored.variables[0].value == "2"
+    finally:
+        await engine.dispose()
 
 
 async def test_schedule_start_failure_survives_task_manager_restart(tmp_path) -> None:

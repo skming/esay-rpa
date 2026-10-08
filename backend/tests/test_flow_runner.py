@@ -175,6 +175,21 @@ def test_flow_runner_protects_credential_category_without_sensitive_flag() -> No
     assert request.sensitive_variables == ["username"]
 
 
+async def test_saved_variable_declarations_override_stale_definition_metadata(tmp_path) -> None:
+    from app.services.artifact_store import LocalArtifactStore
+    from unittest.mock import AsyncMock
+    flow = build_flow().model_copy(update={
+        "input_variables": [RuntimeVariableSnapshot(name="code", type="String", value="123")],
+    })
+    flow.definition["inputVariables"] = [{"name": "code", "type": "Integer", "value": "123"}]
+    manager = TaskManager(FakeRunner(), LogBroker(), artifact_store=LocalArtifactStore(tmp_path))
+    manager._queue.enqueue = AsyncMock()
+    request = FlowRunService(manager)._build_task_request(flow, mode="run")
+    task = await manager.start_task(request)
+    assert manager._tasks[task.task_id].variables.get("code") == "123"
+    assert isinstance(manager._tasks[task.task_id].variables.get("code"), str)
+
+
 def test_every_node_type_offered_to_the_model_is_actually_runnable() -> None:
     """告诉模型「有这个节点」却跑不了，是最难查的一类故障。
 

@@ -9,6 +9,7 @@ describe('工具证据状态', () => {
     [{ error: 'invalid_arguments' }, 'error'],
     [{ status: 'blocking_lint_findings' }, 'blocked'],
     [{ status: 'blocked_extension_busy', error: 'busy' }, 'blocked'],
+    [{ status: 'invalid_input_variables', error: '输入变量 count 必须为有效的 Integer' }, 'blocked'],
     [{ passed: false }, 'error'],
     [{ status: 'success', acceptance_audit: { passed: false } }, 'error'],
     [{ status: 'success', acceptance_audit: { passed: true } }, 'done'],

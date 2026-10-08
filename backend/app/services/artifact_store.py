@@ -63,6 +63,8 @@ class ArtifactStore(Protocol):
 
     def list_task_artifacts(self, task_id: str) -> list[ArtifactSnapshot] | None: ...
 
+    def release_task(self, task_id: str) -> None: ...
+
     def read_artifact_content(self, task_id: str, artifact_id: str) -> ArtifactContent | None: ...
 
     def read_snapshot_content(self, artifact: ArtifactSnapshot) -> ArtifactContent | None: ...
@@ -164,6 +166,16 @@ class LocalArtifactStore:
 
     def list_task_artifacts(self, task_id: str) -> list[ArtifactSnapshot] | None:
         return list(self._artifacts.get(task_id, []))
+
+    def forget_run_artifacts(self, run_dirs: list[Path]) -> list[str]:
+        task_ids = [run_dir.name for run_dir in run_dirs if run_dir.resolve().parent.parent == self._artifact_root]
+        for task_id in task_ids:
+            self.release_task(task_id)
+        return task_ids
+
+    def release_task(self, task_id: str) -> None:
+        for artifact in self._artifacts.pop(task_id, []):
+            self._artifact_paths.pop(artifact.artifact_id, None)
 
     def read_artifact_content(self, task_id: str, artifact_id: str) -> ArtifactContent | None:
         artifact = next(
@@ -284,6 +296,10 @@ class MinioArtifactStore:
 
     def list_task_artifacts(self, task_id: str) -> list[ArtifactSnapshot] | None:
         return list(self._artifacts.get(task_id, []))
+
+    def release_task(self, task_id: str) -> None:
+        for artifact in self._artifacts.pop(task_id, []):
+            self._artifact_objects.pop(artifact.artifact_id, None)
 
     def read_artifact_content(self, task_id: str, artifact_id: str) -> ArtifactContent | None:
         artifact = next(

@@ -213,30 +213,6 @@ def _parse_runtime_value(value: Any) -> Any:
         return value
 
 
-def _build_input_variable_defaults(input_variables: list[Any]) -> dict[str, Any]:
-    """把流程声明的 input_variables 默认值转换成运行时变量。
-
-    AI 工具的 run_flow 会直接调用 TaskManager；如果不在这里合并默认值，
-    静态校验会认为变量已定义，但实际执行器的变量仓库里没有这些值。
-    """
-    defaults: dict[str, Any] = {}
-    for variable in input_variables:
-        if isinstance(variable, dict):
-            name = variable.get("name")
-            value = variable.get("value", variable.get("defaultValue", ""))
-        else:
-            name = getattr(variable, "name", None)
-            value = getattr(variable, "value", "")
-        if isinstance(name, str) and name.strip():
-            defaults[name.strip()] = _parse_runtime_value(value)
-    return defaults
-
-
-
-
-
-
-
 
 # 需求里出现这些词，说明用户明确要的是按行/按列的结构化数据
 _TABLE_REQUIREMENT_TOKENS = (

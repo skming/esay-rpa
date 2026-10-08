@@ -10,6 +10,53 @@ _VARIABLE_PATTERN = re.compile(r"\$\{var\.([A-Za-z_][A-Za-z0-9_.-]{0,119})\}")
 _MAX_TEMPLATE_RESOLUTION_DEPTH = 5  # 防止循环/过深嵌套的模板引用
 
 
+def parse_input_variable_value(variable_type: str, value: object, *, name: str) -> object:
+    parsed = value
+    if variable_type == "String" and isinstance(value, str):
+        return value
+    if variable_type == "Integer":
+        if isinstance(value, str) and re.fullmatch(r"[+-]?[0-9]+", value.strip()):
+            try:
+                parsed = int(value.strip())
+            except ValueError:
+                parsed = None
+        if type(parsed) is int and abs(parsed) <= 9_007_199_254_740_991:
+            return parsed
+    if variable_type == "Boolean":
+        if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+            return value.strip().lower() == "true"
+        if isinstance(value, bool):
+            return value
+    if variable_type in {"List", "Dict"}:
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except (ValueError, RecursionError):
+                parsed = None
+        expected = list if variable_type == "List" else dict
+        if isinstance(parsed, expected):
+            return parsed
+    # 输入值可能是凭据；错误只标出变量名和类型，不包含原值。
+    raise ValueError(f"输入变量 {name} 必须为有效的 {variable_type}")
+
+
+def build_input_variables(variables: list[object], overrides: dict[str, object] | None = None) -> dict[str, object]:
+    supplied = overrides or {}
+    result = dict(supplied)
+    for variable in variables:
+        if isinstance(variable, dict):
+            name, variable_type, value = variable.get("name"), variable.get("type"), variable.get("value", "")
+        else:
+            name, variable_type, value = getattr(variable, "name", None), getattr(variable, "type", None), getattr(variable, "value", "")
+        if not isinstance(name, str) or not isinstance(variable_type, str):
+            raise ValueError("输入变量缺少 name 或 type")
+        name = normalize_variable_name(name)
+        result[name] = parse_input_variable_value(variable_type, supplied.get(name, value), name=name)
+    if len(result) > 100:
+        raise ValueError("variables 最多支持 100 个变量")
+    return result
+
+
 def protected_variable_names(variables: list[object]) -> list[str]:
     """返回运行时不得默认暴露给脚本的变量名。"""
     protected: list[str] = []

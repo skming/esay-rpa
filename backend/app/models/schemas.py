@@ -428,6 +428,7 @@ class RunTaskRequest(ApiModel):
     definition_digest: str | None = Field(default=None, max_length=64)
     acceptance_contract: FlowAcceptanceContract = Field(default_factory=FlowAcceptanceContract)
     sensitive_variables: list[str] = Field(default_factory=list, max_length=100)
+    input_variables: list[RuntimeVariableSnapshot] | None = Field(default=None, max_length=100)
     variables: dict[str, object] = Field(default_factory=dict)
     timeout_ms: int = Field(default=30_000, ge=1_000, le=300_000)
     scope: RunScope = "full"

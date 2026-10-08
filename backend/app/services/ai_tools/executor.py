@@ -32,14 +32,13 @@ from app.services.ai_tools.diagnostics import (
     SELECTOR_MATCH_NOT_VISIBLE,
     SELECTOR_MULTI_MATCH_FIRST_NOT_ACTIONABLE,
     SELECTOR_ZERO_MATCH,
-    _build_input_variable_defaults,
     _build_run_root_cause_hints,
     build_navigation_trace,
     build_navigation_verdict,
     _find_swallowed_critical_failures,
 )
 from app.services.ai_tools.graph import _unreachable_node_ids
-from app.services.ai_tools.lint import _lint_flow, annotate_lint_findings
+from app.services.ai_tools.lint import _lint_flow, annotate_lint_findings, is_blocking_finding
 from app.services.ai_tools.lint_diff import ChangeContext, execution_signature, inspect_change
 from app.services.ai_tools.normalize import (
     _choose_layout_lane,
@@ -67,9 +66,10 @@ import app.services.ai_tools.page_session as _page_session
 from app.services.ai_tools.static_page_probe import inspect_static_page, snapshot_from_html
 from app.services.ai_tools.static_page_content import clear_static_snapshot, read_static_snapshot
 from app.services.ai_tools.variables import _RUNTIME_BUILTINS, _collect_defined_vars, _validate_variable_refs
-from app.services.runtime_variables import protected_variable_names
+from app.services.runtime_variables import build_input_variables, protected_variable_names
 
 if TYPE_CHECKING:
+    from app.models.schemas import FlowSnapshot
     from app.services.flow_service import FlowService
     from app.services.scheduler_service import ScheduleService
     from app.services.task_manager import TaskManager
@@ -384,8 +384,6 @@ class RpaToolExecutor:
                 return await self._apply_node_fix(**args, change_context=change_context)
             case "set_acceptance_contract":
                 return await self._set_acceptance_contract(**args)
-            case "publish_flow":
-                return await self._publish_flow(**args)
             case "get_run_output":
                 return await self._get_run_output(**args)
             case "audit_run":
@@ -1022,6 +1020,7 @@ class RpaToolExecutor:
             "revision": updated.revision,
             "node_count": len(nodes),
             "edge_count": len(edges),
+            "execution_changed": execution_signature(flow.definition) != execution_signature(definition),
         }
         if change.tracked_field_changes:
             # 编排层据此记修复台账。取自 before/after 而不是调用参数：
@@ -1415,6 +1414,14 @@ class RpaToolExecutor:
                 "hint": "请先让用户在输入变量面板填写默认值，或在 create_schedule 的 variables 参数中提供。",
             }
 
+        try:
+            merged_variables = build_input_variables(list(flow.input_variables), run_variables)
+        except ValueError as exc:
+            return {"status": "invalid_input_variables", "error": str(exc)}
+        block = self._run_definition_block(flow, merged_variables)
+        if block is not None:
+            return {"error": "schedule_not_ready", **block}
+
         effective_executor = browser_executor or getattr(flow, "default_browser_executor", None) or "playwright"
         try:
             request = ScheduleCreateRequest(
@@ -1462,6 +1469,50 @@ class RpaToolExecutor:
         result = self._schedule_brief(snapshot)
         result["message"] = f"定时任务已{'启用' if enabled else '停用'}。"
         return result
+
+    @staticmethod
+    def _run_definition_block(
+        flow: FlowSnapshot, merged_variables: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        nodes: list[Any] = flow.definition.get("nodes", [])
+        edges: list[Any] = flow.definition.get("edges", [])
+        input_var_names = [iv.name for iv in flow.input_variables]
+        all_var_names = input_var_names + list(merged_variables)
+        lint_findings = _lint_flow(nodes, edges, input_variable_names=all_var_names)
+        blocking = [finding for finding in lint_findings if is_blocking_finding(finding)]
+        if blocking:
+            return {
+                "status": "blocking_lint_findings",
+                "lint_findings": blocking[:12],
+                "message": (
+                    "流程存在阻断级静态检查问题，已阻止运行。"
+                    "请按 lint_findings 修复变量字段、条件表达式、分支连线或节点配置后重试。"
+                ),
+            }
+        issues = _validate_variable_refs(nodes, all_var_names)
+        if issues:
+            return {
+                "status": "undefined_variable_refs",
+                "undefined_refs": issues,
+                "message": (
+                    "流程存在节点引用了未定义变量，已阻止运行。"
+                    "明细就在 undefined_refs 里，请用 apply_node_fix 或 update_flow 修复后重试。"
+                ),
+            }
+        contract_errors = contract_validation_errors(
+            flow.acceptance_contract,
+            defined_variables=set(_collect_defined_vars(nodes, input_var_names)),
+            input_values=merged_variables,
+            pagination_caps=pagination_caps_from_nodes(nodes),
+        )
+        if contract_errors:
+            return {
+                "status": "blocking_acceptance_contract",
+                "contract_errors": contract_errors,
+                "message": "流程缺少完整、可追溯的验收契约，已在启动浏览器前阻止运行。",
+            }
+
+        return None
 
     async def _run_flow(
         self,
@@ -1547,8 +1598,7 @@ class RpaToolExecutor:
             }
 
         # 凭据为空时运行必然失败，且失败现场看起来像选择器问题，助手会一路查错方向。
-        # 注意判据必须基于「调用方真的传了什么」：_build_input_variable_defaults 会把每个
-        # 声明过的变量名都塞进 merged_variables（值可能是空串），拿合并结果判空永远判不出来。
+        # 判据基于调用方实际提供的值，不把合并后的空默认值视为已提供输入。
         readiness = self._credential_readiness(flow, supplied=set(variables or {}))
         if not readiness["ready"]:
             return {
@@ -1561,14 +1611,13 @@ class RpaToolExecutor:
                 ),
             }
 
-        # 模型常在 input_variables 无默认值时也不传 variables，导致运行中途报"变量未定义"，这里提前拦截
-        input_defaults = _build_input_variable_defaults(list(flow.input_variables))
-        merged_variables: dict[str, Any] = {**input_defaults, **(variables or {})}
-        supplied = set(merged_variables.keys())
+        protected_names = set(protected_variable_names(list(flow.input_variables)))
         missing_vars = [
-            {"name": iv.name, "category": getattr(iv, "category", "credential")}
+            {"name": iv.name, "category": iv.category}
             for iv in flow.input_variables
-            if not (iv.value or "").strip() and iv.name not in supplied
+            if iv.name not in protected_names
+            and not iv.value.strip()
+            and (iv.name not in (variables or {}) or (variables or {})[iv.name] in (None, ""))
         ]
         if missing_vars:
             return {
@@ -1590,43 +1639,14 @@ class RpaToolExecutor:
                 ),
             }
 
-        nodes: list[Any] = flow.definition.get("nodes", [])
-        edges: list[Any] = flow.definition.get("edges", [])
-        input_var_names = [iv.name for iv in flow.input_variables]
-        all_var_names = input_var_names + [k for k in merged_variables]
-        lint_findings = _lint_flow(nodes, edges, input_variable_names=all_var_names)
-        lint_errors = [finding for finding in lint_findings if finding.get("severity") == "error"]
-        if lint_errors:
-            return {
-                "status": "blocking_lint_findings",
-                "lint_findings": lint_errors[:12],
-                "message": (
-                    "流程存在阻断级静态检查错误，已阻止运行。"
-                    "请按 lint_findings 修复变量字段、条件表达式、分支连线或节点配置后重试。"
-                ),
-            }
-        issues = _validate_variable_refs(nodes, all_var_names)
-        if issues:
-            return {
-                "status": "undefined_variable_refs",
-                "undefined_refs": issues,
-                "message": (
-                    "流程存在节点引用了未定义变量，已阻止运行。"
-                    "明细就在 undefined_refs 里，请用 apply_node_fix 或 update_flow 修复后重试。"
-                ),
-            }
-        contract_errors = contract_validation_errors(
-            flow.acceptance_contract,
-            defined_variables=set(_collect_defined_vars(nodes, input_var_names)),
-            input_values=merged_variables,
-            pagination_caps=pagination_caps_from_nodes(nodes),
-        )
-        if contract_errors:
-            return {
-                "status": "blocking_acceptance_contract",
-                "contract_errors": contract_errors,
-                "message": "流程缺少完整、可追溯的验收契约，已在启动浏览器前阻止运行。",
-            }
+        try:
+            merged_variables = build_input_variables(list(flow.input_variables), variables)
+        except ValueError as exc:
+            return {"status": "invalid_input_variables", "error": str(exc)}
+
+        block = self._run_definition_block(flow, merged_variables)
+        if block is not None:
+            return block
 
         req = RunTaskRequest(
             flow_id=flow_id,
@@ -1635,7 +1655,8 @@ class RpaToolExecutor:
             flow_revision=flow.revision,
             acceptance_contract=flow.acceptance_contract,
             sensitive_variables=protected_variable_names(flow.input_variables),
-            variables={k: str(v) for k, v in merged_variables.items()},
+            input_variables=flow.input_variables,
+            variables=merged_variables,
             browser_executor=browser_executor,
         )
         task = await self._task_manager.start_task(req)
@@ -2185,12 +2206,6 @@ class RpaToolExecutor:
         else:
             result["lint_clean"] = True
         return result
-
-    async def _publish_flow(self, flow_id: str) -> dict[str, Any]:
-        result = await self._flow_service.set_flow_status(flow_id, "active")
-        if result is None:
-            return {"error": f"流程 {flow_id} 不存在"}
-        return {"flow_id": flow_id, "status": result.status}
 
     async def _set_acceptance_contract(
         self,

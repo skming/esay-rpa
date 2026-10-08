@@ -44,7 +44,7 @@ export function toolResultStatus(value: unknown): ToolCallState['status'] {
   const status = typeof result.status === 'string' ? result.status : '';
   if (status.startsWith('blocked_') || status.startsWith('blocking_') || [
     'extension_not_connected', 'extension_disabled', 'empty_credential_variables',
-    'missing_run_variables', 'misplaced_call_parameters', 'undefined_variable_refs',
+    'missing_run_variables', 'invalid_input_variables', 'misplaced_call_parameters', 'undefined_variable_refs',
   ].includes(status)) return 'blocked';
   if (status === 'stopped') return 'stopped';
   if (result.error || ['error', 'failed', 'timeout'].includes(status)

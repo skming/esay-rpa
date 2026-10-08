@@ -21,6 +21,32 @@ def _generate(flow_name: str, flow: dict) -> object:
     )
 
 
+@pytest.mark.parametrize(("variable_type", "value", "expected"), [
+    ("String", "123", "123"), ("Integer", "12", 12), ("Boolean", "false", False),
+    ("List", '[1, "2"]', [1, "2"]), ("Dict", '{"count": 2}', {"count": 2}),
+])
+def test_exported_inputs_preserve_declared_types(variable_type, value, expected) -> None:
+    script = _generate("typed-inputs", {
+        "inputVariables": [{"name": "input", "type": variable_type, "value": value}],
+        "nodes": [{"id": "start", "type": "start"}], "edges": [],
+    })
+    actual = _exec_script(script.content)["VARIABLES"]["input"]
+    assert actual == expected
+    assert type(actual) is type(expected)
+
+
+@pytest.mark.parametrize(("variable_type", "value"), [
+    ("Integer", "secret-invalid"), ("Boolean", "yes"), ("List", "{}"), ("Dict", "[]"),
+])
+def test_export_rejects_invalid_inputs_without_exposing_values(variable_type, value) -> None:
+    with pytest.raises(ValueError) as error:
+        _generate("invalid-inputs", {
+            "inputVariables": [{"name": "input", "type": variable_type, "value": value}],
+            "nodes": [{"id": "start", "type": "start"}], "edges": [],
+        })
+    assert str(error.value) == f"输入变量 input 必须为有效的 {variable_type}"
+
+
 def test_generate_full_flow_scrapling_script_is_valid_python() -> None:
     script = _generate(
         "订单自动处理",

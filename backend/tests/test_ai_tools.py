@@ -960,6 +960,50 @@ async def test_run_flow_rejects_call_parameters_smuggled_into_variables() -> Non
     assert task_manager.started is False
 
 
+@pytest.mark.parametrize("supplied", [None, {}, {"date_start": ""}, {"date_start": None}])
+async def test_run_flow_rejects_missing_business_inputs_before_execution(supplied) -> None:
+    manager = FakeTaskManager(with_failing_tasks=False)
+    executor = RpaToolExecutor(
+        _CredentialFlowService([_cred("date_start", category="flow")], reference="${var.date_start}"), manager,
+    )
+    result = await executor._run_flow("flow-1", variables=supplied)
+    assert result["status"] == "missing_run_variables"
+    assert result["missing_variables"] == ["date_start"]
+    assert manager.started is False
+
+
+async def test_ai_run_preserves_declared_input_types() -> None:
+    from unittest.mock import AsyncMock
+    manager = FakeTaskManager(with_failing_tasks=False)
+    manager.start_task = AsyncMock(wraps=manager.start_task)
+    executor = RpaToolExecutor(
+        _CredentialFlowService([
+            _cred("code", "123", category="flow"),
+            {"name": "items", "type": "List", "value": '[1, "2"]'},
+            {"name": "count", "type": "Integer", "value": "3"},
+        ], reference="${var.code}"), manager,
+    )
+    await executor._run_flow("flow-1")
+    request = manager.start_task.call_args.args[0]
+    assert request.variables == {"code": "123", "items": [1, "2"], "count": 3}
+
+
+@pytest.mark.parametrize("tool", ["run_flow", "create_schedule"])
+async def test_ai_execution_entrypoints_reject_invalid_typed_inputs(tool) -> None:
+    manager = FakeTaskManager(with_failing_tasks=False)
+    schedules = FakeScheduleService()
+    flow = _make_flow_snapshot(input_variables=[{"name": "count", "type": "Integer", "value": "12abc"}])
+    executor = RpaToolExecutor(FakeScheduleFlowService(flow), manager, schedules)
+    args = {"flow_id": flow.flow_id}
+    if tool == "create_schedule":
+        args["cron_expression"] = "0 9 * * *"
+    result = await executor.execute(tool, args)
+    assert result["status"] == "invalid_input_variables"
+    assert "12abc" not in result["error"]
+    assert manager.started is False
+    assert schedules.created_request is None
+
+
 async def test_run_flow_blocks_when_another_run_holds_the_browser_profile() -> None:
     """浏览器被占用时若照常起跑，失败现场是一屏 Chrome 启动参数，模型会当成 selector 问题去改流程。"""
     from app.core import storage
@@ -1973,6 +2017,28 @@ async def test_ai_schedule_rejects_unrunnable_definitions(failure) -> None:
     executor = RpaToolExecutor(FakeScheduleFlowService(flow), FakeTaskManager(with_failing_tasks=False), schedules)
     result = await executor.execute("create_schedule", {"flow_id": flow.flow_id, "cron_expression": "0 9 * * *"})
     assert result["error"] == "schedule_not_ready"
+    assert schedules.created_request is None
+
+
+@pytest.mark.parametrize("tool_name", ["run_flow", "create_schedule"])
+async def test_ai_execution_entrypoints_reject_blocking_warnings(monkeypatch, tool_name) -> None:
+    from app.services.ai_tools import executor as executor_module
+
+    finding = {"severity": "warn", "issue": "unread_node_field"}
+    monkeypatch.setattr(executor_module, "_lint_flow", lambda *args, **kwargs: [finding])
+    flow = _make_flow_snapshot()
+    manager = FakeTaskManager(with_failing_tasks=False)
+    schedules = FakeScheduleService()
+    executor = RpaToolExecutor(FakeScheduleFlowService(flow), manager, schedules)
+    args = {"flow_id": flow.flow_id}
+    if tool_name == "create_schedule":
+        args["cron_expression"] = "0 9 * * *"
+
+    result = await executor.execute(tool_name, args)
+
+    assert result["status"] == "blocking_lint_findings"
+    assert result["lint_findings"] == [finding]
+    assert manager.started is False
     assert schedules.created_request is None
 
 

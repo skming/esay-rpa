@@ -2058,6 +2058,7 @@ _RUN_NOT_STARTED_STATUSES = frozenset({
     "extension_disabled",
     "empty_credential_variables",
     "missing_run_variables",
+    "invalid_input_variables",
     "misplaced_call_parameters",
     "blocking_lint_findings",
     "undefined_variable_refs",

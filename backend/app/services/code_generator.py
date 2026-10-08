@@ -12,6 +12,7 @@ from app.services.flow_loop import (
     read_repeat_until_expression,
     split_loop_edges,
 )
+from app.services.runtime_variables import parse_input_variable_value
 
 _INDENT = "    "
 # 凭据不写进脚本，改由环境变量注入。前缀是为了在用户的 shell 里与其它变量区分开。
@@ -701,7 +702,7 @@ class ScraplingCodeGenerator:
             if self._is_sensitive(item):
                 credentials[name] = self._env_key(name, used_env_keys)
                 continue
-            variables[name] = self._parse_variable_value(str(item.get("value") or ""), str(item.get("type") or "String"))
+            variables[name] = parse_input_variable_value(str(item.get("type") or "String"), item.get("value", ""), name=name)
         return variables, credentials
 
     def _is_sensitive(self, item: dict[str, Any]) -> bool:
@@ -719,21 +720,6 @@ class ScraplingCodeGenerator:
             suffix += 1
         used.add(key)
         return key
-
-    def _parse_variable_value(self, value: str, value_type: str) -> Any:
-        if value_type == "Integer":
-            try:
-                return int(value)
-            except ValueError:
-                return 0
-        if value_type == "Boolean":
-            return value.strip().lower() in {"true", "1", "yes", "y", "是"}
-        if value_type in {"List", "Dict"}:
-            try:
-                return json.loads(value)
-            except json.JSONDecodeError:
-                return [] if value_type == "List" else {}
-        return value
 
     # ---------- 杂项 ----------
 

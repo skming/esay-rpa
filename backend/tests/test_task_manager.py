@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -9,16 +10,18 @@ from typing import Any
 
 import pytest
 
-from app.models.schemas import RunTaskRequest, RuntimeProgress, ScrapeResult, TaskSnapshot
+from app.core import storage
+from app.models.schemas import RunTaskRequest, RuntimeProgress, RuntimeVariableSnapshot, ScrapeResult, TaskLogEntry, TaskSnapshot
 from app.services import browser_profile_lock
-from app.services.artifact_store import LocalArtifactStore
+from app.services.artifact_store import LocalArtifactStore, MinioArtifactStore
 from app.services.extension_bridge_service import ExtensionActionOutcomeUnknown
 from app.services.file_action_runner import FileActionRunner
 from app.services.log_broker import LogBroker
 from app.services.scrapling_runner import LogCallback
 from app.services.script_action_runner import ScriptActionRunner
-from app.services.task_manager import TaskManager
-from app.services.task_store import InMemoryTaskStore
+from app.services.schedule_store import create_schedule_engine
+from app.services.task_manager import TaskManager, TaskRecord
+from app.services.task_store import InMemoryTaskStore, SqlAlchemyTaskStore
 
 
 class LocalApiHandler(BaseHTTPRequestHandler):
@@ -70,6 +73,136 @@ class FakeRunner:
         return ScrapeResult(url=str(request.target_url), selector=request.selector, count=1, values=["hello"])
 
 
+@pytest.mark.parametrize("status", ["success", "error", "stopped"])
+@pytest.mark.parametrize("artifact_backend", ["local", "minio"])
+async def test_terminal_tasks_release_memory_after_persistence_and_cleanup(tmp_path, status, artifact_backend) -> None:
+    from tests.test_artifact_store import FakeMinioClient
+    engine = create_schedule_engine(f"sqlite+aiosqlite:///{tmp_path / 'finished.db'}")
+    store = SqlAlchemyTaskStore(engine)
+    await store.create_schema()
+    artifacts = LocalArtifactStore(tmp_path) if artifact_backend == "local" else MinioArtifactStore(FakeMinioClient(), bucket="test")
+    runner = FakeRunner() if status == "success" else AlwaysFailingRunner() if status == "error" else SlowRunner()
+    manager = TaskManager(runner, LogBroker(), task_store=store, artifact_store=artifacts)
+    try:
+        snapshot = await manager.start_task(RunTaskRequest(
+            flowName="recycle", targetUrl="https://example.com", selector="h1",
+            flowDefinition={"nodes": [{"id": "fetch", "type": "browser.fetch", "targetUrl": "https://example.com", "selector": "h1"}], "edges": []},
+        ))
+        record = manager._tasks[snapshot.task_id]
+        if status == "stopped":
+            while not runner.started:
+                await asyncio.sleep(0)
+            await manager.stop_task(snapshot.task_id)
+        await asyncio.wait_for(record.done_waiter.wait(), timeout=5)
+        assert snapshot.task_id not in manager._tasks
+        assert artifacts.list_task_artifacts(snapshot.task_id) == []
+        restored = await manager.get_task(snapshot.task_id)
+        assert restored is not None and restored.status == status
+        assert await manager.get_logs(snapshot.task_id)
+        assert await manager.get_variables(snapshot.task_id)
+        assert (await manager.stop_task(snapshot.task_id)).status == status
+        if status == "success":
+            assert len(restored.artifacts) == 1
+            assert await manager.get_artifact_content(snapshot.task_id, restored.artifacts[0].artifact_id) is not None
+    finally:
+        await manager.stop_workers()
+        await engine.dispose()
+
+
+async def test_failed_terminal_persistence_keeps_task_record(tmp_path) -> None:
+    from unittest.mock import AsyncMock
+    class FailingStore(InMemoryTaskStore):
+        async def save_task(self, task, request, **options):
+            if task.status in {"success", "error", "stopped"}:
+                raise RuntimeError("database unavailable")
+            return await super().save_task(task, request, **options)
+    store = FailingStore()
+    manager = TaskManager(FakeRunner(), LogBroker(), task_store=store, artifact_store=LocalArtifactStore(tmp_path))
+    manager._queue.enqueue = AsyncMock()
+    snapshot = await manager.start_task(RunTaskRequest(
+        flowName="persist-failure", targetUrl="https://example.com", selector="h1",
+        flowDefinition={"nodes": [{"id": "fetch", "type": "browser.fetch", "targetUrl": "https://example.com", "selector": "h1"}], "edges": []},
+    ))
+    record = manager._tasks[snapshot.task_id]
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        await manager._run_record(snapshot.task_id)
+    assert manager._tasks[snapshot.task_id] is record
+    assert record.done_waiter.is_set()
+    assert record.persisted_snapshot.status == "running"
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+@pytest.mark.parametrize("artifact_backend", ["local", "local-custom-root", "minio"])
+async def test_prune_run_outputs_synchronizes_artifact_records(tmp_path, monkeypatch, store_kind, artifact_backend) -> None:
+    from tests.test_artifact_store import FakeMinioClient
+
+    monkeypatch.setenv("RPA_WORKSPACE_ROOT", str(tmp_path))
+    engine = None
+    if store_kind == "sqlite":
+        engine = create_schedule_engine(f"sqlite+aiosqlite:///{tmp_path / 'tasks.db'}")
+        store = SqlAlchemyTaskStore(engine)
+        await store.create_schema()
+    else:
+        store = InMemoryTaskStore()
+    if artifact_backend == "minio":
+        artifacts = MinioArtifactStore(FakeMinioClient(), bucket="test")
+    else:
+        root = tmp_path / ("runs" if artifact_backend == "local" else "independent-artifacts")
+        artifacts = LocalArtifactStore(root)
+    manager = TaskManager(runner=FakeRunner(), broker=LogBroker(), artifact_store=artifacts, task_store=store)
+    request = RunTaskRequest(flowName="retention", targetUrl="https://example.com", selector="h1")
+    originals = {}
+    try:
+        for index, task_id in enumerate(("old-memory", "old-persisted", "kept")):
+            artifact = await artifacts.save_bytes(
+                task_id=task_id, artifact_type="dataset", filename="result.txt",
+                content=b"result", content_type="text/plain", flow_id="retention",
+            )
+            now = datetime.now(UTC)
+            snapshot = TaskSnapshot(
+                taskId=task_id, flowName=request.flow_name, status="success", mode="run",
+                progress=RuntimeProgress(currentStep=1, totalSteps=1, percent=100, elapsedMs=1),
+                createdAt=now, updatedAt=now, artifacts=[artifact],
+                variables=[RuntimeVariableSnapshot(name="count", type="Integer", value="1", scope="局部")],
+            )
+            await store.save_task(snapshot, request)
+            log = TaskLogEntry(taskId=task_id, level="success", message="done")
+            await store.append_log(log)
+            if task_id != "old-persisted":
+                manager._tasks[task_id] = TaskRecord(request=request, snapshot=snapshot, artifacts=[artifact], logs=[log])
+            originals[task_id] = artifact
+            run_dir = storage.run_output_dir("retention", task_id)
+            run_dir.mkdir(parents=True, exist_ok=True)
+            os.utime(run_dir, (100 + index, 100 + index))
+
+        await store.delete_artifacts([])
+        await store.delete_artifacts(["missing"])
+        prune = storage.prune_run_outputs
+        monkeypatch.setattr(storage, "prune_run_outputs", lambda flow_key: prune(flow_key, keep=1))
+        await manager._prune_run_outputs(manager._tasks["kept"])
+        await manager._prune_run_outputs(manager._tasks["kept"])
+
+        for task_id, artifact in originals.items():
+            retained = task_id == "kept" or artifact_backend != "local"
+            expected = [artifact] if retained else []
+            persisted = await store.get_task(task_id)
+            assert persisted is not None
+            assert persisted.artifacts == expected
+            assert persisted.variables[0].value == "1"
+            assert [log.message for log in await store.list_logs(task_id)] == ["done"]
+            assert await manager.get_artifacts(task_id) == expected
+            assert artifacts.list_task_artifacts(task_id) == expected
+            content = await manager.get_artifact_content(task_id, artifact.artifact_id)
+            assert (content is not None) == retained
+            if task_id in manager._tasks:
+                assert manager._tasks[task_id].artifacts == expected
+                assert manager._tasks[task_id].snapshot.artifacts == expected
+            assert storage.run_output_dir("retention", task_id).exists() == (task_id == "kept")
+    finally:
+        if engine is not None:
+            await engine.dispose()
+
+
 class RecordingRunner:
     def __init__(self) -> None:
         self.requests: list[RunTaskRequest] = []
@@ -106,12 +239,12 @@ async def test_terminal_status_is_persisted_after_final_log(tmp_path) -> None:
             super().__init__()
             self.terminal_log_seen: list[bool] = []
 
-        async def save_task(self, task: TaskSnapshot, request: RunTaskRequest) -> TaskSnapshot:
+        async def save_task(self, task: TaskSnapshot, request: RunTaskRequest, **options) -> TaskSnapshot:
             if task.status in {"success", "error"}:
                 logs = await self.list_logs(task.task_id) or []
                 expected = "任务完成" if task.status == "success" else "任务失败"
                 self.terminal_log_seen.append(any(log.message == expected for log in logs))
-            return await super().save_task(task, request)
+            return await super().save_task(task, request, **options)
 
     for runner, status in ((FakeRunner(), "success"), (AlwaysFailingRunner(), "error")):
         store = ObservedStore()
