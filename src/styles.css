@@ -258,6 +258,8 @@ select {
 }
 
 .react-flow__minimap {
+  width: 156px;
+  height: 116px;
   margin: 14px;
   border: 1px solid var(--color-rule);
   border-radius: 12px;
