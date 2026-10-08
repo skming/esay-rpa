@@ -3,12 +3,41 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
+import sys
 import time
 
 import pytest
 
 from app.core.config import load_settings
 from app.core.logging import AccessLogFilter, create_log_handler, prune_log_archives, redact_log_text, setup_logging
+
+
+def test_application_startup_uses_safe_file_logging(tmp_path) -> None:
+    # 新进程覆盖真实启动入口，避免 pytest 的日志捕获替换根 logger 的 handlers。
+    script = """
+import logging
+from pathlib import Path
+from app.main import settings
+from app.core.logging import DailyLogFileHandler
+
+log_path = (Path(settings.log_dir) / 'backend.log').resolve()
+handlers = [h for h in logging.getLogger().handlers if getattr(h, 'baseFilename', None) == str(log_path)]
+assert len(handlers) == 1
+handler = handlers[0]
+assert isinstance(handler, DailyLogFileHandler)
+assert handler.backupCount == 2
+assert handler.retention_days == 7
+record = logging.LogRecord('app.test', logging.ERROR, '', 0, 'api_key=sample-credential', (), None)
+assert 'sample-credential' not in handler.format(record)
+assert '[REDACTED]' in handler.format(record)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env={**os.environ, "RPA_LOG_DIR": str(tmp_path), "RPA_LOG_BACKUP_COUNT": "2", "RPA_LOG_RETENTION_DAYS": "7"},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def emit(handler, message: str, *, exc_info=None) -> None:
