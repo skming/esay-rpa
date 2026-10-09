@@ -108,7 +108,7 @@ export function Panel({
         <header className="flex h-11 items-center justify-between border-b border-rule px-5">
           <div className="flex items-center gap-2 text-ink-3">
             {icon}
-            <span className="text-[12px] font-semibold text-ink-2">{label}</span>
+            <span className="text-[12px] font-semibold text-ink">{label}</span>
           </div>
           {action}
         </header>
@@ -223,15 +223,17 @@ export function SearchField({
 
 /** 分段筛选 + 搜索的横条。任务中心与调度中心共用同一套，勿再各写各的高度、间距与选中态。 */
 export function FilterBar<T extends string>({
-  counts, filters, onQueryChange, onValueChange, query, searchLabel, searchPlaceholder, value,
+  counts, filters, onQueryChange, onReset, onValueChange, query, searchLabel, searchPlaceholder, statusText, value,
 }: {
   counts: Record<T, number>;
   filters: ReadonlyArray<{ label: string; value: T }>;
   onQueryChange: (query: string) => void;
+  onReset?: () => void;
   onValueChange: (value: T) => void;
   query: string;
   searchLabel: string;
   searchPlaceholder: string;
+  statusText?: string;
   value: T;
 }): ReactElement {
   return (
@@ -267,6 +269,12 @@ export function FilterBar<T extends string>({
         placeholder={searchPlaceholder}
         value={query}
       />
+      {statusText !== undefined && (
+        <div className={onReset === undefined ? 'sr-only' : 'flex w-full items-center justify-between gap-3 border-t border-rule px-1 pt-2'}>
+          <p aria-live="polite" className="text-[11px] text-ink-3" role="status">{statusText}</p>
+          {onReset !== undefined && <button className="rounded-sm text-[11px] font-medium text-accent-strong hover:text-accent-press" onClick={onReset} type="button">清除筛选</button>}
+        </div>
+      )}
     </div>
   );
 }

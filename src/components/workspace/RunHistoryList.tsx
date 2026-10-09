@@ -7,9 +7,12 @@ import { cn } from '../../lib/utils';
 import type { TaskSnapshot } from '../../types/electron';
 import { Button, IconButton } from '../ui/button';
 import { RefreshIconButton } from '../ui/refresh-button';
+import { Tooltip, TooltipContent, TooltipTrigger } from '../ui/tooltip';
 import { SurfaceEmpty, Panel, StateTag } from './surfaces';
 
 type RunHistoryListProps = {
+  embedded?: boolean;
+  formatTime?: (value: string) => string;
   hasMore?: boolean;
   loadingMore?: boolean;
   onInspectRun: (run: TaskSnapshot) => void;
@@ -21,20 +24,9 @@ type RunHistoryListProps = {
 
 const ROW_GRID = 'grid grid-cols-[minmax(0,1fr)_80px_28px] items-center gap-3 @min-[520px]:grid-cols-[minmax(0,1fr)_88px_64px_28px] @min-[680px]:grid-cols-[minmax(0,1fr)_88px_64px_96px_28px] @min-[860px]:grid-cols-[minmax(0,1fr)_88px_64px_96px_148px_28px]';
 
-export function RunHistoryList({ hasMore, loadingMore, onInspectRun, onLoadMore, onRefresh, runs, title = '最近运行' }: RunHistoryListProps): ReactElement {
-  return (
-    <Panel
-      label={title}
-      icon={<Clock3 className="h-3.5 w-3.5" strokeWidth={1.5} />}
-      className="@container min-w-0"
-      bodyClassName="p-0"
-      action={
-        <div className="flex items-center gap-3">
-          {runs.length > 0 && <span className="text-[11px] tabular-nums text-ink-3">已加载 {runs.length} 条</span>}
-          <RefreshIconButton label="刷新历史" onClick={onRefresh} />
-        </div>
-      }
-    >
+export function RunHistoryList({ embedded = false, formatTime = formatDateTime, hasMore, loadingMore, onInspectRun, onLoadMore, onRefresh, runs, title = '最近运行' }: RunHistoryListProps): ReactElement {
+  const content = (
+    <>
       {runs.length === 0 ? (
         <SurfaceEmpty
           icon={<Inbox className="h-5 w-5" strokeWidth={1.25} />}
@@ -54,8 +46,8 @@ export function RunHistoryList({ hasMore, loadingMore, onInspectRun, onLoadMore,
             </div>
             {runs.map((run) => {
               const s = TASK_STATUS_META[run.status];
-              const detail = run.status === 'error' ? run.error
-                : run.status === 'awaiting_confirmation' ? run.confirmationMessage
+              const detail = run.status === 'error' ? run.error?.trim() || '运行失败，打开详情查看执行证据'
+                : run.status === 'awaiting_confirmation' ? run.confirmationMessage?.trim() || '流程正在等待操作确认'
                 : run.status === 'running' ? `执行进度 ${run.progress.currentStep} / ${run.progress.totalSteps} 步`
                 : null;
               const elapsed = formatElapsedTime(run.progress.elapsedMs);
@@ -67,35 +59,48 @@ export function RunHistoryList({ hasMore, loadingMore, onInspectRun, onLoadMore,
                   role="row"
                 >
                   <div className="min-w-0" role="cell">
-                    <button
-                      aria-label={`查看 ${run.flowName} 的运行详情，运行 ID ${run.taskId}`}
-                      className="block max-w-full truncate rounded-sm text-left text-[12.5px] font-medium text-ink hover:text-accent-strong hover:underline hover:underline-offset-4"
-                      onClick={() => onInspectRun(run)}
-                      title={run.flowName}
-                      type="button"
-                    >
-                      {run.flowName}
-                    </button>
-                    <div
-                      className={cn('mt-1 truncate text-[11px] leading-4', detail && run.status === 'error' ? 'text-red-600' : detail && run.status === 'awaiting_confirmation' ? 'text-amber-700' : 'text-ink-3')}
-                      title={detail || run.taskId}
-                    >
-                      {detail || <>{run.mode === 'debug' ? '调试' : '运行'} · <span className="font-mono text-[10px]">{run.taskId.slice(0, 10)}</span></>}
+                    <div className="flex min-w-0 items-center gap-2">
+                      <button
+                        aria-label={`查看 ${run.flowName} 的运行详情，运行 ID ${run.taskId}`}
+                        className="min-w-0 truncate rounded-sm text-left text-[12.5px] font-medium text-ink-2 hover:text-accent-strong hover:underline hover:underline-offset-4"
+                        onClick={() => onInspectRun(run)}
+                        title={run.flowName}
+                        type="button"
+                      >
+                        {run.flowName}
+                      </button>
+                      {run.mode === 'debug' && <span className="shrink-0 text-[10px] text-ink-3">调试</span>}
                     </div>
                     <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] tabular-nums text-ink-3 @min-[860px]:hidden">
                       <span className="@min-[520px]:hidden">耗时 {elapsed}</span>
                       <span className="@min-[680px]:hidden">输出 {output}</span>
-                      <time className="basis-full whitespace-nowrap" dateTime={run.updatedAt}>{formatDateTime(run.updatedAt)}</time>
+                      <time className="basis-full whitespace-nowrap" dateTime={run.updatedAt}>{formatTime(run.updatedAt)}</time>
                     </div>
                   </div>
-                  <div role="cell"><StateTag state={s.tone} label={s.label} /></div>
+                  <div role="cell">
+                    {detail === null ? <StateTag state={s.tone} label={s.label} /> : (
+                      <Tooltip>
+                        <TooltipTrigger
+                          aria-label={`${s.label}，查看 ${run.flowName} 的运行详情`}
+                          className="inline-flex min-h-7 max-w-full items-center rounded-sm text-left underline decoration-dotted decoration-ink-4 underline-offset-4"
+                          onClick={() => onInspectRun(run)}
+                          type="button"
+                        >
+                          <StateTag state={s.tone} label={s.label} />
+                        </TooltipTrigger>
+                        <TooltipContent className="max-h-[min(20rem,calc(100vh-2rem))] max-w-[min(24rem,calc(100vw-2rem))] overflow-y-auto whitespace-pre-wrap wrap-break-word leading-5" side="top">
+                          {detail}
+                        </TooltipContent>
+                      </Tooltip>
+                    )}
+                  </div>
                   <span className="hidden text-right font-mono text-[11px] tabular-nums text-ink-2 @min-[520px]:block" role="cell">
                     {elapsed}
                   </span>
                   <span className="hidden text-right text-[11px] tabular-nums text-ink-2 @min-[680px]:block" role="cell">
                     {output}
                   </span>
-                  <span className="hidden text-right font-mono text-[10.5px] tabular-nums text-ink-3 @min-[860px]:block" role="cell"><time dateTime={run.updatedAt}>{formatDateTime(run.updatedAt)}</time></span>
+                  <span className="hidden text-right font-mono text-[10.5px] tabular-nums text-ink-3 @min-[860px]:block" role="cell"><time dateTime={run.updatedAt}>{formatTime(run.updatedAt)}</time></span>
                   <div className="flex justify-end" role="cell">
                     <IconButton className="h-7 w-7" label={`查看 ${run.flowName} 的运行详情（${run.taskId.slice(0, 10)}）`} onClick={() => onInspectRun(run)}>
                       <ChevronRight className="h-3.5 w-3.5" strokeWidth={1.5} />
@@ -121,6 +126,18 @@ export function RunHistoryList({ hasMore, loadingMore, onInspectRun, onLoadMore,
           )}
         </>
       )}
+    </>
+  );
+  if (embedded) return <div className="@container min-w-0">{content}</div>;
+  return (
+    <Panel
+      label={title}
+      icon={<Clock3 className="h-3.5 w-3.5" strokeWidth={1.5} />}
+      className="@container min-w-0"
+      bodyClassName="p-0"
+      action={<RefreshIconButton label="刷新历史" onClick={onRefresh} />}
+    >
+      {content}
     </Panel>
   );
 }

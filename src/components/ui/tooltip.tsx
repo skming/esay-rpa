@@ -29,7 +29,7 @@ function TooltipContent({
       <TooltipPrimitive.Positioner
         align={align}
         alignOffset={alignOffset}
-        className="isolate z-(--z-dropdown)"
+        className="isolate z-(--z-select)"
         side={side}
         sideOffset={sideOffset}
       >
