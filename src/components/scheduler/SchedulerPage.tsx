@@ -8,7 +8,7 @@ import { useSearchParams } from 'react-router-dom';
 import type { ElectronBridgeState } from '../../hooks/useElectronBridge';
 import { filterSchedules, hasScheduleError, type ScheduleFilter } from '../../lib/schedulePresentation';
 import { Button } from '../ui/button';
-import { RefreshButton } from '../ui/refresh-button';
+import { RefreshIconButton } from '../ui/refresh-button';
 import { ScheduleCreateDialog } from '../studio/property-panel/ScheduleCreateDialog';
 import { SchedulerMetrics } from './SchedulerMetrics';
 import { ScheduleListTable } from './ScheduleListTable';
@@ -74,16 +74,15 @@ export function SchedulerPage({ electron }: { electron: ElectronBridgeState }): 
     <WorkspaceShell
       actions={
         <>
-          <RefreshButton variant="subtle" onClick={async () => {
+          <RefreshIconButton label="刷新调度中心" onClick={async () => {
             await Promise.all([electron.loadFlows(), electron.loadSchedules(), electron.loadScheduleRunSummaries()]);
-          }}>刷新</RefreshButton>
+          }} />
           <Button onClick={() => setCreateOpen(true)} variant="primary" className="h-8 rounded-md px-3.5">
             <Plus className="h-3.5 w-3.5" strokeWidth={1.75} />
             新建调度
           </Button>
         </>
       }
-      description="Cron 触发器与手动调度"
       title="调度中心"
     >
       <SchedulerMetrics
@@ -98,17 +97,14 @@ export function SchedulerPage({ electron }: { electron: ElectronBridgeState }): 
         counts={counts}
         filters={SCHEDULE_FILTERS}
         onQueryChange={(nextQuery) => updateSearch({ query: nextQuery })}
+        onReset={filter !== 'all' || query !== '' ? () => updateSearch({ filter: 'all', query: '' }) : undefined}
         onValueChange={(nextFilter) => updateSearch({ filter: nextFilter })}
         query={query}
         searchLabel="搜索调度"
         searchPlaceholder="搜索调度名称或流程…"
+        statusText={firstLoad ? '正在读取调度…' : `显示 ${schedules.length} / ${electron.schedules.length} 个调度`}
         value={filter}
       />
-
-      <div className="flex items-center justify-between gap-3 text-[11px] text-ink-3">
-        <p aria-live="polite" role="status">{firstLoad ? '正在读取调度…' : `显示 ${schedules.length} / ${electron.schedules.length} 个调度`}</p>
-        {(filter !== 'all' || query !== '') && <Button onClick={() => updateSearch({ filter: 'all', query: '' })} size="sm" variant="ghost">清除筛选</Button>}
-      </div>
 
       {firstLoad && electron.schedules.length === 0 ? (
         <LoadingPanel label="加载调度…" />

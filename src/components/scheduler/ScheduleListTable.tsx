@@ -1,10 +1,10 @@
-import { AlertTriangle, Eye, Loader2, MoreHorizontal, Pencil, Power, PowerOff, Trash2, Zap } from 'lucide-react';
+import { Eye, Loader2, MoreHorizontal, Pencil, Power, PowerOff, Trash2, Zap } from 'lucide-react';
 import type { ReactElement } from 'react';
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import type { ElectronBridgeState } from '../../hooks/useElectronBridge';
 import { describeCronExpression, describeNextRun, formatScheduleDateTime, hasScheduleError } from '../../lib/schedulePresentation';
-import { TASK_STATUS_META } from '../../lib/runPresentation';
+import { loadScheduleRunDetails } from '../../lib/scheduleRunDetails';
 import type { ScheduleRunSummary, ScheduleSnapshot, TaskSnapshot } from '../../types/electron';
 import { IconButton } from '../ui/button';
 import {
@@ -17,10 +17,11 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '../ui/alert-dialog';
-import { Dialog, DialogBody, DialogContent, DialogHeader, DialogTitle } from '../ui/dialog';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '../ui/dropdown-menu';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../ui/table';
+import { Tooltip, TooltipContent, TooltipTrigger } from '../ui/tooltip';
 import { ScheduleCreateDialog } from '../studio/property-panel/ScheduleCreateDialog';
+import { ScheduleRunResultsDialog, type ScheduleRunBatch } from './ScheduleRunResultsDialog';
 import { RunDetailDialog } from '../workspace/RunDetailDialog';
 import { StateTag, SURFACE, type StatusTone } from '../workspace/surfaces';
 import { cn } from '../../lib/utils';
@@ -47,13 +48,13 @@ export function ScheduleListTable({
   const [editSchedule, setEditSchedule] = useState<ScheduleSnapshot | null>(null);
   const [deleteSchedule, setDeleteSchedule] = useState<ScheduleSnapshot | null>(null);
   const [detailRun, setDetailRun] = useState<TaskSnapshot | null>(null);
-  const [batch, setBatch] = useState<{ schedule: ScheduleSnapshot; tasks: TaskSnapshot[] } | null>(null);
+  const [batch, setBatch] = useState<ScheduleRunBatch | null>(null);
   const [batchLoading, setBatchLoading] = useState(false);
   const [pendingScheduleIds, setPendingScheduleIds] = useState(new Set<string>());
   const pendingRef = useRef(new Set<string>());
   // 关闭批次弹窗或再次触发查看时作废在途请求，避免旧请求回来把已关闭的弹窗重新撑开。
   const batchReqRef = useRef(0);
-  const detailReqRef = useRef(0);
+  useEffect(() => () => { batchReqRef.current += 1; }, []);
 
   const runAction = async (scheduleId: string, action: () => Promise<void>): Promise<void> => {
     if (pendingRef.current.has(scheduleId)) return;
@@ -81,46 +82,61 @@ export function ScheduleListTable({
     return schedule.lastTaskId !== null && schedule.lastTaskId !== undefined ? [schedule.lastTaskId] : [];
   };
 
-  const openDetail = (taskId: string): void => {
-    const req = ++detailReqRef.current;
-    void electron.getRunDetail(taskId).then(({ run }) => {
-      if (detailReqRef.current === req) setDetailRun(run);
-    });
-  };
-
-  const openBatch = (schedule: ScheduleSnapshot, ids: string[]): void => {
+  const openBatch = (schedule: ScheduleSnapshot, ids: string[], runAt?: string | null): void => {
     const req = ++batchReqRef.current;
-    setBatch({ schedule, tasks: [] });
+    setDetailRun(null);
+    setBatch({ schedule, taskIds: ids, entries: [], runAt });
     setBatchLoading(true);
     // 后端没有「按 taskId 批量取快照」的轻接口，只能逐个 getRunDetail；批次即「所有流程」的任务数，量小可接受。
-    void Promise.all(ids.map((id) => electron.getRunDetail(id).then(({ run }) => run).catch(() => null)))
-      .then((runs) => {
+    void loadScheduleRunDetails(ids, electron.getRunDetail)
+      .then((entries) => {
         if (batchReqRef.current !== req) return;
-        setBatch({ schedule, tasks: runs.filter((run): run is TaskSnapshot => run !== null) });
+        if (entries.length === 1 && entries[0].state === 'ready') {
+          setBatch(null);
+          setDetailRun(entries[0].run);
+        } else {
+          setBatch({ schedule, taskIds: ids, entries, runAt });
+        }
       })
       .finally(() => { if (batchReqRef.current === req) setBatchLoading(false); });
+  };
+
+  const closeBatch = (): void => {
+    batchReqRef.current += 1;
+    setBatch(null);
+    setDetailRun(null);
   };
 
   const viewResult = (schedule: ScheduleSnapshot): void => {
     const ids = resolveTaskIds(schedule);
     if (ids.length === 0) return;
-    if (ids.length === 1) { openDetail(ids[0]); return; }
-    openBatch(schedule, ids);
+    openBatch(schedule, ids, runSummaries[schedule.scheduleId]?.runAt);
   };
+
+  const runDetail = (
+    <RunDetailDialog
+      onLoadDetail={electron.getRunDetail}
+      onReadArtifact={electron.getArtifactContent}
+      onOpenArtifact={(artifact) => void electron.openArtifactPath(artifact.storageUrl)}
+      onOpenChange={(open) => { if (!open) setDetailRun(null); }}
+      open={detailRun !== null}
+      run={detailRun}
+    />
+  );
 
   return (
     <>
       <div className={cn('overflow-hidden', SURFACE)}>
-        <Table aria-label="调度列表" className="w-full min-w-[900px] table-fixed">
+        <Table aria-label="调度列表" className="w-full min-w-[760px] table-fixed">
           <TableHeader className="bg-paper-sunk">
             <TableRow className="border-rule-2 hover:bg-transparent">
-              <TableHead className="w-[28%] pl-5 text-[11px] font-medium text-ink-2 xl:w-[22%]">调度</TableHead>
+              <TableHead className="w-[20%] pl-5 text-[11px] font-medium text-ink-2 xl:w-[22%]">调度</TableHead>
               <TableHead className="w-[16%] text-[11px] font-medium text-ink-2 xl:w-[14%]">绑定流程</TableHead>
               <TableHead className="w-[18%] text-[11px] font-medium text-ink-2 xl:w-[14%]">触发规则</TableHead>
-              <TableHead className="w-[18%] text-[11px] font-medium text-ink-2 xl:w-[16%]">下次触发</TableHead>
+              <TableHead className="w-[20%] text-[11px] font-medium text-ink-2 xl:w-[16%]">下次触发</TableHead>
               <TableHead className="hidden w-[14%] text-[11px] font-medium text-ink-2 xl:table-cell">最近运行</TableHead>
-              <TableHead className="w-[10%] text-[11px] font-medium text-ink-2">状态</TableHead>
-              <TableHead className="w-[10%] pr-5 text-right text-[11px] font-medium text-ink-2">操作</TableHead>
+              <TableHead className="w-[12%] text-[11px] font-medium text-ink-2 xl:w-[10%]">状态</TableHead>
+              <TableHead className="w-[14%] pr-5 text-right text-[11px] font-medium text-ink-2 xl:w-[10%]">操作</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -130,46 +146,45 @@ export function ScheduleListTable({
               const attention = hasScheduleError(schedule, runSummaries[schedule.scheduleId]);
               const cronDescription = describeCronExpression(schedule.cronExpression);
               const runResult = runSummaries[schedule.scheduleId];
-              const attentionText = schedule.lastError ?? (runResult ? RUN_RESULT_META[runResult.status].label : '');
+              const attentionText = schedule.lastError?.trim() || (runResult
+                ? `最近一批${RUN_RESULT_META[runResult.status].label}：成功 ${runResult.success}，失败 ${runResult.failed}，停止 ${runResult.stopped}，共 ${runResult.total} 个流程`
+                : '调度存在异常，请检查触发规则');
               return (
                 <TableRow
-                  className={cn(
-                    'border-rule hover:bg-paper',
-                    !enabled && 'opacity-60',
-                    attention && 'bg-red-50/40 hover:bg-red-50/60',
-                  )}
+                  className="border-rule hover:bg-paper"
                   key={schedule.scheduleId}
                 >
                   <TableCell className="pl-5">
-                    <button className="block w-full min-w-0 text-left" onClick={() => setEditSchedule(schedule)} type="button">
-                      <span className="block truncate text-[12px] font-medium text-ink">{schedule.name}</span>
-                      <span className="mt-0.5 block max-w-full truncate font-mono text-[10px] text-ink-3" title={schedule.scheduleId}>
-                        {schedule.scheduleId}
-                      </span>
+                    <button
+                      aria-label={`编辑 ${schedule.name}，调度 ID ${schedule.scheduleId}`}
+                      className="block w-full min-w-0 rounded-sm text-left hover:text-accent-strong"
+                      onClick={() => setEditSchedule(schedule)}
+                      title={schedule.name}
+                      type="button"
+                    >
+                      <span className="block truncate text-[12px] font-medium text-ink-2">{schedule.name}</span>
                     </button>
-                    {attention && (
-                      <span className="mt-1 flex items-center gap-1 text-[10px] text-red-600" title={attentionText}>
-                        <AlertTriangle className="h-3 w-3 shrink-0" strokeWidth={1.5} />
-                        <span className="truncate">{attentionText}</span>
-                      </span>
-                    )}
                   </TableCell>
                   <TableCell>
                     <span className="block truncate text-[11px] font-medium text-ink-2">{schedule.task.flowName}</span>
-                    <span className="mt-0.5 block truncate text-[10px] text-ink-3">{schedule.timezone}</span>
                   </TableCell>
                   <TableCell>
-                    <span className={cn(
-                      'block truncate text-[11px] text-ink-2',
-                      cronDescription === schedule.cronExpression && 'font-mono text-[10px]',
-                    )}>
-                      {cronDescription}
-                    </span>
-                    {cronDescription !== schedule.cronExpression && (
-                      <span className="mt-0.5 block truncate font-mono text-[10px] text-ink-3">{schedule.cronExpression}</span>
-                    )}
+                    <Tooltip>
+                      <TooltipTrigger
+                        aria-label={`${cronDescription}，时区 ${schedule.timezone}，编辑触发规则`}
+                        className={cn('block min-h-7 w-full truncate rounded-sm text-left text-[11px] text-ink-2', cronDescription === schedule.cronExpression && 'font-mono text-[10px]')}
+                        onClick={() => setEditSchedule(schedule)}
+                        type="button"
+                      >
+                        {cronDescription}
+                      </TooltipTrigger>
+                      <TooltipContent side="top">
+                        <p className="font-mono">{schedule.cronExpression}</p>
+                        <p className="mt-1">时区 {schedule.timezone}</p>
+                      </TooltipContent>
+                    </Tooltip>
                   </TableCell>
-                  <TableCell className="font-mono text-[10px] tabular-nums text-ink-3">
+                  <TableCell className="font-mono text-[10px] tabular-nums text-ink-3" title={`时区 ${schedule.timezone}`}>
                     {describeNextRun(schedule)}
                   </TableCell>
                   <TableCell className="hidden xl:table-cell">
@@ -180,6 +195,7 @@ export function ScheduleListTable({
                     </span>
                     {runResult !== undefined && (
                       <button
+                        aria-label={`查看 ${schedule.name} 的运行详情`}
                         className="mt-1 flex items-center gap-1.5 rounded transition-opacity hover:opacity-75 disabled:cursor-default disabled:hover:opacity-100"
                         disabled={resolveTaskIds(schedule).length === 0}
                         onClick={() => viewResult(schedule)}
@@ -194,10 +210,21 @@ export function ScheduleListTable({
                     )}
                   </TableCell>
                   <TableCell>
-                    <StateTag
-                      label={attention ? '需处理' : enabled ? '启用' : '停用'}
-                      state={attention ? 'error' : enabled ? 'success' : 'idle'}
-                    />
+                    {attention ? (
+                      <Tooltip>
+                        <TooltipTrigger
+                          aria-label={`需处理，查看 ${schedule.name} 的${resolveTaskIds(schedule).length > 0 ? '运行结果' : '调度配置'}`}
+                          className="inline-flex min-h-7 items-center rounded-sm text-left underline decoration-dotted decoration-ink-4 underline-offset-4"
+                          onClick={() => resolveTaskIds(schedule).length > 0 ? viewResult(schedule) : setEditSchedule(schedule)}
+                          type="button"
+                        >
+                          <StateTag label="需处理" state="error" />
+                        </TooltipTrigger>
+                        <TooltipContent className="max-h-[min(20rem,calc(100vh-2rem))] max-w-[min(24rem,calc(100vw-2rem))] overflow-y-auto whitespace-pre-wrap wrap-break-word leading-5" side="top">
+                          {attentionText}
+                        </TooltipContent>
+                      </Tooltip>
+                    ) : <StateTag label={enabled ? '启用' : '停用'} state={enabled ? 'success' : 'idle'} />}
                   </TableCell>
                   <TableCell className="pr-5">
                     <div className="flex justify-end gap-1" aria-busy={pending}>
@@ -288,42 +315,16 @@ export function ScheduleListTable({
         </AlertDialogContent>
       </AlertDialog>
 
-      <Dialog onOpenChange={(open) => { if (!open) { batchReqRef.current += 1; setBatch(null); } }} open={batch !== null}>
-        <DialogContent className="flex max-h-[min(70vh,560px)] w-140 max-w-[calc(100vw-32px)] flex-col overflow-hidden">
-          <DialogHeader>
-            <DialogTitle>本批运行结果 · {batch?.schedule.name}</DialogTitle>
-          </DialogHeader>
-          <DialogBody className="min-h-0 flex-1 space-y-1.5 overflow-y-auto">
-            {batchLoading && <p className="text-[11px] text-ink-3">正在读取本批任务…</p>}
-            {!batchLoading && batch?.tasks.length === 0 && (
-              <p className="rounded-md bg-paper-sunk px-3 py-3 text-[11px] text-ink-3">没有可查看的任务记录</p>
-            )}
-            {batch?.tasks.map((task) => (
-              <button
-                className="flex w-full items-center justify-between gap-3 rounded-md border border-rule bg-paper px-3 py-2 text-left transition-colors hover:bg-paper-sunk"
-                key={task.taskId}
-                onClick={() => setDetailRun(task)}
-                type="button"
-              >
-                <span className="min-w-0">
-                  <span className="block truncate text-[12px] font-medium text-ink">{task.flowName}</span>
-                  <span className="block truncate font-mono text-[10px] text-ink-3">{task.taskId}</span>
-                </span>
-                <StateTag label={TASK_STATUS_META[task.status].label} state={TASK_STATUS_META[task.status].tone} />
-              </button>
-            ))}
-          </DialogBody>
-        </DialogContent>
-      </Dialog>
-
-      <RunDetailDialog
-        onLoadDetail={electron.getRunDetail}
-        onReadArtifact={electron.getArtifactContent}
-        onOpenArtifact={(artifact) => void electron.openArtifactPath(artifact.storageUrl)}
-        onOpenChange={(open) => { if (!open) setDetailRun(null); }}
-        open={detailRun !== null}
-        run={detailRun}
-      />
+      <ScheduleRunResultsDialog
+        batch={batch}
+        loading={batchLoading}
+        onClose={closeBatch}
+        onInspectRun={setDetailRun}
+        onRefresh={() => { if (batch !== null) openBatch(batch.schedule, batch.taskIds, batch.runAt); }}
+      >
+        {batch !== null && runDetail}
+      </ScheduleRunResultsDialog>
+      {batch === null && runDetail}
     </>
   );
 }
