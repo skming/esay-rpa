@@ -1,6 +1,5 @@
-import { Archive, Check, CirclePause, CirclePlay, Copy, Download, Hash, History, MoreHorizontal, Play, PowerOff, Square, SquarePen, Trash2 } from 'lucide-react';
+import { Archive, CirclePause, CirclePlay, Copy, Download, History, MoreHorizontal, Play, PowerOff, Square, SquarePen, Trash2 } from 'lucide-react';
 import type { ReactElement } from 'react';
-import { useState } from 'react';
 
 import { FlowStatusBadge } from './FlowStatusBadge';
 import { SURFACE } from './surfaces';
@@ -16,6 +15,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '../ui/tooltip';
 export function FlowListTable({
   items,
   onArchive,
+  onCopyId,
   onDelete,
   onEdit,
   onExport,
@@ -23,9 +23,11 @@ export function FlowListTable({
   onRun,
   onSetStatus,
   onStop,
+  runErrors,
 }: {
   items: FlowListItem[];
   onArchive: (flowId: string) => void;
+  onCopyId: (flowId: string) => Promise<void>;
   onDelete: (flowId: string) => void;
   onEdit: (flowId: string) => void;
   onExport: (flowId: string) => void;
@@ -33,10 +35,11 @@ export function FlowListTable({
   onRun: (flowId: string) => void;
   onSetStatus: (flowId: string, status: FlowStatus) => void;
   onStop: () => void;
+  runErrors: Record<string, string>;
 }): ReactElement {
   return (
     <div className={cn('overflow-hidden', SURFACE)}>
-      <Table className="w-full min-w-0 table-fixed">
+      <Table aria-label="流程列表" className="w-full min-w-[760px] table-fixed">
         <TableHeader className="bg-paper-sunk">
           <TableRow className="border-rule-2 hover:bg-transparent">
             <TableHead className="w-[30%] pl-5 text-[11px] font-medium text-ink-2 xl:w-[25%]">流程</TableHead>
@@ -51,28 +54,38 @@ export function FlowListTable({
         <TableBody>
           {items.map((item) => (
             <TableRow
-              className={cn(
-                'border-rule hover:bg-paper',
-                item.state === 'disabled' && 'opacity-50',
-                item.state === 'paused' && 'opacity-65',
-                item.state === 'failed' && 'bg-red-50/40 hover:bg-red-50/60',
-              )}
+              className="border-rule hover:bg-paper"
               key={item.flow.flowId}
             >
               <TableCell className="pl-5">
                 <div className="min-w-0">
-                  <button className="min-w-0 text-left" onClick={() => onEdit(item.flow.flowId)} type="button">
-                    <div className="truncate text-[12.5px] font-medium text-ink">{item.flow.name}</div>
+                  <button className="block w-full min-w-0 rounded-sm text-left hover:text-accent-strong" onClick={() => onEdit(item.flow.flowId)} title={item.flow.name} type="button">
+                    <div className="truncate text-[12.5px] font-medium text-ink-2">{item.flow.name}</div>
                   </button>
                   <div className="mt-0.5 flex items-center gap-1.5 font-mono text-[10px] text-ink-3">
                     <span className="tabular-nums">{item.flow.version}</span>
                     <span>·</span>
                     <span className="truncate font-sans">{item.folderPath}</span>
                   </div>
-                  <FlowIdChip className="mt-1 max-w-48" flowId={item.flow.flowId} />
                 </div>
               </TableCell>
-              <TableCell><FlowStatusBadge state={item.state} /></TableCell>
+              <TableCell>
+                {item.state === 'failed' ? (
+                  <Tooltip>
+                    <TooltipTrigger
+                      aria-label={`上次失败，查看 ${item.flow.name} 的运行历史`}
+                      className="inline-flex min-h-7 items-center rounded-sm text-left underline decoration-dotted decoration-ink-4 underline-offset-4"
+                      onClick={() => onHistory(item.flow.flowId)}
+                      type="button"
+                    >
+                      <FlowStatusBadge state={item.state} />
+                    </TooltipTrigger>
+                    <TooltipContent className="max-h-[min(20rem,calc(100vh-2rem))] max-w-[min(24rem,calc(100vw-2rem))] overflow-y-auto whitespace-pre-wrap wrap-break-word leading-5" side="top">
+                      {runErrors[item.flow.flowId] || '最近运行失败，打开运行历史查看原因'}
+                    </TooltipContent>
+                  </Tooltip>
+                ) : <FlowStatusBadge state={item.state} />}
+              </TableCell>
               <TableCell className="truncate text-[11px] text-ink-3">{formatLastRun(item.lastRunStatus)}</TableCell>
               <TableCell className={cn(
                 'font-mono text-[11px] font-semibold tabular-nums',
@@ -101,7 +114,7 @@ export function FlowListTable({
                             className="h-7 w-7 rounded-md px-0"
                             disabled={item.state === 'disabled' || item.state === 'paused'}
                             onClick={() => onRun(item.flow.flowId)}
-                            variant="subtle"
+                            variant="ghost"
                           />
                         }
                       >
@@ -111,14 +124,14 @@ export function FlowListTable({
                     </Tooltip>
                   )}
                   <Tooltip>
-                    <TooltipTrigger render={<Button aria-label={`编辑 ${item.flow.name}`} className="h-7 w-7 rounded-md px-0" onClick={() => onEdit(item.flow.flowId)} variant="primary" />}>
+                    <TooltipTrigger render={<Button aria-label={`编辑 ${item.flow.name}`} className="h-7 w-7 rounded-md px-0" onClick={() => onEdit(item.flow.flowId)} variant="ghost" />}>
                       <SquarePen className="h-3.5 w-3.5" strokeWidth={1.5} />
                     </TooltipTrigger>
                     <TooltipContent side="bottom">编辑</TooltipContent>
                   </Tooltip>
                   <DropdownMenu>
                     <Tooltip>
-                      <TooltipTrigger render={<DropdownMenuTrigger render={<Button aria-label={`${item.flow.name} 的更多操作`} className="h-7 w-7 rounded-md px-0" variant="subtle" />} />}>
+                      <TooltipTrigger render={<DropdownMenuTrigger render={<Button aria-label={`${item.flow.name} 的更多操作`} className="h-7 w-7 rounded-md px-0" variant="ghost" />} />}>
                         <MoreHorizontal className="h-3.5 w-3.5" strokeWidth={1.5} />
                       </TooltipTrigger>
                       <TooltipContent side="bottom">更多操作</TooltipContent>
@@ -129,6 +142,9 @@ export function FlowListTable({
                       </DropdownMenuItem>
                       <DropdownMenuItem onClick={() => onExport(item.flow.flowId)}>
                         <Download className="mr-2 h-3.5 w-3.5 text-ink-3" strokeWidth={1.5} />导出 JSON
+                      </DropdownMenuItem>
+                      <DropdownMenuItem onClick={() => void onCopyId(item.flow.flowId)}>
+                        <Copy className="mr-2 h-3.5 w-3.5 text-ink-3" strokeWidth={1.5} />复制流程 ID
                       </DropdownMenuItem>
                       {item.state === 'running' && (
                         <>
@@ -154,49 +170,6 @@ export function FlowListTable({
           ))}
         </TableBody>
       </Table>
-    </div>
-  );
-}
-
-export function FlowIdChip({ flowId, className }: { flowId: string; className?: string }): ReactElement {
-  const [copied, setCopied] = useState(false);
-  const display = flowId.replace(/^local-\d+-?/, '');
-
-  function copy(e: React.MouseEvent) {
-    e.stopPropagation();
-    void navigator.clipboard.writeText(flowId).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    });
-  }
-
-  return (
-    <div className={cn('group flex w-full min-w-0 items-center gap-1', className)}>
-      <Hash className="h-2.5 w-2.5 shrink-0 text-ink-4" strokeWidth={2} />
-      <span className="min-w-0 flex-1 truncate font-mono text-[10px] tabular-nums text-ink-3">{display}</span>
-      <Tooltip>
-        <TooltipTrigger
-          render={
-            <button
-              aria-label={copied ? '已复制流程 ID' : '复制流程 ID'}
-              className={cn(
-                'shrink-0 rounded p-0.5 transition-colors',
-                copied ? 'text-emerald-600' : 'text-ink-4 opacity-0 group-hover:opacity-100 hover:text-ink-2',
-              )}
-              onClick={copy}
-              type="button"
-            />
-          }
-        >
-          {copied
-            ? <Check className="h-3 w-3" strokeWidth={2.5} />
-            : <Copy className="h-3 w-3" strokeWidth={2} />
-          }
-        </TooltipTrigger>
-        <TooltipContent side="bottom" className="font-mono text-[10px]">
-          {copied ? '已复制' : '点击复制'}
-        </TooltipContent>
-      </Tooltip>
     </div>
   );
 }

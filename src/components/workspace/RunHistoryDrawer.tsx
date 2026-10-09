@@ -1,5 +1,5 @@
 import { Dialog as DialogPrimitive } from '@base-ui/react/dialog';
-import { CheckCircle2, Clock3, FileJson, History, Inbox, Loader2, ScanSearch, XCircle, X } from 'lucide-react';
+import { CheckCircle2, History, Inbox, Loader2, ScanSearch, XCircle, X } from 'lucide-react';
 import type { ReactElement } from 'react';
 
 import { formatDateTime, formatElapsedTime } from '../../lib/time';
@@ -87,15 +87,31 @@ export function RunHistoryDrawer({ flowName, hasMore, loadingMore, onClose, onIn
 
                 {runs.map((run) => {
                   const s = TASK_STATUS_META[run.status];
+                  const detail = run.status === 'error' ? run.error?.trim() || '运行失败，打开详情查看执行证据'
+                    : run.status === 'awaiting_confirmation' ? run.confirmationMessage?.trim() || '流程正在等待操作确认'
+                    : null;
                   return (
                     <div
                       key={run.taskId}
                       className="grid grid-cols-[56px_92px_80px_88px_minmax(0,1fr)_44px] items-center gap-3 border-b border-rule px-5 py-3 transition-colors last:border-b-0 hover:bg-paper"
                     >
-                      <StateTag state={s.tone} label={s.label} />
+                      {detail === null ? <StateTag state={s.tone} label={s.label} /> : (
+                        <Tooltip>
+                          <TooltipTrigger
+                            aria-label={`${s.label}，查看运行详情，运行 ID ${run.taskId}`}
+                            className="inline-flex min-h-7 items-center rounded-sm text-left underline decoration-dotted decoration-ink-4 underline-offset-4"
+                            onClick={() => onInspectRun(run)}
+                            type="button"
+                          >
+                            <StateTag state={s.tone} label={s.label} />
+                          </TooltipTrigger>
+                          <TooltipContent className="max-h-[min(20rem,calc(100vh-2rem))] max-w-[min(24rem,calc(100vw-2rem))] overflow-y-auto whitespace-pre-wrap wrap-break-word leading-5" side="top">
+                            {detail}
+                          </TooltipContent>
+                        </Tooltip>
+                      )}
 
                       <span className="inline-flex items-center gap-1.5 font-mono text-[11px] tabular-nums text-ink-3">
-                        <Clock3 className="h-3 w-3 text-ink-4" strokeWidth={1.5} />
                         {formatElapsedTime(run.progress.elapsedMs)}
                       </span>
 
@@ -104,7 +120,6 @@ export function RunHistoryDrawer({ flowName, hasMore, loadingMore, onClose, onIn
                       </span>
 
                       <span className="inline-flex items-center gap-1.5 font-mono text-[11px] tabular-nums text-ink-3">
-                        <FileJson className="h-3 w-3 text-ink-4" strokeWidth={1.5} />
                         {runOutputSummary(run)}
                       </span>
 
@@ -112,12 +127,11 @@ export function RunHistoryDrawer({ flowName, hasMore, loadingMore, onClose, onIn
                         <div className="truncate font-mono text-[11px] tabular-nums text-ink-3">
                           {formatDateTime(run.updatedAt)}
                         </div>
-                        <div className="truncate font-mono text-[10px] text-ink-3">{run.taskId}</div>
                       </div>
 
                       <div className="flex justify-end">
                         <Tooltip>
-                          <TooltipTrigger render={<Button aria-label="查看详情" className="h-7 w-7 text-slate-500 hover:bg-slate-100 hover:text-slate-700" onClick={() => onInspectRun(run)} size="icon" variant="ghost" />}>
+                          <TooltipTrigger render={<Button aria-label={`查看运行详情，运行 ID ${run.taskId}`} className="h-7 w-7 text-slate-500 hover:bg-slate-100 hover:text-slate-700" onClick={() => onInspectRun(run)} size="icon" variant="ghost" />}>
                             <ScanSearch className="h-3.5 w-3.5" strokeWidth={1.5} />
                           </TooltipTrigger>
                           <TooltipContent side="left">查看运行详情</TooltipContent>

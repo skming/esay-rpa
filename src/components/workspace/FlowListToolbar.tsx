@@ -18,14 +18,18 @@ const FILTERS: Array<{ label: string; value: TaskCenterView }> = [
 export function FlowListToolbar({
   counts,
   onQueryChange,
+  onReset,
   onViewChange,
   query,
+  statusText,
   view,
 }: {
   counts: Record<TaskCenterView, number>;
   onQueryChange: (query: string) => void;
+  onReset?: () => void;
   onViewChange: (view: TaskCenterView) => void;
   query: string;
+  statusText?: string;
   view: TaskCenterView;
 }): ReactElement {
   return (
@@ -33,10 +37,12 @@ export function FlowListToolbar({
       counts={counts}
       filters={FILTERS}
       onQueryChange={onQueryChange}
+      onReset={onReset}
       onValueChange={onViewChange}
       query={query}
       searchLabel="搜索流程"
       searchPlaceholder={view === 'archived' ? '搜索归档流程' : '搜索名称、版本或目录'}
+      statusText={statusText}
       value={view}
     />
   );

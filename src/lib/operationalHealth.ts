@@ -76,7 +76,7 @@ function sortNewest(items: OperationalAttentionItem[]): OperationalAttentionItem
   return items.sort((left, right) => toTime(right.updatedAt) - toTime(left.updatedAt));
 }
 
-function selectLatestRunPerFlow(runs: TaskSnapshot[]): TaskSnapshot[] {
+export function selectLatestRunPerFlow(runs: TaskSnapshot[]): TaskSnapshot[] {
   const latestByFlow = new Map<string, TaskSnapshot>();
   for (const run of runs) {
     const key = run.flowId?.trim() || run.flowName;

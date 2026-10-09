@@ -10,10 +10,11 @@ import { FlowListToolbar, type TaskCenterView } from './FlowListToolbar';
 import { RunHistoryDrawer } from './RunHistoryDrawer';
 import type { ElectronBridgeState } from '../../hooks/useElectronBridge';
 import { buildFlowListItems, filterFlowItems, formatRelativeTime } from '../../lib/taskCenter';
+import { selectLatestRunPerFlow } from '../../lib/operationalHealth';
 import { cn } from '../../lib/utils';
 import type { FlowSnapshot } from '../../types/electron';
 import { Button } from '../ui/button';
-import { RefreshButton } from '../ui/refresh-button';
+import { RefreshIconButton } from '../ui/refresh-button';
 import { Table, TableBody, TableCell, TableRow } from '../ui/table';
 import {
   AlertDialog,
@@ -113,6 +114,11 @@ export function TaskCenterPage({
     running: items.filter((item) => item.state === 'running').length,
     scheduled: items.filter((item) => item.state === 'scheduled').length,
   }), [archivedFlows.length, items]);
+  const runErrors = useMemo(() => Object.fromEntries(
+    selectLatestRunPerFlow(electron.runs).flatMap((run) =>
+      run.flowId && run.status === 'error' && run.error?.trim() ? [[run.flowId, run.error.trim()]] : [],
+    ),
+  ), [electron.runs]);
 
   const updateSearch = (next: { query?: string; view?: TaskCenterView }): void => {
     const params = new URLSearchParams(searchParams);
@@ -163,6 +169,14 @@ export function TaskCenterPage({
   const exportFlow = (flowId: string): void => {
     void electron.exportFlowById(flowId);
   };
+  const copyFlowId = async (flowId: string): Promise<void> => {
+    try {
+      await navigator.clipboard.writeText(flowId);
+      electron.pushToast('success', '已复制流程 ID');
+    } catch {
+      electron.pushToast('error', '无法复制流程 ID，请重试');
+    }
+  };
   const importFlow = (): void => {
     setIsImporting(true);
     void electron.openFlow().then((ok) => {
@@ -175,8 +189,8 @@ export function TaskCenterPage({
     <WorkspaceShell
       actions={
         <>
-          <RefreshButton
-            variant="subtle"
+          <RefreshIconButton
+            label="刷新任务中心"
             onClick={async () => {
               await Promise.all([
                 electron.loadFlows(),
@@ -185,10 +199,8 @@ export function TaskCenterPage({
                 electron.loadRuns({ limit: 20 }),
               ]);
             }}
-          >
-            刷新
-          </RefreshButton>
-          <Button className="h-8 rounded-md px-3" disabled={isImporting} onClick={importFlow} variant="subtle">
+          />
+          <Button className="h-8 rounded-md px-3" disabled={isImporting} onClick={importFlow} variant="ghost">
             {isImporting
               ? <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.5} />
               : <FolderOpen className="h-3.5 w-3.5" strokeWidth={1.5} />}
@@ -200,7 +212,6 @@ export function TaskCenterPage({
           </Button>
         </>
       }
-      description="流程的运行、调度与历史"
       title="任务中心"
     >
       <HealthRail>
@@ -248,15 +259,12 @@ export function TaskCenterPage({
       <FlowListToolbar
         counts={viewCounts}
         onQueryChange={(query) => updateSearch({ query })}
+        onReset={view !== 'all' || flowQuery !== '' ? () => updateSearch({ view: 'all', query: '' }) : undefined}
         onViewChange={(nextView) => updateSearch({ view: nextView })}
         query={flowQuery}
+        statusText={firstLoad ? '正在读取流程…' : `显示 ${view === 'archived' ? filteredArchivedFlows.length : visibleItems.length} / ${view === 'archived' ? archivedFlows.length : items.length} 个流程${view === 'archived' ? ' · 已归档' : ''}`}
         view={view}
       />
-
-      <div className="flex items-center justify-between gap-3 text-[11px] text-ink-3">
-        <p aria-live="polite" role="status">{firstLoad ? '正在读取流程…' : `显示 ${view === 'archived' ? filteredArchivedFlows.length : visibleItems.length} / ${view === 'archived' ? archivedFlows.length : items.length} 个流程${view === 'archived' ? ' · 已归档' : ''}`}</p>
-        {(view !== 'all' || flowQuery !== '') && <Button onClick={() => updateSearch({ view: 'all', query: '' })} size="sm" variant="ghost">清除筛选</Button>}
-      </div>
 
       <div className="min-w-0">
         {firstLoad && electron.flows.length === 0 ? (
@@ -284,6 +292,7 @@ export function TaskCenterPage({
           <FlowListTable
             items={visibleItems}
             onArchive={archiveFlow}
+            onCopyId={copyFlowId}
             onDelete={setDeleteFlowId}
             onEdit={openFlow}
             onExport={exportFlow}
@@ -291,6 +300,7 @@ export function TaskCenterPage({
             onRun={runFlow}
             onSetStatus={setStatus}
             onStop={stopFlow}
+            runErrors={runErrors}
           />
         )}
       </div>
