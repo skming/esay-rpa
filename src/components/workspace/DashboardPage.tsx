@@ -1,4 +1,4 @@
-import { Activity, AlertTriangle, ArrowUpRight, CalendarClock, CheckCircle2, Clock3, ShieldCheck } from 'lucide-react';
+import { Activity, AlertTriangle, ArrowUpRight, CalendarClock, CheckCircle2 } from 'lucide-react';
 import type { ReactElement } from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
@@ -12,13 +12,15 @@ import type { TaskSnapshot } from '../../types/electron';
 import { cn } from '../../lib/utils';
 import { RefreshIconButton } from '../ui/refresh-button';
 import { Button } from '../ui/button';
+import { Tooltip, TooltipContent, TooltipTrigger } from '../ui/tooltip';
 import { HealthRail, HealthSignal, LoadingPanel, Panel, SurfaceEmpty, SurfaceLoading } from './surfaces';
 import { RunDetailDialog } from './RunDetailDialog';
 import { RunHistoryList } from './RunHistoryList';
 import { WorkspaceShell } from './WorkspaceShell';
 
-const UPCOMING_LIMIT = 5;
-const RUN_PAGE_SIZE = 20;
+const UPCOMING_LIMIT = 3;
+const ATTENTION_LIMIT = 3;
+const RUN_PAGE_SIZE = 10;
 
 export function DashboardPage({ electron }: { electron: ElectronBridgeState }): ReactElement {
   const loadedRef = useRef(false);
@@ -63,6 +65,8 @@ export function DashboardPage({ electron }: { electron: ElectronBridgeState }): 
   );
   const nextSchedule = upcoming[0];
   const enabledScheduleCount = countEnabledSchedules(electron.schedules);
+  const showAttention = firstLoad || health.attention.length > 0;
+  const showUpcoming = firstLoad || enabledScheduleCount > 0;
 
   const inspectRun = (run: TaskSnapshot): void => {
     setDetailRun(run);
@@ -90,7 +94,6 @@ export function DashboardPage({ electron }: { electron: ElectronBridgeState }): 
           }}
         />
       }
-      description="运行状态 · 调度概况 · 历史"
       title="概览"
     >
       <HealthRail>
@@ -105,10 +108,10 @@ export function DashboardPage({ electron }: { electron: ElectronBridgeState }): 
         />
         <HealthSignal
           loading={firstLoad}
-          onClick={() => {
+          onClick={health.attention.length > 0 ? () => {
             setShowAllAttention(true);
             document.getElementById('dashboard-attention')?.scrollIntoView({ block: 'start' });
-          }}
+          } : undefined}
           detail={health.attention.length > 0 ? '等待处理' : '没有未恢复异常'}
           icon={<AlertTriangle className="h-3.5 w-3.5" strokeWidth={1.5} />}
           label="需关注"
@@ -133,11 +136,11 @@ export function DashboardPage({ electron }: { electron: ElectronBridgeState }): 
         />
       </HealthRail>
 
-      <div className="@container min-w-0">
-        <div className="grid min-w-0 items-start gap-5 @min-4xl:grid-cols-[minmax(0,1.35fr)_minmax(320px,0.65fr)]">
-          <div id="dashboard-attention" className="min-w-0 scroll-mt-5">
+      {(showAttention || showUpcoming) && <div className="@container min-w-0">
+        <div className={cn('grid min-w-0 items-start gap-5', showAttention && showUpcoming && '@min-4xl:grid-cols-[minmax(0,1.35fr)_minmax(320px,0.65fr)]')}>
+          {showAttention && <div id="dashboard-attention" className="min-w-0 scroll-mt-5">
             <AttentionPanel
-              items={showAllAttention ? health.attention : health.attention.slice(0, 6)}
+              items={showAllAttention ? health.attention : health.attention.slice(0, ATTENTION_LIMIT)}
               loading={firstLoad}
               total={health.attention.length}
               showAll={showAllAttention}
@@ -145,9 +148,9 @@ export function DashboardPage({ electron }: { electron: ElectronBridgeState }): 
               onInspectRun={inspectRun}
               onOpenSchedule={(name) => openSchedule(name, true)}
             />
-          </div>
+          </div>}
 
-          <Panel
+          {showUpcoming && <Panel
             action={upcoming.length > 0 ? (
               <button className="inline-flex items-center gap-1 text-[11px] font-medium text-accent-strong hover:text-accent-press" onClick={() => openSchedule()} type="button">
                 查看全部
@@ -169,6 +172,7 @@ export function DashboardPage({ electron }: { electron: ElectronBridgeState }): 
                 {upcoming.map((schedule) => (
                   <button
                     className="flex w-full items-center justify-between gap-4 border-b border-rule px-5 py-3 text-left transition-colors last:border-b-0 hover:bg-paper"
+                    aria-label={`${schedule.name}，${formatScheduleDateTime(schedule.nextRunAt, schedule.timezone)}（${schedule.timezone}），查看调度`}
                     key={schedule.scheduleId}
                     onClick={() => openSchedule(schedule.name)}
                     type="button"
@@ -178,16 +182,15 @@ export function DashboardPage({ electron }: { electron: ElectronBridgeState }): 
                       <span className="mt-0.5 block truncate text-[10px] text-ink-3">{schedule.task.flowName}</span>
                     </span>
                     <span className="shrink-0 text-right font-mono text-[10px] tabular-nums text-ink-3">
-                      <span className="block">{formatScheduleDateTime(schedule.nextRunAt, schedule.timezone)}</span>
-                      <span className="mt-0.5 block text-ink-4">{schedule.timezone}</span>
+                      <span className="block" title={`时区 ${schedule.timezone}`}>{formatScheduleDateTime(schedule.nextRunAt, schedule.timezone)}</span>
                     </span>
                   </button>
                 ))}
               </div>
             )}
-          </Panel>
+          </Panel>}
         </div>
-      </div>
+      </div>}
 
       {firstLoad && electron.runs.length === 0 ? (
         <LoadingPanel label="加载运行历史…" />
@@ -238,45 +241,46 @@ function AttentionPanel({
       bodyClassName="p-0"
       icon={<AlertTriangle className="h-3.5 w-3.5" strokeWidth={1.5} />}
       label="需关注"
-      action={total > 6 ? <Button onClick={onToggleAll} size="sm" variant="ghost">{showAll ? '收起' : `查看全部 ${total} 项`}</Button> : undefined}
+      action={total > ATTENTION_LIMIT ? <Button onClick={onToggleAll} size="sm" variant="ghost">{showAll ? '收起' : `查看全部 ${total} 项`}</Button> : undefined}
     >
-      {loading ? <SurfaceLoading label="读取待处理事项…" /> : items.length === 0 ? (
-        <SurfaceEmpty
-          icon={<CheckCircle2 className="h-5 w-5 text-emerald-500" strokeWidth={1.5} />}
-          title="当前没有未恢复异常"
-          hint="最新运行和启用调度均未报告需要处理的问题。"
-        />
-      ) : (
+      {loading ? <SurfaceLoading label="读取待处理事项…" /> : (
         <div>
           {items.map((item) => {
             const config = ATTENTION_META[item.kind];
-            const Icon = config.icon;
+            const inspect = (): void => {
+              if (item.run !== undefined) onInspectRun(item.run);
+              if (item.schedule !== undefined) onOpenSchedule(item.schedule.name);
+            };
             return (
-              <button
-                className="group flex w-full items-center gap-3 border-b border-rule px-5 py-3 text-left transition-colors last:border-b-0 hover:bg-paper"
+              <div
+                className="flex w-full items-center gap-3 border-b border-rule px-5 py-2.5 last:border-b-0"
                 key={item.id}
-                onClick={() => {
-                  if (item.run !== undefined) onInspectRun(item.run);
-                  if (item.schedule !== undefined) onOpenSchedule(item.schedule.name);
-                }}
-                type="button"
               >
-                <span className={cn('grid h-7 w-7 shrink-0 place-items-center rounded-md', config.surface, config.text)}>
-                  <Icon className="h-3.5 w-3.5" strokeWidth={1.5} />
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="flex items-center gap-2">
-                    <span className="truncate text-[12px] font-medium text-ink-2">{item.title}</span>
-                    <span className={cn('shrink-0 text-[10px] font-medium', config.text)}>{config.label}</span>
-                  </span>
-                  <span className="mt-0.5 block truncate text-[10px] text-ink-3">{item.detail}</span>
-                </span>
-                <span className="flex shrink-0 items-center gap-1.5 font-mono text-[10px] tabular-nums text-ink-3">
-                  <Clock3 className="h-3 w-3 text-ink-4" strokeWidth={1.5} />
+                <button
+                  aria-label={`查看 ${item.title} 的${item.schedule === undefined ? '运行' : '调度'}详情`}
+                  className="min-w-0 flex-1 truncate rounded-sm text-left text-[12px] font-medium text-ink-2 hover:text-accent-strong hover:underline hover:underline-offset-4"
+                  onClick={inspect}
+                  type="button"
+                >
+                  {item.title}
+                </button>
+                <Tooltip>
+                  <TooltipTrigger
+                    aria-label={`${config.label}，查看 ${item.title} 的详情`}
+                    className={cn('inline-flex min-h-7 shrink-0 items-center rounded-sm text-[11px] font-medium underline decoration-dotted underline-offset-4', config.text)}
+                    onClick={inspect}
+                    type="button"
+                  >
+                    {config.label}
+                  </TooltipTrigger>
+                  <TooltipContent className="max-h-[min(20rem,calc(100vh-2rem))] max-w-[min(24rem,calc(100vw-2rem))] overflow-y-auto whitespace-pre-wrap wrap-break-word leading-5" side="top">
+                    {item.detail}
+                  </TooltipContent>
+                </Tooltip>
+                <span className="shrink-0 text-[10px] tabular-nums text-ink-3">
                   {formatRelativeTime(item.updatedAt)}
-                  <ArrowUpRight className="h-3 w-3 text-ink-4 transition-colors group-hover:text-accent-strong" strokeWidth={1.5} />
                 </span>
-              </button>
+              </div>
             );
           })}
         </div>
@@ -286,7 +290,7 @@ function AttentionPanel({
 }
 
 const ATTENTION_META = {
-  confirmation: { icon: ShieldCheck, label: '等待确认', surface: 'bg-amber-50', text: 'text-amber-700' },
-  'run-error': { icon: AlertTriangle, label: '运行失败', surface: 'bg-red-50', text: 'text-red-600' },
-  'schedule-error': { icon: CalendarClock, label: '调度错误', surface: 'bg-red-50', text: 'text-red-600' },
-} satisfies Record<OperationalAttentionItem['kind'], { icon: typeof AlertTriangle; label: string; surface: string; text: string }>;
+  confirmation: { label: '等待确认', text: 'text-amber-700' },
+  'run-error': { label: '运行失败', text: 'text-red-600' },
+  'schedule-error': { label: '调度错误', text: 'text-red-600' },
+} satisfies Record<OperationalAttentionItem['kind'], { label: string; text: string }>;
