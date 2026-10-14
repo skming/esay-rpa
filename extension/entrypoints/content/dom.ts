@@ -353,11 +353,11 @@ function accessibleName(el: Element): string {
 }
 
 export function readElementAttribute(el: Element, attribute: string): string {
-  if (attribute === 'value' && (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement)) {
-    return el.value;
+  if (attribute === 'value' && ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName)) {
+    return (el as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement).value;
   }
   const propertyValue = (el as unknown as Record<string, unknown>)[attribute];
-  if ((attribute === 'href' || attribute === 'src' || attribute === 'action') && typeof propertyValue === 'string') {
+  if (['href', 'src', 'action', 'poster'].includes(attribute) && typeof propertyValue === 'string') {
     return propertyValue;
   }
   return el.getAttribute(attribute) ?? '';

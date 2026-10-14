@@ -1,4 +1,4 @@
-import { querySelectorAllDeep, readElementAttribute, resolveElement } from './dom';
+import { isVisible, querySelectorAllDeep, readElementAttribute, resolveElement } from './dom';
 import { extractTableRows, emptyScopeVerdict } from './tableExtract';
 import type { TableScopeError } from './tableExtract';
 import type { ContentAction, ExtractedTableRow } from './types';
@@ -34,11 +34,17 @@ export function dispatchExtract(
     const values = elements.map((item) => readElementAttribute(item, attribute)).filter((value) => value !== '');
     return { text: values.join('\n'), values, count: values.length };
   }
-  const values = elements.map((item) => (item.textContent ?? '').trim()).filter((value) => value !== '');
+  const values = visibleTextValues(elements);
   return { text: values.join('\n'), values, count: values.length };
 }
 
 export function dispatchExtractAll(selector: string): { values: string[]; count: number } {
-  const values = querySelectorAllDeep(selector).map((el) => (el.textContent ?? '').trim());
+  const values = visibleTextValues(querySelectorAllDeep(selector));
   return { values, count: values.length };
+}
+
+function visibleTextValues(elements: Element[]): string[] {
+  return elements.filter(isVisible)
+    .map((el) => typeof (el as HTMLElement).innerText === 'string' ? (el as HTMLElement).innerText.trim() : '')
+    .filter((value) => value !== '');
 }

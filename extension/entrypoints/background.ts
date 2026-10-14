@@ -11,6 +11,8 @@ interface BridgeInstruction {
     ref?: string;
     selector?: string;
     inputValue?: string;
+    fillMode?: string;
+    inputAction?: 'browser.click' | 'browser.fill';
     extractMode?: string; // browser.extract: text/count/attribute/html
     attribute?: string;
     query?: string;
@@ -18,6 +20,7 @@ interface BridgeInstruction {
     distance?: number;
     trusted?: boolean; // true 时改走 chrome.debugger(CDP) 可信输入，规避 dispatchEvent 的 isTrusted:false
     targetUrl?: string; // browser.open / tab.open / page.begin（探索会话要打开或复用的目标页）
+    timeoutMs?: number;
     clearStorage?: boolean; // 插件模式暂不支持，见 navigateActiveTab
     clearCookies?: boolean;
     index?: number; // browser.tab.switch：按自动化自己持有的标签页顺序的下标（见 switchTab / ownedTabIds）
@@ -112,11 +115,10 @@ async function resolveControlledTab(options: ResolveTabOptions = {}): Promise<Br
     try {
       const controlled = await browser.tabs.get(controlledTabId);
       if (!options.requireInjectable || isInjectableTabUrl(controlled.url)) return controlled;
-      if (options.passive) return null;
-      controlledTabId = null;
+      return null;
     } catch {
-      if (options.passive) return null;
-      controlledTabId = null;
+      // 受控页消失不能转而接管用户当前页；显式 browser.open 会另建专用页。
+      return null;
     }
   } else if (options.passive) {
     return null;
@@ -262,23 +264,29 @@ async function findInjectableTab(): Promise<Browser.tabs.Tab | null> {
 }
 
 function waitForTabLoad(tabId: number, timeoutMs: number): Promise<void> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let settled = false;
-    const finish = () => {
+    const finish = (error?: Error) => {
       if (settled) return;
       settled = true;
       browser.tabs.onUpdated.removeListener(listener);
+      browser.tabs.onRemoved.removeListener(removed);
       clearTimeout(timer);
-      resolve();
+      if (error !== undefined) reject(error);
+      else resolve();
     };
     const listener = (updatedTabId: number, changeInfo: { status?: string }) => {
       if (updatedTabId === tabId && changeInfo.status === 'complete') finish();
     };
+    const removed = (removedTabId: number) => {
+      if (removedTabId === tabId) finish(new Error('导航期间目标标签页已关闭'));
+    };
     browser.tabs.onUpdated.addListener(listener);
-    const timer = setTimeout(finish, timeoutMs);
+    browser.tabs.onRemoved.addListener(removed);
+    const timer = setTimeout(() => finish(new Error(`页面加载超时（${timeoutMs}ms）`)), timeoutMs);
     browser.tabs.get(tabId).then((tab) => {
       if (tab.status === 'complete') finish();
-    }, finish);
+    }, () => finish(new Error('导航期间无法读取目标标签页')));
   });
 }
 
@@ -300,7 +308,7 @@ async function navigateActiveTab(action: BridgeInstruction['action']): Promise<{
   if (existing !== null) {
     await browser.tabs.update(tab.id, { url: action.targetUrl });
   }
-  await waitForTabLoad(tab.id, NAVIGATION_TIMEOUT_MS);
+  await waitForTabLoad(tab.id, Math.max(1, action.timeoutMs ?? NAVIGATION_TIMEOUT_MS));
   // 加载完统一归组：覆盖复用已存在标签的分支，也避开 create 即 group 的时序竞态（幂等）。
   await formControlledGroup(tab.id);
   const updated = await browser.tabs.get(tab.id);
@@ -316,7 +324,7 @@ async function openNewTab(action: BridgeInstruction['action']): Promise<{ ok: bo
   setControlledTab(newTab.id);
   await formControlledGroup(newTab.id);
   if (action.targetUrl !== undefined) {
-    await waitForTabLoad(newTab.id, NAVIGATION_TIMEOUT_MS);
+    await waitForTabLoad(newTab.id, Math.max(1, action.timeoutMs ?? NAVIGATION_TIMEOUT_MS));
   }
   const updated = await browser.tabs.get(newTab.id);
   void notifyAutomationActivity(4);
@@ -350,12 +358,18 @@ async function formControlledGroup(tabId: number): Promise<void> {
 
 // index 来自流程定义（AI 也写得出来）：拿它索引整个窗口的标签页，等于让流程把用户任意一个已登录
 // 标签页收为受控，之后的 fill/click/extract 全落在那里。
+async function ownedTabs(): Promise<Browser.tabs.Tab[]> {
+  const tabs = new Map((await browser.tabs.query({})).map((tab) => [tab.id, tab]));
+  // 与 Playwright context.pages 一致，按创建/登记顺序索引，不随用户拖动标签变化。
+  return Array.from(ownedTabIds).flatMap((id) => {
+    const tab = tabs.get(id);
+    return tab === undefined ? [] : [tab];
+  });
+}
+
 async function switchTab(action: BridgeInstruction['action']): Promise<{ ok: boolean; result?: unknown; error?: string }> {
   const index = action.index ?? 0;
-  const tabs = await browser.tabs.query({});
-  const owned = tabs
-    .filter((tab) => tab.id !== undefined && ownedTabIds.has(tab.id))
-    .sort((a, b) => (a.windowId ?? 0) - (b.windowId ?? 0) || a.index - b.index);
+  const owned = await ownedTabs();
   const target = owned[index];
   if (target?.id === undefined) {
     return { ok: false, error: `标签页索引超出范围：自动化当前持有 ${owned.length} 个标签页` };
@@ -373,16 +387,18 @@ async function closeControlledTab(): Promise<{ ok: boolean; result?: unknown; er
   if (tab?.id === undefined) {
     return { ok: false, error: '未找到可操作的浏览器标签页' };
   }
-  const windowTabs = await browser.tabs.query({ windowId: tab.windowId });
-  if (windowTabs.length <= 1) {
-    // 与 Playwright 执行器的 browser.tab.close 一致：唯一的标签页不关，避免话都说不上就断了连接。
+  const owned = await ownedTabs();
+  if (owned.length <= 1) {
+    // 与 Playwright 一致，保留最后一个自动化标签页；用户自己的标签不参与计数。
     return { ok: true, result: { url: tab.url ?? '' } };
   }
   await browser.tabs.remove(tab.id);
-  controlledTabId = null;
-  // 必须 passive：controlledTabId 刚被置 null，不带这个选项就会落到 findActiveTab()，
-  // 把用户当前正在看的标签页收为受控——下一次 browser.open 就直接把它导航走了。
-  const remaining = await resolveControlledTab({ passive: true });
+  ownedTabIds.delete(tab.id);
+  const remaining = owned.find((candidate) => candidate.id !== tab.id);
+  if (remaining?.id !== undefined) {
+    setControlledTab(remaining.id);
+    await browser.tabs.update(remaining.id, { active: true });
+  }
   return { ok: true, result: { url: remaining?.url ?? '' } };
 }
 
@@ -708,8 +724,9 @@ async function notifyAutomationActivity(retries = 1): Promise<void> {
   }
 }
 
-async function setActivePageBlocked(blocked: boolean): Promise<void> {
-  const result = await sendToActiveTab({ type: 'automation.pageBlock', blocked }, { passive: true });
+async function setActivePageBlocked(blocked: boolean, tab?: Browser.tabs.Tab): Promise<void> {
+  const action = { type: 'automation.pageBlock', blocked };
+  const result = tab === undefined ? await sendToActiveTab(action, { passive: true }) : await sendToTab(tab, action);
   if (!result.ok && !String(result.error ?? '').includes('专属标签页尚未导航到可交互页面')) {
     console.debug('[rpa-studio-bridge] 切换页面交互锁失败', result.error);
   }
@@ -717,6 +734,9 @@ async function setActivePageBlocked(blocked: boolean): Promise<void> {
 
 // CDP 可信输入兜底：dispatchEvent 的 isTrusted 恒 false 会被部分站点拒绝，改用 CDP 注入原生事件，用完即 detach。
 async function dispatchTrustedInput(action: BridgeInstruction['action']): Promise<{ ok: boolean; result?: unknown; error?: string }> {
+  if (action.type === 'browser.fill' && action.inputValue === undefined) {
+    return { ok: false, error: 'browser.fill 需要 inputValue' };
+  }
   const tab = await resolveControlledTab();
   if (tab?.id === undefined) {
     return { ok: false, error: '未找到可操作的浏览器标签页' };
@@ -724,16 +744,17 @@ async function dispatchTrustedInput(action: BridgeInstruction['action']): Promis
   const tabId = tab.id;
   const debuggee = { tabId };
 
-  const scrolled = await sendToActiveTab({ type: 'scrollIntoView', ref: action.ref, selector: action.selector });
+  const target = { ref: action.ref, selector: action.selector, inputAction: action.type as 'browser.click' | 'browser.fill' };
+  const scrolled = await sendToTab(tab, { ...target, type: 'scrollIntoView' });
   if (!scrolled.ok) return scrolled;
-  const rectResponse = await sendToActiveTab({ type: 'resolveRect', ref: action.ref, selector: action.selector });
+  const rectResponse = await sendToTab(tab, { ...target, type: 'resolveRect' });
   if (!rectResponse.ok) return rectResponse;
   const rect = rectResponse.result as { x: number; y: number; width: number; height: number };
   const x = rect.x + rect.width / 2;
   const y = rect.y + rect.height / 2;
 
   try {
-    await setActivePageBlocked(false);
+    await setActivePageBlocked(false, tab);
     await chrome.debugger.attach(debuggee, '1.3');
     try {
       await chrome.debugger.sendCommand(debuggee, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
@@ -741,7 +762,7 @@ async function dispatchTrustedInput(action: BridgeInstruction['action']): Promis
       await chrome.debugger.sendCommand(debuggee, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
       // 光标脉冲纯装饰，且它的取标签页路径会在标签页刚被关掉时 reject：
       // 点击已经由 CDP 落下，少画一圈不该把成功的动作变成未处理的 rejection。
-      void sendToActiveTab({ type: 'automation.pointer', x, y, pulse: true }).catch(() => undefined);
+      void sendToTab(tab, { type: 'automation.pointer', x, y, pulse: true }).catch(() => undefined);
 
       if (action.type === 'browser.fill') {
         if (action.inputValue === undefined) return { ok: false, error: 'browser.fill 需要 inputValue' };
@@ -761,7 +782,7 @@ async function dispatchTrustedInput(action: BridgeInstruction['action']): Promis
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   } finally {
-    await setActivePageBlocked(true);
+    await setActivePageBlocked(true, tab);
   }
 }
 
@@ -782,6 +803,10 @@ async function captureActiveTabScreenshot(): Promise<{ ok: boolean; result?: unk
       return { ok: false, error: '受控标签页无法切到前台，已放弃截图，避免截到用户当前正在看的其他页面' };
     }
     const dataUrl = await browser.tabs.captureVisibleTab(confirmed.windowId ?? tab.windowId, { format: 'png' });
+    const afterCapture = await browser.tabs.get(tab.id);
+    if (afterCapture.active !== true || afterCapture.windowId !== confirmed.windowId) {
+      return { ok: false, error: '截图期间活动标签页已变化，已丢弃截图' };
+    }
     return { ok: true, result: { dataUrl } };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };

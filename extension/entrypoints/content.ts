@@ -96,7 +96,9 @@ function dispatchClick(el: Element): void {
 // Vue/Angular 读 event.target.value，两种写法都通；<select> 走 React 的 change 事件通路、
 // 不做值比对，所以 dispatchSelect 不需要这层。
 function setNativeValue(el: HTMLInputElement | HTMLTextAreaElement, text: string): void {
-  const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  const view = el.ownerDocument.defaultView;
+  const proto = el.tagName === 'TEXTAREA' ? view?.HTMLTextAreaElement.prototype : view?.HTMLInputElement.prototype;
+  if (proto === undefined) throw new Error('输入元素所在文档已失效');
   const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
   if (setter === undefined) {
     el.value = text;
@@ -105,12 +107,38 @@ function setNativeValue(el: HTMLInputElement | HTMLTextAreaElement, text: string
   setter.call(el, text);
 }
 
+function assertTextInput(el: Element, allowReadOnly = false): void {
+  if ((el as HTMLElement).isContentEditable) return;
+  if (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA') throw new Error('目标不支持文本输入');
+  if (el.tagName === 'INPUT' && ['button', 'checkbox', 'color', 'file', 'hidden', 'image', 'radio', 'range', 'reset', 'submit'].includes((el as HTMLInputElement).type)) {
+    throw new Error('该 input 类型不支持文本输入');
+  }
+  if (!allowReadOnly && (el as HTMLInputElement).readOnly) throw new Error('目标元素只读');
+}
+
+function resolveActionElement(action: ContentAction): Element {
+  const operation = action.inputAction ?? action.type;
+  const el = operation === 'browser.click' && action.ref === undefined && action.selector !== undefined
+    ? querySelectorAllDeep(action.selector).find(isVisible)
+    : resolveElement(action);
+  if (el === undefined || (!isVisible(el) && !(operation === 'browser.fill' && action.fillMode === 'js'))) {
+    throw new Error('目标元素不存在或不可见');
+  }
+  if (el.matches(':disabled') || el.getAttribute('aria-disabled') === 'true') throw new Error('目标元素已禁用');
+  if (operation === 'browser.fill') assertTextInput(el, action.fillMode === 'js');
+  return el;
+}
+
 function dispatchType(el: Element, text: string): void {
-  if (!(el instanceof HTMLInputElement) && !(el instanceof HTMLTextAreaElement)) return;
   const rect = el.getBoundingClientRect();
   moveCursorTo(rect.x + rect.width / 2, rect.y + rect.height / 2);
-  el.focus();
-  setNativeValue(el, text);
+  (el as HTMLElement).focus();
+  if ((el as HTMLElement).isContentEditable) {
+    el.textContent = text;
+  } else {
+    setNativeValue(el as HTMLInputElement | HTMLTextAreaElement, text);
+    if ((el as HTMLInputElement).value !== text) throw new Error('输入值未被控件接受');
+  }
   el.dispatchEvent(new Event('input', { bubbles: true }));
   el.dispatchEvent(new Event('change', { bubbles: true }));
 }
@@ -125,13 +153,17 @@ function dispatchHover(el: Element): void {
 }
 
 function dispatchSelect(el: Element, optionValue: string): string[] {
-  if (!(el instanceof HTMLSelectElement)) throw new Error('browser.select 只支持 <select> 元素');
+  if (el.tagName !== 'SELECT') throw new Error('browser.select 只支持 <select> 元素');
+  const select = el as HTMLSelectElement;
+  if (!Array.from(select.options).some((option) => option.value === optionValue)) throw new Error('未找到对应的下拉选项');
   const rect = el.getBoundingClientRect();
   moveCursorTo(rect.x + rect.width / 2, rect.y + rect.height / 2);
-  el.value = optionValue;
+  select.value = optionValue;
   el.dispatchEvent(new Event('input', { bubbles: true }));
   el.dispatchEvent(new Event('change', { bubbles: true }));
-  return Array.from(el.selectedOptions).map((option) => option.value);
+  const selected = Array.from(select.selectedOptions).map((option) => option.value);
+  if (selected.length !== 1 || selected[0] !== optionValue) throw new Error('下拉框未保持期望选中项');
+  return selected;
 }
 
 // 老框架（Element UI/iView/layui）判键用已废弃的 keyCode，而 KeyboardEvent 的 keyCode 恒 0 会识别不出按键——
@@ -240,9 +272,8 @@ async function handleAction(action: ContentAction): Promise<unknown> {
     if (!isVisible(el)) throw new Error('目标元素不可见');
     if ((el as HTMLInputElement).disabled || el.getAttribute('aria-disabled') === 'true') throw new Error('目标元素已禁用');
     if (action.type === 'browser.fill') {
-      if (!(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) throw new Error('目标不支持文本输入');
-      if (el.readOnly) throw new Error('目标元素只读');
-      if (el instanceof HTMLInputElement && el.type === 'password') throw new Error('凭据输入必须通过流程凭据变量完成');
+      assertTextInput(el);
+      if (el.tagName === 'INPUT' && (el as HTMLInputElement).type === 'password') throw new Error('凭据输入必须通过流程凭据变量完成');
     }
   }
   markAutomationActivity();
@@ -260,24 +291,24 @@ async function handleAction(action: ContentAction): Promise<unknown> {
       return findElements(action.query, action.limit ?? 10);
     }
     case 'browser.click': {
-      dispatchClick(resolveElement(action));
+      dispatchClick(resolveActionElement(action));
       return { ok: true };
     }
     case 'browser.fill': {
       if (action.inputValue === undefined) throw new Error('browser.fill 需要 inputValue');
-      dispatchType(resolveElement(action), action.inputValue);
+      dispatchType(resolveActionElement(action), action.inputValue);
       return { ok: true };
     }
     case 'browser.extract': {
       return dispatchExtract(action);
     }
     case 'browser.hover': {
-      dispatchHover(resolveElement(action));
+      dispatchHover(resolveActionElement(action));
       return { ok: true };
     }
     case 'browser.select': {
       if (action.inputValue === undefined) throw new Error('browser.select 需要 inputValue');
-      const selected = dispatchSelect(resolveElement(action), action.inputValue);
+      const selected = dispatchSelect(resolveActionElement(action), action.inputValue);
       return { selected };
     }
     case 'browser.press': {
@@ -297,20 +328,21 @@ async function handleAction(action: ContentAction): Promise<unknown> {
       return { ok: true };
     }
     case 'browser.check': {
-      const el = resolveElement(action);
-      if (!(el instanceof HTMLInputElement) || (el.type !== 'checkbox' && el.type !== 'radio')) {
+      const el = resolveActionElement(action) as HTMLInputElement;
+      if (el.tagName !== 'INPUT' || (el.type !== 'checkbox' && el.type !== 'radio')) {
         throw new Error('browser.check 只支持 checkbox/radio 类型的 input');
       }
       const shouldCheck = action.checked ?? true;
       if (el.checked !== shouldCheck) dispatchClick(el);
+      if (el.checked !== shouldCheck) throw new Error('复选框/单选框未达到期望勾选状态');
       return { checked: el.checked };
     }
     case 'browser.drag': {
-      const source = resolveElement(action);
+      const source = resolveActionElement(action);
       if (action.targetRef === undefined && action.targetSelector === undefined) {
         throw new Error('browser.drag 需要 targetRef 或 targetSelector');
       }
-      const target = resolveElement({ ref: action.targetRef, selector: action.targetSelector });
+      const target = resolveActionElement({ type: 'browser.drag', ref: action.targetRef, selector: action.targetSelector });
       dispatchDrag(source, target);
       return { ok: true };
     }
@@ -337,12 +369,12 @@ async function handleAction(action: ContentAction): Promise<unknown> {
       return { status: 'logged_in' };
     }
     case 'scrollIntoView': {
-      resolveElement(action).scrollIntoView({ block: 'center' });
+      resolveActionElement(action).scrollIntoView({ block: 'center' });
       return { ok: true };
     }
     case 'resolveRect': {
       // 供 background 的 CDP 可信输入用：视口相对坐标，调用方须先 scrollIntoView，否则点击落空。
-      const rect = resolveElement(action).getBoundingClientRect();
+      const rect = resolveActionElement(action).getBoundingClientRect();
       moveCursorTo(rect.x + rect.width / 2, rect.y + rect.height / 2);
       return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
     }

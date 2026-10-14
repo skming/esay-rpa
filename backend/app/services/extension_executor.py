@@ -24,10 +24,12 @@ from app.services.browser_action_runner import (
     _healing_candidates,
     _normalize_action_type,
     _normalize_table_rows,
+    _post_action_delay_ms,
     _raise_if_table_scope_error,
     _read_action_type,
     _read_bool,
     _read_int,
+    _read_non_negative_int,
     _read_optional_string,
     _read_required_string,
     _read_selector_config,
@@ -142,17 +144,23 @@ class ExtensionExecutor:
         # 节点会自己建），写成后者运行会卡死在自己身上。只有拿到租约的那个上下文能释放它。
         holds_lease = self._lease_owner is None
         self._lease_owner = label
-        if manage_tabs:
-            await self._ensure_tab_group()
+        try:
+            if manage_tabs:
+                await self._ensure_tab_group()
+        except BaseException:
+            if holds_lease and self._lease_owner == label:
+                self._lease_owner = None
+            raise
         return ExtensionExecutionContext(owner=label, holds_lease=holds_lease, manage_tabs=manage_tabs)
 
     async def close_context(self, context: ExtensionExecutionContext | None) -> None:
-        if context is not None and context.manage_tabs:
-            await self._mark_tab_group_done()
-        # 只有登记者本人能释放（同 browser_profile_lock.release）：抢不到租约的一方也会走进自己的
-        # finally，无条件清空会抹掉正在跑的那次运行的登记，第三次运行就拿到空闲的假象。
-        if context is not None and context.holds_lease and self._lease_owner == context.owner:
-            self._lease_owner = None
+        try:
+            if context is not None and context.manage_tabs:
+                await self._mark_tab_group_done()
+        finally:
+            # 取消分组操作也必须归还租约，嵌套上下文不能释放外层持有者。
+            if context is not None and context.holds_lease and self._lease_owner == context.owner:
+                self._lease_owner = None
 
     async def _ensure_tab_group(self) -> None:
         """标签页分组仅作可视化隔离，失败不应阻断真实流程执行。"""
@@ -214,10 +222,11 @@ class ExtensionExecutor:
                 "这是为了防止失控循环对用户真实登录态的浏览器做出无限次操作。"
             )
         # 审计行要能落到哪次运行的哪个节点；自愈探测也包进来，它同样落在用户的真实页面上。
+        delay_ms = _post_action_delay_ms(node, variables)
         with audit_scope(run_label=context.owner, node_id=_read_optional_string(node, "id")):
             try:
-                return await self._run_action(node, variables, context, timeout_ms=timeout_ms)
-            except ExtensionActionOutcomeUnknown:
+                result = await self._run_action(node, variables, context, timeout_ms=timeout_ms)
+            except (ExtensionActionOutcomeUnknown, ValueError):
                 raise
             except Exception:
                 healed = await self._heal_selector(node, variables)
@@ -226,12 +235,15 @@ class ExtensionExecutor:
                 healed_node = dict(node)
                 healed_node["selector"] = healed
                 result = await self._run_action(healed_node, variables, context, timeout_ms=timeout_ms)
-                return BrowserActionResult(
+                result = BrowserActionResult(
                     action_type=result.action_type,
                     detail=f"{result.detail}（selector 自愈：原 selector 未命中，改用备选 {healed}）",
                     values=result.values,
                     structured=result.structured,
                 )
+            if delay_ms > 0:
+                await asyncio.sleep(delay_ms / 1000)
+            return result
 
     async def _heal_selector(self, node: FlowNode, variables: RuntimeVariableStore) -> str | None:
         """复用 BrowserActionRunner 的候选生成逻辑，探测改走 browser.elementState；
@@ -267,6 +279,8 @@ class ExtensionExecutor:
         # trustedInput: true 时改走 background 的 chrome.debugger(CDP) 可信输入路径，
         # 应对检查 event.isTrusted 而拒绝 dispatchEvent 合成事件的站点。
         trusted_input = _read_bool(node, "trustedInput", default=False)
+        if trusted_input and action_type not in {"browser.click", "browser.fill"}:
+            raise ValueError("插件执行器的 trustedInput 仅支持 browser.click/browser.fill")
 
         if action_type == "browser.screenshot":
             # 纯诊断标记节点，真正截图由 task_manager._save_browser_screenshot 生成，此处不重复触发。
@@ -275,26 +289,26 @@ class ExtensionExecutor:
         if action_type == "browser.open":
             # clearStorage/clearCookies 对插件驱动的用户真实登录态浏览器无意义，交给 background 拒绝。
             target_url = variables.resolve_text(_read_required_string(node, "targetUrl"))
-            open_payload: dict[str, object] = {"type": "browser.open", "targetUrl": target_url}
+            open_payload: dict[str, object] = {"type": "browser.open", "targetUrl": target_url, "timeoutMs": max(1, timeout_ms)}
             if _read_bool(node, "clearStorage", default=False):
                 open_payload["clearStorage"] = True
             if _read_bool(node, "clearCookies", default=False):
                 open_payload["clearCookies"] = True
-            result = await self._bridge.execute(open_payload, timeout=timeout_seconds)
+            result = await self._bridge.execute(open_payload, timeout=timeout_seconds + 1.0)
             url = str(result.get("url", target_url))
             return BrowserActionResult(action_type=action_type, detail=url, values=[url])
 
         if action_type == "browser.tab.open":
             raw_url = _read_optional_string(node, "targetUrl")
-            payload: dict[str, object] = {"type": "browser.tab.open"}
+            payload: dict[str, object] = {"type": "browser.tab.open", "timeoutMs": max(1, timeout_ms)}
             if raw_url is not None:
                 payload["targetUrl"] = variables.resolve_text(raw_url)
-            result = await self._bridge.execute(payload, timeout=timeout_seconds)
+            result = await self._bridge.execute(payload, timeout=timeout_seconds + 1.0)
             url = str(result.get("url", ""))
             return BrowserActionResult(action_type=action_type, detail=url, values=[url])
 
         if action_type == "browser.tab.switch":
-            index = _read_int(node, "index", default=0, variables=variables)
+            index = _read_non_negative_int(node, "index", default=0, variables=variables)
             result = await self._bridge.execute({"type": "browser.tab.switch", "index": index}, timeout=timeout_seconds)
             url = str(result.get("url", ""))
             return BrowserActionResult(action_type=action_type, detail=url, values=[url])
@@ -305,6 +319,8 @@ class ExtensionExecutor:
             return BrowserActionResult(action_type=action_type, detail=url, values=[url])
 
         if action_type == "browser.click":
+            if _read_bool(node, "force", default=False):
+                raise ValueError("插件执行器暂不支持 force 点击，请确认目标可见或使用 Playwright 执行器")
             selector = variables.resolve_text(_read_required_string(node, "selector"))
             await self._highlight_best_effort(selector)
             await self._bridge.execute(
@@ -316,8 +332,12 @@ class ExtensionExecutor:
             selector = variables.resolve_text(_read_required_string(node, "selector"))
             input_value = variables.resolve_text(_read_required_string(node, "inputValue", fallback_keys=("value",)))
             await self._highlight_best_effort(selector)
+            payload = {"type": "browser.fill", "selector": selector, "inputValue": input_value, "trusted": trusted_input}
+            fill_mode = _read_optional_string(node, "fillMode")
+            if fill_mode is not None:
+                payload["fillMode"] = fill_mode
             await self._bridge.execute(
-                {"type": "browser.fill", "selector": selector, "inputValue": input_value, "trusted": trusted_input},
+                payload,
                 timeout=timeout_seconds,
             )
             return BrowserActionResult(action_type=action_type, detail=selector, values=[input_value])
@@ -364,8 +384,9 @@ class ExtensionExecutor:
                 {"type": "browser.select", "selector": selector, "inputValue": input_value}, timeout=timeout_seconds
             )
             selected = result.get("selected")
-            values = [str(v) for v in selected] if isinstance(selected, list) else [input_value]
-            return BrowserActionResult(action_type=action_type, detail=selector, values=values)
+            if selected != [input_value]:
+                raise RuntimeError("下拉框未返回期望选中项，无法确认选择成功")
+            return BrowserActionResult(action_type=action_type, detail=selector, values=[input_value])
 
         if action_type == "browser.press":
             key = variables.resolve_text(_read_required_string(node, "inputValue", fallback_keys=("key", "value")))
@@ -388,8 +409,9 @@ class ExtensionExecutor:
             result = await self._bridge.execute(
                 {"type": "browser.check", "selector": selector, "checked": checked}, timeout=timeout_seconds
             )
-            actual = bool(result.get("checked", checked))
-            return BrowserActionResult(action_type=action_type, detail=selector, values=[str(actual).lower()])
+            if result.get("checked") is not checked:
+                raise RuntimeError("复选框/单选框未达到期望勾选状态")
+            return BrowserActionResult(action_type=action_type, detail=selector, values=[str(checked).lower()])
 
         if action_type == "browser.drag":
             selector = variables.resolve_text(_read_required_string(node, "selector"))
@@ -400,6 +422,12 @@ class ExtensionExecutor:
             return BrowserActionResult(action_type=action_type, detail=f"{selector} -> {target_selector}", values=[target_selector])
 
         if action_type == "browser.ensureLogin":
+            target_url = variables.resolve_text(_read_required_string(node, "targetUrl"))
+            opened = await self._bridge.execute(
+                {"type": "browser.open", "targetUrl": target_url, "timeoutMs": max(1, timeout_ms)},
+                timeout=timeout_seconds + 1.0,
+            )
+            await asyncio.sleep(1.5)
             logged_in_probe = _read_optional_string(node, "selector")
             logged_out_probe = _read_optional_string(node, "targetSelector")
             payload: dict[str, object] = {"type": "browser.ensureLogin"}
@@ -408,11 +436,13 @@ class ExtensionExecutor:
             if logged_out_probe is not None:
                 payload["targetSelector"] = variables.resolve_text(logged_out_probe)
             result = await self._bridge.execute(payload, timeout=timeout_seconds)
-            status = str(result.get("status", "logged_in"))
-            return BrowserActionResult(action_type=action_type, detail=status, values=[status])
+            status = result.get("status")
+            if not isinstance(status, str) or status not in {"logged_in", "login_required"}:
+                raise RuntimeError("插件未返回有效登录状态，无法确认已登录")
+            return BrowserActionResult(action_type=action_type, detail=f"{opened.get('url', target_url)} → {status}", values=[status])
 
         if action_type == "browser.waitFor":
-            # 区别于只轮询"是否存在"的 browser.wait，还支持等消失/等文本包含。
+            # browser.wait 只等可见；此节点还支持等消失/等文本包含。
             selector = variables.resolve_text(_read_required_string(node, "selector"))
             condition = _read_optional_string(node, "waitCondition") or "visible"
             if condition == "textContains":
@@ -483,16 +513,7 @@ class ExtensionExecutor:
             await asyncio.sleep(_WAIT_POLL_INTERVAL_SECONDS)
 
     async def _wait_for_selector(self, selector: str, *, timeout_ms: int) -> None:
-        deadline = time.monotonic() + timeout_ms / 1000
-        last_error: Exception | None = None
-        while time.monotonic() < deadline:
-            try:
-                await self._bridge.execute({"type": "browser.extract", "selector": selector}, timeout=5.0)
-                return
-            except RuntimeError as exc:
-                last_error = exc
-                await asyncio.sleep(_WAIT_POLL_INTERVAL_SECONDS)
-        raise TimeoutError(f"等待元素超时（{timeout_ms}ms）: {selector}") from last_error
+        await self._wait_for_visibility(selector, hidden=False, timeout_ms=timeout_ms)
 
     async def _wait_for_visibility(self, selector: str, *, hidden: bool, timeout_ms: int) -> None:
         """hidden=True 要求元素消失或不可见，hidden=False 要求存在且可见。"""
@@ -754,7 +775,10 @@ class ExtensionExecutor:
         for index in range(max_iterations):
             page_number = start_page + index * page_step
             target_url = url_template.replace("${page}", str(page_number))
-            await self._bridge.execute({"type": "browser.open", "targetUrl": target_url}, timeout=timeout_seconds)
+            await self._bridge.execute(
+                {"type": "browser.open", "targetUrl": target_url, "timeoutMs": max(1, int(timeout_seconds * 1000))},
+                timeout=timeout_seconds + 1.0,
+            )
             if delay_ms > 0:
                 await asyncio.sleep(delay_ms / 1000)
             try:

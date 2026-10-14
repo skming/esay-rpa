@@ -55,6 +55,9 @@ export interface ContentAction {
   targetSelector?: string;
   /** browser.fill/select/press 使用：分别为待填文本/待选 option value/按键名（如 Enter） */
   inputValue?: string;
+  fillMode?: string;
+  /** CDP 输入前的定位检查也必须验证实际动作的可操作性。 */
+  inputAction?: 'browser.click' | 'browser.fill';
   /** browser.extract 使用：对齐 Playwright 执行器的 text/count/attribute/html/table 抽取模式 */
   extractMode?: 'text' | 'count' | 'attribute' | 'html' | 'table';
   /** browser.extract extractMode=attribute 时读取的属性名，默认 href */

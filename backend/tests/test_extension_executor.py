@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 
 import pytest
@@ -99,7 +100,7 @@ async def test_browser_ensure_login_returns_status_from_bridge() -> None:
     variables = RuntimeVariableStore.from_initial({})
 
     result = await executor.run(
-        {"type": "browser.ensureLogin", "selector": ".avatar", "targetSelector": "#login-form"},
+        {"type": "browser.ensureLogin", "targetUrl": "https://example.test/account", "selector": ".avatar", "targetSelector": "#login-form"},
         variables,
         context,
         timeout_ms=1000,
@@ -110,7 +111,101 @@ async def test_browser_ensure_login_returns_status_from_bridge() -> None:
         "selector": ".avatar",
         "targetSelector": "#login-form",
     }
+    assert bridge.calls[-2] == {
+        "type": "browser.open", "targetUrl": "https://example.test/account", "timeoutMs": 1000,
+    }
     assert result.values == ["login_required"]
+
+
+@pytest.mark.parametrize("phase", ["start", "end"])
+async def test_cancelled_group_operation_releases_only_its_lease(phase):
+    entered = asyncio.Event()
+
+    class BlockingBridge(FakeBridge):
+        async def execute(self, action, timeout=30.0):
+            if action["type"] == f"automation.group.{phase}":
+                entered.set()
+                await asyncio.Future()
+            return await super().execute(action, timeout)
+
+    executor = ExtensionExecutor(BlockingBridge())
+    if phase == "start":
+        operation = executor.create_context(owner="cancelled")
+    else:
+        context = await executor.create_context(owner="cancelled")
+        operation = executor.close_context(context)
+    task = asyncio.create_task(operation)
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert executor.lease_holder is None
+    next_context = await executor.create_context(owner="next", manage_tabs=False)
+    await executor.close_context(next_context)
+
+
+async def test_cancelled_nested_creation_preserves_outer_lease():
+    entered = asyncio.Event()
+
+    class BlockingBridge(FakeBridge):
+        async def execute(self, action, timeout=30.0):
+            entered.set()
+            await asyncio.Future()
+
+    executor = ExtensionExecutor(BlockingBridge())
+    context = await executor.create_context(owner="outer", manage_tabs=False)
+    task = asyncio.create_task(executor.create_context(owner="outer"))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert executor.lease_holder == "outer"
+    await executor.close_context(context)
+
+
+async def test_check_rejects_incomplete_or_wrong_bridge_receipts():
+    for receipt in ({}, {"checked": False}, {"checked": "true"}):
+        executor, context = await make_context(FakeBridge({"browser.check": [receipt]}))
+        with pytest.raises(RuntimeError, match="勾选"):
+            await executor.run(
+                {"type": "browser.check", "selector": "#check", "checked": True},
+                RuntimeVariableStore.from_initial({}), context, timeout_ms=1000,
+            )
+
+
+async def test_login_does_not_invent_success_from_an_empty_receipt(monkeypatch):
+    async def no_sleep(_seconds):
+        pass
+
+    monkeypatch.setattr("app.services.extension_executor.asyncio.sleep", no_sleep)
+    executor, context = await make_context(FakeBridge())
+    with pytest.raises(RuntimeError, match="登录状态"):
+        await executor.run(
+            {"type": "browser.ensureLogin", "targetUrl": "https://example.test/account"},
+            RuntimeVariableStore.from_initial({}), context, timeout_ms=1000,
+        )
+
+
+@pytest.mark.parametrize("receipt", [{}, {"selected": []}, {"selected": ["wrong"]}])
+async def test_select_requires_a_matching_receipt(receipt):
+    executor, context = await make_context(FakeBridge({"browser.select": [receipt]}))
+    with pytest.raises(RuntimeError, match="选中项"):
+        await executor.run(
+            {"type": "browser.select", "selector": "#select", "inputValue": "wanted"},
+            RuntimeVariableStore.from_initial({}), context, timeout_ms=1000,
+        )
+
+
+@pytest.mark.parametrize("node", [
+    {"type": "browser.click", "selector": "#button", "force": True, "fallbackSelectors": "#other"},
+    {"type": "browser.press", "selector": "#input", "inputValue": "Enter", "trustedInput": True},
+])
+async def test_unsupported_input_flags_are_rejected_before_dispatch(node):
+    bridge = FakeBridge()
+    executor, context = await make_context(bridge)
+    with pytest.raises(ValueError):
+        await executor.run(node, RuntimeVariableStore.from_initial({}), context, timeout_ms=1000)
+    assert action_calls(bridge) == []
 
 
 async def test_browser_extract_attribute_forwards_mode_and_attribute() -> None:
@@ -424,7 +519,8 @@ async def test_browser_paginate_next_preserves_table_rows() -> None:
     assert variables.get("page_count") == 1
 
 
-async def test_browser_wait_for_visible_polls_until_element_shows() -> None:
+@pytest.mark.parametrize("action_type", ["browser.waitFor", "browser.wait", "ui.wait"])
+async def test_browser_wait_for_visible_polls_until_element_shows(action_type) -> None:
     bridge = FakeBridge(
         responses={
             "browser.elementState": [
@@ -437,7 +533,7 @@ async def test_browser_wait_for_visible_polls_until_element_shows() -> None:
     variables = RuntimeVariableStore.from_initial({})
 
     result = await executor.run(
-        {"type": "browser.waitFor", "selector": "#result"},
+        {"type": action_type, "selector": "#result"},
         variables,
         context,
         timeout_ms=2000,

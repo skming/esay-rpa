@@ -341,8 +341,11 @@ class BrowserActionRunner:
         return await context.page.screenshot(full_page=True, type="png")
 
     async def run(self, node: FlowNode, variables: RuntimeVariableStore, context: BrowserActionContext, *, timeout_ms: int) -> BrowserActionResult:
+        delay_ms = _post_action_delay_ms(node, variables)
         try:
-            return await self._run_action(node, variables, context, timeout_ms=timeout_ms)
+            result = await self._run_action(node, variables, context, timeout_ms=timeout_ms)
+        except ValueError:
+            raise
         except Exception:
             healed = await _heal_selector(context.page, node, variables)
             if healed is None:
@@ -350,22 +353,20 @@ class BrowserActionRunner:
             healed_node = dict(node)
             healed_node["selector"] = healed
             result = await self._run_action(healed_node, variables, context, timeout_ms=timeout_ms)
-            return BrowserActionResult(
+            result = BrowserActionResult(
                 action_type=result.action_type,
                 detail=f"{result.detail}（selector 自愈：原 selector 未命中，改用备选 {healed}）",
                 values=result.values,
                 structured=result.structured,
             )
+        if delay_ms > 0:
+            await context.page.wait_for_timeout(delay_ms)
+        return result
 
     async def _run_action(self, node: FlowNode, variables: RuntimeVariableStore, context: BrowserActionContext, *, timeout_ms: int) -> BrowserActionResult:
         action_type = _normalize_action_type(_read_action_type(node))
         timeout = max(1, timeout_ms)
         page = context.page
-
-        delay_ms = _read_int(node, "delayMs", default=0, variables=variables)
-        compound_delay_actions = {"browser.clickLoadMore", "browser.paginateNext", "browser.dismiss"}
-        if delay_ms > 0 and action_type not in compound_delay_actions:
-            await page.wait_for_timeout(delay_ms)
 
         if action_type == "browser.open":
             url = variables.resolve_text(_read_required_string(node, "targetUrl"))
@@ -496,6 +497,8 @@ class BrowserActionRunner:
             elif fill_mode == "type":
                 target = _target_locator(page, selector).first
                 try:
+                    if not await target.is_editable(timeout=timeout):
+                        raise ValueError("目标元素不支持文本输入或处于只读/禁用状态")
                     await target.click(timeout=timeout)
                 except Exception as exc:
                     await _enrich_selector_error(exc, selector)
@@ -622,10 +625,6 @@ class BrowserActionRunner:
             except Exception as exc:
                 await _enrich_selector_error(exc, selector)
                 raise
-            delay_ms = max(0, _read_int(node, "delayMs", default=0, variables=variables))
-            if delay_ms > 0:
-                import asyncio as _asyncio
-                await _asyncio.sleep(delay_ms / 1000)
             return BrowserActionResult(action_type=action_type, detail=selector, values=[selector])
 
         if action_type == "browser.drag":
@@ -1026,6 +1025,13 @@ def _read_selector_config(node: FlowNode, variables: RuntimeVariableStore) -> Se
 
 def _is_page_level_press_selector(selector: str) -> bool:
     return selector.strip().lower() in {"body", "html", "document", "window", ":root", "page"}
+
+
+def _post_action_delay_ms(node: FlowNode, variables: RuntimeVariableStore) -> int:
+    # 复合节点已在每轮动作后等待；普通节点只在成功后等待一次。
+    if _normalize_action_type(_read_action_type(node)) in {"browser.clickLoadMore", "browser.paginateNext", "browser.dismiss"}:
+        return 0
+    return max(0, _read_int(node, "delayMs", default=0, variables=variables))
 
 
 def _read_target_selector_config(node: FlowNode, variables: RuntimeVariableStore) -> SelectorConfig:
