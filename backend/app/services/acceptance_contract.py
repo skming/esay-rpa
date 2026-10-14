@@ -25,7 +25,7 @@ _VARIABLE_REF = re.compile(r"\$\{var\.([A-Za-z_][A-Za-z0-9_.-]{0,119})\}")
 
 @dataclass(frozen=True)
 class PaginationCaps:
-    """翻页上限由输入变量控制的节点：cap_variables 是上限变量名，output_variables 是这些节点的产出。"""
+    """翻页上限由输入变量控制的节点：cap_variables 是上限变量名，output_variables 是可能成功截断的节点产出。"""
 
     cap_variables: frozenset[str]
     output_variables: frozenset[str]
@@ -45,7 +45,12 @@ def pagination_caps_from_nodes(nodes: Any) -> PaginationCaps:
         }
         if names:
             cap_variables |= names
-            output_variables.update(collect_node_output_names(node))
+            varies_start_or_step = any(
+                isinstance(node.get(key), str) and _VARIABLE_REF.search(node[key])
+                for key in ("startPage", "pageStep")
+            )
+            if node.get("type") != "browser.paginateNext" or varies_start_or_step:
+                output_variables.update(collect_node_output_names(node))
     return PaginationCaps(frozenset(cap_variables), frozenset(output_variables))
 
 
@@ -122,8 +127,8 @@ def contract_validation_errors(
 
 
 def _page_cap_row_bound_errors(deliverable, caps: PaginationCaps) -> list[str]:
-    """翻页上限是「最多翻几页」，不是「应该有多少行」：max_pages=2 抓回 2 行完全正确，
-    写死的 min_rows=3 却把它判成缺数据。两者不能互相换算——一页几行只有跑完才知道。
+    """页数不能作为行数界。完整分页的安全上限不足时运行失败，不再改变成功交付的行数；
+    仍可成功截断的其他节点保留对固定行数界的检查。
     """
     errors: list[str] = []
     for field_name, variable_name in (

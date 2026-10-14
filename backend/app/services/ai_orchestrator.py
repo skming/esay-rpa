@@ -310,7 +310,9 @@ def _demo_date_controls() -> list[dict[str, Any]]:
 
 
 def _build_few_shot_messages() -> list[dict[str, Any]]:
-    """真实验证过的一次会话作为 few-shot：已登录页面取证→日期选择→多选→表格提取→校验。
+    """已登录页面取证→日期选择→多选→表格提取→校验的 few-shot。
+
+    示例使用下一页控件的禁用状态确认结束。
 
     站点域名与凭据一律用 mock：这段每轮都随请求发给模型厂商。
     """
@@ -330,7 +332,7 @@ def _build_few_shot_messages() -> list[dict[str, Any]]:
         {"id": "n20",     "type": "browser.click",     "title": "选择待尽调",         "kind": "browser", "status": "pending", "position": {"x": 100, "y": 2300}, "selector": ".el-select-dropdown__item:has-text('待尽调')", "delayMs": 500, "description": "勾选「待尽调」"},
         {"id": "n21",     "type": "browser.click",     "title": "点击查询按钮",       "kind": "browser", "status": "pending", "position": {"x": 100, "y": 2400}, "selector": "button:has-text('查询')", "delayMs": 2000, "description": "提交筛选条件；按钮用文本定位，不挂库专属 class"},
         {"id": "n22",     "type": "browser.wait",      "title": "等待筛选结果",       "kind": "browser", "status": "pending", "position": {"x": 100, "y": 2500}, "selector": "table, .el-table__body", "timeoutMs": 10000, "description": "等筛选后的表格刷新"},
-        {"id": "n23",     "type": "browser.paginateNext", "title": "翻页提取全部数据", "kind": "browser", "status": "pending", "position": {"x": 100, "y": 2600}, "selector": ".audit-table-wrapper .el-pagination button.btn-next", "targetSelector": ".audit-table-wrapper tbody tr", "extractMode": "table", "outputVariable": "project_data", "countVariable": "project_table_count", "pageCountVariable": "project_page_count", "maxIterations": 20, "delayMs": 1500, "description": "从当前页起逐页累计提取，翻页按钮消失/禁用即停 → project_data"},
+        {"id": "n23",     "type": "browser.paginateNext", "title": "翻页提取全部数据", "kind": "browser", "status": "pending", "position": {"x": 100, "y": 2600}, "selector": ".audit-table-wrapper .el-pagination button.btn-next", "targetSelector": ".audit-table-wrapper tbody tr", "extractMode": "table", "outputVariable": "project_data", "countVariable": "project_table_count", "pageCountVariable": "project_page_count", "maxIterations": 20, "delayMs": 1500, "description": "从当前页起累计稳定的新页，下一页控件禁用后结束 → project_data"},
         {"id": "n24",     "type": "file.write",        "title": "保存结果",           "kind": "file",    "status": "pending", "position": {"x": 100, "y": 2700}, "path": "${var.output_prefix}.json", "content": "${var.project_data}", "description": "写出 JSON 到本次运行目录"},
         {"id": "end",     "type": "end",               "title": "结束",               "kind": "control", "status": "pending", "position": {"x": 100, "y": 2800}},
     ]

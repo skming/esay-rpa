@@ -243,13 +243,19 @@ def test_page_cap_variable_cannot_be_bound_as_a_row_bound() -> None:
     assert any("minRowsVariable" in error and "max_pages" in error for error in errors)
 
 
-def test_literal_row_bound_is_rejected_on_a_page_capped_deliverable() -> None:
-    # pagination_sweep 的真实失败形态：min_rows=3 冻自没有页数上限的那一轮，
-    # max_pages=2 抓回 2 行完全正确却被判 too_few_rows。
-    errors = contract_validation_errors(
+def test_full_pagination_safety_cap_does_not_invalidate_a_business_row_bound() -> None:
+    assert contract_validation_errors(
         _table_contract(minRows=3),
         defined_variables={"rows", "max_pages"},
         pagination_caps=pagination_caps_from_nodes(_SWEEP_NODES),
+    ) == []
+
+
+def test_bounded_loading_preserves_its_row_bound_check() -> None:
+    nodes = [{**_SWEEP_NODES[0], "type": "browser.clickLoadMore"}]
+    errors = contract_validation_errors(
+        _table_contract(minRows=3), defined_variables={"rows", "max_pages"},
+        pagination_caps=pagination_caps_from_nodes(nodes),
     )
     assert any("minRows" in error and "max_pages" in error for error in errors)
 

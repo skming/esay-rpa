@@ -624,42 +624,9 @@ class ScraplingCodeGenerator:
         raise ValueError(f"Scrapling 脚本不支持节点 {title}（{node_type or '缺少类型'}）")
 
     def _pagination_lines(self, node: dict[str, Any], depth: int) -> list[str]:
-        """点击式翻页在 Scrapling 里没有对应能力，只能拒绝。
-
-        此前它落进 browser.* 兜底变成 pass：脚本只抓第 1 页，跑完还报成功。
-        运行时对「只翻到第 1 页」有硬门控，导出路径不能比它松。
-        """
-        pad = _INDENT * depth
-        url_template = str(node.get("urlTemplate") or "").strip()
-        if not url_template:
-            raise ValueError(
-                f"翻页节点 {node.get('id') or ''} 是点击式，Scrapling 不执行点击，无法导出为脚本；"
-                "改用 urlTemplate（形如 https://example.com/list?p=${page}）后可导出"
-            )
-
-        start_page = self._read_int(node, "startPage", default=1)
-        page_step = self._read_int(node, "pageStep", default=1) or 1
-        # 与 browser_action_runner._paginate_next_and_extract 同名同默认值；
-        # maxPages 是 FIELD_ALIAS_HINTS 里的错写法，平台任何一层都不读。
-        max_pages = self._read_int(node, "maxIterations", default=20)
-        selector = self._node_string_expr(node.get("targetSelector") or node.get("selector"))
-        mode = str(node.get("extractMode") or "text")
-        payload = self._json_load_expr(self._output_node_payload(node))
-        stop = start_page + page_step * max_pages
-        return [
-            f"{pad}collected: list[str] = []",
-            f"{pad}for page_number in range({start_page}, {stop}, {page_step}):",
-            f"{pad}{_INDENT}page = fetch_page(render_template("
-            f"{json.dumps(url_template, ensure_ascii=False)}.replace('${{page}}', str(page_number)), variables))",
-            f"{pad}{_INDENT}page_values = extract_values(page, render_template({selector}, variables), {json.dumps(mode)})",
-            # 翻到空页即停：URL 式翻页越界通常返回空列表而不是 404
-            f"{pad}{_INDENT}if not page_values:",
-            f"{pad}{_INDENT}{_INDENT}break",
-            f"{pad}{_INDENT}collected.extend(page_values)",
-            f"{pad}node = {payload}",
-            f"{pad}save_output(variables, node, collected, {json.dumps(mode)})",
-            f"{pad}outputs[str(node.get('id') or node.get('title') or 'paginate')] = collected",
-        ]
+        raise ValueError(
+            f"翻页节点 {node.get('id') or ''} 无法等价导出：Scrapling 脚本不能等价实现浏览器控件状态和导航进展判定。"
+        )
 
     def _extract_lines(self, node: dict[str, Any], depth: int) -> list[str]:
         pad = _INDENT * depth

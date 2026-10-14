@@ -33,6 +33,7 @@ from app.services.ai_tools.variables import (
     _template_refs,
     _validate_variable_refs,
 )
+from app.services.pagination_runtime import pagination_max_pages
 
 # 两类循环节点的出边契约完全一致（body/exit），结构规则共用
 _LOOP_LIKE_NODE_TYPES = frozenset({"control.foreach", "control.repeat_until"})
@@ -134,6 +135,22 @@ def _lint_flow(
 
         if ntype in ("start", "end"):
             continue
+
+        if ntype == "browser.paginateNext":
+            pagination_problem = None
+            if node.get("continueOnError"):
+                pagination_problem = "分页不能用 continueOnError 跳过失败并继续处理不完整数据。"
+            if pagination_problem is None and "${var." not in str(node.get("maxIterations", "")):
+                try:
+                    pagination_max_pages(node, lambda text: text)
+                except ValueError as exc:
+                    pagination_problem = str(exc)
+            if pagination_problem:
+                findings.append({
+                    "severity": "error", "node_id": nid, "node_title": ntitle,
+                    "issue": "invalid_pagination_completion_contract", "message": pagination_problem,
+                    "fix": "核对下一页控件与地址规律；maxIterations 仅作安全上限，并停止处理分页失败。",
+                })
 
         findings.extend(_lint_branch_edges_for_node(out_edges.get(nid, []), nid=nid, ntitle=ntitle, ntype=ntype))
         findings.extend(_lint_output_contract_for_node(node, nid=nid, ntitle=ntitle, ntype=ntype))

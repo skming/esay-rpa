@@ -145,17 +145,16 @@ NODE_TYPE_CATALOG: list[dict[str, str]] = [
         "key_fields": "selector, targetSelector（点击式）／urlTemplate, targetSelector（URL 式）, extractMode, maxIterations",
         "output_var_field": "outputVariable（逐页累计提取到的内容列表，可选）",
         "description": (
-            "逐页抓取，两种模式二选一。"
-            "**点击式**：selector 指向「下一页」按钮，翻一页抽一页；按钮消失/禁用即停。"
-            "**URL 式**：填 urlTemplate（含 `${page}` 占位，如 `https://x.com/list?p=${page}`）并**不要填 selector**，"
-            "逐页直接换地址进入，本页抽不到内容或与上一页逐字相同即停；可选 startPage（默认 1，有的站从 0 开始）、"
-            "pageStep（默认 1；offset 型分页如 `?start=${page}` 配 startPage=0 + pageStep=20）。"
-            "**数字页码站点（1 2 3 … 下一页）必须用 URL 式**：点到第 2 页后页码控件位置就变了，点击式会当场失效。"
-            "两种模式都用 targetSelector 提取本页内容，结果累计存入 outputVariable，页数存入 pageCountVariable；"
-            "**抓表格必须显式写 extractMode='table'**（语义同 browser.extract，作用在 targetSelector 上）——"
-            "这个字段缺省是 text，漏写不会报错，只会每页交出一堆整行文本，列结构当场丢掉；"
-            "**限页数只有 maxIterations 这一个字段**（默认 20，最多翻多少页；需求说「最多 N 页」就填它，可写 `${var.x}`）；"
-            "支持 outputSchema（同 browser.extract）"
+            "逐页抓取，两种模式二选一，运行器通过下一页控件状态和实际导航结果判断结束。"
+            "**点击式**：填 selector（稳定的下一页控件）与 targetSelector。"
+            "**URL 式**：填 urlTemplate（含 `${page}`，如 `https://x.com/list?p=${page}`），selector 可选（下一页控件，仅用于探测禁用状态，不执行点击）；"
+            "仅在已观察地址规律且不依赖点击状态时使用。startPage 默认 1，pageStep 默认 1；offset 型如 ?start=${page} 可配 0 和 20。"
+            "两种模式共用分页状态机：等待连续稳定的新页快照，累计 outputVariable，页数存入 pageCountVariable。"
+            "**抓表格必须写 extractMode='table'**；默认 text 不保留列结构；支持 outputSchema。"
+            "maxIterations 默认 20，仅作安全上限，可写 `${var.x}`；到上限仍未确认末页必须失败。"
+            "下一页可见且禁用时确认末页；URL 模式已取得翻页进展后，确认导航回到上一页且内容稳定相同也可结束。短暂重复、无进展、控件消失、抓取异常都不能单独证明完整；禁止 continueOnError 跳过。"
+            "先 inspect_page 观察行范围、下一页控件与分页地址规律，不猜总页数或 class，也不要求额外末页选择器。"
+
         ),
     },
     {

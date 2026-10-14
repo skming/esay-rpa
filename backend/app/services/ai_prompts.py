@@ -327,7 +327,7 @@ _SEC['node_patterns'] = """## 常用节点组合模式
 | 无挑战的账号密码登录 | `browser.open`(登录页) → `browser.wait`(`input[type='password']`,超时10s) → `browser.fill`(账号,`${var.username}`) → `browser.fill`(密码,`${var.password}`) → `browser.click`(登录) → `browser.wait`(目标页) → `browser.extract` |
 | 复用扩展已登录会话（默认） | 用户先在扩展标签页完成登录 → `browser.open`(目标数据页) → `browser.wait`(已登录区域) → `browser.extract`；若仍跳回登录页则停止并提示重新登录 |
 | 分页按钮翻页抓取（有「下一页」按钮） | `browser.open` → `browser.paginateNext`(翻页按钮 selector + 内容 targetSelector) 累计提取 |
-| 数字页码翻页抓取（1 2 3 … 无稳定「下一页」） | `browser.paginateNext`(urlTemplate=`…?p=${page}` + 内容 targetSelector，不填 selector) 逐页换地址累计提取 |
+| 数字页码翻页抓取（1 2 3 … 无稳定「下一页」） | `browser.paginateNext`(urlTemplate=`…?p=${page}` + 内容 targetSelector，selector 可选用于禁用状态探测) 逐页换地址累计提取 |
 | 无限滚动/加载更多 | `browser.open` → `browser.clickLoadMore`(加载更多按钮 selector + 内容 targetSelector) 累计提取 |
 | 可搜索候选弹层筛选 | `browser.click`(输入框) → `browser.fill`(同一输入框, 目标文本) → `browser.click`(可见候选项精确文本) → `browser.click`(查询按钮) |
 | 页码列表循环抓取 | 外层 `foreach`（页码列表）→ `browser.open`(每页 URL) → 内层 `browser.extract` |
@@ -368,9 +368,9 @@ _SEC['scraping_practices'] = """## 抓取与表格数据最佳实践（构建通
 
 1. **行选择器对准数据行容器**。table 模式会顺着行向上找 `<table>` 取表头，所以 selector 指向 `tbody tr`（标准表格）或从 `inspect_page` 返回的 `page_layout[].html` 中识别实际数据行 class 即可；引擎已兜底影子行，无需为此写额外脚本。
 
-2. **分页累加要整行去重**。`browser.paginateNext` 单节点内部已按页面指纹检测末页并停止；若用 `foreach` + 手动累加翻页，仍要按整行内容去重，并优先用"下一页按钮禁用/不存在"作为停止条件，不要硬编码页数。
+2. **分页完整性与去重分别验收**。`browser.paginateNext` 等待连续稳定的新页快照，两端共用分页判定。点击式由可见下一页控件的禁用状态结束；URL 式可配置相同控件用于探测，或在已有翻页进展后确认导航回到上一页且内容相同。无需额外末页选择器。`maxIterations` 是安全上限，不是完整采集证据；短暂重复、提取异常、达到上限不算完成，不用 `continueOnError` 绕过。
 
-3. **点击式翻页只在真有「下一页」按钮时用**。页面是 `1 2 3 … ›` 这类数字页码时改用 `urlTemplate` 模式（见节点说明）：点击式翻到第 2 页后页码控件就换位置了。翻页节点若只翻到第 1 页就停，运行器会拿页面证据判断是真单页还是 selector 找错——判定为找错会直接让运行失败并给出候选控件，别绕过它。
+3. **分页方式依据真实页面选择**。有稳定下一页控件可用点击式；仅在已观察地址规律且不依赖点击状态时使用 `urlTemplate`。控件消失或点击未生效时依据运行器页面证据修复，不硬编码页数。
 
 4. **非 `<table>` 结构**（div 网格、卡片列表）用 text/attribute 模式按字段分别提取，再用 `foreach` 组装；table 模式仅适用于真正的 `<table>`。
 

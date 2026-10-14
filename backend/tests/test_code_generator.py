@@ -361,31 +361,17 @@ def test_click_based_pagination_refuses_instead_of_scraping_page_one() -> None:
         _generate("翻页抓取", flow)
 
 
-def test_url_based_pagination_becomes_a_page_loop() -> None:
-    script = _generate(
-        "翻页抓取",
-        {
-            "nodes": [
-                {"id": "start", "type": "start"},
-                {
-                    "id": "p",
-                    "type": "browser.paginateNext",
-                    "urlTemplate": "https://example.com/list?p=${page}",
-                    "startPage": 1,
-                    "pageStep": 1,
-                    "maxIterations": 5,
-                    "targetSelector": ".row::text",
-                    "outputVariable": "rows",
-                },
-            ],
-            "edges": [{"source": "start", "target": "p"}],
-        },
-    )
-
-    compile(script.content, script.filename, "exec")
-    # 循环变量不能占用 page：下游节点靠 page 拿当前文档
-    assert "for page_number in range(" in script.content
-    assert '${page}' in script.content
+def test_url_pagination_refuses_export_without_equivalent_terminal_evidence() -> None:
+    flow = {
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {"id": "p", "type": "browser.paginateNext", "urlTemplate": "https://example.com/list?p=${page}",
+             "targetSelector": ".row", },
+        ],
+        "edges": [{"source": "start", "target": "p"}],
+    }
+    with pytest.raises(ValueError, match="无法等价导出"):
+        _generate("翻页抓取", flow)
 
 
 def test_count_mode_reports_the_real_count_not_one() -> None:

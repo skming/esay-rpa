@@ -4493,3 +4493,14 @@ def test_missing_argument_feedback_names_only_missing_fields_once():
     required = [issue for issue in result["issues"] if issue["rule"] == "required"]
     assert len(required) == 1
     assert required[0]["fields"] == ["nodes"]
+
+
+@pytest.mark.parametrize("cap,continue_on_error,invalid", [
+    (20, False, False), (20, True, True), (0, False, True), ("${var.limit}", False, False),
+])
+def test_pagination_creation_validates_limits_without_extra_end_configuration(cap, continue_on_error, invalid):
+    node = {"id": "pages", "type": "browser.paginateNext", "selector": ".next", "targetSelector": ".row",
+            "maxIterations": cap, "continueOnError": continue_on_error}
+    findings = [f for f in _lint_flow([node], []) if f["issue"] == "invalid_pagination_completion_contract"]
+    assert bool(findings) is invalid
+    assert all(is_blocking_finding(f) for f in findings)

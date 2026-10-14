@@ -208,17 +208,17 @@ CASES: list[E2ECase] = [
         kind="table",
         requirement=(
             "把这张分页表格的所有行汇总成变量 rows，一行都不能漏。"
-            "翻页上限用 input_variable max_pages 控制，运行时由 variables 传入，"
+            "页数安全上限用 input_variable max_pages 控制，运行时由 variables 传入；由下一页控件禁用状态判断末页，达到上限却未确认末页必须失败，"
             "不要把翻几页写死在节点里。"
         ),
         output_variable="rows",
         row_fields=("单号",),
         date_formats=(),
-        variants=[{"max_pages": "20"}, {"max_pages": "2"}],
-        # 第二组量「上限真的由输入变量决定」：翻页次数写死的流程在第一组也全对。
+        variants=[{"max_pages": "20"}, {"max_pages": "3"}],
+        # 末页恰好等于上限也应完整成功；截断失败边界由运行器行为用例覆盖。
         expected_records=[
             [["P1-A"], ["P2-A"], ["P3-A"]],
-            [["P1-A"], ["P2-A"]],
+            [["P1-A"], ["P2-A"], ["P3-A"]],
         ],
         note="翻页只换一行内容，且末页才置灰；停在第 1 页是这一类页面的已知失败模式。",
     ),
