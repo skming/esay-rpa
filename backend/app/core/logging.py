@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import time
+from collections.abc import Iterable
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
@@ -22,7 +23,12 @@ _QUERY_SECRET = re.compile(r"(?i)([?&](?:token|secret)=)[^\s\"',;}&#]+")
 _BEARER = re.compile(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/-]+=*")
 
 
-def redact_log_text(text: str) -> str:
+def redact_log_text(text: str, sensitive_values: Iterable[str] = ()) -> str:
+    values = sorted({value for value in sensitive_values if value}, key=len, reverse=True)
+    if values:
+        # 单次替换并保留标记，避免短凭据再次改写脱敏结果。
+        pattern = r"\[REDACTED\]|" + "|".join(re.escape(value) for value in values)
+        text = re.sub(pattern, lambda _: "[REDACTED]", text)
     # Bare token/secret labels can be business text; quoted fields and query parameters identify credential contexts.
     text = _SECRET.sub(lambda match: (match.group(1) or "") + "[REDACTED]", text)
     text = _QUERY_SECRET.sub(r"\1[REDACTED]", text)

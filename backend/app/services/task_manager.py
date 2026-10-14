@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 from app.core import storage
+from app.core.logging import redact_log_text
 from app.models.schemas import ArtifactContent, ArtifactSnapshot, DebugControlCommand, QueueStats, RunConfigSnapshot, RunTaskRequest, RuntimeProgress, RuntimeVariableSnapshot, ScrapeResult, TaskLogEntry, TaskSnapshot, TaskStatus
 from app.services.artifact_store import ArtifactStore, LocalArtifactStore
 from app.services.acceptance_audit import freeze_contract_inputs
@@ -567,11 +568,14 @@ class TaskManager:
             "result": result if result is not None else record.snapshot.result,
             "artifacts": artifacts if artifacts is not None else record.snapshot.artifacts,
             "variables": variables if variables is not None else record.variables.snapshots(),
-            "error": error,
+            "error": redact_log_text(error, record.variables.sensitive_values()) if error else error,
             "updated_at": datetime.now(UTC),
         }
         if confirmation_message is not _SENTINEL:
-            update["confirmation_message"] = confirmation_message
+            update["confirmation_message"] = (
+                redact_log_text(confirmation_message, record.variables.sensitive_values())
+                if confirmation_message else confirmation_message
+            )
         record.snapshot = record.snapshot.model_copy(update=update)
         snapshot = record.snapshot
         persisted = record.persisted_snapshot
@@ -583,7 +587,12 @@ class TaskManager:
         record.persisted_snapshot = snapshot
 
     async def _append_log(self, record: TaskRecord, level: str, message: str, detail: str | None, *, node_id: str | None = None) -> None:
-        entry = TaskLogEntry(task_id=record.snapshot.task_id, level=level, message=message, detail=detail, node_id=node_id)
+        sensitive_values = record.variables.sensitive_values()
+        entry = TaskLogEntry(
+            task_id=record.snapshot.task_id, level=level,
+            message=redact_log_text(message, sensitive_values),
+            detail=redact_log_text(detail, sensitive_values) if detail else detail, node_id=node_id,
+        )
         record.logs.append(entry)
         await self._task_store.append_log(entry)
         await self._broker.publish(entry)

@@ -74,6 +74,15 @@ def protected_variable_names(variables: list[object]) -> list[str]:
     return protected
 
 
+def protected_variable_values(variables: list[object]) -> set[str]:
+    names = set(protected_variable_names(variables))
+    return {
+        stringify_variable_value(variable.get("value", "") if isinstance(variable, dict) else variable.value)
+        for variable in variables
+        if (variable.get("name") if isinstance(variable, dict) else variable.name) in names
+    } - {""}
+
+
 @dataclass
 class RuntimeVariableStore:
     """In-memory key-value store for runtime variables during a single task execution."""
@@ -81,6 +90,7 @@ class RuntimeVariableStore:
     _scopes: dict[str, str] = field(default_factory=dict)
     _producers: dict[str, str] = field(default_factory=dict)
     _sensitive: set[str] = field(default_factory=set)
+    _sensitive_values: set[str] = field(default_factory=set, repr=False)
 
     @classmethod
     def from_initial(
@@ -112,6 +122,11 @@ class RuntimeVariableStore:
             self._sensitive.add(normalized_name)
         elif sensitive is False:
             self._sensitive.discard(normalized_name)
+        if normalized_name in self._sensitive:
+            # 异步错误/日志可能仍引用更新前的凭据，保留到本次任务释放。
+            text = stringify_variable_value(value)
+            if text:
+                self._sensitive_values.add(text)
 
     def get(self, name: str) -> object:
         normalized_name = normalize_variable_name(name)
@@ -149,6 +164,9 @@ class RuntimeVariableStore:
 
     def raw_values(self) -> dict[str, object]:
         return dict(self._values)
+
+    def sensitive_values(self) -> set[str]:
+        return set(self._sensitive_values)
 
     def mark_producer(self, names: list[str], node_id: str) -> None:
         for name in names:
