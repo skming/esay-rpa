@@ -489,7 +489,10 @@ def test_every_run_flow_status_is_classified_as_started_or_not() -> None:
     只扫 `_run_flow` 自己返回的 status 字面量：真正跑过之后的状态由 task.status 决定，
     是另一条路径（success/error/timeout/stopped/paused_*），在下面显式列出。
     """
-    source = inspect.getsource(RpaToolExecutor._run_flow)
+    source = "\n".join(inspect.getsource(method) for method in (
+        RpaToolExecutor._run_flow, RpaToolExecutor._observe_run_flow,
+        RpaToolExecutor._credential_override_block,
+    ))
     literals = set(re.findall(r'"status":\s*"([a-z_]+)"', source))
     assert literals, "取不到 run_flow 的 status 字面量，这条元测试会静默通过"
 
@@ -575,12 +578,16 @@ def test_the_two_lock_statuses_come_from_exactly_one_tool_each() -> None:
             )
         }
         assert producers, f"{status} 在执行器里已经没有产出点，判据该跟着删"
-        reachable = {entry_point} | {
-            n.func.attr
-            for m in methods if m.name == entry_point
-            for n in ast.walk(m)
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-        }
+        reachable = {entry_point}
+        while True:
+            found = {
+                n.func.attr for m in methods if m.name in reachable
+                for n in ast.walk(m)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            }
+            if found <= reachable:
+                break
+            reachable |= found
         assert not producers - reachable, (
             f"{status} 还从 {sorted(producers - reachable)} 产出，"
             f"不再只属于 {entry_point}，写入侧的分派要跟着改"
@@ -1279,7 +1286,7 @@ def test_identical_repeated_tool_result_is_elided_but_a_changed_one_is_not() -> 
     big = {"html": "a" * _ELIDE_MIN_CHARS}
 
     assert "_unchanged" not in _elide_repeated_result("inspect_page", args, big, seen)
-    assert '"_unchanged": true' in _elide_repeated_result("inspect_page", args, big, seen)
+    assert '"_unchanged": true' in _elide_repeated_result("inspect_page", args, big, seen, [{"role": "tool", "content": json.dumps(big, ensure_ascii=False)}])
     changed = _elide_repeated_result(
         "inspect_page", args, {"html": "b" * _ELIDE_MIN_CHARS}, seen
     )
@@ -1296,7 +1303,8 @@ def test_set_valued_arguments_fold_regardless_of_element_order() -> None:
 
     _elide_repeated_result("list_node_types", '{"types":["browser.open","file.write"]}', big, seen)
     reordered = _elide_repeated_result(
-        "list_node_types", '{"types":["file.write","browser.open"]}', big, seen
+        "list_node_types", '{"types":["file.write","browser.open"]}', big, seen,
+        [{"role": "tool", "content": json.dumps(big, ensure_ascii=False)}],
     )
     assert '"_unchanged": true' in reordered
 
@@ -2647,7 +2655,7 @@ async def test_turn_exit_cancels_and_awaits_all_tool_tasks(monkeypatch, close_at
     tasks = []
 
     class Executor(_FakeExecutor):
-        async def execute(self, name, args, *rest):
+        async def execute(self, name, args, *rest, change_context=None):
             tasks.append(asyncio.current_task())
             if len(tasks) == 2:
                 started.set()
@@ -2702,7 +2710,7 @@ async def test_chat_cancellation_closes_run_observer_and_keeps_background_run(mo
     background = None
 
     class Executor(_FakeExecutor):
-        async def execute(self, name, args, *rest):
+        async def execute(self, name, args, *rest, change_context=None):
             nonlocal background
             if name == "run_flow":
                 background = asyncio.create_task(background_gate.wait())
@@ -2966,7 +2974,7 @@ async def test_background_completion_reaches_verification_in_the_tool_loop(monke
     digest = definition_digest(_VERIFIABLE_DEFINITION)
 
     class Executor(_RunnableFlowExecutor):
-        async def execute(self, name, args, *rest):
+        async def execute(self, name, args, *rest, change_context=None):
             if name == "run_flow":
                 self.calls.append((name, args))
                 return {
@@ -3120,7 +3128,7 @@ async def test_batch_read_observes_preceding_schedule_write(monkeypatch):
     class Executor(_RunnableFlowExecutor):
         created = False
 
-        async def execute(self, name, args, *rest):
+        async def execute(self, name, args, *rest, change_context=None):
             if name == "create_schedule":
                 await asyncio.sleep(0)
                 self.created = True

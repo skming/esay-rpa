@@ -24,6 +24,7 @@ _COMPACTED_MARK = '"_compacted": true'
 _CHARS_PER_TOKEN = 1.5               # 中英混排保守估计：纯 ASCII 约 4，CJK 约 1
 _CONTEXT_USABLE_RATIO = 0.7          # 余量留给本轮输出与静态前缀
 _MAX_CONTEXT_CHARS = 400_000         # 大窗口模型的实用上限：百万窗口塞满纯属烧钱
+_IMAGE_BUDGET_CHARS = 16_384         # 每张图预留约 10k tokens；base64 字节数并非图像 token 数
 
 
 def _context_char_budget(model: str) -> int:
@@ -132,6 +133,7 @@ _OLD_SCREENSHOT_PLACEHOLDER = "[历史截图已移除以控制上下文，如需
 
 
 _DROPPED_HISTORY_MARK = "[上下文超限，已丢弃最早的"
+_CONTEXT_SYNTHETIC_KEY = "_context_synthetic"
 
 _KEPT_CONSTRAINT_MARK = "【用户此前提出的硬性要求】"
 
@@ -163,7 +165,35 @@ def _extract_user_constraints(text: str) -> list[str]:
 
 
 def _total_content_chars(messages: list[dict[str, Any]]) -> int:
-    return sum(len(str(m.get("content") or "")) for m in messages)
+    # tool_calls 的参数会随 assistant 消息一起发给模型，不能只按 content 估算。
+    return sum(
+        (sum(_IMAGE_BUDGET_CHARS if isinstance(part, dict) and part.get("type") == "image_url"
+             else len(str(part)) for part in m["content"])
+         if isinstance(m.get("content"), list) else len(str(m.get("content") or "")))
+        + (len(json.dumps(m["tool_calls"], ensure_ascii=False, default=str)) if m.get("tool_calls") else 0)
+        for m in messages
+    )
+
+
+def _next_turn_boundary(messages: list[dict[str, Any]], protect_prefix: int) -> int | None:
+    """只在下一条真实用户消息前切，且不能把待应答的工具批次切开。"""
+    first_user_seen = False
+    pending_calls: set[str] = set()
+    for index in range(protect_prefix, len(messages)):
+        message = messages[index]
+        role = message.get("role")
+        if role == "assistant":
+            pending_calls.update(
+                str(call["id"]) for call in message.get("tool_calls") or []
+                if isinstance(call, dict) and call.get("id") is not None
+            )
+        elif role == "tool":
+            pending_calls.discard(str(message.get("tool_call_id")))
+        elif role == "user" and not message.get(_CONTEXT_SYNTHETIC_KEY):
+            if first_user_seen and not pending_calls:
+                return index
+            first_user_seen = True
+    return None
 
 
 def _drop_oldest_turns(messages: list[dict[str, Any]], protect_prefix: int, budget: int) -> int:
@@ -182,18 +212,13 @@ def _drop_oldest_turns(messages: list[dict[str, Any]], protect_prefix: int, budg
     dropped = 0
     kept_constraints: list[str] = []
     while _total_content_chars(messages) > budget:
-        # 只在 user 消息处切：保证不会留下没有 assistant.tool_calls 配对的 tool 消息，
-        # 也保证最后一轮（没有后继 user）永远留着
-        cut = next(
-            (i for i in range(protect_prefix + 1, len(messages)) if messages[i].get("role") == "user"),
-            None,
-        )
+        cut = _next_turn_boundary(messages, protect_prefix)
         if cut is None:
             break
         # 丢之前先把要求捞出来：这一段里可能有上一次丢弃时留下的摘要，它同样会被删掉
         for doomed in messages[protect_prefix:cut]:
             content = str(doomed.get("content") or "")
-            if doomed.get("role") == "user":
+            if doomed.get("role") == "user" and not doomed.get(_CONTEXT_SYNTHETIC_KEY):
                 kept_constraints.extend(_extract_user_constraints(content))
             elif content.startswith(_KEPT_CONSTRAINT_MARK):
                 kept_constraints.extend(
@@ -292,16 +317,22 @@ def _canonical_args(arguments: str) -> str:
 
 
 def _elide_repeated_result(
-    tool_name: str, arguments: str, result: Any, seen: dict[tuple[str, str], str]
+    tool_name: str, arguments: str, result: Any, seen: dict[tuple[str, str], str],
+    messages: list[dict[str, Any]] | None = None,
 ) -> str:
-    """同参数同结果的工具调用只送一次全文，之后送一句指回原文的话。
+    """同参数同结果且原文仍在上下文时，之后只送一句指回原文的话。
 
     inspect_page 一次一万七千字符，同一页反复探是常态。这里是「已执行、逐字比对后确认相同」
     才折叠，不是跳过调用——页面被点击改变过就不会相等，也就不会折叠，不存在读到旧状态的风险。
     """
     payload = json.dumps(result, ensure_ascii=False)
     key = (tool_name, _canonical_args(arguments))
-    if seen.get(key) == payload and len(payload) >= _ELIDE_MIN_CHARS:
+    repeated = seen.get(key) == payload and len(payload) >= _ELIDE_MIN_CHARS
+    original_is_available = repeated and messages is not None and any(
+        message.get("role") == "tool" and message.get("content") == payload
+        for message in messages
+    )
+    if repeated and original_is_available:
         return json.dumps({
             "_unchanged": True,
             "message": f"本次 {tool_name} 的返回与上一次同参数调用逐字相同，内容见上文，未重复输出。",

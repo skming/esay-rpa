@@ -1,18 +1,22 @@
 """跨请求保留失败预算和未完成的修复要求，避免中断重置额度。
 
-最终回复后清空；节点级修复轨迹由生命周期不同的 ai_repair_ledger 管理。
+验收完成且无未完成义务时清空；新任务通过 task_key 隔离旧状态。
+节点级修复轨迹由生命周期不同的 ai_repair_ledger 管理。
 检查点写入失败不阻断任务，正确性不能依赖检查点可用。"""
 from __future__ import annotations
 
 import json
 import math
 import time
+import os
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from app.core.storage import resolve_ai_dir
 from app.services.ai_guard_state import is_valid_checkpoint_value
 from app.services.ai_phases import VERIFY_ATTEMPT_BUDGET
+from app.services.ai_tool_events import current_verification_status
 
 if TYPE_CHECKING:
     # 只用于类型标注：save() 只 getattr 读字段，from __future__ 让标注变惰性字符串，
@@ -22,6 +26,7 @@ if TYPE_CHECKING:
 # 只有「重来一次要再付一次代价」的状态值得存。
 # 页面探测结果、消息、requirement 文本都不在此列：它们随下一轮请求重新给。
 _PERSISTED_KEYS = (
+    "task_key", "pending_run", "run_accounted_key",
     # 收敛预算：进程重启不该重新发一份试错额度，否则「一路盲改」只要断线就能续上。
     "attempt_budget",
     "failure_budget_lock",
@@ -49,7 +54,7 @@ _PERSISTED_KEYS = (
 _PER_ROUND_KEYS = frozenset({
     # 每轮由状态块或对话历史重算：存一份只会在事实已经变了之后还按旧的判
     "blocking_diagnostics", "flow_has_nodes", "run_succeeded", "audit_passed",
-    "page_evidence_done", "evidence_collected", "fresh_page_evidence",
+    "page_evidence_done", "evidence_collected", "evidence_refresh", "fresh_page_evidence",
     # 每轮由 build_flow_state 从流程的 acceptance_contract 重算（草稿无契约即为 False）。
     # 存下来只会在用户中途补齐契约后还按旧的「仍是草稿」挡着运行。
     "acceptance_contract_initialized",
@@ -91,7 +96,7 @@ def _checkpoint_path(flow_id: str) -> Path:
     return _checkpoint_dir() / f"flow_{flow_id}.json"
 
 
-def load(flow_id: str | None) -> dict[str, Any]:
+def load(flow_id: str | None, *, task_key: str | None = None) -> dict[str, Any]:
     """读回可续跑的 guard_state 片段；缺失/损坏/过期一律当空。"""
     if not flow_id:
         return {}
@@ -111,6 +116,8 @@ def load(flow_id: str | None) -> dict[str, Any]:
     state = data.get("state")
     if not isinstance(state, dict):
         return {}
+    if task_key is not None and state.get("task_key") != task_key:
+        return {}
     persisted = {k: v for k, v in state.items() if k in _PERSISTED_KEYS}
     if any(not is_valid_checkpoint_value(key, value) for key, value in persisted.items()):
         return {}
@@ -122,6 +129,7 @@ def save(flow_id: str | None, state: GuardState, *, rounds: int) -> None:
     if not flow_id:
         return
     snapshot = {k: v for k in _PERSISTED_KEYS if (v := getattr(state, k, None))}
+    task_key = snapshot.pop("task_key", None)
     # attempt_budget 默认就是一份真值 dict（new_budget()），不滤掉它 snapshot 永不为空，
     # 下面的「全空即删」就成了死码、每轮都白写一份检查点。只有真花过额度、记过签名（首次
     # 拦截不计价但要留签名）、或攒下尝试记录的预算才算「重来要再付的代价」，值得存。
@@ -133,14 +141,37 @@ def save(flow_id: str | None, state: GuardState, *, rounds: int) -> None:
     if not snapshot:
         clear(flow_id)
         return
+    if task_key:
+        snapshot["task_key"] = task_key
+    temporary: str | None = None
     try:
         _checkpoint_dir().mkdir(parents=True, exist_ok=True)
-        _checkpoint_path(flow_id).write_text(
-            json.dumps({"state": snapshot, "rounds": rounds, "updated_at": time.time()}, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=_checkpoint_dir(), delete=False) as output:
+            temporary = output.name
+            json.dump({"state": snapshot, "rounds": rounds, "updated_at": time.time()}, output, ensure_ascii=False)
+        os.replace(temporary, _checkpoint_path(flow_id))
     except Exception:
         pass
+    finally:
+        if temporary:
+            try:
+                Path(temporary).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def finish(flow_id: str | None, state: GuardState, *, rounds: int) -> None:
+    """正文结束不等于后台运行或修复义务结束；保留同一任务仍需处理的状态。"""
+    run = state.pending_run or {}
+    unfinished = run.get("status") in {"queued", "pending", "running", "timeout", "awaiting_confirmation"}
+    budget = state.attempt_budget
+    unfinished_attempts = any(budget.get(key) for key in ("spent", "signatures", "attempts")) and current_verification_status(state) != "accepted"
+    if (unfinished or unfinished_attempts or state.audit_findings or state.runtime_escape_findings
+            or state.failure_budget_lock or state.navigation_failure_hint
+            or (state.page_evidence_required and not state.page_evidence_done)):
+        save(flow_id, state, rounds=rounds)
+    else:
+        clear(flow_id)
 
 
 def clear(flow_id: str | None) -> None:
@@ -159,6 +190,8 @@ def summarize(checkpoint: dict[str, Any]) -> str | None:
     只在真有未了结事项时出声；纯计数（还没触发锁）不值得占提示词。
     """
     lines: list[str] = []
+    if checkpoint.get("pending_run"):
+        lines.append("- 已提交的运行会从任务服务恢复状态，请观察现有任务，不要重复启动。")
     budget = checkpoint.get("attempt_budget") if isinstance(checkpoint.get("attempt_budget"), dict) else {}
     spent = int(budget.get("spent") or 0)
     if spent >= VERIFY_ATTEMPT_BUDGET:

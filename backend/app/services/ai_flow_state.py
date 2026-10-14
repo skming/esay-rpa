@@ -204,6 +204,11 @@ async def _refresh_run(
         except Exception:
             logger.warning("运行状态刷新失败（task_id=%s）", task_id, exc_info=True)
             fresh = None
+        if isinstance(fresh, dict) and fresh.get("status") == "not_found":
+            return None
+        if (isinstance(fresh, dict) and fresh.get("flow_id") and last_run.get("flow_id")
+                and fresh["flow_id"] != last_run["flow_id"]):
+            return None
         if isinstance(fresh, dict) and fresh.get("task_id") == task_id:
             # 合并而不是替换：get_run_status 只回状态与进度，产物与审计只有另外两处有
             run = dict(last_run)

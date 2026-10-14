@@ -7,6 +7,10 @@ REPORT 禁止运行，但允许 apply_node_fix；写入仍受 lint_diff 的差�
 from __future__ import annotations
 
 from enum import Enum
+import hashlib
+import json
+import math
+import time
 from typing import Any
 
 from app.services.ai_guard_state import GuardState, new_budget
@@ -221,16 +225,17 @@ def _check_repeated_evidence(
     """无进展时阻止重复取证。写入或运行成功由 note_progress 清空指纹，允许重新观察。"""
     if not evidence_already_collected(tool_name, args, state):
         return None
+    refresh = state.evidence_refresh.get(call_fingerprint(tool_name, args))
     return _blocked(
         tool_name,
         "evidence_already_collected",
         phase,
         required_action="use_evidence_already_in_context",
         allowed_next_tools=sorted(_ADMISSION[phase]) or ["inspect_page"],
+        retry_after_seconds=max(0, math.ceil(refresh["available_at"] - time.monotonic())) if refresh else None,
         message=(
-            f"这次 {tool_name} 的参数与本轮已经取过的一次完全相同，流程期间没有任何改动，"
-            "结果只会是同一份。请直接用上下文里已有的那份证据下判断；"
-            "确实需要新证据时，换目标（另一个 URL / 另一个 task_id）或先落一次改动。"
+            f"这次 {tool_name} 已有可用证据，请先使用上下文里的结果。"
+            "终态任务结果可复用；页面和进行中的任务允许稍后刷新，连续无变化时会延长刷新间隔。"
         ),
     )
 
@@ -247,7 +252,11 @@ def evidence_already_collected(
     """
     if tool_name not in EVIDENCE_TOOLS:
         return False
-    return call_fingerprint(tool_name, args) in (state.evidence_collected or [])
+    fingerprint = call_fingerprint(tool_name, args)
+    if fingerprint not in state.evidence_collected:
+        return False
+    refresh = state.evidence_refresh.get(fingerprint)
+    return refresh is None or time.monotonic() < refresh["available_at"]
 
 
 def _refuse_for_phase(
@@ -479,13 +488,35 @@ def note_verified(state: GuardState) -> None:
     note_progress(state)
 
 
-def note_evidence(state: GuardState, tool_name: str, args: dict[str, Any]) -> None:
+def note_evidence(
+    state: GuardState, tool_name: str, args: dict[str, Any], result: dict[str, Any] | None = None,
+) -> None:
     """记下一次已经拿到的取证调用，供重复取证判据比对。"""
     if tool_name not in EVIDENCE_TOOLS:
         return
     fingerprint = call_fingerprint(tool_name, args)
     if fingerprint not in state.evidence_collected:
         state.evidence_collected.append(fingerprint)
+    terminal = (result or {}).get("status") in {"success", "error", "stopped"}
+    if terminal and tool_name in {"get_run_error", "get_run_output", "get_run_logs"}:
+        state.evidence_refresh.pop(fingerprint, None)
+        return
+
+    def stable(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: stable(item) for key, item in value.items()
+                    if key not in {"timestamp", "observed_at", "observation_id", "screenshot_id", "session_id"}}
+        if isinstance(value, list):
+            return [stable(item) for item in value]
+        return value
+
+    signature = hashlib.sha256(json.dumps(stable(result), sort_keys=True, default=str).encode()).hexdigest()
+    previous = state.evidence_refresh.get(fingerprint, {})
+    unchanged = min(previous.get("unchanged", 0) + 1, 4) if signature == previous.get("signature") else 0
+    state.evidence_refresh[fingerprint] = {
+        "signature": signature, "unchanged": unchanged,
+        "available_at": time.monotonic() + min(5 * (2 ** unchanged), 60),
+    }
 
 
 def note_progress(state: GuardState) -> None:
@@ -494,6 +525,7 @@ def note_progress(state: GuardState) -> None:
     页面和运行结果都可能因为这次改动而不同，此时重探同一个目标是正当动作。
     """
     state.evidence_collected = []
+    state.evidence_refresh = {}
 
 
 # ── 提示词与自省 ──────────────────────────────────────────────────────────────

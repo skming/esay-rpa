@@ -135,6 +135,19 @@ def test_clear_removes_the_checkpoint() -> None:
     assert checkpoint.load("f1") == {}
 
 
+def test_finish_clears_attempts_after_current_revision_is_accepted() -> None:
+    state = GuardState(attempt_budget=_budget(2), current_flow_revision=3, accepted_revision=3)
+    checkpoint.save("f1", state, rounds=3)
+    checkpoint.finish("f1", state, rounds=3)
+    assert checkpoint.load("f1") == {}
+
+
+def test_acceptance_of_an_older_revision_does_not_clear_attempts() -> None:
+    state = GuardState(attempt_budget=_budget(2), current_flow_revision=4, accepted_revision=3)
+    checkpoint.finish("f1", state, rounds=3)
+    assert checkpoint.load("f1")["attempt_budget"] == _budget(2)
+
+
 def test_static_page_evidence_survives_into_the_next_turn() -> None:
     """流程存下来之后，下一轮不再回读探测历史——不持久化这条，第二轮护栏就凭空消失。"""
     checkpoint.save("f1", GuardState(page_evidence_source="scrapling_static"), rounds=1)
@@ -328,10 +341,10 @@ async def test_created_flow_moves_interrupted_checkpoint_off_the_local_draft(
     assert checkpoint.load("local-draft") == {}
 
 
-async def test_orchestrator_resumes_then_clears_on_completion(
+async def test_orchestrator_keeps_unresolved_budget_after_final_reply(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """端到端钉住生命周期：上轮的熔断要带进这轮的提示词，任务收尾要把它清掉。"""
+    """模型结束回复不能重置同一未完成任务的失败预算。"""
     import litellm
 
     from app.services.ai_orchestrator import AiOrchestrator
@@ -357,4 +370,4 @@ async def test_orchestrator_resumes_then_clears_on_completion(
     resume_notes = [m for m in captured[0] if "上次未完成的会话" in str(m.get("content"))]
     assert resume_notes, "熔断没带进这轮，模型会重新领一份完整额度"
     assert events[-1] == {"type": "done"}
-    assert checkpoint.load("f-ck") == {}, "任务已收尾，下一条新需求不该背着这次的熔断"
+    assert checkpoint.load("f-ck")["attempt_budget"] == _budget(VERIFY_ATTEMPT_BUDGET)
