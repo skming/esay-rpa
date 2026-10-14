@@ -17,6 +17,15 @@ def new_budget() -> dict[str, Any]:
 
 def is_valid_checkpoint_value(key: str, value: Any) -> bool:
     """检查点字段的 JSON 形状校验；坏值宁可丢弃，也不能污染本轮状态。"""
+    if key in {"task_key", "run_accounted_key"}:
+        return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+    if key == "pending_run":
+        return (
+            isinstance(value, dict) and set(value) <= {"task_id", "flow_id", "status", "flow_revision", "definition_digest"}
+            and all(isinstance(value.get(k), str) and value[k] for k in ("task_id", "flow_id", "status"))
+            and (value.get("flow_revision") is None or type(value["flow_revision"]) is int)
+            and (value.get("definition_digest") is None or isinstance(value["definition_digest"], str))
+        )
     if key == "attempt_budget":
         if not isinstance(value, dict):
             return False
@@ -71,6 +80,7 @@ class GuardState:
     audit_findings: dict[str, Any] | None = None
     attempt_budget: dict[str, Any] = field(default_factory=new_budget)
     evidence_collected: list[str] = field(default_factory=list)
+    evidence_refresh: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     # 验收台账事实：构造时由 load_verification_state 给，本轮内由
     # reduce_evidence_state 按工具事件推进（写流程作废已验证的 revision）
@@ -86,6 +96,10 @@ class GuardState:
 
     # 运行期才暴露、静态诊断算不出、需跨轮存的逃逸项
     runtime_escape_findings: list[Any] = field(default_factory=list)
+    # 只存任务定位信息；恢复后从任务服务重新取状态，不信任缓存中的成功结论。
+    pending_run: dict[str, Any] | None = None
+    task_key: str | None = None
+    run_accounted_key: str | None = None
 
     # 一次性的锁与提示：命中即跨轮生效，直到会话结束
     challenge_page_lock: dict[str, Any] | None = None

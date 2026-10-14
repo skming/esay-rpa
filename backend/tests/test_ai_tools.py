@@ -943,9 +943,10 @@ async def test_run_flow_tells_the_model_to_ask_the_user_not_to_invent_credential
     assert "不要自行编造" in result["message"]
     assert task_manager.started is False
 
-    # 调用方真的传了值就照常跑：判据看的是 variables 参数，不是被默认值填满的 merged_variables
-    ok = await executor._run_flow("flow-1", variables={"password": "hunter2"})
-    assert ok["status"] != "empty_credential_variables"
+    # AI 工具不能通过运行参数绕过输入变量面板的凭据配置边界。
+    blocked = await executor._run_flow("flow-1", variables={"password": "hunter2"})
+    assert blocked["status"] == "blocked_credential_override"
+    assert task_manager.started is False
 
 
 async def test_run_flow_rejects_call_parameters_smuggled_into_variables() -> None:

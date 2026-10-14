@@ -126,10 +126,17 @@ class ScheduleService:
     async def get_schedule(self, schedule_id: str) -> ScheduleSnapshot | None:
         return await self._store.get(schedule_id)
 
-    async def update_schedule(self, schedule_id: str, request: ScheduleUpdateRequest) -> ScheduleSnapshot | None:
+    async def update_schedule(
+        self, schedule_id: str, request: ScheduleUpdateRequest, *, expected_flow_id: str | None = None,
+    ) -> ScheduleSnapshot | None:
         current = await self._store.get(schedule_id)
         if current is None:
             return None
+        if expected_flow_id is not None and (
+            current.task.flow_id != expected_flow_id
+            or (request.task is not None and request.task.flow_id != expected_flow_id)
+        ):
+            raise ValueError("tool_target_flow_mismatch")
 
         cron_expression = request.cron_expression or current.cron_expression
         timezone = request.timezone or current.timezone

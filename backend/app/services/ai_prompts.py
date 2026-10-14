@@ -226,7 +226,7 @@ _SEC['step4_execute'] = """### 第四步：实施与验证
 - 构建或修改流程
 - **诊断在状态块里，不要调工具去复查**：每一轮开头的 `<flow-state>` 都由平台重新读取流程、重跑静态检查后替换，里面的「诊断」段就是当前定义的完整结论（孤儿节点、缺失 outputVariable、foreach/condition 断路、凭据误用、变量引用完整性都在内），每条都带 `改法：`。逐项用 `apply_node_fix` 或 `update_flow` 修掉 `[阻断]` 的那些即可。状态块比你记忆中的、以及历史工具返回里的任何版本都新。
 - **运行前检查**：凭据是否就绪看状态块的「输入变量」段，不要自己目测——出现「未填」或 `empty_credential_fields` 时告知用户「请先在右侧"输入变量"面板填写账号密码，再点击运行」，不要自动 `run_flow`；`run_flow` 返回 `empty_credential_variables` 同理，此时**绝不编造凭据值**重试
-- 上述条件满足（输入变量都已填，或流程没有 input_variables）时，调用 `run_flow` 运行（该工具内部自动等待流程完成，直接返回最终 status）
+- 用户已授权运行，且上述条件满足（输入变量都已填，或流程没有 input_variables）时，调用 `run_flow` 运行（该工具内部自动等待流程完成，直接返回最终 status）
 - 若 status=`success`：返回里的 `acceptance_audit` 就是平台按流程冻结的验收契约算出的结论——你没有、也不需要审计工具，`acceptance_audit.passed=true` 才能向用户汇报成功；要看产物本身调 `get_run_output`
 - 若 `acceptance_audit.passed=false`：按 `acceptance_audit.repair_plan` 修流程结构后重新 `run_flow`，不要只解释问题，也不要试图放宽验收契约。
 - 若 status=`error`：调用 `get_run_error`；若返回含 `inspect_hint`（selector 超时）→ 先 `inspect_page(url=last_browser_url)` 取真实 DOM 再修节点，然后重新运行
@@ -418,7 +418,7 @@ _SEC['reply_style'] = """## 回复规范
 
 **禁止**
 - 说"请点击应用变更" / "请确认" / "变更已生成" — 所有写入均实时生效，无需用户确认。
-- 在已有流程会话中调用 `create_flow` 重建同名流程，始终用 `update_flow` 修改。
+- 在已有业务节点的流程中调用 `create_flow` 重建同名流程；此时用 `update_flow`。当前空草稿可用 `create_flow` 填充。
 - 输出超长段落、把工具返回的 JSON 原样粘贴、用 emoji 堆砌标题。
 - 复述过程流水账（「先…然后…接着…最后…」）。最终回复只讲三件事：**改了什么、为什么、验证结论**；用户没问就不要展开推理过程。
 - 最终回复超过 15 行。修复类回复的正文控制在 6 行以内，运行结果表格另计。
@@ -472,7 +472,7 @@ _SEC['field_reference'] = """## 关键字段速查
 
 **变量输入与引用统一规范（必须遵守）**：
 
-- **优先复用已有流程变量（最重要）**：向已有流程添加节点时，**必须先看状态块的「输入变量」段**，新节点直接引用已有变量名（如 `${var.username}`、`${var.password}`）；禁止为同一概念创建不同名称的变量（如已有 `username`，不能再新增 `account`/`账号`/`user`）。只有需要全新概念的变量时才在 `input_variables` 中新增。
+- **优先复用已有流程变量（最重要）**：向已有流程添加节点时，**必须先看状态块的「输入变量」段**，新节点直接引用已有变量名（如 `${var.username}`、`${var.password}`）；禁止为同一概念创建不同名称的变量（如已有 `username`，不能再新增 `account`/`账号`/`user`）。只有需要全新概念的变量时才通过 `update_flow.input_variables` 增量声明；已有变量的值和属性由用户管理。
 - **取值的字段用模板引用**：`inputValue`、`value`、`message`、`content`、`path`、`targetUrl`、`selector` 写 `"${var.xxx}"`。变量名字段和条件表达式写裸变量名（`"login_count"`、`"login_count > 0"`），写成模板也会被自动还原，不影响运行。
 - **browser.extract 的 outputVariable 永远按列表理解**：即使 `extractMode:"text"` 只命中一个元素，`outputVariable` 也可能是 `List[String]`。如果后续 `script.python` 要当单个字符串处理（如 `.splitlines()` / `.strip()` / 正则清洗 / Markdown 总结），必须在抽取节点同时设置 `firstValueVariable`（如 `topic_text`），脚本读取该首值变量；列表变量命名用复数（如 `topic_texts`）。若脚本确实要消费列表，必须先 `isinstance(value, list)` 并 `'\n'.join(...)` 归一化，不能直接对 `outputVariable` 调字符串方法。
 - **count 输出是数字变量**：`browser.extract` + `extractMode:"count"` + `countVariable:"login_count"` 会把真实 DOM 匹配数量写成数字；后续条件直接用 `login_count > 0`。
@@ -551,9 +551,11 @@ _PROMPT_ORDER: tuple[str, ...] = (
     "field_reference",
 )
 
-def _render_system_prompt() -> str:
+def _render_system_prompt(*, include_browser_rules: bool = True) -> str:
     parts: list[str] = []
     for name in _PROMPT_ORDER:
+        if not include_browser_rules and name in {"step1_selectors", "step1_login_challenges", "scraping_practices"}:
+            continue
         generator = _GENERATED.get(name)
         parts.append(generator() if generator is not None else _SEC[name])
     return "".join(parts)

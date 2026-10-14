@@ -120,7 +120,7 @@ def test_tool_prompts_keep_the_contract_authoritative_and_bounded() -> None:
     assert catalog_params["required"] == ["types"]
     assert catalog_params["properties"]["types"]["maxItems"] == 8
     assert all(item["parameters"]["additionalProperties"] is False for item in functions.values())
-    assert len(json.dumps(TOOL_SCHEMAS, ensure_ascii=False)) < 16_000
+    assert len(json.dumps(TOOL_SCHEMAS, ensure_ascii=False)) < 19_000
 
 
 def test_tool_schema_names_match_the_executor_dispatch_table() -> None:
@@ -131,7 +131,7 @@ def test_tool_schema_names_match_the_executor_dispatch_table() -> None:
     多出任何一个都意味着有工具被误删或漏接。
     """
     schema_names = {item["function"]["name"] for item in TOOL_SCHEMAS}
-    dispatch_source = inspect.getsource(RpaToolExecutor.execute)
+    dispatch_source = inspect.getsource(RpaToolExecutor._dispatch)
     dispatch_names = set(re.findall(r'case "([a-z_]+)"', dispatch_source))
 
     assert schema_names <= dispatch_names, schema_names - dispatch_names

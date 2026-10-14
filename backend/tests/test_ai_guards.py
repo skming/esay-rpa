@@ -13,6 +13,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from app.services.ai_guard_state import GuardState
 from app.services.ai_guards import (
     FLOW_WRITE_TOOLS,
@@ -250,6 +252,34 @@ def test_acceptance_contract_change_requires_an_exact_user_quote() -> None:
         {"requirement_change_quote": "把交付格式改成 Excel"},
         state,
     ) is None
+
+
+@pytest.mark.parametrize("text", ["不要创建定时任务，只解释流程", "Do not create a schedule", "解释一下 cron", "定时任务如何运行？"])
+def test_schedule_mentions_are_not_authorization(text) -> None:
+    state = GuardState(user_requirement_text=text, latest_user_message=text)
+    assert _blocked_by("create_schedule", {}, state)["guard_id"] == "schedule_requires_user_request"
+
+
+def test_schedule_revocation_overrides_historical_permission() -> None:
+    state = GuardState(user_requirement_text="每天9点自动运行", latest_user_message="不要创建定时任务")
+    assert _blocked_by("create_schedule", {}, state)["guard_id"] == "schedule_requires_user_request"
+
+
+def test_explicit_schedule_reauthorization_overrides_historical_refusal() -> None:
+    state = GuardState(user_requirement_text="不要创建定时任务，只解释流程", latest_user_message="现在创建每天9点运行的定时任务")
+    assert apply_pre_tool_guards("create_schedule", {}, state) is None
+
+
+def test_repair_quote_cannot_authorize_changing_acceptance() -> None:
+    state = GuardState(latest_user_message="修复流程，保持原要求")
+    assert _blocked_by("set_acceptance_contract", {"requirement_change_quote": "修复流程"}, state)["guard_id"] == "acceptance_contract_change_requires_user_quote"
+
+
+@pytest.mark.parametrize("status", ["queued", "running", "timeout", "awaiting_confirmation"])
+def test_unfinished_run_is_not_submitted_again(status) -> None:
+    state = GuardState(pending_run={"task_id": "t1", "status": status})
+    assert _blocked_by("run_flow", {}, state)["guard_id"] == "unfinished_run_must_be_reused"
+    assert apply_pre_tool_guards("stop_run", {"task_id": "t1"}, state) is None
 
 
 def test_acceptance_contract_sources_must_match_user_requirement_text() -> None:

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field as dc_field
 from typing import Any
 
@@ -41,6 +42,65 @@ class ChangeContext:
     draft_flow_id: str | None = None
     protected_node_ids: frozenset[str] = frozenset()
     fresh_page_evidence: bool = False
+    # 只来自编排层的用户原话和当前版本，模型工具参数不能提供授权上下文。
+    flow_id: str | None = None
+    flow_revision: int | None = None
+    latest_user_message: str = ""
+
+
+def unrequested_contract_changes(before: dict[str, Any], after: dict[str, Any], quote: str) -> list[str]:
+    """按归一化字段核对变更范围；改文件格式不能顺带删字段或放宽行数。
+
+    无法从用户原文定位的条件保持原值。新增谓词默认不开放修改，避免 schema 扩展
+    自动扩大已有授权范围。需求描述和引用由来源护栏校验，这里保护实际验收谓词。
+    """
+    groups = (
+        ({"min_rows", "max_rows", "min_rows_variable", "max_rows_variable", "expected_count_variable", "minimum_coverage_ratio"},
+         r"行数|数量|条数|记录数|覆盖|\d+\s*[行条]|\b(?:rows?|count|coverage)\b"),
+        ({"required_fields"}, r"字段|列|\b(?:fields?|columns?)\b"),
+        ({"date_ranges"}, r"日期|时间|\bdate\b"),
+        ({"allowed_values"}, r"允许|状态|取值|枚举|\bvalues?\b"),
+        ({"unique_by"}, r"唯一|去重|重复|\bunique\b"),
+        ({"min_chars", "required_terms", "forbidden_terms"}, r"字符|文字|词|文本|内容|\b(?:text|terms?|chars?)\b"),
+        ({"source_variables"}, r"来源|数据源|输入|\bsource\b"),
+        ({"extensions"}, r"格式|扩展名|Excel|CSV|JSON|PDF|\bformat\b"),
+        ({"min_bytes"}, r"大小|字节|\b(?:size|bytes?)\b"),
+        ({"numeric_ranges"}, r"数值|范围|金额|\brange\b"),
+        ({"field_formats"}, r"字段|列|格式|\bformat\b"),
+        ({"cross_field_assertions"}, r"字段|关系|比较|\b(?:field|compare)\b"),
+        ({"sort_assertions"}, r"排序|顺序|升序|降序|\bsort\b"),
+        ({"aggregate_assertions"}, r"合计|统计|总计|平均|汇总|\b(?:sum|average|aggregate)\b"),
+    )
+    allowed = {field for fields, pattern in groups if re.search(pattern, quote, re.I) for field in fields}
+    removing = bool(re.search(r"取消|删除|去掉|不再|不用|无需|\b(?:remove|drop)\b", quote, re.I))
+    next_items = after.get("deliverables") or []
+    violations: list[str] = []
+    for old in before.get("deliverables") or []:
+        new = next((item for item in next_items if item.get("id") == old.get("id")), None)
+        prefix = f"deliverables.{old.get('id')}"
+        if new is None:
+            if not (removing and str(old.get("variable")) in quote):
+                violations.append(prefix)
+            continue
+        for field, value in old.items():
+            target = new.get(field)
+            if field in {"id", "requirement_ids"} or value == target:
+                continue
+            permitted = field in allowed
+            if field in {"variable", "kind", "required"}:
+                permitted = str(old.get("variable")) in quote and (
+                    (field == "required" and removing) or str(target) in quote
+                )
+            if field in {"min_rows", "max_rows", "min_chars", "min_bytes", "minimum_coverage_ratio"}:
+                permitted = permitted and (
+                    removing if target is None else bool(re.search(r"(?<![\d.])" + re.escape(str(target)) + r"(?![\d.])", quote))
+                )
+            if field == "required_fields":
+                removed = set(value or []) - set(target or [])
+                permitted = permitted and (not removed or removing) and all(name in quote for name in removed)
+            if not permitted:
+                violations.append(f"{prefix}.{field}")
+    return violations
 
 
 @dataclass(frozen=True)

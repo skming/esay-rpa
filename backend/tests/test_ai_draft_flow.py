@@ -35,6 +35,42 @@ async def test_create_flow_fills_persisted_draft_and_preserves_id():
     assert len(await service.list_flows()) == 1
 
 
+@pytest.mark.parametrize("include_contract", [False, True])
+async def test_generation_preserves_existing_draft_contract_and_activates_flow(include_contract):
+    service = FlowService()
+    args = generated_args()
+    draft = await service.create_flow(FlowCreateRequest(
+        name="已有验收条件", status="draft",
+        input_variables=[{"name": "result", "type": "String", "value": ""}],
+        acceptance_contract=args["acceptance_contract"],
+    ))
+    if not include_contract:
+        args.pop("acceptance_contract")
+    result = await RpaToolExecutor(service, SimpleNamespace()).execute(
+        "create_flow", args, change_context=ChangeContext(draft_flow_id=draft.flow_id),
+    )
+    assert result["status"] == "active", result
+    saved = await service.get_flow(draft.flow_id)
+    assert saved.acceptance_contract == draft.acceptance_contract
+    assert any(node["id"] == "n1" for node in saved.definition["nodes"])
+
+
+async def test_generation_cannot_replace_existing_draft_contract():
+    service = FlowService()
+    args = generated_args()
+    draft = await service.create_flow(FlowCreateRequest(
+        name="已有验收条件", status="draft",
+        input_variables=[{"name": "result", "type": "String", "value": ""}],
+        acceptance_contract=args["acceptance_contract"],
+    ))
+    args["acceptance_contract"]["deliverables"][0]["required"] = False
+    result = await RpaToolExecutor(service, SimpleNamespace()).execute(
+        "create_flow", args, change_context=ChangeContext(draft_flow_id=draft.flow_id),
+    )
+    assert result["status"] == "blocked_acceptance_contract_change"
+    assert await service.get_flow(draft.flow_id) == draft
+
+
 @pytest.mark.parametrize("status,nodes", [("active", []), ("draft", [{"id": "existing", "type": "variable.set"}])])
 async def test_create_flow_does_not_replace_existing_content(status, nodes):
     service = FlowService()

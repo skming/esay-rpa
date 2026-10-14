@@ -7,93 +7,47 @@
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, get_args
+
+from app.models.schemas import FlowAcceptanceContract, TaskLogLevel
 
 from jsonschema import Draft202012Validator
 
 # Tool JSON Schemas (OpenAI tool format)
 
-# 契约对象是审计引擎的固定读取面，所以三层都封死扩展字段：多写的字段没人读，模型却以为
-# 约束已经生效，运行完还会拿一份"通过"的审计结论。这里拦不住就会落到 executor 的
-# model_validate 抛 ValidationError，而 Pydantic 把 input_value 原样拼进异常文本，
-# 编排层对工具异常只做 {"error": str(exc)}——契约里的用户原话和页面数据会顺着回传给模型。
-# 与之相对，nodes / patch / input_variables 必须保持开放：那些字段由节点类型目录决定，
-# 封死等于新增一种节点就得先改这里，模型只会收到"参数非法"且无从绕开。
-_ACCEPTANCE_CONTRACT_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "description": (
-        "运行前冻结的交付验收契约。requirements 必须逐条记录用户原文来源；"
-        "审计只验这里声明的交付变量。"
-        "随输入变化的筛选值与行数界不能写字面量（契约会换输入重放），"
-        "改用对应的 *_variable 字段绑定输入变量。"
-    ),
-    "properties": {
-        "requirements": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "id": {"type": "string"},
-                    "description": {"type": "string"},
-                    "source_kind": {"type": "string", "enum": ["user", "product_default"]},
-                    "source_quote": {"type": "string"},
-                    "source_turn_id": {"type": "string"},
-                },
-                "required": ["id", "description", "source_kind"],
-            },
-        },
-        "deliverables": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "id": {"type": "string"},
-                    "variable": {"type": "string"},
-                    "kind": {"type": "string", "enum": ["table", "document", "file", "scalar"]},
-                    "required": {"type": "boolean"},
-                    "min_rows": {"type": "integer"},
-                    "max_rows": {"type": "integer"},
-                    "min_rows_variable": {"type": "string"},
-                    "max_rows_variable": {"type": "string"},
-                    "required_fields": {"type": "array", "items": {"type": "string"}},
-                    "date_ranges": {"type": "array", "items": {"type": "object"}},
-                    "allowed_values": {
-                        "type": "array",
-                        "items": {"type": "object"},
-                        "description": "每项 {field, values?, value_variables?}，两者至少一个非空。",
-                    },
-                    "unique_by": {"type": "array", "items": {"type": "string"}},
-                    "min_chars": {"type": "integer"},
-                    "required_terms": {"type": "array", "items": {"type": "string"}},
-                    "forbidden_terms": {"type": "array", "items": {"type": "string"}},
-                    "source_variables": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": (
-                            "文档正文取自哪些运行变量。kind=document 时必填："
-                            "审计用它验证正文里确实含有本次运行抓到的数据。"
-                        ),
-                    },
-                    "extensions": {"type": "array", "items": {"type": "string"}},
-                    "min_bytes": {"type": "integer"},
-                    "requirement_ids": {"type": "array", "items": {"type": "string"}},
-                    "numeric_ranges": {"type": "array", "items": {"type": "object"}},
-                    "field_formats": {"type": "array", "items": {"type": "object"}},
-                    "cross_field_assertions": {"type": "array", "items": {"type": "object"}},
-                    "sort_assertions": {"type": "array", "items": {"type": "object"}},
-                    "aggregate_assertions": {"type": "array", "items": {"type": "object"}},
-                    "expected_count_variable": {"type": "string"},
-                    "minimum_coverage_ratio": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
-                },
-                "required": ["id", "variable", "kind", "requirement_ids"],
-            },
-        },
-    },
-    "required": ["requirements", "deliverables"],
-}
+def _acceptance_contract_schema() -> dict[str, Any]:
+    # 由审计模型生成嵌套字段与边界，避免工具声明和实际验收分别维护。
+    schema = FlowAcceptanceContract.model_json_schema(by_alias=False)
+    definitions = schema.pop("$defs", {})
+
+    def inline(value: Any) -> Any:
+        if isinstance(value, list):
+            return [inline(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        if "$ref" in value:
+            return inline(definitions[value["$ref"].rsplit("/", 1)[-1]])
+        return {
+            key: {name: inline(prop) for name, prop in item.items()} if key == "properties" else inline(item)
+            for key, item in value.items() if key not in {"title", "default", "description"}
+        }
+
+    result = inline(schema)
+    result["required"] = ["requirements", "deliverables"]
+    requirements = result["properties"]["requirements"]["items"]
+    requirements["required"] = ["id", "description", "source_kind"]
+    requirements["description"] = "source_kind=user 时必须提供 source_quote 用户原文。"
+    deliverable = result["properties"]["deliverables"]["items"]
+    deliverable["required"] = ["id", "variable", "kind", "requirement_ids"]
+    properties = deliverable["properties"]
+    properties["allowed_values"]["description"] = "values 与 value_variables 至少一个非空；动态筛选值使用输入变量。"
+    properties["numeric_ranges"]["description"] = "minimum 与 maximum 至少一个非空；minimum 不得大于 maximum。"
+    properties["source_variables"]["description"] = "kind=document 时必填，用于核对正文含有本次运行数据。"
+    result["description"] = "运行前冻结的交付验收契约。随输入变化的筛选值与行数界使用 *_variable 字段；字面量与变量界限互斥。"
+    return result
+
+
+_ACCEPTANCE_CONTRACT_SCHEMA = _acceptance_contract_schema()
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -125,7 +79,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "create_flow",
             "description": (
-                "创建全新流程；已有 flow_id 时改用 update_flow。所有节点字段平铺在节点根层。"
+                "创建全新流程或填充当前空草稿；已有业务节点时用 update_flow。节点字段平铺在根层。"
                 "可省略 acceptance_contract 先存草稿，再用 set_acceptance_contract 补齐；未补齐禁止运行。返回 flow_id、revision、"
                 "changed_nodes 和带 blocks_run 标记的 lint_findings。凭据变量只声明空值，"
                 "不得把账号、密码或 Token 写入参数。"
@@ -195,6 +149,22 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "name": {
                         "type": "string",
                         "description": "流程名称。仅当当前名称是占位名（新建 RPA 流程/未命名流程）时才需要传入并覆盖。",
+                    },
+                    "input_variables": {
+                        "type": "array", "maxItems": 100,
+                        "description": "增量声明新输入变量，不替换或删除已有变量；同名声明保留用户的值和属性。凭据只声明空值。",
+                        "items": {
+                            "type": "object", "additionalProperties": False,
+                            "properties": {
+                                "name": {"type": "string", "minLength": 1, "maxLength": 120},
+                                "type": {"type": "string", "enum": ["String", "Integer", "Boolean", "List", "Dict"]},
+                                "value": {"type": "string"},
+                                "category": {"type": "string", "enum": ["flow", "credential"]},
+                                "sensitive": {"type": "boolean"},
+                                "scope": {"type": "string", "enum": ["全局", "循环", "局部"]},
+                            },
+                            "required": ["name", "type"],
+                        },
                     },
                     "add_nodes": {
                         "type": "array",
@@ -312,7 +282,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "list_schedules",
             "description": (
-                "列出全部定时任务（schedule_id、名称、cron 表达式、时区、启用状态、"
+                "列出当前流程的定时任务（schedule_id、名称、cron 表达式、时区、启用状态、"
                 "关联 flow_id、下次/上次运行时间）。创建新定时任务前先调用，避免重复创建。"
             ),
             "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
@@ -432,7 +402,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "name": "set_acceptance_contract",
             "description": (
                 "为尚无契约的草稿补齐验收契约；已有契约仅在用户本轮明确改变需求时替换。"
-                "普通节点修复不得调用此工具放宽验收条件；调用后流程 revision 递增，旧运行证据全部失效。"
+                "普通节点修复不得调用此工具放宽验收条件；契约实际变化时 revision 递增并使旧证据失效，相同契约不变更。"
             ),
             "parameters": {
                 "type": "object",
@@ -628,7 +598,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                     "level": {
                         "type": "string",
-                        "enum": ["error", "warn", "info", "debug"],
+                        "enum": list(get_args(TaskLogLevel)),
                         "description": "日志级别过滤（可选）",
                     },
                 },

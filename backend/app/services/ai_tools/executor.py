@@ -16,10 +16,12 @@ from typing import TYPE_CHECKING, Any
 from collections.abc import Awaitable
 
 from app.core import storage
-from app.models.schemas import FlowAcceptanceContract, FlowUpdateRequest
+from app.core.logging import redact_log_text
+from app.models.schemas import FlowAcceptanceContract, FlowUpdateRequest, RuntimeVariableSnapshot
+from pydantic import ValidationError
 from app.services.acceptance_contract import contract_validation_errors, pagination_caps_from_nodes
 from app.services.ai_checks import audit_run
-from app.services.ai_guards import exposed_credential_values
+from app.services.ai_guards import acceptance_change_authorized, exposed_credential_values
 from app.services import browser_profile_lock
 from app.services import ai_repair_ledger as repair_ledger
 from app.services.browser_action_runner import detect_blocking_interstitial, persistent_browser_context
@@ -39,7 +41,7 @@ from app.services.ai_tools.diagnostics import (
 )
 from app.services.ai_tools.graph import _unreachable_node_ids
 from app.services.ai_tools.lint import _lint_flow, annotate_lint_findings, is_blocking_finding
-from app.services.ai_tools.lint_diff import ChangeContext, execution_signature, inspect_change
+from app.services.ai_tools.lint_diff import ChangeContext, execution_signature, inspect_change, unrequested_contract_changes
 from app.services.ai_tools.normalize import (
     _choose_layout_lane,
     _next_layout_lane,
@@ -66,7 +68,7 @@ import app.services.ai_tools.page_session as _page_session
 from app.services.ai_tools.static_page_probe import inspect_static_page, snapshot_from_html
 from app.services.ai_tools.static_page_content import clear_static_snapshot, read_static_snapshot
 from app.services.ai_tools.variables import _RUNTIME_BUILTINS, _collect_defined_vars, _validate_variable_refs
-from app.services.runtime_variables import build_input_variables, protected_variable_names
+from app.services.runtime_variables import build_input_variables, protected_variable_names, protected_variable_values, normalize_variable_name, stringify_variable_value
 
 if TYPE_CHECKING:
     from app.models.schemas import FlowSnapshot
@@ -335,6 +337,7 @@ class RpaToolExecutor:
         self._schedule_service = schedule_service
         # 运行"成功"但业务断言失败的证据，供下次 run_flow 使用，防止 成功→审计失败→盲目重跑 死循环
         self._quality_failures_by_flow: dict[str, list[dict[str, Any]]] = {}
+        self._observing_runs: set[str] = set()
 
     async def execute(
         self,
@@ -351,6 +354,68 @@ class RpaToolExecutor:
         invalid = validate_tool_arguments(name, args)
         if invalid is not None:
             return invalid
+        target_error = await self._validate_target(name, args, change_context)
+        if target_error is not None:
+            return target_error
+        result = await self._dispatch(name, args, progress_sink, change_context)
+        task_id = args.get("task_id") or result.get("task_id")
+        if task_id and name in {"run_flow", "get_run_status", "get_run_error", "get_run_logs", "get_run_output", "audit_run"}:
+            result = await self._redact_task_result(str(task_id), result)
+        return result
+
+    async def _validate_target(
+        self, name: str, args: dict[str, Any], context: ChangeContext | None,
+    ) -> dict[str, Any] | None:
+        if context is None:
+            return None  # 平台状态查询不带模型会话；模型调用必须传可信上下文。
+        target_flow_id = args.get("flow_id")
+        if args.get("task_id"):
+            task = await self._task_manager.get_task(args["task_id"])
+            target_flow_id = task.flow_id if task else None
+        elif name == "toggle_schedule":
+            schedule = await self._schedule_service.get_schedule(args["schedule_id"]) if self._schedule_service else None
+            target_flow_id = schedule.task.flow_id if schedule else None
+        elif name == "list_schedules":
+            target_flow_id = context.flow_id
+        else:
+            if "flow_id" not in args:
+                return None
+        if not context.flow_id or not target_flow_id or target_flow_id != context.flow_id:
+            return {
+                "error": "tool_target_flow_mismatch",
+                "message": "目标不属于当前会话绑定的流程或已不存在；请使用当前流程的任务/定时任务 ID。",
+            }
+        return None
+
+    async def _redact_task_result(self, task_id: str, result: dict[str, Any]) -> dict[str, Any]:
+        task = await self._task_manager.get_task(task_id)
+        values = protected_variable_values(list(task.variables or [])) if task else set()
+        if self._flow_service is not None and task and task.flow_id:
+            flow = await self._flow_service.get_flow(task.flow_id)
+            if flow:
+                values.update(protected_variable_values(list(getattr(flow, "input_variables", []))))
+
+        def redact(value: Any) -> Any:
+            if isinstance(value, str):
+                return redact_log_text(value, values)
+            if isinstance(value, dict):
+                return {key: redact(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [redact(item) for item in value]
+            return value
+
+        # 协议字段不属于日志正文；短凭据不能破坏 status、ID 等调度事实。
+        protocol_fields = {"task_id", "flow_id", "status", "flow_revision", "definition_digest", "progress", "failed_node_id", "redacted_variables"}
+        safe = {key: value if key in protocol_fields else redact(value) for key, value in result.items()}
+        for key, value in safe.get("variables", {}).items():
+            if isinstance(value, str) and len(value) > 500:
+                safe["variables"][key] = value[:500] + "…（已截断）"
+        return safe
+
+    async def _dispatch(
+        self, name: str, args: dict[str, Any], progress_sink: dict[str, Any] | None,
+        change_context: ChangeContext | None,
+    ) -> dict[str, Any]:
         match name:
             case "lint_flow":
                 return await self._lint_flow_tool(**args)
@@ -371,11 +436,11 @@ class RpaToolExecutor:
             case "stop_run":
                 return await self._stop_run(**args)
             case "list_schedules":
-                return await self._list_schedules()
+                return await self._list_schedules(change_context.flow_id if change_context else None)
             case "create_schedule":
                 return await self._create_schedule(**args)
             case "toggle_schedule":
-                return await self._toggle_schedule(**args)
+                return await self._toggle_schedule(**args, expected_flow_id=change_context.flow_id if change_context else None)
             case "get_run_status":
                 return await self._get_run_status(**args)
             case "get_run_error":
@@ -383,7 +448,7 @@ class RpaToolExecutor:
             case "apply_node_fix":
                 return await self._apply_node_fix(**args, change_context=change_context)
             case "set_acceptance_contract":
-                return await self._set_acceptance_contract(**args)
+                return await self._set_acceptance_contract(**args, change_context=change_context)
             case "get_run_output":
                 return await self._get_run_output(**args)
             case "audit_run":
@@ -683,6 +748,38 @@ class RpaToolExecutor:
             )
             node_map["end"]["position"] = {"x": MAIN_X + end_lane * LANE_STEP_X, "y": max_y + ROW_STEP_Y}
 
+    @staticmethod
+    def _normalize_input_declarations(input_variables: list[dict[str, Any]] | None) -> list[RuntimeVariableSnapshot]:
+        iv_snapshots: list[dict[str, Any]] = []
+        for iv in (input_variables or []):
+            iv_name = normalize_variable_name(str(iv.get("name", "")))
+            if iv_name:
+                raw_type = iv.get("type", "String")
+                _type_map = {"string": "String", "integer": "Integer", "int": "Integer",
+                             "boolean": "Boolean", "bool": "Boolean", "list": "List",
+                             "array": "List", "dict": "Dict", "object": "Dict"}
+                norm_type = _type_map.get(str(raw_type).lower(), raw_type)
+                raw_scope = iv.get("scope", "全局")
+                norm_scope = raw_scope if raw_scope in ("全局", "循环", "局部") else "全局"
+                iv_snapshots.append({
+                    "name": iv_name,
+                    "type": norm_type,
+                    # 存储字段叫 value；defaultValue 只是模型的旧写法，留作输入别名
+                    "value": stringify_variable_value(iv.get("value", iv.get("defaultValue", ""))),
+                    "scope": norm_scope,
+                    "category": iv.get("category", "credential") if any(
+                        kw in iv_name.lower() for kw in ("password", "passwd", "secret", "token", "key", "pwd")
+                    ) else iv.get("category", "flow"),
+                    "sensitive": bool(iv.get("sensitive", any(
+                        kw in iv_name.lower() for kw in ("password", "passwd", "secret", "token", "key", "pwd")
+                    ))),
+                })
+
+        declarations = [RuntimeVariableSnapshot.model_validate(item) for item in iv_snapshots]
+        if len({item.name for item in declarations}) != len(declarations):
+            raise ValueError("duplicate_input_variables")
+        return declarations
+
     async def _create_flow(
         self,
         name: str,
@@ -762,32 +859,11 @@ class RpaToolExecutor:
 
         definition: dict[str, Any] = {"nodes": nodes, "edges": edges}
 
-        iv_names: list[str] = []
-        iv_snapshots: list[dict[str, Any]] = []
-        for iv in (input_variables or []):
-            iv_name = iv.get("name", "")
-            if iv_name:
-                iv_names.append(iv_name)
-                raw_type = iv.get("type", "String")
-                _type_map = {"string": "String", "integer": "Integer", "int": "Integer",
-                             "boolean": "Boolean", "bool": "Boolean", "list": "List",
-                             "array": "List", "dict": "Dict", "object": "Dict"}
-                norm_type = _type_map.get(str(raw_type).lower(), raw_type)
-                raw_scope = iv.get("scope", "全局")
-                norm_scope = raw_scope if raw_scope in ("全局", "循环", "局部") else "全局"
-                iv_snapshots.append({
-                    "name": iv_name,
-                    "type": norm_type,
-                    # 存储字段叫 value；defaultValue 只是模型的旧写法，留作输入别名
-                    "value": str(iv.get("value") or iv.get("defaultValue") or ""),
-                    "scope": norm_scope,
-                    "category": iv.get("category", "credential") if any(
-                        kw in iv_name.lower() for kw in ("password", "passwd", "secret", "token", "key", "pwd")
-                    ) else iv.get("category", "flow"),
-                    "sensitive": bool(iv.get("sensitive", any(
-                        kw in iv_name.lower() for kw in ("password", "passwd", "secret", "token", "key", "pwd")
-                    ))),
-                })
+        try:
+            iv_snapshots = self._normalize_input_declarations(input_variables)
+        except (ValueError, ValidationError):
+            return {"error": "invalid_input_variables", "message": "输入变量的名称、类型或属性无效，名称不能重复。"}
+        iv_names = [item.name for item in iv_snapshots]
 
         draft_flow_id = change_context.draft_flow_id if change_context else None
         if draft_flow_id:
@@ -808,13 +884,19 @@ class RpaToolExecutor:
         contract, contract_invalid = _validated_contract(acceptance_contract)
         if contract_invalid is not None:
             return contract_invalid
+        if draft_flow_id and (draft.acceptance_contract.requirements or draft.acceptance_contract.deliverables):
+            if acceptance_contract is not None and contract != draft.acceptance_contract:
+                return {"status": "blocked_acceptance_contract_change", "flow_id": draft_flow_id,
+                        "message": "已有草稿验收契约不能通过 create_flow 覆盖，请保留契约并用 set_acceptance_contract 处理明确的需求变更。"}
+            contract = draft.acceptance_contract
+        has_contract = acceptance_contract is not None or bool(contract.requirements or contract.deliverables)
         defined_variables = _collect_defined_vars(nodes, iv_names)
         contract_errors = contract_validation_errors(
             contract,
             defined_variables=set(defined_variables),
             pagination_caps=pagination_caps_from_nodes(nodes),
         )
-        if acceptance_contract is not None and contract_errors:
+        if has_contract and contract_errors:
             return {
                 "error": "acceptance_contract_invalid",
                 "contract_errors": contract_errors,
@@ -826,7 +908,7 @@ class RpaToolExecutor:
             definition=definition,
             input_variables=iv_snapshots,
             acceptance_contract=contract,
-            status="active" if acceptance_contract is not None and any(node.get("type") not in {"start", "end"} for node in nodes) else "draft",
+            status="active" if has_contract and any(node.get("type") not in {"start", "end"} for node in nodes) else "draft",
         )
         if draft_flow_id:
             # 草稿中用户已配置的变量（尤其凭据）不能被模型生成的空默认值清掉。
@@ -885,12 +967,37 @@ class RpaToolExecutor:
         remove_node_ids: list[str] | None = None,
         add_edges: list[dict[str, Any]] | None = None,
         remove_edge_ids: list[str] | None = None,
+        input_variables: list[dict[str, Any]] | None = None,
         change_context: ChangeContext | None = None,
     ) -> dict[str, Any]:
         """Apply structural changes to a flow immediately — no user confirmation required."""
         flow = await self._flow_service.get_flow(flow_id)
         if flow is None:
             return {"error": f"流程 {flow_id} 不存在"}
+
+        protected_names = set(protected_variable_names(list(flow.input_variables)))
+        exposed = exposed_credential_values([
+            {**item, **({"sensitive": True} if str(item.get("name", "")).strip() in protected_names else {})}
+            for item in (input_variables or [])
+        ])
+        if exposed:
+            return {"status": "blocked_credential_values", "exposed_variables": exposed,
+                    "required_action": "use_empty_credential_variables",
+                    "message": "凭据只允许空值声明，请在输入变量面板配置秘密值。"}
+        try:
+            declarations = self._normalize_input_declarations(input_variables)
+        except (ValueError, ValidationError):
+            return {"error": "invalid_input_variables", "message": "输入变量的名称、类型或属性无效，名称不能重复。"}
+        existing_names = {item.name for item in flow.input_variables}
+        additions = [item for item in declarations if item.name not in existing_names]
+        merged_variables = [*flow.input_variables, *additions]
+        if len(merged_variables) > 100:
+            return {"error": "invalid_input_variables", "message": "输入变量最多支持 100 个。"}
+        reused_names = [item.name for item in declarations if item.name in existing_names]
+        if declarations and not additions and not any((name, add_nodes, update_nodes, remove_node_ids, add_edges, remove_edge_ids)):
+            return {"status": "no_effective_change", "flow_id": flow_id, "revision": flow.revision,
+                    "execution_changed": False, "reused_input_variables": reused_names,
+                    "message": "这些输入变量已存在，保留用户的值和属性，无需重复声明。"}
 
         existing_nodes: list[Any] = list(flow.definition.get("nodes", []))
         existing_edges: list[Any] = list(flow.definition.get("edges", []))
@@ -963,7 +1070,7 @@ class RpaToolExecutor:
             definition,
             context=change_context,
             ledger=repair_ledger.load(flow_id),
-            allow_no_effective_change=requested_name is not None,
+            allow_no_effective_change=requested_name is not None or bool(additions),
         )
         if change.rejected:
             return change.refusal()
@@ -993,11 +1100,12 @@ class RpaToolExecutor:
             return _unavailable_interactive_nodes_result(unavailable_nodes)
         contract_ready = not contract_validation_errors(
             flow.acceptance_contract,
-            defined_variables=set(_collect_defined_vars(nodes, [iv.name for iv in flow.input_variables])),
+            defined_variables=set(_collect_defined_vars(nodes, [iv.name for iv in merged_variables])),
             pagination_caps=pagination_caps_from_nodes(nodes),
         )
         req = FlowUpdateRequest(
             definition=definition,
+            input_variables=merged_variables if additions else None,
             name=new_name,
             status="active" if flow.status == "draft" and generated_business_nodes and contract_ready else None,
         )
@@ -1006,7 +1114,7 @@ class RpaToolExecutor:
             return {"error": "流程更新失败，未找到对应流程"}
 
         # Post-change validation (informational only — changes are already applied)
-        input_var_names = [iv.name for iv in flow.input_variables]
+        input_var_names = [iv.name for iv in merged_variables]
         issues = _validate_variable_refs(nodes, input_var_names)
         lint_findings = _lint_flow(nodes, edges, input_variable_names=input_var_names)
         changed_nodes, updated_node_snapshots = self._summarize_changed_nodes(
@@ -1020,7 +1128,9 @@ class RpaToolExecutor:
             "revision": updated.revision,
             "node_count": len(nodes),
             "edge_count": len(edges),
-            "execution_changed": execution_signature(flow.definition) != execution_signature(definition),
+            "execution_changed": bool(additions) or execution_signature(flow.definition) != execution_signature(definition),
+            "added_input_variables": [item.name for item in additions],
+            "reused_input_variables": reused_names,
         }
         if change.tracked_field_changes:
             # 编排层据此记修复台账。取自 before/after 而不是调用参数：
@@ -1350,6 +1460,7 @@ class RpaToolExecutor:
             return {"error": f"任务 {task_id} 不存在"}
         return {
             "task_id": task_id,
+            "flow_id": snapshot.flow_id,
             "status": snapshot.status,
             "message": (
                 "任务已停止。"
@@ -1372,10 +1483,12 @@ class RpaToolExecutor:
             "last_run_at": schedule.last_run_at.isoformat() if schedule.last_run_at else None,
         }
 
-    async def _list_schedules(self) -> dict[str, Any]:
+    async def _list_schedules(self, flow_id: str | None = None) -> dict[str, Any]:
         if self._schedule_service is None:
             return {"error": "定时任务服务不可用"}
         schedules = await self._schedule_service.list_schedules()
+        if flow_id is not None:
+            schedules = [schedule for schedule in schedules if schedule.task.flow_id == flow_id]
         return {
             "schedules": [self._schedule_brief(s) for s in schedules],
             "count": len(schedules),
@@ -1402,6 +1515,9 @@ class RpaToolExecutor:
             return {"error": f"流程 {flow_id} 不存在"}
 
         run_variables = variables or {}
+        credential_block = self._credential_override_block(flow, run_variables)
+        if credential_block is not None:
+            return credential_block
         missing_vars = [
             {"name": iv.name, "category": getattr(iv, "category", "credential")}
             for iv in flow.input_variables
@@ -1456,14 +1572,18 @@ class RpaToolExecutor:
             )
         return result
 
-    async def _toggle_schedule(self, schedule_id: str, enabled: bool) -> dict[str, Any]:
+    async def _toggle_schedule(self, schedule_id: str, enabled: bool, *, expected_flow_id: str | None = None) -> dict[str, Any]:
         from app.models.schemas import ScheduleUpdateRequest
 
         if self._schedule_service is None:
             return {"error": "定时任务服务不可用"}
-        snapshot = await self._schedule_service.update_schedule(
-            schedule_id, ScheduleUpdateRequest(enabled=enabled)
-        )
+        try:
+            snapshot = await self._schedule_service.update_schedule(
+                schedule_id, ScheduleUpdateRequest(enabled=enabled),
+                **({"expected_flow_id": expected_flow_id} if expected_flow_id else {}),
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
         if snapshot is None:
             return {"error": f"定时任务 {schedule_id} 不存在"}
         result = self._schedule_brief(snapshot)
@@ -1521,12 +1641,57 @@ class RpaToolExecutor:
         browser_executor: str = "playwright",
         progress_sink: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        # 同一执行器内先占位再 await，避免两个 AI 请求同时通过活跃任务检查。
+        starting = self._observing_runs
+        if flow_id in starting:
+            return {"status": "blocked_run_in_progress", "flow_id": flow_id,
+                    "message": "当前流程正在启动或等待运行结果，请等待现有任务，不要重复运行。"}
+        starting.add(flow_id)
+        try:
+            return await self._observe_run_flow(flow_id, variables, browser_executor, progress_sink)
+        finally:
+            starting.discard(flow_id)
+
+    @staticmethod
+    def _credential_override_block(flow: Any, variables: dict[str, Any]) -> dict[str, Any] | None:
+        protected = set(protected_variable_names(flow.input_variables))
+        exposed = sorted(protected.intersection(variables))
+        exposed.extend(name for name in exposed_credential_values([
+            {"name": name, "value": value} for name, value in variables.items()
+        ]) if name not in exposed)
+        if not exposed:
+            return None
+        return {"status": "blocked_credential_override", "exposed_variables": exposed,
+                "message": "凭据不能通过 AI 工具传入或覆盖，请在输入变量面板配置。"}
+
+    async def _observe_run_flow(
+        self,
+        flow_id: str,
+        variables: dict[str, Any] | None,
+        browser_executor: str,
+        progress_sink: dict[str, Any] | None,
+    ) -> dict[str, Any]:
         import asyncio
         from app.models.schemas import RunTaskRequest
 
         flow = await self._flow_service.get_flow(flow_id)
         if flow is None:
             return {"error": f"流程 {flow_id} 不存在"}
+
+        credential_block = self._credential_override_block(flow, variables or {})
+        if credential_block is not None:
+            return credential_block
+        # 断流只停止观察。权威任务记录仍然存在，检查点丢失时也不能重复提交。
+        active = next((task for task in await self._task_manager.list_tasks(flow_id=flow_id, limit=200)
+                       if task.status in {"queued", "pending", "running", "awaiting_confirmation"}), None)
+        if active is not None:
+            result = {"task_id": active.task_id, "status": active.status, "flow_id": flow_id,
+                      "flow_revision": active.flow_revision, "definition_digest": active.definition_digest,
+                      "reused_existing_run": True,
+                      "message": "当前流程已有未完成任务，已恢复观察，请勿重复运行。"}
+            if progress_sink is not None:
+                progress_sink.update(result)
+            return result
 
         # 探索会话占着同一个 browser profile 的进程内互斥锁，不先让开，这次运行会被自己刚才的
         # 观察挡成 blocked_browser_profile_busy——那个状态禁止改流程，模型会卡在无解的死局里。
@@ -1659,34 +1824,43 @@ class RpaToolExecutor:
             variables=merged_variables,
             browser_executor=browser_executor,
         )
-        task = await self._task_manager.start_task(req)
-
-        def _publish_progress() -> None:
+        def _publish_progress(task: Any) -> None:
             # 运行要几分钟，AI 面板在这期间只能靠这份进度证明自己没死
             if progress_sink is None:
                 return
             progress_sink.update({
                 "task_id": task.task_id,
                 "status": task.status,
+                "flow_id": flow_id,
+                "flow_revision": task.flow_revision,
+                "definition_digest": task.definition_digest,
                 "current_step": task.progress.current_step,
                 "total_steps": task.progress.total_steps,
                 "percent": task.progress.percent,
             })
 
-        _publish_progress()
+        # 提交一旦开始必须拿到回执；取消观察不能落在「任务已入队但尚未保存 task_id」之间。
+        submission = asyncio.create_task(self._task_manager.start_task(req))
+        try:
+            task = await asyncio.shield(submission)
+        except asyncio.CancelledError:
+            task = await submission
+            _publish_progress(task)
+            raise
+        _publish_progress(task)
 
         _TERMINAL = {"success", "error", "stopped"}
         _MAX_WAIT_S = 90
         _POLL_INTERVAL_S = 2
         elapsed = 0
-        while task.status not in _TERMINAL and elapsed < _MAX_WAIT_S:
+        while task.status not in _TERMINAL | {"awaiting_confirmation"} and elapsed < _MAX_WAIT_S:
             await asyncio.sleep(_POLL_INTERVAL_S)
             elapsed += _POLL_INTERVAL_S
             refreshed = await self._task_manager.get_task(task.task_id)
             if refreshed is None:
                 break
             task = refreshed
-            _publish_progress()
+            _publish_progress(task)
 
         if task.status == "success":
             try:
@@ -1818,10 +1992,13 @@ class RpaToolExecutor:
     async def _get_run_status(self, task_id: str) -> dict[str, Any]:
         task = await self._task_manager.get_task(task_id)
         if task is None:
-            return {"error": f"任务 {task_id} 不存在"}
+            return {"status": "not_found", "error": f"任务 {task_id} 不存在"}
         return {
             "task_id": task_id,
             "status": task.status,
+            "flow_id": task.flow_id,
+            "flow_revision": task.flow_revision,
+            "definition_digest": task.definition_digest,
             "progress": task.progress.model_dump(mode="json"),
             "error": task.error,
         }
@@ -2212,14 +2389,33 @@ class RpaToolExecutor:
         flow_id: str,
         acceptance_contract: dict[str, Any],
         requirement_change_quote: str = "",
+        change_context: ChangeContext | None = None,
     ) -> dict[str, Any]:
-        del requirement_change_quote
         flow = await self._flow_service.get_flow(flow_id)
         if flow is None:
             return {"error": f"流程 {flow_id} 不存在"}
         contract, contract_invalid = _validated_contract(acceptance_contract)
         if contract_invalid is not None:
             return contract_invalid
+        previous = flow.acceptance_contract
+        if previous == contract:
+            return {"status": "no_effective_change", "flow_id": flow_id, "revision": flow.revision,
+                    "execution_changed": False,
+                    "message": "验收契约未发生变化，无需重复保存。"}
+        if previous.requirements or previous.deliverables:
+            context = change_context or ChangeContext()
+            if not (
+                context.flow_id == flow_id and context.flow_revision == flow.revision
+                and acceptance_change_authorized(context.latest_user_message, requirement_change_quote.strip())
+            ):
+                return {"status": "blocked_acceptance_contract_change", "flow_id": flow_id,
+                        "required_action": "preserve_acceptance_contract",
+                        "message": "现有验收契约已保留。只有本轮明确的需求变更并匹配当前流程版本才可修改。"}
+            unrequested = unrequested_contract_changes(previous.model_dump(), contract.model_dump(), requirement_change_quote)
+            if unrequested:
+                return {"status": "blocked_acceptance_contract_change", "flow_id": flow_id,
+                        "unrequested_changes": unrequested, "required_action": "preserve_acceptance_contract",
+                        "message": "变更超出用户原文指定的验收条件，请保留未被要求修改的契约字段。"}
         defined = _collect_defined_vars(
             list(flow.definition.get("nodes", [])),
             [iv.name for iv in flow.input_variables],
@@ -2265,11 +2461,14 @@ class RpaToolExecutor:
 
         _SYSTEM_VARS = frozenset({"run_timestamp"})
         variables: dict[str, Any] = {}
+        redacted_variables: list[str] = []
         for snap in (task.variables or []):
             if snap.name not in _SYSTEM_VARS:
+                # 内存快照尚未经过持久化层脱敏；必须在 AI 出口再次执行该边界。
+                if getattr(snap, "sensitive", False) or getattr(snap, "category", None) == "credential":
+                    redacted_variables.append(snap.name)
+                    continue
                 val = snap.value
-                if isinstance(val, str) and len(val) > 500:
-                    val = val[:500] + "…（已截断）"
                 variables[snap.name] = val
 
         artifacts = [
@@ -2289,6 +2488,7 @@ class RpaToolExecutor:
             "status": task.status,
             "summary": summary,
             "variables": variables,
+            "redacted_variables": redacted_variables,
             "artifacts": artifacts,
         }
 

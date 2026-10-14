@@ -41,8 +41,8 @@ _CREDENTIAL_NAME_TOKENS = (
     "password", "passwd", "pwd", "token", "secret", "api_key", "apikey", "credential",
 )
 
-# 用户提过定时/周期，才算要过定时任务。判据放在本模块而不是编排层：ai_guards 运行期
-# 保持零 ai_* 依赖，而这条判据只有这一个执行点。
+# 周期词只提供调度意图线索，授权还须匹配动作且排除否定或讲解请求。
+# 判据留在本模块以保持 ai_guards 运行期零 ai_* 依赖。
 #
 # 判宽的代价不对称：多收一个词，流程就可能在用户不知情的时候每天自己跑起来去操作站点；
 # 漏判只是多一轮问答（cron 时间和时区本来也得问）。所以这里只收「明说了周期」的措辞，
@@ -52,6 +52,61 @@ _SCHEDULE_AUTHORIZATION_RE = re.compile(
     r"自动跑|自动运行|自动执行|排程|schedule|cron)",
     re.IGNORECASE,
 )
+
+_RUN_REQUEST_RE = re.compile(
+    r"验收|跑一下|跑一次|跑一遍|跑通|跑起来看|运行一下|运行一次|运行看|运行验证|"
+    r"执行一下|重跑|重新运行|再跑|测一下|测试一下|能不能用|是否可用|\brun it\b",
+    re.IGNORECASE,
+)
+_NEGATION = r"(?:不要|不用|别|先不|暂不|不需要|无需|无须|禁止|停止|取消|do not|don't|never)"
+_CLAUSE_TEXT = r"[^，,。；;！!？?\n]{0,32}"
+_RUN_DENIAL_RE = re.compile(
+    _NEGATION + _CLAUSE_TEXT + r"(?:运行|执行|跑|验收|\brun\b|\bexecute\b)", re.IGNORECASE,
+)
+_EXPLANATION_RE = re.compile(
+    r"(?:只|仅|先)(?:需要|想|要|做)?(?:解释|说明|讨论|看结构|改配置|修复配置)|"
+    r"\b(?:only|just)\s+(?:explain|describe|discuss)\b", re.IGNORECASE,
+)
+_INFORMATION_REQUEST_RE = re.compile(r"解释|说明|讨论|如何|怎么|什么|\b(?:explain|describe|discuss|how|what is)\b", re.I)
+_SCHEDULE_DENIAL_RE = re.compile(
+    _NEGATION + _CLAUSE_TEXT + _SCHEDULE_AUTHORIZATION_RE.pattern, re.IGNORECASE,
+)
+_REQUIREMENT_CHANGE_RE = re.compile(
+    r"(?:改成|改为|改到|降低|提高|调整|取消|删除|去掉|不再要求|不用再|只需要|只要|新增|增加|补充)"
+    r"|\b(?:change|reduce|increase|remove|drop|add)\b", re.IGNORECASE,
+)
+
+
+def run_request_denied(text: str) -> bool:
+    """否定与仅解释优先；提到验收或重跑本身不构成执行授权。"""
+    return bool(_RUN_DENIAL_RE.search(text) or _EXPLANATION_RE.search(text)
+                or (_INFORMATION_REQUEST_RE.search(text) and not _positive_run_clause(text)) or "取消任务" in text)
+
+
+def _positive_run_clause(text: str) -> bool:
+    for clause in re.split(r"[，,。；;\n]|然后|并且|并说明|并解释", text):
+        if _INFORMATION_REQUEST_RE.search(clause):
+            continue
+        for match in _RUN_REQUEST_RE.finditer(clause):
+            if match.group() != "验收" or not re.match(r"标准|条件|规则|报告|机制", clause[match.end():]):
+                return True
+    return False
+
+
+def run_request_authorized(text: str) -> bool:
+    return not run_request_denied(text) and _positive_run_clause(text)
+
+
+def acceptance_change_authorized(latest: str, quote: str) -> bool:
+    """模型引用只能定位用户明确的需求变更，不能把普通修复请求变成授权。"""
+    return bool(
+        quote and quote in latest
+        and _REQUIREMENT_CHANGE_RE.search(quote)
+        and re.search(r"需求|要求|交付|验收|标准|字段|格式|行|列|条|页|Excel|CSV|JSON|数量|条数|\b(?:requirement|deliverable|field|format|rows?)\b", quote, re.I)
+        and not _EXPLANATION_RE.search(latest)
+        and not re.search(_NEGATION + _CLAUSE_TEXT + r"(?:改|调整|降低|删除|change|remove)", latest, re.I)
+        and not re.search(r"保持原|保留原.*(?:要求|标准|契约)|不要.*(?:降低|放宽)", latest)
+    )
 
 
 def exposed_credential_values(input_variables: Any) -> list[str]:
@@ -68,8 +123,7 @@ def exposed_credential_values(input_variables: Any) -> list[str]:
     for item in input_variables or []:
         if not isinstance(item, dict):
             continue
-        value = str(item.get("value") or item.get("defaultValue") or "").strip()
-        if not value:
+        if not any(value is not None and str(value).strip() for value in (item.get("value"), item.get("defaultValue"))):
             continue
         name = str(item.get("name") or "")
         lowered = name.lower()
@@ -185,14 +239,14 @@ def _check_acceptance_contract_change(
         return None
     quote = str(args.get("requirement_change_quote") or "").strip()
     latest = str(state.latest_user_message or "")
-    if quote and quote in latest:
+    if acceptance_change_authorized(latest, quote):
         return None
     return _blocked(
         tool_name,
         required_action="preserve_acceptance_contract",
         message=(
             "验收契约只能在用户本轮明确改变交付目标时修改。"
-            "requirement_change_quote 必须是用户最新消息中的连续原文，不能用模型自己的需求复述。"
+            "requirement_change_quote 必须引用用户最新消息中明确变更要求的连续原文；普通修复或保持原要求不构成授权。"
         ),
     )
 
@@ -276,7 +330,15 @@ def _check_schedule_authorization(
     if tool_name == "toggle_schedule" and not args.get("enabled"):
         return None
     text = " ".join(str(state.user_requirement_text or state.latest_user_message or "").split())
-    if _SCHEDULE_AUTHORIZATION_RE.search(text):
+    latest = str(state.latest_user_message or "")
+    if (_SCHEDULE_AUTHORIZATION_RE.search(latest)
+            or re.search(r"新任务|另一个任务|换个网站|新的网址", latest)):
+        text = latest
+    # 本轮撤回优先于历史授权；解释 cron 或提到 schedule 不等于要求创建。
+    denied = any(_SCHEDULE_DENIAL_RE.search(value) or _EXPLANATION_RE.search(value) or _INFORMATION_REQUEST_RE.search(value)
+                 for value in (text, latest))
+    action = re.search(r"创建|建立|加个|添加|设置|设成|安排|启用|开启|自动跑|自动运行|自动执行|跑|执行|运行|\b(?:create|enable|set|run)\b", text, re.I)
+    if not denied and action and _SCHEDULE_AUTHORIZATION_RE.search(text):
         return None
     return _blocked(
         tool_name,
@@ -286,6 +348,14 @@ def _check_schedule_authorization(
             "流程交回用户手动运行；确实需要定时就先问清周期、具体时间和时区，由用户确认后再建。"
         ),
     )
+
+
+def _check_unfinished_run(tool_name: str, args: dict[str, Any], state: GuardState) -> dict[str, Any] | None:
+    run = state.pending_run or {}
+    if run.get("status") not in {"queued", "pending", "running", "timeout", "awaiting_confirmation"}:
+        return None
+    return _blocked(tool_name, task_id=run.get("task_id"), required_action="observe_existing_run",
+                    message="当前流程已有未完成任务，状态块会刷新该任务；需要终止时用 stop_run，不要重复启动。")
 
 
 def _check_model_no_vision(tool_name: str, args: dict[str, Any], state: GuardState) -> dict[str, Any] | None:
@@ -393,6 +463,8 @@ def _check_challenge_page_lock(tool_name: str, args: dict[str, Any], state: Guar
 
 
 def _check_failure_budget_lock(tool_name: str, args: dict[str, Any], state: GuardState) -> dict[str, Any] | None:
+    if tool_name == "stop_run" or (tool_name == "toggle_schedule" and args.get("enabled") is False):
+        return None
     locked = state.failure_budget_lock
     return _blocked(
         tool_name,
@@ -427,7 +499,7 @@ GUARDS: tuple[Guard, ...] = (
     Guard(
         id="credential_values_must_stay_out_of_ai_tools",
         summary="账号、密码和 Token 等秘密值不得进入 AI 工具参数",
-        scope=ToolScope(include=frozenset({"create_flow"})),
+        scope=ToolScope(include=frozenset({"create_flow", "update_flow"})),
         check=_check_credential_values_in_flow,
         contract="凭据变量只能声明名称和敏感属性，value 必须为空；秘密值由用户在输入变量面板配置。",
     ),
@@ -470,6 +542,13 @@ GUARDS: tuple[Guard, ...] = (
             "定时任务只能在用户明确要求周期运行（「定时」「每天」「每隔…」等）时创建或启用；"
             "用户没提就把流程交回他手动运行，不要顺手挂定时器。"
         ),
+    ),
+    Guard(
+        id="unfinished_run_must_be_reused",
+        summary="已提交的任务未结束时不得重复运行",
+        scope=ToolScope(include=frozenset({"run_flow"})),
+        check=_check_unfinished_run,
+        contract="已有排队、运行中或等待确认的任务时观察原任务，不要再次 run_flow。",
     ),
     Guard(
         id="model_no_vision",
