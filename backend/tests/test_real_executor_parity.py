@@ -93,8 +93,14 @@ async def executor_page(request, tmp_path, monkeypatch):
             async def run(node, timeout_ms=1800):
                 return await executor.run(node, RuntimeVariableStore.from_initial({}), context, timeout_ms=timeout_ms)
 
-            await run({"type": "browser.open", "targetUrl": "https://parity.test/page"})
-            page = next(page for page in browser.pages if page.url == "https://parity.test/page")
+            if request.param == "extension":
+                async with browser.expect_page(timeout=5000) as opened:
+                    await run({"type": "browser.open", "targetUrl": "https://parity.test/page"})
+                page = await opened.value
+                await page.wait_for_url("https://parity.test/page", wait_until="load", timeout=5000)
+            else:
+                await run({"type": "browser.open", "targetUrl": "https://parity.test/page"})
+                page = context.page
             yield SimpleNamespace(run=run, page=page, bridge=bridge, channel=request.param)
         finally:
             await browser.close()
@@ -109,6 +115,13 @@ async def test_ensure_login_navigates_to_the_requested_page(executor_page):
 async def test_wait_requires_visibility(executor_page):
     await executor_page.page.evaluate("setTimeout(() => document.querySelector('#late').hidden=false, 150)")
     await executor_page.run({"type": "browser.wait", "selector": "#late"})
+    assert await executor_page.page.locator("#late").is_visible()
+
+
+async def test_text_extract_waits_for_rendered_content(executor_page):
+    await executor_page.page.evaluate("setTimeout(() => document.querySelector('#late').hidden=false, 150)")
+    result = await executor_page.run({"type": "browser.extract", "selector": "#late"})
+    assert result.values == ["Ready"]
     assert await executor_page.page.locator("#late").is_visible()
 
 
@@ -164,3 +177,82 @@ async def test_closing_a_second_owned_tab_restores_the_first(executor_page):
     assert result.values == ["https://parity.test/page"]
     await executor_page.run({"type": "browser.fill", "selector": "#input", "inputValue": "first page"})
     assert await executor_page.page.locator("#input").input_value() == "first page"
+
+
+async def prepare_async_pagination(page):
+    await page.evaluate("""() => {
+      document.body.innerHTML = '<div id="rows">Page 1</div><button id="next">Next</button>';
+      window.pageNumber = 1;
+      window.paginationClicks = 0;
+      document.querySelector('#next').onclick = () => {
+        window.paginationClicks++;
+        const rows = document.querySelector('#rows');
+        rows.setAttribute('aria-busy', 'true');
+        setTimeout(() => {
+          window.pageNumber++;
+          rows.textContent = 'Page ' + window.pageNumber;
+          rows.setAttribute('aria-busy', 'false');
+          document.querySelector('#next').disabled = window.pageNumber === 3;
+        }, 600);
+      };
+    }""")
+
+
+async def test_async_pagination_has_the_same_complete_result_on_both_channels(executor_page):
+    await prepare_async_pagination(executor_page.page)
+    result = await executor_page.run({
+        'type': 'browser.paginateNext', 'selector': '#next', 'targetSelector': '#rows',
+        'maxIterations': 10, 'delayMs': 0,
+    })
+    assert result.values == ['Page 1', 'Page 2', 'Page 3']
+    assert '3 页 · [1, 1, 1] · stop=next_button_disabled' in result.detail
+    assert await executor_page.page.evaluate('window.paginationClicks') == 2
+
+
+async def test_pagination_cap_is_not_complete_on_either_channel(executor_page):
+    await prepare_async_pagination(executor_page.page)
+    with pytest.raises(ValueError, match='安全上限 1 页'):
+        await executor_page.run({
+            'type': 'browser.paginateNext', 'selector': '#next', 'targetSelector': '#rows',
+            'maxIterations': 1, 'delayMs': 0,
+        })
+    assert await executor_page.page.evaluate('window.paginationClicks') == 0
+
+
+async def test_url_pagination_uses_confirmed_navigation_return_on_both_channels(executor_page):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+    from urllib.parse import parse_qs, urlsplit
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            number = int(parse_qs(urlsplit(self.path).query).get('p', ['1'])[0])
+            if number >= 3:
+                self.send_response(302)
+                self.send_header('Location', '/numbered?p=2')
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+            else:
+                body = f'<!doctype html><html><body><div id="rows">Page {number}</div></body></html>'.encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            pass
+
+    with ThreadingHTTPServer(('127.0.0.1', 0), Handler) as server:
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            result = await executor_page.run({
+                'type': 'browser.paginateNext', 'urlTemplate': f'http://127.0.0.1:{server.server_port}/numbered?p=${{page}}',
+                'targetSelector': '#rows', 'maxIterations': 10, 'delayMs': 0,
+            })
+            assert result.values == ['Page 1', 'Page 2']
+            assert 'stop=navigation_returned_to_previous_page' in result.detail
+        finally:
+            server.shutdown()
+            thread.join(timeout=2)

@@ -1,25 +1,10 @@
-"""翻页在第 1 页就停下时，判断到底是「本来只有一页」还是「下一页 selector 找错了」。
-
-两种情况交出的东西一模一样：任务 success、变量非空、只有第 1 页，谁也看不出少了什么。
-判错的代价不对称——把真·单页判成失败只多一轮修复，把漏抓判成成功会把残缺数据交给
-用户、还附一句「验收通过」。所以这里不信任节点上配的那个 selector，改问页面本身：
-DOM 里还能不能找到指向第 2 页及以后的控件。
-"""
+"""分页失败时的页面证据与诊断。"""
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
 from typing import Any
-
-# 停在第 1 页的三种原因都说明「这里有下一页」这个断言没有兑现，都要送去证据裁决。
-FIRST_PAGE_STOP_REASONS = frozenset({
-    "next_selector_not_found",
-    "next_button_hidden",
-    "next_button_disabled",
-})
-
-SINGLE_PAGE_VERDICT = "single_page_confirmed"
 
 # 插件执行器没有 evaluate 通道，只能拿这批固定 CSS 逐个问 elementState。
 # 覆盖 rel=next、aria/title 标注的下一页，以及最常见的分页容器内链接。
@@ -65,6 +50,7 @@ PAGINATION_PROBE_JS = """() => {
   };
   const record = (el, kind) => {
     if (!isVisible(el)) return;
+    if (el.matches(':disabled, [disabled], [aria-disabled="true"]')) return;
     const text = (el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 24);
     const href = (el.tagName === 'A' && el.href) ? el.href : (el.getAttribute('href') || '');
     const key = kind + '|' + text + '|' + href;
@@ -166,10 +152,10 @@ def build_first_page_stop_error(
         lines.append(
             f"页面用的是数字页码分页：{_format_candidates(page_links)}。"
             + (
-                f"点击式翻页对这种站点不可靠（点到第 2 页后按钮位置就变了），改用 URL 翻页："
-                f"给该节点填 urlTemplate=`{template}`（`${{page}}` 会被替换成页号），并删掉 selector。"
+                f"若这些已观察链接按页号变化且不依赖点击状态，可改用 URL 翻页："
+                f"给该节点填 urlTemplate=`{template}`（`${{page}}` 会被替换成页号），selector 可保留用于探测下一页禁用状态。"
                 if template
-                else "点击式翻页对这种站点不可靠，改用 URL 翻页：给该节点填 urlTemplate（含 `${page}` 占位），并删掉 selector。"
+                else "请核对已观察的分页地址；确认地址规律后再填 urlTemplate（含 `${page}` 占位），selector 可保留用于探测下一页禁用状态。"
             )
         )
     if not next_controls and not page_links:
@@ -178,14 +164,10 @@ def build_first_page_stop_error(
 
 
 def build_blank_page_error(*, page_number: int, target_selector: str) -> str:
-    """翻页中途抽到零行、而「下一页」还可点时报错，不按「本页没有数据」继续。
-
-    真·空表只出现在末页，那时按钮已 hidden/disabled；「后面还要翻」这个前提本身就否掉了
-    「这页就是空的」。
-    """
+    """无法确认合法空末页时，不跳过整页数据。"""
     return (
         f"翻页到第 {page_number} 页时，targetSelector `{target_selector}` 一行数据都没抽到，"
-        "但「下一页」还可点。继续翻会把这一页整页丢掉，交出去的数据看不出缺口。"
+        "且尚未确认合法空末页。继续翻可能整页漏采，已停止，不能交付为完整结果。"
         "两种常见原因：这一页还没渲染完（调大该节点的 timeoutMs 或 delayMs），"
         "或翻页后行选择器失效（用 inspect_page 核对当前页真实的行选择器）。"
     )

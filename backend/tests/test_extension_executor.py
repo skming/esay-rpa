@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from types import SimpleNamespace
 
 import pytest
 
+import app.services.extension_executor as extension_module
 from app.services.extension_bridge_service import ExtensionActionOutcomeUnknown
 from app.services.extension_executor import ExtensionBusyError, ExtensionExecutionContext, ExtensionExecutor
 from app.services.runtime_variables import RuntimeVariableStore
@@ -27,6 +29,33 @@ class FakeBridge:
         return {}
 
 
+class FakePaginationBridge(FakeBridge):
+    def __init__(self, responses=None, *, confirm_end=True):
+        responses = {key: list(value) for key, value in (responses or {}).items()}
+        responses["browser.extract"] = [item for item in responses.get("browser.extract", []) for _ in range(2)]
+        super().__init__(responses)
+        self.confirm_end = confirm_end
+        self.last_extract = {"values": []}
+        self.page_url = "https://example.test/current"
+
+    async def execute(self, action, timeout=30.0):
+        if action["type"] == "browser.open":
+            self.calls.append(action)
+            self.page_url = action["targetUrl"]
+            return {"url": self.page_url}
+        if action["type"] == "browser.elementState" and action["selector"] in {".next", ".next-page", "a.next"} and self.confirm_end:
+            self.calls.append(action)
+            ended = not self._responses["browser.extract"]
+            return {"exists": True, "hidden": False, "disabled": ended}
+        if action["type"] == "browser.extract":
+            if not self._responses["browser.extract"]:
+                self.calls.append(action)
+                return self.last_extract
+            self.last_extract = {**await super().execute(action, timeout), "url": self.page_url}
+            return self.last_extract
+        return await super().execute(action, timeout)
+
+
 async def make_context(bridge: FakeBridge) -> tuple[ExtensionExecutor, ExtensionExecutionContext]:
     executor = ExtensionExecutor(bridge)  # type: ignore[arg-type]
     context = await executor.create_context()
@@ -35,6 +64,116 @@ async def make_context(bridge: FakeBridge) -> tuple[ExtensionExecutor, Extension
 
 def action_calls(bridge: FakeBridge) -> list[dict]:
     return [call for call in bridge.calls if not str(call.get("type", "")).startswith("automation.group.")]
+
+
+@pytest.fixture
+def extraction_clock(monkeypatch):
+    clock = SimpleNamespace(now=0.0, sleeps=[])
+
+    async def sleep(seconds):
+        clock.sleeps.append(seconds)
+        clock.now += seconds
+
+    monkeypatch.setattr(extension_module, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(extension_module, "asyncio", SimpleNamespace(sleep=sleep))
+    return clock
+
+
+async def test_text_extract_waits_through_empty_layout_results(extraction_clock):
+    bridge = FakeBridge({"browser.extract": [
+        {"values": []}, {"values": ["", " \n"]}, {"text": "rendered text"},
+    ]})
+    executor, context = await make_context(bridge)
+    result = await executor.run(
+        {"type": "browser.extract", "selector": ".content"},
+        RuntimeVariableStore.from_initial({}), context, timeout_ms=1000,
+    )
+    assert result.values == ["rendered text"]
+    assert len(action_calls(bridge)) == 3
+    assert extraction_clock.now == pytest.approx(0.6)
+
+
+async def test_pagination_waits_for_rendering_without_reclicking(extraction_clock):
+    bridge = FakePaginationBridge({
+        "browser.extract": [
+            {"values": ["page one"]}, {"values": []}, {"values": ["page two"]},
+        ],
+        "browser.elementState": [
+            {"exists": True, "hidden": False, "disabled": False},
+            {"exists": True, "hidden": False, "disabled": True},
+        ],
+    })
+    executor, context = await make_context(bridge)
+    result = await executor.run(
+        {"type": "browser.paginateNext", "selector": ".next", "targetSelector": ".content", "delayMs": 0},
+        RuntimeVariableStore.from_initial({}), context, timeout_ms=1000,
+    )
+    assert result.values == ["page one", "page two"]
+    assert len([call for call in bridge.calls if call["type"] == "browser.click"]) == 1
+    assert extraction_clock.now == pytest.approx(1.2)
+
+
+async def test_text_extract_uses_remaining_timeout_and_keeps_empty_results_empty(extraction_clock):
+    class RecordingBridge(FakeBridge):
+        def __init__(self):
+            super().__init__()
+            self.timeouts = []
+
+        async def execute(self, action, timeout=30.0):
+            if action["type"] == "browser.extract":
+                self.timeouts.append(timeout)
+            return await super().execute(action, timeout)
+
+    bridge = RecordingBridge()
+    executor, context = await make_context(bridge)
+    result = await executor.run(
+        {"type": "browser.extract", "selector": ".content"},
+        RuntimeVariableStore.from_initial({}), context, timeout_ms=1000,
+    )
+    assert result.values == []
+    assert extraction_clock.now == pytest.approx(1.0)
+    assert bridge.timeouts == pytest.approx([1.0, 0.7, 0.4, 0.1])
+
+
+async def test_text_extract_waits_for_temporarily_missing_elements(extraction_clock):
+    class MissingBridge(FakeBridge):
+        async def execute(self, action, timeout=30.0):
+            if action["type"] == "browser.extract" and not extraction_clock.sleeps:
+                self.calls.append(action)
+                raise RuntimeError("未找到元素: .content")
+            return await super().execute(action, timeout)
+
+    bridge = MissingBridge({"browser.extract": [{"values": ["ready"]}]})
+    executor, context = await make_context(bridge)
+    result = await executor.run(
+        {"type": "browser.extract", "selector": ".content"},
+        RuntimeVariableStore.from_initial({}), context, timeout_ms=1000,
+    )
+    assert result.values == ["ready"]
+    assert extraction_clock.now == pytest.approx(0.3)
+
+
+@pytest.mark.parametrize("error", [
+    RuntimeError("不支持的选择器"), ExtensionActionOutcomeUnknown("扩展连接中断"),
+])
+async def test_text_extract_does_not_retry_invalid_selectors_or_unknown_outcomes(extraction_clock, error):
+    class FailingBridge(FakeBridge):
+        async def execute(self, action, timeout=30.0):
+            if action["type"] == "browser.extract":
+                self.calls.append(action)
+                raise error
+            return await super().execute(action, timeout)
+
+    bridge = FailingBridge()
+    executor, context = await make_context(bridge)
+    with pytest.raises(type(error)) as caught:
+        await executor.run(
+            {"type": "browser.extract", "selector": ".content"},
+            RuntimeVariableStore.from_initial({}), context, timeout_ms=1000,
+        )
+    assert caught.value is error
+    assert len(action_calls(bridge)) == 1
+    assert extraction_clock.sleeps == []
 
 
 async def test_create_context_rejects_when_extension_not_connected() -> None:
@@ -363,46 +502,30 @@ async def test_browser_click_load_more_stops_when_button_hidden() -> None:
     assert click_calls == [{"type": "browser.click", "selector": ".load-more"}]
 
 
-async def test_browser_paginate_next_stops_on_repeated_fingerprint() -> None:
-    bridge = FakeBridge(
-        responses={
-            "browser.extract": [
-                {"values": ["row1", "row2"]},  # 第一页初次抓取
-                {"values": ["row1", "row2"]},  # 点下一页后抓取 → 与点击前相同，判定翻页无效
-            ],
-            "browser.elementState": [
-                {"exists": True, "hidden": False, "disabled": False},
-            ],
-        }
-    )
+async def test_browser_paginate_next_rejects_nonadvancing_content(extraction_clock) -> None:
+    bridge = FakePaginationBridge({
+        "browser.extract": [{"values": ["row1", "row2"]}],
+        "browser.elementState": [{"exists": True, "hidden": False, "disabled": False}],
+    }, confirm_end=False)
     executor, context = await make_context(bridge)
     variables = RuntimeVariableStore.from_initial({})
-
-    result = await executor.run(
-        {
-            "type": "browser.paginateNext",
-            "selector": ".next-page",
-            "targetSelector": ".row",
-            "maxIterations": 10,
-            "delayMs": 0,
-            "pageCountVariable": "page_count",
-        },
-        variables,
-        context,
-        timeout_ms=1000,
-    )
-
-    assert result.values == ["row1", "row2"]
-    assert variables.get("page_count") == 1
-    click_calls = [call for call in bridge.calls if call["type"] == "browser.click"]
-    assert click_calls == [{"type": "browser.click", "selector": ".next-page"}]
+    with pytest.raises(ValueError, match="分页未确认"):
+        await executor.run(
+            {"type": "browser.paginateNext", "selector": ".next-page", "targetSelector": ".row",
+             "delayMs": 0, "pageCountVariable": "page_count"},
+            variables, context, timeout_ms=1000,
+        )
+    assert all(snapshot.name != "page_count" for snapshot in variables.snapshots())
+    assert [call for call in bridge.calls if call["type"] == "browser.click"] == [
+        {"type": "browser.click", "selector": ".next-page"},
+    ]
 
 
-async def test_browser_paginate_next_fails_when_page_still_shows_pagination() -> None:
+async def test_browser_paginate_next_fails_when_page_still_shows_pagination(extraction_clock) -> None:
     """只翻到第 1 页时不能默认「就这一页」：页面上还挂着可见的页码控件就说明 selector 找错了，
     静默成功等于让用户自己去发现少抓了后面所有页。"""
-    bridge = FakeBridge(
-        responses={
+    bridge = FakePaginationBridge(
+        confirm_end=False, responses={
             "browser.extract": [{"values": ["row1"]}],
             # 第一次是「下一页」按钮本身（隐藏），其余是证据探测逐个问的候选控件
             "browser.elementState": [{"exists": True, "hidden": True, "disabled": False}],
@@ -418,8 +541,7 @@ async def test_browser_paginate_next_fails_when_page_still_shows_pagination() ->
     with pytest.raises(ValueError, match="页面上存在可见的下一页控件"):
         await executor.run(
             {
-                "type": "browser.paginateNext",
-                "selector": ".next-page",
+                "type": "browser.paginateNext", "selector": ".next-page",
                 "targetSelector": ".contract-row",
                 "delayMs": 0,
             },
@@ -429,8 +551,8 @@ async def test_browser_paginate_next_fails_when_page_still_shows_pagination() ->
         )
 
 
-async def test_browser_paginate_next_by_url_walks_pages_until_empty() -> None:
-    bridge = FakeBridge(
+async def test_browser_paginate_next_by_url_accepts_confirmed_empty_terminal(extraction_clock) -> None:
+    bridge = FakePaginationBridge(
         responses={
             "browser.extract": [
                 {"values": ["a1", "a2"]},
@@ -444,8 +566,7 @@ async def test_browser_paginate_next_by_url_walks_pages_until_empty() -> None:
 
     result = await executor.run(
         {
-            "type": "browser.paginateNext",
-            "urlTemplate": "https://example.com/list?p=${page}",
+            "type": "browser.paginateNext", "selector": ".next", "urlTemplate": "https://example.com/list?p=${page}",
             "targetSelector": ".contract-row",
             "delayMs": 0,
             "pageCountVariable": "page_count",
@@ -465,16 +586,15 @@ async def test_browser_paginate_next_by_url_walks_pages_until_empty() -> None:
     assert variables.get("page_count") == 2
 
 
-async def test_browser_paginate_next_by_url_rejects_template_without_placeholder() -> None:
-    bridge = FakeBridge()
+async def test_browser_paginate_next_by_url_rejects_template_without_placeholder(extraction_clock) -> None:
+    bridge = FakePaginationBridge()
     executor, context = await make_context(bridge)
     variables = RuntimeVariableStore.from_initial({})
 
     with pytest.raises(ValueError, match=r"必须包含 \$\{page\}"):
         await executor.run(
             {
-                "type": "browser.paginateNext",
-                "urlTemplate": "https://example.com/list",
+                "type": "browser.paginateNext", "urlTemplate": "https://example.com/list",
                 "targetSelector": ".contract-row",
             },
             variables,
@@ -483,9 +603,9 @@ async def test_browser_paginate_next_by_url_rejects_template_without_placeholder
         )
 
 
-async def test_browser_paginate_next_preserves_table_rows() -> None:
+async def test_browser_paginate_next_preserves_table_rows(extraction_clock) -> None:
     rows = [{"序号": "1", "合约编号": "Y001"}, {"序号": "2", "合约编号": "Y002"}]
-    bridge = FakeBridge(
+    bridge = FakePaginationBridge(
         responses={
             "browser.extract": [
                 {"values": rows},
@@ -500,8 +620,7 @@ async def test_browser_paginate_next_preserves_table_rows() -> None:
 
     result = await executor.run(
         {
-            "type": "browser.paginateNext",
-            "selector": ".next-page",
+            "type": "browser.paginateNext", "selector": ".next-page",
             "targetSelector": ".contract-row",
             "extractMode": "table",
             "delayMs": 0,
@@ -513,7 +632,7 @@ async def test_browser_paginate_next_preserves_table_rows() -> None:
     )
 
     extract_calls = [call for call in bridge.calls if call["type"] == "browser.extract"]
-    assert extract_calls == [{"type": "browser.extract", "selector": ".contract-row", "extractMode": "table"}]
+    assert extract_calls == [{"type": "browser.extract", "selector": ".contract-row", "extractMode": "table"}] * 2
     assert result.structured == rows
     assert result.values == ['{"序号": "1", "合约编号": "Y001"}', '{"序号": "2", "合约编号": "Y002"}']
     assert variables.get("page_count") == 1
@@ -788,10 +907,10 @@ async def test_screenshot_does_not_throttle_when_interval_already_elapsed(
     await executor.screenshot(context)
 
 
-async def test_browser_paginate_next_fails_loudly_when_next_selector_does_not_exist() -> None:
+async def test_browser_paginate_next_fails_loudly_when_next_selector_does_not_exist(extraction_clock) -> None:
     """扩展执行器与 Playwright 执行器共用判据，两边都要拦——漏一边等于没修。"""
-    bridge = FakeBridge(
-        responses={
+    bridge = FakePaginationBridge(
+        confirm_end=False, responses={
             "browser.extract": [{"values": ["row1", "row2"]}],
             "browser.elementState": [{"exists": False, "hidden": True, "disabled": False}],
         }
@@ -916,8 +1035,8 @@ _SWEEP_SCHEMA = [
 ]
 
 
-async def test_paginate_next_applies_output_schema() -> None:
-    bridge = FakeBridge(responses={
+async def test_paginate_next_applies_output_schema(extraction_clock) -> None:
+    bridge = FakePaginationBridge(responses={
         "browser.extract": [{"values": [{"Token": "1", "费用": "$1"}]}],
         "browser.elementState": [{"exists": True, "hidden": True, "disabled": False}],
     })
@@ -930,14 +1049,14 @@ async def test_paginate_next_applies_output_schema() -> None:
     assert result.structured == [{"token": "1", "费用": "$1"}]
 
 
-async def test_paginate_by_url_applies_output_schema() -> None:
-    bridge = FakeBridge(responses={"browser.extract": [
+async def test_paginate_by_url_applies_output_schema(extraction_clock) -> None:
+    bridge = FakePaginationBridge(responses={"browser.extract": [
         {"values": [{"Token": "1", "费用": "$1"}]},
         {"values": []},
     ]})
     executor, context = await make_context(bridge)
     result = await executor.run(
-        {"type": "browser.paginateNext", "urlTemplate": "https://e.test/?p=${page}",
+        {"type": "browser.paginateNext", "selector": ".next", "urlTemplate": "https://e.test/?p=${page}",
          "targetSelector": ".row", "extractMode": "table", "delayMs": 0, "outputSchema": _SWEEP_SCHEMA},
         RuntimeVariableStore.from_initial({}), context, timeout_ms=1000,
     )
@@ -973,11 +1092,10 @@ async def test_table_extract_waits_out_skeleton_rows() -> None:
     assert len(action_calls(bridge)) == 2
 
 
-async def test_paginate_next_rejects_blank_mid_sweep_page() -> None:
-    bridge = FakeBridge(responses={
+async def test_paginate_next_rejects_blank_mid_sweep_page(extraction_clock) -> None:
+    bridge = FakePaginationBridge(confirm_end=False, responses={
         "browser.extract": [
             {"values": ["row1"]},   # 第 1 页
-            {"values": ["row2"]},   # 点击后的对比抓取
             {"values": []},         # 第 2 页：一行都没抽到
         ],
         "browser.elementState": [
@@ -991,3 +1109,4 @@ async def test_paginate_next_rejects_blank_mid_sweep_page() -> None:
             {"type": "browser.paginateNext", "selector": ".next", "targetSelector": ".row", "delayMs": 0},
             RuntimeVariableStore.from_initial({}), context, timeout_ms=1000,
         )
+    assert extraction_clock.now == pytest.approx(1.3)

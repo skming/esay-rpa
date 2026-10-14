@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import json
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from app.services.browser_action_runner import (
@@ -39,13 +39,11 @@ from app.services.browser_action_runner import (
 from app.services.extension_bridge_service import ExtensionActionOutcomeUnknown, ExtensionBridgeService, audit_scope
 from app.services.pagination_probe import (
     EXTENSION_EVIDENCE_SELECTORS,
-    FIRST_PAGE_STOP_REASONS,
-    SINGLE_PAGE_VERDICT,
     PaginationEvidence,
-    build_blank_page_error,
     build_first_page_stop_error,
 )
 from app.services.runtime_variables import RuntimeVariableStore
+from app.services.pagination_runtime import PaginationPage, collect_paginated_pages, pagination_max_pages
 
 _SUPPORTED_ACTION_TYPES = {
     "browser.screenshot",
@@ -362,12 +360,15 @@ class ExtensionExecutor:
                 rows = _normalize_table_rows(raw_values)
                 rows, schema_note = _apply_output_schema(rows, node)
                 return _build_extract_result(action_type, _with_schema_note(selector_config.selector, schema_note), rows)
-            result = await self._bridge.execute(payload, timeout=timeout_seconds)
-            raw_values = result.get("values")
-            if isinstance(raw_values, list):
-                values = [str(v) for v in raw_values]
+            if selector_config.extract_mode == "text":
+                values = await self._await_text_values(payload, timeout_seconds=timeout_seconds)
             else:
-                values = [str(result.get("text", ""))]
+                result = await self._bridge.execute(payload, timeout=timeout_seconds)
+                raw_values = result.get("values")
+                if isinstance(raw_values, list):
+                    values = [str(v) for v in raw_values]
+                else:
+                    values = [str(result.get("text", ""))]
             rows, schema_note = _apply_output_schema(values, node)
             return _build_extract_result(action_type, _with_schema_note(selector_config.selector, schema_note), rows)
 
@@ -490,7 +491,59 @@ class ExtensionExecutor:
         await self._wait_for_selector(selector, timeout_ms=timeout_ms)
         return BrowserActionResult(action_type=action_type, detail=selector, values=[selector])
 
+    async def _await_text_values(self, payload: dict[str, object], *, timeout_seconds: float) -> list[str]:
+        result = await self._await_text_result(payload, timeout_seconds=timeout_seconds)
+        values = result.get("values")
+        return [str(value) for value in values] if isinstance(values, list) else []
+
+    async def _await_text_result(self, payload: dict[str, object], *, timeout_seconds: float) -> dict[str, object]:
+        # 导航后元素可能已存在，但尚无布局和 innerText；空结果等满预算才交给空页检查。
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        attempted = False
+        last_error: RuntimeError | None = None
+        latest: dict[str, object] = {"values": []}
+        while True:
+            remaining = deadline - time.monotonic()
+            if attempted and remaining <= 0:
+                if last_error is not None:
+                    raise last_error
+                if latest.get("busy"):
+                    raise TimeoutError("目标区域仍为 aria-busy，无法确认数据已就绪。")
+                return latest
+            attempted = True
+            try:
+                result = await self._bridge.execute(payload, timeout=max(0.001, remaining))
+            except ExtensionActionOutcomeUnknown:
+                raise
+            except RuntimeError as exc:
+                if not str(exc).startswith("未找到元素:"):
+                    raise
+                last_error = exc
+            else:
+                last_error = None
+                if bool(result.get("busy")):
+                    result = {**result, "values": []}
+                raw_values = result.get("values")
+                if not isinstance(raw_values, list):
+                    raw_values = [result.get("text", "")]
+                values = [value for value in raw_values if isinstance(value, str) and value.strip()]
+                latest = {**result, "values": values}
+                if values:
+                    return latest
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if last_error is not None:
+                    raise last_error
+                if latest.get("busy"):
+                    raise TimeoutError("目标区域仍为 aria-busy，无法确认数据已就绪。")
+                return latest
+            await asyncio.sleep(min(_WAIT_POLL_INTERVAL_SECONDS, remaining))
+
     async def _await_table_values(self, payload: dict[str, object], *, timeout_ms: int) -> object:
+        result = await self._await_table_result(payload, timeout_ms=timeout_ms)
+        return result.get("values")
+
+    async def _await_table_result(self, payload: dict[str, object], *, timeout_ms: int) -> dict[str, object]:
         """table 模式等的是「目标区域就绪或明确空状态」，不是「有元素命中」。
 
         内容脚本已按容器把零行裁成两态：空列表＝圈到了有列标题行的表、此刻没有数据行；
@@ -498,19 +551,30 @@ class ExtensionExecutor:
         都是「表壳已在、数据未到」，那样会把没加载完的数据当成空结果，所以要等满超时仍是
         空才认。选择器此刻定位不到（页面还在渲染）同理，等满超时才把内容脚本的错原样交出。
         """
-        deadline = time.monotonic() + timeout_ms / 1000
+        deadline = time.monotonic() + max(0, timeout_ms) / 1000
         while True:
+            remaining = deadline - time.monotonic()
             try:
-                result = await self._bridge.execute(payload, timeout=max(1.0, timeout_ms / 1000))
-            except RuntimeError:
-                if time.monotonic() >= deadline:
+                result = await self._bridge.execute(payload, timeout=max(0.001, remaining))
+            except ExtensionActionOutcomeUnknown:
+                raise
+            except RuntimeError as exc:
+                if not str(exc).startswith("未找到元素:"):
                     raise
-                await asyncio.sleep(_WAIT_POLL_INTERVAL_SECONDS)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                await asyncio.sleep(min(_WAIT_POLL_INTERVAL_SECONDS, remaining))
                 continue
-            raw_values = result.get("values")
-            if not _table_values_still_rendering(raw_values) or time.monotonic() >= deadline:
-                return raw_values
-            await asyncio.sleep(_WAIT_POLL_INTERVAL_SECONDS)
+            busy = bool(result.get("busy"))
+            if not busy and not _table_values_still_rendering(result.get("values")):
+                return result
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if busy:
+                    raise TimeoutError("目标区域仍为 aria-busy，无法确认数据已就绪。")
+                return result
+            await asyncio.sleep(min(_WAIT_POLL_INTERVAL_SECONDS, remaining))
 
     async def _wait_for_selector(self, selector: str, *, timeout_ms: int) -> None:
         await self._wait_for_visibility(selector, hidden=False, timeout_ms=timeout_ms)
@@ -554,6 +618,9 @@ class ExtensionExecutor:
         return await self._bridge.execute({"type": "browser.elementState", "selector": selector}, timeout=timeout_seconds)
 
     async def _extract_selector_values(self, selector_config: SelectorConfig, *, timeout_seconds: float) -> list[object]:
+        return (await self._extract_selector_snapshot(selector_config, timeout_seconds=timeout_seconds)).rows
+
+    async def _extract_selector_snapshot(self, selector_config: SelectorConfig, *, timeout_seconds: float, wait_for_ready: bool = True) -> PaginationPage:
         payload: dict[str, object] = {
             "type": "browser.extract",
             "selector": selector_config.selector,
@@ -564,15 +631,23 @@ class ExtensionExecutor:
         if selector_config.extract_mode == "table":
             # 翻页/加载更多的每一页都走这里，所以就绪等待与范围错判定必须和单次 extract 同一份：
             # 少了 guard，圈错范围的标记会被 _normalize_table_rows 当成数据静默吞掉。
-            raw_values = await self._await_table_values(payload, timeout_ms=int(timeout_seconds * 1000))
+            result = (await self._await_table_result(payload, timeout_ms=int(timeout_seconds * 1000))
+                      if wait_for_ready else await self._bridge.execute(payload, timeout=max(0.001, timeout_seconds)))
+            raw_values = result.get("values")
+            if not wait_for_ready and isinstance(raw_values, dict) and raw_values.get("__table_scope_error") == "no_rows_in_scope":
+                return PaginationPage(rows=[])
             _raise_if_table_scope_error(raw_values, selector_config.selector)
-            return _normalize_table_rows(raw_values)
-        result = await self._bridge.execute(payload, timeout=timeout_seconds)
-        values = result.get("values")
-        if isinstance(values, list):
-            return [str(v) for v in values]
-        text = str(result.get("text", ""))
-        return [text] if text else []
+            rows = _normalize_table_rows(raw_values)
+        else:
+            if selector_config.extract_mode == "text" and wait_for_ready:
+                result = await self._await_text_result(payload, timeout_seconds=timeout_seconds)
+            else:
+                result = await self._bridge.execute(payload, timeout=timeout_seconds)
+            values = result.get("values")
+            text = str(result.get("text", ""))
+            rows = [str(v) for v in values if str(v).strip()] if isinstance(values, list) else ([text] if text.strip() else [])
+        url = result.get("url")
+        return PaginationPage(rows=rows, url=url if isinstance(url, str) else "", ready=not bool(result.get("busy")))
 
     async def _dismiss_overlays(
         self, selector: str, variables: RuntimeVariableStore, node: FlowNode, *, timeout_seconds: float
@@ -653,85 +728,35 @@ class ExtensionExecutor:
         )
 
     async def _paginate_next_and_extract(
-        self,
-        next_selector: str,
-        target_selector_config: SelectorConfig,
-        variables: RuntimeVariableStore,
-        node: FlowNode,
-        *,
-        timeout_seconds: float,
+        self, next_selector: str, target_selector_config: SelectorConfig,
+        variables: RuntimeVariableStore, node: FlowNode, *, timeout_seconds: float,
     ) -> SweepOutcome:
-        max_iterations = max(1, _read_int(node, "maxIterations", default=20, variables=variables))
-        delay_ms = max(0, _read_int(node, "delayMs", default=500, variables=variables))
-        pages_visited = 0
-        all_values: list[object] = []
-        per_page_counts: list[int] = []
-        previous_fingerprint = ""
-        stop_reason = "max_iterations_reached"
-        exists = False
+        pagination_max_pages(node, variables.resolve_text)
 
-        for _index in range(max_iterations):
-            current_values = await self._extract_selector_values(target_selector_config, timeout_seconds=timeout_seconds)
-            all_values.extend(current_values)
-            per_page_counts.append(len(current_values))
-            pages_visited += 1
+        state: dict[str, object] = {}
 
-            state = await self._element_state(next_selector, timeout_seconds=timeout_seconds)
-            exists = bool(state.get("exists", False))
-            if not exists:
-                # 末页的按钮仍然 exists，只是 hidden/disabled；不存在只能是 selector 错了
-                stop_reason = "next_selector_not_found"
-                break
-            if state.get("hidden", True):
-                stop_reason = "next_button_hidden"
-                break
-            if state.get("disabled", False):
-                stop_reason = "next_button_disabled"
-                break
-            # 必须排在三个终止判据之后：末页的空表由 hidden/disabled 收尾，走不到这里
-            if not current_values:
-                raise ValueError(build_blank_page_error(
-                    page_number=pages_visited,
-                    target_selector=target_selector_config.selector,
-                ))
+        async def is_terminal(remaining: float) -> str | None:
+            nonlocal state
+            state = await self._element_state(next_selector, timeout_seconds=max(0.001, remaining))
+            return "next_button_disabled" if state.get("exists") and not state.get("hidden", True) and state.get("disabled") else None
 
-            before_fingerprint = _fingerprint_rows(current_values)
+        async def advance(page_number: int, row_count: int) -> None:
+            if not state.get("exists") or state.get("hidden", True) or state.get("disabled"):
+                if page_number == 1:
+                    evidence = await self._probe_pagination_evidence(timeout_seconds=timeout_seconds)
+                    raise ValueError(build_first_page_stop_error(
+                        next_selector=next_selector,
+                        stop_reason="next_selector_not_found" if not state.get("exists") else "next_button_hidden",
+                        row_count=row_count, evidence=evidence,
+                    ))
+                raise ValueError("分页采集未完成：下一页控件消失或不可见，无法确认末页；请核对分页控件。")
             await self._bridge.execute({"type": "browser.click", "selector": next_selector}, timeout=timeout_seconds)
-            if delay_ms > 0:
+            delay_ms = max(0, _read_int(node, "delayMs", default=500, variables=variables))
+            if delay_ms:
                 await asyncio.sleep(delay_ms / 1000)
-            after_values = await self._extract_selector_values(target_selector_config, timeout_seconds=timeout_seconds)
-            after_fingerprint = _fingerprint_rows(after_values)
-            if after_fingerprint == before_fingerprint or after_fingerprint == previous_fingerprint:
-                stop_reason = "duplicate_content"
-                break
-            previous_fingerprint = before_fingerprint
 
-        pages_variable = _read_optional_string(node, "pageCountVariable")
-        if pages_variable is not None:
-            variables.set(pages_variable, pages_visited, scope="局部")
-
-        verdict: str | None = None
-        if pages_visited <= 1 and stop_reason in FIRST_PAGE_STOP_REASONS:
-            # 判据与 Playwright 执行器一致，见 browser_action_runner._paginate_next_and_extract
-            evidence = await self._probe_pagination_evidence(timeout_seconds=timeout_seconds)
-            if stop_reason == "next_selector_not_found" or evidence.has_more_pages:
-                raise ValueError(build_first_page_stop_error(
-                    next_selector=next_selector,
-                    stop_reason=stop_reason,
-                    row_count=len(all_values),
-                    evidence=evidence,
-                ))
-            verdict = SINGLE_PAGE_VERDICT
-
-        return SweepOutcome(
-            rows=all_values,
-            rounds=pages_visited,
-            progress_counts=per_page_counts,
-            stop_reason=stop_reason,
-            trigger_matches=1 if exists else 0,
-            unit=" 页",
-            verdict=verdict,
-        )
+        return await self._collect_pagination(target_selector_config, variables, node, timeout_seconds=timeout_seconds,
+                                              advance=advance, is_terminal=is_terminal, next_selector=next_selector)
 
     async def _probe_pagination_evidence(self, *, timeout_seconds: float) -> PaginationEvidence:
         """插件没有 evaluate 通道，只能拿固定 CSS 逐个问 elementState 换取证据。
@@ -745,79 +770,84 @@ class ExtensionExecutor:
                 state = await self._element_state(selector, timeout_seconds=min(timeout_seconds, 3.0))
             except Exception:
                 continue
-            if not state.get("exists", False) or state.get("hidden", True):
+            if not state.get("exists", False) or state.get("hidden", True) or state.get("disabled", False):
                 continue
             kind = "page_number" if "=2" in selector else "next_control"
             candidates.append({"kind": kind, "text": "", "href": selector, "selector": selector})
         return PaginationEvidence(candidates=candidates)
 
     async def _paginate_by_url_and_extract(
-        self,
-        url_template: str,
-        target_selector_config: SelectorConfig,
-        variables: RuntimeVariableStore,
-        node: FlowNode,
-        *,
-        timeout_seconds: float,
+        self, url_template: str, target_selector_config: SelectorConfig,
+        variables: RuntimeVariableStore, node: FlowNode, *, timeout_seconds: float,
     ) -> SweepOutcome:
-        """按 URL 逐页抓取，判据与 browser_action_runner._paginate_by_url_and_extract 一致。"""
-        max_iterations = max(1, _read_int(node, "maxIterations", default=20, variables=variables))
+        pagination_max_pages(node, variables.resolve_text)
         start_page = _read_int(node, "startPage", default=1, variables=variables)
         page_step = max(1, _read_int(node, "pageStep", default=1, variables=variables))
-        delay_ms = max(0, _read_int(node, "delayMs", default=500, variables=variables))
 
-        all_values: list[object] = []
-        per_page_counts: list[int] = []
-        previous_fingerprint = ""
-        pages_visited = 0
-        stop_reason = "max_iterations_reached"
+        next_selector = _read_optional_string(node, "selector")
+        next_selector = variables.resolve_text(next_selector) if next_selector else None
+        returned = False
+        last_url = ""
 
-        for index in range(max_iterations):
-            page_number = start_page + index * page_step
-            target_url = url_template.replace("${page}", str(page_number))
-            await self._bridge.execute(
+        async def advance(page_index: int, row_count: int = 0) -> None:
+            nonlocal returned, last_url
+            target_url = url_template.replace("${page}", str(start_page + page_index * page_step))
+            receipt = await self._bridge.execute(
                 {"type": "browser.open", "targetUrl": target_url, "timeoutMs": max(1, int(timeout_seconds * 1000))},
                 timeout=timeout_seconds + 1.0,
             )
-            if delay_ms > 0:
+            actual_url = receipt.get("url")
+            if not isinstance(actual_url, str) or not actual_url:
+                raise RuntimeError("URL 分页导航缺少实际 URL 回执，无法确认页面进展。")
+            returned = page_index > 0 and actual_url == last_url and actual_url != target_url
+            last_url = actual_url
+            delay_ms = max(0, _read_int(node, "delayMs", default=500, variables=variables))
+            if delay_ms:
                 await asyncio.sleep(delay_ms / 1000)
+
+        async def is_terminal(remaining: float) -> str | None:
+            if next_selector:
+                state = await self._element_state(next_selector, timeout_seconds=max(0.001, remaining))
+                if state.get("exists") and not state.get("hidden", True):
+                    return "next_button_disabled" if state.get("disabled") else None
+            return "navigation_returned_to_previous_page" if returned else None
+
+        await advance(0)
+        return await self._collect_pagination(target_selector_config, variables, node, timeout_seconds=timeout_seconds,
+                                              advance=advance, is_terminal=is_terminal, allow_navigation_return=True)
+
+    async def _collect_pagination(
+        self, target_selector_config: SelectorConfig, variables: RuntimeVariableStore, node: FlowNode,
+        *, timeout_seconds: float, advance: Callable[[int, int], Awaitable[None]],
+        is_terminal: Callable[[float], Awaitable[str | None]], next_selector: str | None = None,
+        allow_navigation_return: bool = False,
+    ) -> SweepOutcome:
+        async def read_page(remaining: float) -> PaginationPage:
             try:
-                current_values = await self._extract_selector_values(target_selector_config, timeout_seconds=timeout_seconds)
-            except RuntimeError:
-                # 翻过头是这条路径的正常收尾方式：末页之后行选择器在插件端报「没找到元素」，
-                # 这属于「没有下一页了」，不是流程失败。第 1 页就失败会走下面的 pages_visited==0 分支
-                current_values = []
-            if not current_values:
-                stop_reason = "empty_page"
-                break
-            fingerprint = _fingerprint_rows(current_values)
-            if fingerprint == previous_fingerprint:
-                stop_reason = "duplicate_content"
-                break
-            all_values.extend(current_values)
-            per_page_counts.append(len(current_values))
-            pages_visited += 1
-            previous_fingerprint = fingerprint
+                return await self._extract_selector_snapshot(target_selector_config, timeout_seconds=remaining, wait_for_ready=False)
+            except ExtensionActionOutcomeUnknown:
+                raise
+            except RuntimeError as exc:
+                if not str(exc).startswith("未找到元素:"):
+                    raise
+                return PaginationPage(rows=[])
 
-        pages_variable = _read_optional_string(node, "pageCountVariable")
-        if pages_variable is not None:
-            variables.set(pages_variable, pages_visited, scope="局部")
-
-        if pages_visited == 0:
-            raise ValueError(
-                f"按 URL 翻页第 1 页（{url_template.replace('${page}', str(start_page))}）就没抽到任何内容："
-                f"targetSelector `{target_selector_config.selector}` 没命中，或 startPage 起点不对。"
-                "请用 inspect_page 核对行选择器与真实页号起点（有的站从 0 开始，offset 型分页要配 pageStep）。"
-            )
-
-        return SweepOutcome(
-            rows=all_values,
-            rounds=pages_visited,
-            progress_counts=per_page_counts,
-            stop_reason=stop_reason,
-            trigger_matches=None,
-            unit=" 页",
+        result = await collect_paginated_pages(
+            read_page, advance, is_terminal, asyncio.sleep,
+            max_pages=pagination_max_pages(node, variables.resolve_text),
+            timeout_seconds=timeout_seconds, target_selector=target_selector_config.selector, clock=time.monotonic,
+            allow_navigation_return=allow_navigation_return,
         )
+        if next_selector and len(result.per_page_counts) <= 1 and result.stop_reason == "next_button_disabled":
+            evidence = await self._probe_pagination_evidence(timeout_seconds=timeout_seconds)
+            if evidence.has_more_pages:
+                raise ValueError(build_first_page_stop_error(next_selector=next_selector, stop_reason=result.stop_reason,
+                                                            row_count=len(result.rows), evidence=evidence))
+        pages_variable = _read_optional_string(node, "pageCountVariable")
+        if pages_variable:
+            variables.set(pages_variable, len(result.per_page_counts), scope="局部")
+        return SweepOutcome(rows=result.rows, rounds=len(result.per_page_counts), progress_counts=result.per_page_counts,
+                            stop_reason=result.stop_reason, trigger_matches=None, unit=" 页")
 
 
 def _table_values_still_rendering(raw_values: object) -> bool:
@@ -832,7 +862,3 @@ def _table_values_still_rendering(raw_values: object) -> bool:
     if isinstance(raw_values, list):
         return not _normalize_table_rows(raw_values)
     return isinstance(raw_values, dict) and raw_values.get("__table_scope_error") == "no_rows_in_scope"
-
-
-def _fingerprint_rows(rows: list[object]) -> str:
-    return json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

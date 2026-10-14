@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -361,15 +362,29 @@ async def test_browser_click_load_more_clicks_until_no_growth_and_extracts_value
     assert variables.get("loaded_dom_count") == 2
 
 
-async def test_browser_paginate_next_collects_each_page_until_button_disabled() -> None:
+@pytest.fixture
+def pagination_clock(monkeypatch):
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(browser_action_runner, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    for cls in (FakePaginatePage, FakeUrlPaginatePage):
+        original = cls.wait_for_timeout
+
+        async def pause(self, delay_ms, original=original):
+            await original(self, delay_ms)
+            clock.now += delay_ms / 1000
+
+        monkeypatch.setattr(cls, "wait_for_timeout", pause)
+    return clock
+
+
+async def test_browser_paginate_next_collects_each_page_until_button_disabled(pagination_clock) -> None:
     variables = RuntimeVariableStore.from_initial({})
     page = FakePaginatePage()
     context = BrowserActionContext(playwright=object(), browser=object(), page=page)
 
     result = await BrowserActionRunner().run(
         {
-            "type": "browser.paginateNext",
-            "selector": "a.next",
+            "type": "browser.paginateNext", "selector": "a.next",
             "targetSelector": ".row::text",
             "maxIterations": 10,
             "delayMs": 50,
@@ -381,61 +396,49 @@ async def test_browser_paginate_next_collects_each_page_until_button_disabled() 
     )
 
     assert page.clicked_count == 2
-    assert page.waited_timeouts == [50, 50]
+    assert [delay for delay in page.waited_timeouts if delay == 50] == [50, 50]
     assert result.detail == "a.next -> .row · 3 页 · [2, 2, 1] · stop=next_button_disabled"
     assert result.values == ["A1", "A2", "B1", "B2", "C1"]
     assert variables.get("visited_pages") == 3
 
 
-async def test_browser_paginate_next_reads_max_iterations_from_a_runtime_variable() -> None:
+async def test_browser_paginate_next_reads_max_iterations_from_a_runtime_variable(pagination_clock) -> None:
     """上限写成 ${var.x} 必须真的生效：不解析模板时会静默回落默认 20，把该停的翻页翻到底。"""
     variables = RuntimeVariableStore.from_initial({"max_pages": "2"})
     page = FakePaginatePage()
     context = BrowserActionContext(playwright=object(), browser=object(), page=page)
 
-    result = await BrowserActionRunner().run(
-        {
-            "type": "browser.paginateNext",
-            "selector": "a.next",
-            "targetSelector": ".row::text",
-            "maxIterations": "${var.max_pages}",
-            "delayMs": 0,
-            "pageCountVariable": "visited_pages",
-        },
-        variables,
-        context,
-        timeout_ms=1000,
-    )
+    with pytest.raises(ValueError, match="安全上限 2 页"):
+        await BrowserActionRunner().run(
+            {
+                "type": "browser.paginateNext", "selector": "a.next",
+                "targetSelector": ".row::text",
+                "maxIterations": "${var.max_pages}",
+                "delayMs": 0,
+                "pageCountVariable": "visited_pages",
+            },
+            variables,
+            context,
+            timeout_ms=1000,
+        )
 
-    assert result.values == ["A1", "A2", "B1", "B2"]
-    assert variables.get("visited_pages") == 2
-    assert "stop=max_iterations_reached" in result.detail
+    assert page.clicked_count == 1
+    assert all(snapshot.name != "visited_pages" for snapshot in variables.snapshots())
 
 
-async def test_browser_paginate_next_falls_back_to_default_when_the_limit_variable_is_undefined() -> None:
-    """变量缺失只能回落默认值：整数字段没有「报错停住」的调用方，抛异常会把整条流程带崩。"""
-    variables = RuntimeVariableStore.from_initial({})
+async def test_browser_paginate_next_rejects_an_undefined_limit_variable(pagination_clock) -> None:
     page = FakePaginatePage()
     context = BrowserActionContext(playwright=object(), browser=object(), page=page)
-
-    result = await BrowserActionRunner().run(
-        {
-            "type": "browser.paginateNext",
-            "selector": "a.next",
-            "targetSelector": ".row::text",
-            "maxIterations": "${var.missing_limit}",
-            "delayMs": 0,
-        },
-        variables,
-        context,
-        timeout_ms=1000,
-    )
-
-    assert result.values == ["A1", "A2", "B1", "B2", "C1"]
-    assert "stop=next_button_disabled" in result.detail
+    with pytest.raises(ValueError, match="安全上限变量必须已定义"):
+        await BrowserActionRunner().run(
+            {"type": "browser.paginateNext", "selector": "a.next", "targetSelector": ".row",
+             "maxIterations": "${var.missing_limit}"},
+            RuntimeVariableStore.from_initial({}), context, timeout_ms=1000,
+        )
+    assert page.clicked_count == 0
 
 
-async def test_browser_paginate_next_fails_loudly_when_next_selector_matches_nothing() -> None:
+async def test_browser_paginate_next_fails_loudly_when_next_selector_matches_nothing(pagination_clock) -> None:
     """配了 paginateNext 就是断言「这里有下一页」，断言不成立必须当场失败。
 
     否则表现是 success + 只有第 1 页的数据，没有任何字段能看出残缺。
@@ -447,8 +450,7 @@ async def test_browser_paginate_next_fails_loudly_when_next_selector_matches_not
     with pytest.raises(ValueError, match="分页未生效"):
         await BrowserActionRunner().run(
             {
-                "type": "browser.paginateNext",
-                "selector": "a.normal_page_right",
+                "type": "browser.paginateNext", "selector": "a.normal_page_right",
                 "targetSelector": ".row::text",
             },
             variables,
@@ -457,7 +459,7 @@ async def test_browser_paginate_next_fails_loudly_when_next_selector_matches_not
         )
 
 
-async def test_browser_paginate_next_fails_when_dom_still_reports_more_pages() -> None:
+async def test_browser_paginate_next_fails_when_dom_still_reports_more_pages(pagination_clock) -> None:
     """按钮「隐藏/禁用」不等于「已经是最后一页」——DOM 里还挂着可见的页码链接就说明 selector 找错了。
 
     这里不失败的代价是 success + 只有第 1 页，用户只能靠肉眼发现少了后面所有页。
@@ -475,15 +477,14 @@ async def test_browser_paginate_next_fails_when_dom_still_reports_more_pages() -
         )
 
 
-async def test_browser_paginate_next_by_url_walks_pages_until_duplicate() -> None:
+async def test_browser_paginate_next_by_url_stops_at_confirmed_end(pagination_clock) -> None:
     variables = RuntimeVariableStore.from_initial({})
     page = FakeUrlPaginatePage()
     context = BrowserActionContext(playwright=object(), browser=object(), page=page)
 
     result = await BrowserActionRunner().run(
         {
-            "type": "browser.paginateNext",
-            "urlTemplate": "https://example.com/list?p=${page}",
+            "type": "browser.paginateNext", "selector": "a.next", "urlTemplate": "https://example.com/list?p=${page}",
             "targetSelector": ".row::text",
             "delayMs": 0,
             "pageCountVariable": "visited_pages",
@@ -497,21 +498,19 @@ async def test_browser_paginate_next_by_url_walks_pages_until_duplicate() -> Non
         "https://example.com/list?p=1",
         "https://example.com/list?p=2",
         "https://example.com/list?p=3",
-        "https://example.com/list?p=4",
     ]
     assert result.values == ["A1", "A2", "B1", "B2", "C1"]
     assert variables.get("visited_pages") == 3
 
 
-async def test_browser_paginate_next_by_url_rejects_template_without_placeholder() -> None:
+async def test_browser_paginate_next_by_url_rejects_template_without_placeholder(pagination_clock) -> None:
     variables = RuntimeVariableStore.from_initial({})
     context = BrowserActionContext(playwright=object(), browser=object(), page=FakeUrlPaginatePage())
 
     with pytest.raises(ValueError, match=r"必须包含 \$\{page\}"):
         await BrowserActionRunner().run(
             {
-                "type": "browser.paginateNext",
-                "urlTemplate": "https://example.com/list",
+                "type": "browser.paginateNext", "urlTemplate": "https://example.com/list",
                 "targetSelector": ".row::text",
             },
             variables,
@@ -520,7 +519,7 @@ async def test_browser_paginate_next_by_url_rejects_template_without_placeholder
         )
 
 
-async def test_browser_paginate_next_picks_union_selector_candidates_in_written_order() -> None:
+async def test_browser_paginate_next_picks_union_selector_candidates_in_written_order(pagination_clock) -> None:
     """逗号组按书写顺序取第一组有命中的，不按 DOM 顺序。
 
     `locator("A, B")` 返回 DOM 里靠前的那个，扩展执行器返回写在前面的那个；同一份流程
@@ -533,8 +532,7 @@ async def test_browser_paginate_next_picks_union_selector_candidates_in_written_
 
     result = await BrowserActionRunner().run(
         {
-            "type": "browser.paginateNext",
-            "selector": 'a.next_page, a.page_normal[href*="?p=2"]',
+            "type": "browser.paginateNext", "selector": 'a.next_page, a.page_normal[href*="?p=2"]',
             "targetSelector": ".row::text",
             "outputVariable": "rows",
         },
@@ -547,10 +545,17 @@ async def test_browser_paginate_next_picks_union_selector_candidates_in_written_
     assert page.clicked_selectors == ["a.next_page", "a.next_page"]
 
 
-async def test_browser_paginate_next_keeps_running_when_locator_cannot_report_match_count() -> None:
+async def test_browser_paginate_next_keeps_running_when_locator_cannot_report_match_count(pagination_clock) -> None:
     """报不出匹配数 != 匹配数为 0，否则不支持 count() 的 locator 会被误判成分页坏了。"""
     variables = RuntimeVariableStore.from_initial({})
-    page = FakePaginatePage()
+    class PageWithoutNextCount(FakePaginatePage):
+        def locator(self, selector):
+            locator = super().locator(selector)
+            if selector == "a.next":
+                locator.count = None
+            return locator
+
+    page = PageWithoutNextCount()
     context = BrowserActionContext(playwright=object(), browser=object(), page=page)
 
     result = await BrowserActionRunner().run(
@@ -1264,7 +1269,12 @@ class FakePaginateLocator:
     async def wait_for(self, *, state: str, timeout: int) -> None:
         return None
 
+    async def count(self) -> int:
+        return 1
+
     async def is_visible(self) -> bool:
+        if self._selector == ".end":
+            return not isinstance(self._page, FakeEvidencePaginatePage) and self._page.page_index == len(self._page.pages) - 1
         return True
 
     async def is_disabled(self) -> bool:
@@ -1280,6 +1290,8 @@ class FakePaginateLocator:
         return []
 
     async def evaluate_all(self, script: str, attribute: str | None = None) -> list[str | None]:
+        if "aria-busy" in script:
+            return False
         return await self.all_text_contents()
 
 
@@ -1297,7 +1309,7 @@ class FakeEvidencePaginatePage(FakePaginatePage):
 
 
 class FakeUrlPaginatePage:
-    """按 URL 逐页导航；第 4 页重复第 3 页的内容，用来验证重复即收工。"""
+    """按 URL 逐页导航；第 3 页的下一页按钮禁用。"""
 
     def __init__(self) -> None:
         self.visited: list[str] = []
@@ -1333,6 +1345,15 @@ class FakeUrlPaginateLocator:
     def first(self) -> "FakeUrlPaginateLocator":
         return self
 
+    async def count(self) -> int:
+        return 1
+
+    async def is_visible(self) -> bool:
+        return True
+
+    async def is_disabled(self) -> bool:
+        return self._page.url.endswith("?p=3")
+
     async def wait_for(self, *, state: str, timeout: int) -> None:
         if not self._page.pages.get(self._page.url):
             raise TimeoutError(f"等待元素超时: {self._selector}")
@@ -1341,6 +1362,8 @@ class FakeUrlPaginateLocator:
         return self._page.pages.get(self._page.url, []) if self._selector == ".row" else []
 
     async def evaluate_all(self, script: str, attribute: str | None = None) -> list[str | None]:
+        if "aria-busy" in script:
+            return False
         return await self.all_text_contents()
 
 
@@ -1387,6 +1410,8 @@ class FakeUnmatchedPaginateLocator(FakePaginateLocator):
         return 0 if self._selector == "a.normal_page_right" else len(self._page.pages)
 
     async def is_visible(self) -> bool:
+        if self._selector == ".end":
+            return False
         return self._selector != "a.normal_page_right"
 
 
@@ -1493,7 +1518,7 @@ class FakeBlankMidPaginatePage(FakePaginatePage):
         self.pages = [["A1"], [], ["C1"]]
 
 
-async def test_browser_paginate_next_rejects_blank_mid_sweep_page() -> None:
+async def test_browser_paginate_next_rejects_blank_mid_sweep_page(pagination_clock) -> None:
     page = FakeBlankMidPaginatePage()
     context = BrowserActionContext(playwright=object(), browser=object(), page=page)
 

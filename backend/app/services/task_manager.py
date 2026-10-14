@@ -1350,7 +1350,9 @@ class TaskManager:
             await self._save_browser_screenshot(record, context, node_id=node_id, node_title=node_title)
             return browser_result.to_scrape_result()
 
-        if confirmed:
+        pagination = node.get("type") == "browser.paginateNext"
+        if confirmed or pagination:
+            # 分页已改变当前位置，失败后重跑会跳过此前页面；不得重试或吞错。
             # 已确认的敏感动作：一次确认最多一次实际调用。绕过 _run_with_retry 与浮层重试，
             # 无论 failureStrategy=retry 还是 continue/continueOnError 都不得重跑或吞错静默继续，
             # 否则一次点击可能变成两次提交/两次支付等不可逆副作用。失败即留证并终止本次运行。
@@ -1359,7 +1361,7 @@ class TaskManager:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                await self._append_log(record, "warn", f"敏感动作失败，按确认契约不重试 · {node_title}", str(exc), node_id=node_id)
+                await self._append_log(record, "warn", f"{'分页失败，不重试或跳过' if pagination else '敏感动作失败，按确认契约不重试'} · {node_title}", str(exc), node_id=node_id)
                 await self._capture_failure_evidence(record, context, exc, node_id=node_id, node_title=node_title)
                 raise
 

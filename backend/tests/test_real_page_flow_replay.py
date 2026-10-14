@@ -209,20 +209,16 @@ async def test_typed_text_alone_passes_readback_but_the_data_gate_still_catches_
 async def test_pagination_sweep_accumulates_every_page_and_stops_by_page_state(
     replay: Any,
 ) -> None:
-    """翻页的终止条件与页数上限都要能在运行时改：换 maxIterations 就换出不同的页数。"""
+    """末页与安全上限分别判断：截断必须失败，末页才可返回完整结果。"""
     def node(max_iterations: int) -> list[dict[str, Any]]:
         return [
             {"id": "p1", "type": "browser.open", "targetUrl": _url("pagination.html")},
-            {"id": "p2", "type": "browser.paginateNext", "selector": ".next-page",
-             "targetSelector": "#grid-body tr", "extractMode": "table", "maxIterations": max_iterations,
+            {"id": "p2", "type": "browser.paginateNext", "selector": ".next-page", "targetSelector": "#grid-body tr", "extractMode": "table", "maxIterations": max_iterations,
              "delayMs": 200, "outputVariable": "rows", "pageCountVariable": "pages"},
         ]
 
-    capped = await replay(node(2))
-    # 这张表只有一列，表头不足 2 列时 table 模式按 list[list] 交出（见 _TABLE_EXTRACT_SCRIPT）
-    assert [row[0] for row in capped.get("rows")] == ["P1-A", "P2-A"]
-    assert capped.get("pages") == 2
-    assert "stop=max_iterations_reached" in str(capped.get("__last_detail"))
+    with pytest.raises(ValueError, match="安全上限 2 页"):
+        await replay(node(2))
 
     full = await replay(node(20))
     assert [row[0] for row in full.get("rows")] == ["P1-A", "P2-A", "P3-A"]

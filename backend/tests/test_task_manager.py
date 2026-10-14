@@ -2743,3 +2743,23 @@ async def test_get_artifact_content_falls_back_to_persisted_snapshot(tmp_path) -
     assert content is not None
     assert content.content.startswith("data:image/png;base64,")
     assert await manager.get_artifact_content("t_hist", "missing") is None
+
+
+@pytest.mark.parametrize("failure_strategy", ["retry", "continue"])
+async def test_pagination_failure_is_never_retried_or_swallowed(tmp_path, failure_strategy):
+    executor = FailOnceExtensionExecutor()
+    manager = _confirming_manager(executor, tmp_path)
+    flow = _confirmation_then_next_flow()
+    flow["nodes"][1] = {"id": "submit", "type": "browser.paginateNext", "title": "完整分页",
+                        "selector": ".next", "targetSelector": ".row", "continueOnError": True}
+    try:
+        snapshot = await manager.start_task(RunTaskRequest(
+            flowName="分页完整性", targetUrl="https://example.com", selector=".row", browserExecutor="extension",
+            failureStrategy=failure_strategy, flowDefinition=flow,
+        ))
+        done = await wait_for_status(manager, snapshot.task_id, {"success", "error"})
+        assert done.status == "error"
+        assert executor.run_attempts == 1
+        assert all(action["id"] != "verify" for action in executor.actions)
+    finally:
+        await manager.stop_workers()

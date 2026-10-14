@@ -4,7 +4,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,13 +12,11 @@ from pathlib import Path
 from app.models.schemas import ScrapeResult
 from app.services import browser_profile_lock
 from app.services.pagination_probe import (
-    FIRST_PAGE_STOP_REASONS,
-    SINGLE_PAGE_VERDICT,
-    build_blank_page_error,
     build_first_page_stop_error,
     probe_pagination_evidence_playwright,
 )
 from app.services.runtime_variables import RuntimeVariableStore, append_variable_values, normalize_variable_name
+from app.services.pagination_runtime import PaginationPage, collect_paginated_pages, pagination_max_pages
 
 logger = logging.getLogger(__name__)
 
@@ -691,162 +689,116 @@ class BrowserActionRunner:
         )
 
     async def _paginate_next_and_extract(
-        self,
-        page: object,
-        next_selector: str,
-        target_selector_config: "SelectorConfig",
-        variables: RuntimeVariableStore,
-        node: FlowNode,
-        *,
-        timeout: int,
+        self, page: object, next_selector: str, target_selector_config: "SelectorConfig",
+        variables: RuntimeVariableStore, node: FlowNode, *, timeout: int,
     ) -> SweepOutcome:
-        max_iterations = max(1, _read_int(node, "maxIterations", default=20, variables=variables))
-        delay_ms = max(0, _read_int(node, "delayMs", default=500, variables=variables))
-        pages_visited = 0
-        all_values: list[object] = []
-        per_page_counts: list[int] = []
-        previous_fingerprint = ""
-        stop_reason = "max_iterations_reached"
-        trigger_matches: int | None = None
+        pagination_max_pages(node, variables.resolve_text)
 
-        for _index in range(max_iterations):
-            current_values = await _extract_locator_values(page, target_selector_config, timeout=timeout)
-            all_values.extend(current_values)
-            per_page_counts.append(len(current_values))
-            pages_visited += 1
+        button: object | None = None
+        matches: int | None = None
+        hidden = False
+        disabled = False
 
-            trigger_matches = await _optional_match_count(page, next_selector)
-            if trigger_matches == 0:
-                # 末页至少还能匹配到一个 hidden/disabled 的按钮，一个都匹配不到只能是 selector 错了
-                stop_reason = "next_selector_not_found"
-                break
-            next_button = _first_locator(await _acting_locator(page, next_selector))
-            if await _is_locator_hidden(next_button):
-                stop_reason = "next_button_hidden"
-                break
-            if await _is_locator_disabled(next_button):
-                stop_reason = "next_button_disabled"
-                break
-            # 必须排在三个终止判据之后：末页的空表由 hidden/disabled 收尾，走不到这里
-            if not current_values:
-                raise ValueError(build_blank_page_error(
-                    page_number=pages_visited,
-                    target_selector=target_selector_config.selector,
-                ))
+        async def is_terminal(remaining: float) -> str | None:
+            nonlocal button, matches, hidden, disabled
+            matches = await _optional_match_count(page, next_selector)
+            button = _first_locator(await _acting_locator(page, next_selector))
+            hidden = matches == 0 or await _is_locator_hidden(button)
+            disabled = not hidden and await _is_locator_disabled(button)
+            return "next_button_disabled" if disabled else None
 
-            before_url = _read_page_url(page)
-            before_fingerprint = _build_page_fingerprint(before_url, current_values)
-            await next_button.click(timeout=timeout)
-            if delay_ms > 0:
+        async def advance(page_number: int, row_count: int) -> None:
+            if hidden or disabled or button is None:
+                if page_number == 1:
+                    evidence = await probe_pagination_evidence_playwright(page)
+                    raise ValueError(build_first_page_stop_error(
+                        next_selector=next_selector,
+                        stop_reason="next_selector_not_found" if matches == 0 else "next_button_hidden",
+                        row_count=row_count, evidence=evidence,
+                    ))
+                raise ValueError("分页采集未完成：下一页控件消失或不可见，无法确认末页；请核对分页控件。")
+            await button.click(timeout=timeout)
+            delay_ms = max(0, _read_int(node, "delayMs", default=500, variables=variables))
+            if delay_ms:
                 await page.wait_for_timeout(delay_ms)
-            after_values = await _extract_locator_values(page, target_selector_config, timeout=timeout)
-            after_url = _read_page_url(page)
-            after_fingerprint = _build_page_fingerprint(after_url, after_values)
-            if after_fingerprint == before_fingerprint or after_fingerprint == previous_fingerprint:
-                stop_reason = "duplicate_content"
-                break
-            previous_fingerprint = before_fingerprint
 
-        pages_variable = _read_optional_string(node, "pageCountVariable")
-        if pages_variable is not None:
-            variables.set(pages_variable, pages_visited, scope="局部")
-
-        verdict: str | None = None
-        if pages_visited <= 1 and stop_reason in FIRST_PAGE_STOP_REASONS:
-            # 配 paginateNext 就是断言「这里有下一页」；断言不成立还当成功，交出去的数据
-            # 只有第 1 页且看不出残缺。但「按钮隐藏/禁用」在真·单页站点上是正常的末页形态，
-            # 不能一律判失败，改由页面自身的分页证据裁决。
-            # clickLoadMore 不做这一步：内容加载完时按钮本就该消失。
-            evidence = await probe_pagination_evidence_playwright(page)
-            if stop_reason == "next_selector_not_found" or evidence.has_more_pages:
-                raise ValueError(build_first_page_stop_error(
-                    next_selector=next_selector,
-                    stop_reason=stop_reason,
-                    row_count=len(all_values),
-                    evidence=evidence,
-                ))
-            verdict = SINGLE_PAGE_VERDICT
-
-        return SweepOutcome(
-            rows=all_values,
-            rounds=pages_visited,
-            progress_counts=per_page_counts,
-            stop_reason=stop_reason,
-            trigger_matches=trigger_matches,
-            unit=" 页",
-            verdict=verdict,
-        )
+        return await self._collect_pagination(page, target_selector_config, variables, node, timeout=timeout,
+                                              advance=advance, is_terminal=is_terminal, next_selector=next_selector)
 
     async def _paginate_by_url_and_extract(
-        self,
-        page: object,
-        url_template: str,
-        target_selector_config: "SelectorConfig",
-        variables: RuntimeVariableStore,
-        node: FlowNode,
-        *,
-        timeout: int,
+        self, page: object, url_template: str, target_selector_config: "SelectorConfig",
+        variables: RuntimeVariableStore, node: FlowNode, *, timeout: int,
     ) -> SweepOutcome:
-        """按 URL 逐页抓取：数字页码站点点不动「下一页」，只能自己拼地址。
-
-        点击式翻页翻到第 2 页后，页码控件的位置和文字都变了，selector 往往当场失效；
-        这条路径每页都从 URL 重新进入，与页面上有没有下一页按钮无关。
-        """
-        max_iterations = max(1, _read_int(node, "maxIterations", default=20, variables=variables))
+        pagination_max_pages(node, variables.resolve_text)
         start_page = _read_int(node, "startPage", default=1, variables=variables)
-        # offset 型分页（?start=0/20/40）靠步长表达，页号本身就是偏移量
         page_step = max(1, _read_int(node, "pageStep", default=1, variables=variables))
-        delay_ms = max(0, _read_int(node, "delayMs", default=500, variables=variables))
 
-        all_values: list[object] = []
-        per_page_counts: list[int] = []
-        previous_fingerprint = ""
-        pages_visited = 0
-        stop_reason = "max_iterations_reached"
+        next_selector = _read_optional_string(node, "selector")
+        next_selector = variables.resolve_text(next_selector) if next_selector else None
+        returned = False
 
-        for index in range(max_iterations):
-            page_number = start_page + index * page_step
-            await _goto_with_retry(page, url_template.replace("${page}", str(page_number)), timeout=timeout)
-            if delay_ms > 0:
+        async def advance(page_index: int, row_count: int = 0) -> None:
+            nonlocal returned
+            before_url = _read_page_url(page)
+            target_url = url_template.replace("${page}", str(start_page + page_index * page_step))
+            await _goto_with_retry(page, target_url, timeout=timeout)
+            actual_url = _read_page_url(page)
+            returned = page_index > 0 and actual_url == before_url and actual_url != target_url
+            delay_ms = max(0, _read_int(node, "delayMs", default=500, variables=variables))
+            if delay_ms:
                 await page.wait_for_timeout(delay_ms)
+
+        async def is_terminal(remaining: float) -> str | None:
+            if next_selector:
+                if await _optional_match_count(page, next_selector) != 0:
+                    button = _first_locator(await _acting_locator(page, next_selector))
+                    if not await _is_locator_hidden(button):
+                        return "next_button_disabled" if await _is_locator_disabled(button) else None
+            return "navigation_returned_to_previous_page" if returned else None
+
+        await advance(0)
+        return await self._collect_pagination(page, target_selector_config, variables, node, timeout=timeout,
+                                              advance=advance, is_terminal=is_terminal, allow_navigation_return=True)
+
+    async def _collect_pagination(
+        self, page: object, target_selector_config: "SelectorConfig", variables: RuntimeVariableStore,
+        node: FlowNode, *, timeout: int, advance: Callable[[int, int], Awaitable[None]],
+        is_terminal: Callable[[float], Awaitable[str | None]], next_selector: str | None = None,
+        allow_navigation_return: bool = False,
+    ) -> SweepOutcome:
+        async def read_page(remaining: float) -> PaginationPage:
+            before_url = _read_page_url(page)
             try:
-                current_values = await _extract_locator_values(page, target_selector_config, timeout=timeout)
-            except Exception:
-                # 翻过头是这条路径的正常收尾方式：末页之后行选择器等不到元素，
-                # 这属于「没有下一页了」，不是流程失败。第 1 页就等不到会走下面的 pages_visited==0 分支
-                current_values = []
-            if not current_values:
-                stop_reason = "empty_page"
-                break
-            # 指纹不含 URL：越界页号常被站点重定向回首页/末页，此时地址不同而内容逐字相同
-            fingerprint = _build_page_fingerprint("", current_values)
-            if fingerprint == previous_fingerprint:
-                stop_reason = "duplicate_content"
-                break
-            all_values.extend(current_values)
-            per_page_counts.append(len(current_values))
-            pages_visited += 1
-            previous_fingerprint = fingerprint
-
-        pages_variable = _read_optional_string(node, "pageCountVariable")
-        if pages_variable is not None:
-            variables.set(pages_variable, pages_visited, scope="局部")
-
-        if pages_visited == 0:
-            raise ValueError(
-                f"按 URL 翻页第 1 页（{url_template.replace('${page}', str(start_page))}）就没抽到任何内容："
-                f"targetSelector `{target_selector_config.selector}` 没命中，或 startPage 起点不对。"
-                "请用 inspect_page 核对行选择器与真实页号起点（有的站从 0 开始，offset 型分页要配 pageStep）。"
+                rows = await _extract_locator_values(page, target_selector_config, timeout=max(1, int(min(0.5, remaining) * 1000)))
+            except Exception as exc:
+                if type(exc).__name__ != "TimeoutError":
+                    raise
+                rows = []
+            busy = await _target_locator(page, target_selector_config.selector).evaluate_all(
+                """(elements) => document.readyState !== 'complete' || elements.some(el => el.closest('[aria-busy="true"]') !== null)"""
             )
+            after_url = _read_page_url(page)
+            return PaginationPage(rows=rows, url=after_url, ready=busy is not True and before_url == after_url)
 
-        return SweepOutcome(
-            rows=all_values,
-            rounds=pages_visited,
-            progress_counts=per_page_counts,
-            stop_reason=stop_reason,
-            trigger_matches=None,
-            unit=" 页",
+        async def pause(seconds: float) -> None:
+            await page.wait_for_timeout(max(1, int(seconds * 1000)))
+
+        result = await collect_paginated_pages(
+            read_page, advance, is_terminal, pause,
+            max_pages=pagination_max_pages(node, variables.resolve_text),
+            timeout_seconds=timeout / 1000, target_selector=target_selector_config.selector, clock=time.monotonic,
+            allow_navigation_return=allow_navigation_return,
         )
+        if next_selector and len(result.per_page_counts) <= 1 and result.stop_reason == "next_button_disabled":
+            evidence = await probe_pagination_evidence_playwright(page)
+            if evidence.has_more_pages:
+                raise ValueError(build_first_page_stop_error(next_selector=next_selector, stop_reason=result.stop_reason,
+                                                            row_count=len(result.rows), evidence=evidence))
+        pages_variable = _read_optional_string(node, "pageCountVariable")
+        if pages_variable:
+            variables.set(pages_variable, len(result.per_page_counts), scope="局部")
+        return SweepOutcome(rows=result.rows, rounds=len(result.per_page_counts), progress_counts=result.per_page_counts,
+                            stop_reason=result.stop_reason, trigger_matches=None, unit=" 页")
 
     async def _dismiss_overlays(self, page: object, selector: str, variables: RuntimeVariableStore, node: FlowNode, *, timeout: int) -> int:
         selectors = _split_selector_candidates(selector)
@@ -2105,12 +2057,6 @@ async def _is_locator_disabled(locator: object) -> bool:
 def _read_page_url(page: object) -> str:
     value = getattr(page, "url", "")
     return value if isinstance(value, str) else ""
-
-
-def _build_page_fingerprint(url: str, values: list[str]) -> str:
-    first = values[0] if values else ""
-    last = values[-1] if values else ""
-    return f"{url}|{len(values)}|{first}|{last}"
 
 
 def _clean_text_values(values: object) -> list[str]:

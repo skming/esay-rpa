@@ -300,7 +300,7 @@ async function handleAction(action: ContentAction): Promise<unknown> {
       return { ok: true };
     }
     case 'browser.extract': {
-      return dispatchExtract(action);
+      return dispatchExtract(action, true);
     }
     case 'browser.hover': {
       dispatchHover(resolveActionElement(action));
