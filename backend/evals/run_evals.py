@@ -29,6 +29,7 @@ import json
 import os
 import re
 import sys
+from copy import deepcopy
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -324,6 +325,8 @@ class MockToolExecutor:
         self._overrides = overrides or {}
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.platform_calls: list[tuple[str, dict[str, Any]]] = []
+        self.evidence: list[dict[str, Any]] = []
+        self.initial_definition: dict[str, Any] | None = None
 
     # 签名必须跟 RpaToolExecutor.execute 一致（含 progress_sink / change_context）：
     # 不一致时编排层把 TypeError 当成「工具执行失败」吞掉，评测结果失真
@@ -334,23 +337,47 @@ class MockToolExecutor:
         progress_sink: dict[str, Any] | None = None,
         change_context: Any = None,
     ) -> dict[str, Any]:
-        (self.calls if name in _MODEL_FACING_TOOLS else self.platform_calls).append((name, args))
-        invalid = validate_tool_arguments(name, args)
-        if invalid is not None:
-            return invalid
-        if name == "list_node_types":
-            return select_node_types(args.get("types"))
-        override = self._overrides.get(name)
-        if callable(override):
-            return override(args, self.calls)
-        if override is not None:
-            return override
-        default = _DEFAULT_TOOL_RESULTS.get(name)
-        if callable(default):
-            return default(args, self.calls)
-        if default is None:
-            return {"error": f"未知工具: {name}"}
-        return dict(default)
+        model_call = name in _MODEL_FACING_TOOLS
+        (self.calls if model_call else self.platform_calls).append((name, deepcopy(args)))
+        record = {"name": name, "outcome": "pending"} if model_call else None
+        if record is not None:
+            self.evidence.append(record)
+        try:
+            invalid = validate_tool_arguments(name, args)
+            if invalid is not None:
+                result = invalid
+            elif name == "list_node_types":
+                result = select_node_types(args.get("types"))
+            else:
+                override = self._overrides.get(name)
+                default = _DEFAULT_TOOL_RESULTS.get(name)
+                fixture = override if override is not None else default
+                if callable(fixture):
+                    # 状态 fixture 只能观察已经成功的写入，失败尝试不能修好样本流程。
+                    calls = (self.successful_calls() if name in {"get_flow", "lint_flow", "validate_flow"}
+                             else self.calls)
+                    result = fixture(args, calls)
+                elif fixture is None:
+                    result = {"error": f"未知工具: {name}"}
+                else:
+                    result = dict(fixture)
+        except BaseException as error:
+            if record is not None:
+                record.update(outcome="exception", exception=type(error).__name__)
+            raise
+        if record is not None:
+            record.update(outcome="returned", result={
+                "status": result.get("status"),
+                "has_error": bool(result.get("error")),
+                "flow_id_present": bool(result.get("flow_id")),
+            })
+        if name == "get_flow" and self.initial_definition is None and isinstance(result.get("definition"), dict):
+            self.initial_definition = deepcopy(result["definition"])
+        return result
+
+    def successful_calls(self) -> list[tuple[str, dict[str, Any]]]:
+        return [call for call, record in zip(self.calls, self.evidence)
+                if record.get("name") == call[0] and _record_succeeded(record)]
 
     def called_tools(self) -> list[str]:
         return [name for name, _ in self.calls]
@@ -773,6 +800,49 @@ def _recording_path(model: str, scenario_name: str, rep: int) -> Path:
     return _RECORDINGS_DIR / model.replace("/", "_") / prompt_dir / f"{scenario_name}-{rep + 1}.json"
 
 
+def _redact_recording(value: Any, *, sensitive: bool = False) -> Any:
+    if sensitive:
+        return "[REDACTED]"
+    if isinstance(value, str):
+        return re.sub(r"(?i)Bearer\s+\S+|\b(?:rc|sk)-[a-zA-Z0-9_-]+", "[REDACTED]", value)
+    if isinstance(value, list):
+        return [_redact_recording(item) for item in value]
+    if isinstance(value, dict):
+        credential_variable = value.get("sensitive") is True or value.get("category") == "credential"
+        return {
+            key: _redact_recording(
+                item,
+                sensitive=(
+                    key.lower() in {"password", "passwd", "secret", "token", "api_key", "authorization"}
+                    or (credential_variable and key in {"value", "defaultValue"})
+                ),
+            )
+            for key, item in value.items()
+        }
+    return value
+
+
+def _record_succeeded(record: dict[str, Any]) -> bool:
+    if record.get("outcome") != "returned":
+        return False
+    result = record.get("result") or {}
+    if result.get("has_error"):
+        return False
+    name, status = record.get("name"), result.get("status")
+    if name == "create_flow":
+        return status in {"draft", "active"} and result.get("flow_id_present") is True
+    if name == "update_flow":
+        return status == "updated" and result.get("flow_id_present") is True
+    if name == "set_acceptance_contract":
+        return status == "applied" and result.get("flow_id_present") is True
+    if name == "apply_node_fix":
+        return status == "patched" and result.get("flow_id_present") is True
+    return not str(status or "").startswith("blocked_") and status not in {
+        "error", "refused", "rejected", "blocked", "cancelled", "failed",
+        "invalid_arguments", "blocked_page_access", "unsupported_capability",
+    }
+
+
 def _replay_scenario(scenario: Scenario, model: str, rep: int) -> tuple[list[str], RunMetrics]:
     path = _recording_path(model, scenario.name, rep)
     if not path.exists():
@@ -780,6 +850,8 @@ def _replay_scenario(scenario: Scenario, model: str, rep: int) -> tuple[list[str
     recorded = json.loads(path.read_text(encoding="utf-8"))
     executor = MockToolExecutor(scenario.tool_overrides)
     executor.calls = [(c["name"], c["args"]) for c in recorded["calls"]]
+    executor.evidence = recorded.get("evidence") or []
+    executor.initial_definition = recorded.get("initial_definition")
     guard_hits = recorded.get("guard_hits") or []
     metrics = RunMetrics.from_dict(recorded.get("metrics"))
     return _judge_scenario(scenario, recorded["reply"], executor, guard_hits), metrics
@@ -825,6 +897,8 @@ async def run_scenario(
             async for event in stream:
                 if event.get("type") == "text":
                     reply_parts.append(str(event.get("delta") or ""))
+                elif event.get("type") == "retract":
+                    reply_parts.clear()
                 elif event.get("type") == "usage":
                     usage = event.get("usage")
                     if isinstance(usage, dict):
@@ -832,7 +906,10 @@ async def run_scenario(
                 elif event.get("type") == "error":
                     errors.append(f"LLM 错误：{event.get('message')}")
                 # 后续回合每轮都重发整个系统提示词，判分用不上就别让它继续
-                if scenario.stop_after_tool and scenario.stop_after_tool in executor.called_tools():
+                if scenario.stop_after_tool and any(
+                    record["name"] == scenario.stop_after_tool and _record_succeeded(record)
+                    for record in executor.evidence
+                ):
                     break
     except Exception as exc:
         errors.append(f"运行异常：{exc}")
@@ -848,8 +925,10 @@ async def run_scenario(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(
             {"model": model, "prompt_fingerprint": _PROMPT_FINGERPRINT,
-             "scenario": scenario.name, "reply": reply,
-             "calls": [{"name": n, "args": a} for n, a in executor.calls],
+             "scenario": scenario.name, "reply": _redact_recording(reply),
+             "calls": [{"name": n, "args": _redact_recording(a)} for n, a in executor.calls],
+             "evidence": executor.evidence,
+             "initial_definition": _redact_recording(executor.initial_definition),
              "guard_hits": guard_hits,
              "metrics": metrics.to_dict()},
             ensure_ascii=False, indent=2,
@@ -887,7 +966,10 @@ def _judge_scenario(
         elif writes and called.index(gate_tool) > writes[0]:
             failures.append(f"期望 {gate_tool} 先于任何写工具，实际顺序 {called}")
     for tool in scenario.expect_tools_called:
-        if tool not in called:
+        completed = [name for name, _ in executor.successful_calls()]
+        if tool in FLOW_WRITE_TOOLS and tool not in completed:
+            failures.append(f"期望 {tool} 成功写入，但没有成功回执（调用序列 {called}）")
+        elif tool not in called:
             failures.append(f"期望调用 {tool}，实际未调用（调用序列 {called}）")
     for tool in scenario.expect_tools_not_called:
         if tool in called:
@@ -919,11 +1001,11 @@ def _judge_scenario(
             f"回复未包含任一关键词 {scenario.expect_reply_contains_any}（回复前120字：{reply[:120]!r}）"
         )
     failures.extend(_check_generated_flow(scenario, executor))
-    failures.extend(_check_fabricated_write(reply, called))
+    failures.extend(_check_fabricated_write(reply, executor))
     return failures
 
 
-def _check_fabricated_write(reply: str, called: list[str]) -> list[str]:
+def _check_fabricated_write(reply: str, executor: MockToolExecutor) -> list[str]:
     """全套不变量：宣称流程已落盘，但一次写入工具都没成功调过。
 
     不挂在场景上是因为它跟场景想测什么无关——任何一局出现这种回复都是假交付，
@@ -934,16 +1016,19 @@ def _check_fabricated_write(reply: str, called: list[str]) -> list[str]:
     短语表与编排层撤回判据同一份（`_FLOW_SAVED_CLAIM_PHRASES`）：各写一份的话，
     编排层补了新说法而评测测不到，等于放掉一条已经修好的缺陷的回归。
     """
-    if any(name in FLOW_WRITE_TOOLS for name in called):
+    if any(record["name"] in FLOW_WRITE_TOOLS and _record_succeeded(record)
+           for record in executor.evidence):
         return []
-    hit = next((p for p in _FLOW_SAVED_CLAIM_PHRASES if p in reply), None)
+    from app.services.ai_response_evidence import factual_claim_text
+    claim_text = factual_claim_text(reply, _FLOW_SAVED_CLAIM_PHRASES)
+    hit = next((p for p in _FLOW_SAVED_CLAIM_PHRASES if p in claim_text), None)
     if hit is None:
         return []
-    return [f"回复宣称「{hit}」，但一次写入工具都没调过（调用序列 {called or '（无）'}）"]
+    return [f"回复宣称「{hit}」，但没有成功写入回执（调用序列 {executor.called_tools() or '（无）'}）"]
 
 
 def _check_generated_flow(scenario: Scenario, executor: MockToolExecutor) -> list[str]:
-    """对模型真正提交的 nodes/edges 判分。"""
+    """只对最后一次成功保存后的流程定义判分。"""
     wants_flow = (
         scenario.expect_flow_created
         or scenario.expect_flow_lint_error_free
@@ -953,12 +1038,9 @@ def _check_generated_flow(scenario: Scenario, executor: MockToolExecutor) -> lis
     if not wants_flow:
         return []
 
-    submitted = [args for name, args in executor.calls if name in ("create_flow", "update_flow")]
-    if not submitted:
-        return [f"未提交任何流程定义（调用序列 {executor.called_tools()}）"]
-
-    payload = submitted[0]
-    definition = payload.get("definition") if isinstance(payload.get("definition"), dict) else payload
+    definition = _saved_flow_definition(executor)
+    if definition is None:
+        return [f"没有可验证的成功保存流程定义（调用序列 {executor.called_tools()}）"]
     # 先过生产的归一化，否则入口本来就会补的字段会算成模型的错
     nodes = _normalize_generated_nodes(definition.get("nodes") or [])
     edges = _normalize_generated_edges(definition.get("edges") or [])
@@ -979,6 +1061,42 @@ def _check_generated_flow(scenario: Scenario, executor: MockToolExecutor) -> lis
         if banned in node_types:
             failures.append(f"生成的流程不该出现节点类型 {banned}（实际 {node_types}）")
     return failures
+
+
+def _saved_flow_definition(executor: MockToolExecutor) -> dict[str, Any] | None:
+    definition = deepcopy(executor.initial_definition)
+    saved = False
+    for (name, args), record in zip(executor.calls, executor.evidence):
+        if record.get("name") != name or not _record_succeeded(record):
+            continue
+        if name == "create_flow":
+            saved = True
+            payload = args.get("definition") if isinstance(args.get("definition"), dict) else args
+            definition = {
+                "nodes": deepcopy(payload.get("nodes") or []),
+                "edges": deepcopy(payload.get("edges") or []),
+            }
+        elif name == "update_flow" and definition is not None:
+            saved = True
+            removed_nodes = set(args.get("remove_node_ids") or [])
+            nodes = [n for n in definition["nodes"] if n.get("id") not in removed_nodes]
+            patches = {n["id"]: n["patch"] for n in args.get("update_nodes") or []}
+            nodes = [{**n, **patches.get(n.get("id"), {})} for n in nodes]
+            nodes.extend(deepcopy(args.get("add_nodes") or []))
+            removed_edges = set(args.get("remove_edge_ids") or [])
+            edges = [e for e in definition["edges"]
+                     if e.get("id") not in removed_edges
+                     and e.get("source") not in removed_nodes
+                     and e.get("target") not in removed_nodes]
+            edges.extend(deepcopy(args.get("add_edges") or []))
+            definition = {"nodes": nodes, "edges": edges}
+        elif name == "apply_node_fix" and definition is not None:
+            saved = True
+            definition["nodes"] = [
+                {**node, **deepcopy(args.get("config_patch") or {})} if node.get("id") == args.get("node_id") else node
+                for node in definition["nodes"]
+            ]
+    return definition if saved else None
 
 
 def _resolve_model_and_key(config: AiConfigService, model_arg: str | None) -> tuple[str, bool]:

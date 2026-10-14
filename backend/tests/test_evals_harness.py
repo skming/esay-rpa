@@ -6,6 +6,7 @@
 
 import os
 import sys
+import json
 
 import pytest
 
@@ -17,6 +18,11 @@ from evals.run_evals import (  # noqa: E402
     Scenario,
     _judge_scenario,
     _observe_guards,
+    _record_succeeded,
+    _replay_scenario,
+    _RUNNABLE_FLOW_NODES,
+    _RUNNABLE_FLOW_EDGES,
+    run_scenario,
 )
 
 
@@ -82,8 +88,54 @@ def test_fabricated_write_claim_fails_even_with_no_scenario_assertion() -> None:
     scenario = Scenario(name="t", description="", user_message="", expect_tool_order=[("a", "b")])
     claim = f"好的，{_FLOW_SAVED_CLAIM_PHRASES[0]}，你可以去运行了。"
     assert _judge_scenario(scenario, claim, _executor(), [])
-    # 真的写了就不算编造，哪怕后面那句话一模一样
-    assert _judge_scenario(scenario, claim, _executor("create_flow"), []) == []
+    attempted = _executor("create_flow")
+    assert _judge_scenario(scenario, claim, attempted, [])
+    attempted.evidence = [{"name": "create_flow", "outcome": "returned", "result": {
+        "status": "draft", "has_error": False, "flow_id_present": True,
+    }}]
+    assert _judge_scenario(scenario, claim, attempted, []) == []
+
+
+@pytest.mark.asyncio
+async def test_invalid_and_refused_writes_are_attempts_without_saved_evidence() -> None:
+    executor = MockToolExecutor({"create_flow": {"status": "refused", "flow_id": "f1"}})
+    invalid = await executor.execute("create_flow", {"nodes": _RUNNABLE_FLOW_NODES})
+    assert invalid["error"] == "invalid_arguments"
+    refused = await executor.execute("create_flow", {"name": "t", "nodes": _RUNNABLE_FLOW_NODES})
+    assert refused["status"] == "refused"
+    assert executor.called_tools() == ["create_flow", "create_flow"]
+    assert not any(_record_succeeded(record) for record in executor.evidence)
+    scenario = Scenario(name="t", description="", user_message="", expect_flow_created=True)
+    assert _judge_scenario(scenario, "流程已创建", executor, [])
+
+
+@pytest.mark.asyncio
+async def test_generated_flow_uses_latest_successful_definition_after_repair() -> None:
+    executor = MockToolExecutor()
+    await executor.execute("create_flow", {"nodes": _RUNNABLE_FLOW_NODES, "edges": _RUNNABLE_FLOW_EDGES})
+    await executor.execute("create_flow", {"name": "t", "nodes": [{"id": "n1", "type": "script.python"}]})
+    await executor.execute("create_flow", {
+        "name": "t", "nodes": _RUNNABLE_FLOW_NODES, "edges": _RUNNABLE_FLOW_EDGES,
+    })
+    scenario = Scenario(
+        name="t", description="", user_message="", expect_flow_created=True,
+        expect_flow_node_types_include=["browser.extract", "file.write"],
+        expect_flow_node_types_exclude=["script.python"],
+    )
+    assert _judge_scenario(scenario, "", executor, []) == []
+
+
+@pytest.mark.asyncio
+async def test_mock_executor_records_exceptions_without_success() -> None:
+    def fail(_args: dict, _calls: list) -> dict:
+        raise RuntimeError("fixture failed")
+
+    executor = MockToolExecutor({"create_flow": fail})
+    with pytest.raises(RuntimeError, match="fixture failed"):
+        await executor.execute("create_flow", {"name": "t", "nodes": []})
+    assert executor.evidence == [{
+        "name": "create_flow", "outcome": "exception", "exception": "RuntimeError",
+    }]
 
 
 def test_tool_argument_assertions_reject_a_made_up_action_id() -> None:
@@ -177,7 +229,9 @@ async def _fixture_phase(
     from app.services.ai_phases import resolve_phase
 
     executor = MockToolExecutor(scenario.tool_overrides)
-    executor.calls = [(name, {}) for name in prior_calls]
+    for name in prior_calls:
+        await executor.execute(name, {"flow_id": scenario.flow_id, "node_id": "n2",
+                                      "config_patch": {"selector": ".data-table tbody tr", "extractMode": "table"}})
     flow_state = await build_flow_state(executor, scenario.flow_id)
     state = GuardState(
         flow_has_nodes=not flow_state.is_blank,
@@ -231,3 +285,66 @@ async def test_acceptance_contract_fixture_echoes_what_was_submitted() -> None:
         "set_acceptance_contract", {"flow_id": "f1", "acceptance_contract": submitted}
     )
     assert applied["acceptance_contract"] == submitted and applied["flow_id"] == "f1"
+
+
+async def test_failed_write_does_not_stop_scenario_before_a_successful_receipt(monkeypatch):
+    from evals import run_evals
+    attempts = []
+    class Orchestrator:
+        def __init__(self, tool_executor, **kwargs):
+            self.executor = tool_executor
+        async def stream(self, **kwargs):
+            for args in ({"nodes": []}, {"name": "saved", "nodes": _RUNNABLE_FLOW_NODES, "edges": _RUNNABLE_FLOW_EDGES}):
+                result = await self.executor.execute("create_flow", args)
+                attempts.append(result)
+                yield {"type": "tool_result", "result": result}
+            raise AssertionError("成功回执后应已提前结束")
+    monkeypatch.setattr(run_evals, "AiOrchestrator", Orchestrator)
+    scenario = Scenario(name="receipt", description="", user_message="", stop_after_tool="create_flow", expect_flow_created=True)
+    failures, _ = await run_scenario(scenario, "offline-test", None)
+    assert failures == []
+    assert len(attempts) == 2 and attempts[0]["error"] == "invalid_arguments"
+
+
+async def test_retracted_text_is_not_scored_as_the_final_reply(monkeypatch):
+    from evals import run_evals
+    class Orchestrator:
+        def __init__(self, **kwargs):
+            pass
+        async def stream(self, **kwargs):
+            yield {"type": "text", "delta": "流程已创建"}
+            yield {"type": "retract"}
+            yield {"type": "text", "delta": "尚未执行写入。"}
+    monkeypatch.setattr(run_evals, "AiOrchestrator", Orchestrator)
+    failures, _ = await run_scenario(Scenario(name="retract", description="", user_message=""), "offline-test", None)
+    assert failures == []
+
+
+async def test_scoring_uses_final_successful_update_and_ignores_refused_patch():
+    from evals.run_evals import _saved_flow_definition
+    executor = MockToolExecutor()
+    await executor.execute("create_flow", {"name": "t", "nodes": [{"id": "n", "type": "browser.extract", "selector": "old"}]})
+    await executor.execute("update_flow", {"flow_id": "eval-flow-0001", "update_nodes": [{"id": "n", "patch": {"selector": "saved"}}]})
+    executor._overrides["apply_node_fix"] = {"status": "refused", "flow_id": "eval-flow-0001"}
+    await executor.execute("apply_node_fix", {"flow_id": "eval-flow-0001", "node_id": "n", "config_patch": {"selector": "unsaved"}})
+    assert _saved_flow_definition(executor)["nodes"][0]["selector"] == "saved"
+
+
+async def test_legacy_recording_without_outcomes_cannot_prove_a_write(monkeypatch, tmp_path):
+    from evals import run_evals
+    path = tmp_path / "legacy.json"
+    path.write_text(json.dumps({"calls": [{"name": "create_flow", "args": {"name": "t", "nodes": _RUNNABLE_FLOW_NODES}}],
+                                "reply": "流程已创建"}), encoding="utf-8")
+    monkeypatch.setattr(run_evals, "_recording_path", lambda *args: path)
+    failures, _ = _replay_scenario(Scenario(name="legacy", description="", user_message="", expect_flow_created=True), "offline", 0)
+    assert any("成功" in failure for failure in failures)
+
+
+def test_recordings_redact_credential_variables_and_headers():
+    from evals.run_evals import _redact_recording
+    value = {"headers": {"Authorization": "Bearer synthetic"},
+             "input_variables": [{"name": "key", "sensitive": True, "value": "secret-a"}],
+             "variables": {"password": "secret-b", "count": 10}}
+    safe = _redact_recording(value)
+    assert "secret-" not in json.dumps(safe)
+    assert safe["variables"]["count"] == 10
