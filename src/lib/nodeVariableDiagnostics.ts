@@ -170,6 +170,7 @@ function collectReferencedVariables(action: RpaNodeAction): Array<{ fieldName: s
   addTemplate('pattern', action.pattern);
   addTemplate('delimiter', action.delimiter);
   addTemplate('targetSelector', action.targetSelector);
+  if (typeof action.maxIterations === 'string') addTemplate('maxIterations', action.maxIterations);
   addTemplate('channel', action.channel);
 
   addDirect('inputVariable', action.inputVariable);

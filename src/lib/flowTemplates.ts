@@ -472,7 +472,7 @@ export const flowTemplates: FlowTemplate[] = [
   {
     id: 'next-button-pagination',
     name: '下一页按钮分页',
-    description: '适合表格/列表通过“下一页”按钮翻页并累计抓取的页面。',
+    description: '原生下一页按钮的分页示例；使用前按页面取证更新行、按钮和末页选择器。',
     variables: [variable('next_page_url', 'https://example.com/orders')],
     nodes: [
       startNode(),
@@ -485,12 +485,12 @@ export const flowTemplates: FlowTemplate[] = [
       }),
       stepNode('paginate-next', 500, 210, {
         title: '下一页累计抓取',
-        description: 'a.next → .table-row',
+        description: 'button.next → .table-row，button.next:disabled 确认末页',
         kind: 'browser',
         status: 'pending',
         action: {
           type: 'browser.paginateNext',
-          selector: 'a.next',
+          selector: 'button.next',
           targetSelector: '.table-row::text',
           extractMode: 'text',
           maxIterations: 20,

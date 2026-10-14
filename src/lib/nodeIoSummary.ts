@@ -83,7 +83,7 @@ export function buildNodeIoSummary(node: Node<RpaNodeData>): NodeIoSummary {
     addOutput(action.firstValueVariable, 'String', '首个提取值');
     addOutput(action.countVariable ?? action.statusVariable, 'Integer', '命中数量');
     addOutput(action.loadedCountVariable, 'Integer', '加载后 DOM 数量');
-    addOutput(action.pageCountVariable, 'Integer', '访问页数');
+    addOutput(action.pageCountVariable, 'Integer', '采集到数据的页数');
   }
 
   if (actionType === 'browser.ensureLogin') {

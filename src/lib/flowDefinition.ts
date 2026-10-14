@@ -228,7 +228,7 @@ function restoreAction(node: Record<string, unknown>, type: string): RpaNodeActi
     itemsVariable: readOptionalString(node.itemsVariable),
     itemVariable: readOptionalString(node.itemVariable),
     indexVariable: readOptionalString(node.indexVariable),
-    maxIterations: readOptionalNumber(node.maxIterations),
+    maxIterations: type === 'browser.paginateNext' && typeof node.maxIterations === 'string' ? node.maxIterations : readOptionalNumber(node.maxIterations),
     condition: readOptionalString(node.condition),
     continueOnMaxIterations: typeof node.continueOnMaxIterations === 'boolean' ? node.continueOnMaxIterations : undefined,
     waitCondition: readWaitCondition(node.waitCondition),

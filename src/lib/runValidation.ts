@@ -288,6 +288,18 @@ function validateNodeAction(node: Node<RpaNodeData>, action: RpaNodeAction): Run
       requireField(action.selector, type === 'browser.paginateNext' ? '下一页按钮选择器' : '加载按钮选择器');
     }
     requireField(action.targetSelector, '列表项选择器');
+    if (type === 'browser.paginateNext') {
+      const cap = action.maxIterations ?? 20;
+      const validCap = typeof cap === 'number'
+        ? Number.isInteger(cap) && cap > 0
+        : /^[1-9]\d*$/.test(cap.trim()) || /^\$\{var\.[A-Za-z_][A-Za-z0-9_.-]*\}$/.test(cap.trim());
+      if (!validCap) {
+        issues.push({ nodeId: node.id, severity: 'error', message: `节点“${title}”的页数安全上限必须是正整数或已定义变量` });
+      }
+    }
+    if (type === 'browser.paginateNext' && action.continueOnError) {
+      issues.push({ nodeId: node.id, severity: 'error', message: `节点“${title}”要求完整采集，不能忽略分页失败` });
+    }
   }
 
   if (type === 'browser.fill' || type === 'ui.fill') {
@@ -705,6 +717,7 @@ function collectReferencedVariableNames(action: RpaNodeAction): string[] {
   addTemplateRefs(action.pattern);
   addTemplateRefs(action.delimiter);
   addTemplateRefs(action.targetSelector);
+  if (typeof action.maxIterations === 'string') addTemplateRefs(action.maxIterations);
   addTemplateRefs(action.channel);
 
   for (const variableName of [action.inputVariable, action.itemsVariable, action.leftVariable, action.rightVariable]) {

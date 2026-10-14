@@ -223,7 +223,16 @@ describe('nodeConfigDraft', () => {
     const backToClick = applyNodeConfigDraft(byUrl, { ...createNodeConfigDraft(byUrl), urlTemplate: '' });
 
     expect(backToClick.action?.urlTemplate).toBeUndefined();
+    expect(draft.maxIterations).toBe(20);
     expect(backToClick.action?.startPage).toBeUndefined();
     expect(backToClick.action?.pageStep).toBeUndefined();
   });
+  it('修改行范围时保留安全上限变量', () => {
+    const data: RpaNodeData = { title: '完整分页', description: '', kind: 'browser', status: 'pending',
+      action: { type: 'browser.paginateNext', selector: '.next', targetSelector: '.row', maxIterations: '${var.limit}', } };
+    const draft = createNodeConfigDraft(data);
+    const saved = applyNodeConfigDraft(data, { ...draft, targetSelector: '.updated-row' });
+    expect(saved.action?.maxIterations).toBe('${var.limit}');
+  });
+
 });

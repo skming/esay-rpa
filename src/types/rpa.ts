@@ -116,7 +116,7 @@ export type RpaNodeAction = {
   itemsVariable?: string;
   itemVariable?: string;
   indexVariable?: string;
-  maxIterations?: number;
+  maxIterations?: number | string;
   /** control.repeat_until 的退出条件表达式（与 control.condition 同语法）。 */
   condition?: string;
   /** control.repeat_until 跑满 maxIterations 仍未满足条件时不失败，仅告警。 */
@@ -185,7 +185,7 @@ export type RpaNodeConfigDraft = {
   stderrVariable: string;
   itemVariable: string;
   indexVariable: string;
-  maxIterations: number;
+  maxIterations: number | string;
   path: string;
   code: string;
   targetPath: string;

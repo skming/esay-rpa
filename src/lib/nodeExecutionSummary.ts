@@ -53,6 +53,13 @@ export function buildNodeExecutionSummary(node: Node<RpaNodeData>): NodeExecutio
     addRow('outputSchema', '输出字段', action.outputSchema);
   }
 
+  if (actionType === 'browser.paginateNext') {
+    addRow('selector', '下一页按钮', action.selector);
+    addRow('urlTemplate', '翻页地址模板', action.urlTemplate);
+    addRow('targetSelector', '内容选择器', action.targetSelector);
+    addRow('maxIterations', '页数安全上限', String(action.maxIterations ?? 20));
+  }
+
   if (actionType === 'browser.fill' || actionType === 'ui.fill') {
     addRow('selector', '目标元素', action.selector);
     addRow('inputValue', '输入内容', action.inputValue);

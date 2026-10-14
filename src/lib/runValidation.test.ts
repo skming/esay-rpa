@@ -453,4 +453,20 @@ describe('runValidation', () => {
     expect(issues[0]?.severity).toBe('error');
     expect(issues[0]?.message).toContain('${page}');
   });
+  it('分页忽略失败时阻止运行', () => {
+    const node = createNode('paginate', {
+      title: '完整抓取',
+      action: { type: 'browser.paginateNext', selector: '.next', targetSelector: '.row', continueOnError: true }
+    });
+    const errors = validateNodeConfigurationInFlow(node, [node], [], []).filter((issue) => issue.severity === 'error');
+    expect(errors.some((issue) => issue.message.includes('不能忽略分页失败'))).toBe(true);
+  });
+
+  it('标准下一页分页不要求额外的末页配置', () => {
+    const node = createNode('paginate', { title: '自动分页', action: {
+      type: 'browser.paginateNext', selector: '.el-pagination button.btn-next', targetSelector: '.table-row', maxIterations: 20
+    } });
+    expect(validateNodeConfigurationInFlow(node, [node], [], []).filter((issue) => issue.severity === 'error')).toEqual([]);
+  });
+
 });

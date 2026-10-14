@@ -47,6 +47,15 @@ describe('flowDefinition', () => {
     expect(restored?.nodes[2]?.data.action).toEqual(expect.objectContaining({ outputVariable: 'browser_texts', firstValueVariable: 'browser_text' }));
   });
 
+  it('分页安全上限变量经过保存恢复后不丢失', () => {
+    const node = createFlowNode({ label: '获取文本', nodeType: 'browser' }, { x: 120, y: 180 }, 1);
+    node.data.action = { type: 'browser.paginateNext', selector: '.next', targetSelector: '.row', maxIterations: '${var.page_limit}' };
+    const definition = buildFlowDefinition([node], []);
+    expect(restoreFlowCanvas(definition)?.nodes[0]?.data.action).toEqual(expect.objectContaining({
+      type: 'browser.paginateNext', maxIterations: '${var.page_limit}'
+    }));
+  });
+
   it('人工确认标记能穿过保存与重新载入', () => {
     // restoreAction 是白名单，漏一行这个字段就在重新载入后静默消失：开关弹回未勾选，
     // 用户以为闸门还在，实际敏感节点已经无人确认直接执行。

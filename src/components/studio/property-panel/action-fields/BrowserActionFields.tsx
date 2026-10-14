@@ -57,7 +57,7 @@ export function BrowserActionFields({ draft, electron, flowTargetUrl, node, onDr
             value={paginatesByUrl ? 'url' : 'click'}
           />
         )}
-        {paginatesByUrl ? (
+        {paginatesByUrl && (
           <>
             <Field label="翻页地址模板" mono onChange={(event) => onDraftPatch('urlTemplate', event.target.value)} placeholder="https://example.com/list?page=${page}" value={draft.urlTemplate} />
             {!draft.urlTemplate.includes('${page}') && <InlineHint text="模板缺少 ${page} 占位符，每页请求的会是同一个地址" tone="warn" />}
@@ -65,13 +65,18 @@ export function BrowserActionFields({ draft, electron, flowTargetUrl, node, onDr
             <Field label="页号步长" onChange={(event) => onDraftPatch('pageStep', Math.max(1, Number.parseInt(event.target.value, 10) || 1))} type="number" value={String(draft.pageStep)} />
             <InlineHint text="按 offset 分页的站点（如 start=0/20/40）把起始页号设为 0、步长设为每页条数。" />
           </>
-        ) : (
-          renderSelectorField('selector', isNextPagination ? '下一页按钮 (CSS)' : '加载按钮 (CSS)')
         )}
+        {renderSelectorField('selector', paginatesByUrl ? '下一页按钮（可选，用于判断禁用状态）' : isNextPagination ? '下一页按钮 (CSS)' : '加载按钮 (CSS)')}
         {renderSelectorField('targetSelector', '列表项选择器', draft.extractMode === 'attribute' ? 'single' : 'multiple')}
         <ExtractModeField onChange={(value) => onDraftPatch('extractMode', value)} value={draft.extractMode} />
         {draft.extractMode === 'attribute' &&<Field label="属性名" mono onChange={(event) => onDraftPatch('attribute', event.target.value)} placeholder="href" value={draft.attribute} />}
-        <Field label={isNextPagination ? '最大页数' : '最大点击次数'} onChange={(event) => onDraftPatch('maxIterations', Math.max(1, Number.parseInt(event.target.value, 10) || 1))} type="number" value={String(draft.maxIterations)} />
+        {isNextPagination && <InlineHint text="根据下一页控件状态确认末页；最大页数是安全上限，达到上限仍未确认结束会报错。" />}
+        {isNextPagination ? (
+          <VariablePickerField label="页数安全上限" placeholder="正整数或选择变量" value={String(draft.maxIterations)} variables={availableVariables}
+            onChange={(value) => onDraftPatch('maxIterations', /^\d+$/.test(value.trim()) ? Number(value) : value)} />
+        ) : (
+          <Field label="最大点击次数" onChange={(event) => onDraftPatch('maxIterations', Math.max(1, Number.parseInt(event.target.value, 10) || 1))} type="number" value={String(draft.maxIterations)} />
+        )}
         <Field label={paginatesByUrl ? '每页等待(ms)' : '点击后等待(ms)'} onChange={(event) => onDraftPatch('delayMs', Math.max(0, Number.parseInt(event.target.value, 10) || 0))} type="number" value={String(draft.delayMs)} />
         <VariableNameField label="输出变量" mode="target" onChange={(value) => onDraftPatch('responseVariable', value)} placeholder={isNextPagination ? 'paged_items' : 'loaded_items'} value={draft.responseVariable} variables={availableVariables} />
       </>
