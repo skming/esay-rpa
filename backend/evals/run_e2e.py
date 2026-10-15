@@ -1155,7 +1155,7 @@ async def _amain(args: argparse.Namespace) -> int:
         base_url = config.get_base_url_for_model(model)
         api_key = config.get_api_key_for_model(model)
         if base_url:
-            from app.services.ai_orchestrator import _normalize_base_url, _resolve_relay_model
+            from app.services.ai_model_transport import _normalize_base_url, _resolve_relay_model
             try:
                 resolved = await _resolve_relay_model(
                     model, _normalize_base_url(base_url), api_key or "sk-relay",

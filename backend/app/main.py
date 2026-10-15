@@ -659,7 +659,7 @@ async def test_ai_model(payload: dict) -> dict:
                 return {"ok": False, "error": f"未配置 {env_key}，请先填写 API Key"}
 
         # 用真实对话同款的 _resolve_relay_model 解析模型，让"测试通过"等于"对话能用"
-        from app.services.ai_orchestrator import _normalize_base_url, _resolve_relay_model
+        from app.services.ai_model_transport import _normalize_base_url, _resolve_relay_model
         normalized_base = _normalize_base_url(base_url) if base_url else None
         test_model = catalog_model
         if normalized_base:

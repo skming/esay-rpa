@@ -759,12 +759,12 @@ async def test_relay_failure_body_reaches_the_user_whole(monkeypatch) -> None:
     于是 type=unauthorized_client_error 这个「拒的是客户端不是密钥」的判断依据被丢掉，
     剩下一句「API Key 无效或已过期」把人指向了错的方向。"""
     import app.main as main_module
-    import app.services.ai_orchestrator as orch
+    import app.services.ai_model_transport as transport
 
     service = main_module.ai_config_service
     env_key = "OPENAI_API_KEY"
     relay_body = '{"error":{"message":"unauthorized client detected, contact support for assistance at https://discord.gg/aYq5B4RW3"},"message":"UNAUTHENTICATED","success":false,"type":"unauthorized_client_error"}'
-    orch._relay_models_cache.clear()
+    transport._relay_models_cache.clear()
     try:
         monkeypatch.setattr(service, "get_model_catalog",
                             lambda: [{"id": "gpt-5.6-sol", "env_key": env_key}])
@@ -772,7 +772,7 @@ async def test_relay_failure_body_reaches_the_user_whole(monkeypatch) -> None:
         async def fake_resolve(model, base_url, api_key):
             return f"openai/{model}"
 
-        monkeypatch.setattr(orch, "_resolve_relay_model", fake_resolve)
+        monkeypatch.setattr(transport, "_resolve_relay_model", fake_resolve)
 
         sent: dict[str, object] = {}
 
@@ -815,7 +815,7 @@ async def test_relay_failure_body_reaches_the_user_whole(monkeypatch) -> None:
         # 点中的模型就是发出去的模型，不能被同族匹配换掉
         assert sent["json"]["model"] == "gpt-5.6-sol"
     finally:
-        orch._relay_models_cache.clear()
+        transport._relay_models_cache.clear()
 
 
 async def test_extension_status_reports_canexecute_separately_from_display_connected() -> None:

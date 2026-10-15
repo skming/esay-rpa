@@ -28,6 +28,8 @@ Electron 承载 React 前端，通过桥接调用本机 FastAPI 服务。SQLite 
 | 浏览器两端 | `backend/app/services/browser_action_runner.py`、`backend/app/services/extension_executor.py`、`extension/entrypoints/` |
 | 分页判定 | `backend/app/services/pagination_runtime.py` |
 | AI 编排 | `backend/app/services/ai_orchestrator.py`、`ai_phases.py`、`ai_guards.py` |
+| 模型通信 | `backend/app/services/ai_model_transport.py`：供应商适配、流式解析、超时与响应释放 |
+| 工具注册 | `backend/app/services/ai_tool_registry.py`：公开边界、读写分类、执行入口与后处理关联 |
 | 提示词与工具 | `backend/app/services/ai_prompts.py`、`ai_tools/schemas.py`、`ai_tools/catalog.py` |
 | 输出验收 | `backend/app/services/acceptance_contract.py`、`ai_checks.py` |
 | 脚本导出 | `backend/app/services/code_generator.py` |
@@ -49,6 +51,7 @@ Electron 承载 React 前端，通过桥接调用本机 FastAPI 服务。SQLite 
 
 - 提示词维护单一规则源，工具参数以 `TOOL_SCHEMAS` 为准；必需的不变量由 Guard、阶段准入和执行器强制检查。
 - 阶段工具集合与准入共用判断；状态块、按需目录与历史摘要减少重复查询。续接状态从真实历史恢复，避免压缩后丢失目标或重复执行。
+- 工具返回与后台轮询共用状态提交入口，核验流程版本并去重运行结果，再更新证据、预算与检查点。工具 Schema 必须与注册表的公开集合完全匹配。
 - 页面证据绑定所属会话。静态抓取证据只证明 HTTP 提取可用，不能证明浏览器交互成功。
 - 验收使用绑定用户需求的契约和真实运行输出；修改最终流程后需重新取得执行证据。
 - 工具读出与持久化日志需脱敏；敏感动作确认只授权一次执行。

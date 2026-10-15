@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import copy
 import inspect
 import json
 import re
 import textwrap
 from contextlib import AsyncExitStack
-from dataclasses import replace
+from dataclasses import asdict, replace
 from importlib import import_module
 from types import SimpleNamespace
 from typing import Any
@@ -22,6 +23,7 @@ from app.services.ai_flow_state import (
     render_flow_state,
     sync_state_message,
 )
+from app.services.ai_model_transport import ModelTransport, _ThinkTagFilter, _split_partial_tag_suffix
 from app.services.ai_guard_state import GuardState
 from app.services.ai_phases import VERIFY_ATTEMPT_BUDGET
 from app.services.ai_model_caps import _model_caps
@@ -53,16 +55,15 @@ from app.services.ai_orchestrator import (
     _RUN_NOT_STARTED_STATUSES,
     _RUN_REFUSED_MODEL_FIXABLE,
     _RUN_WAITING_STATUSES,
-    _split_partial_tag_suffix,
     _system_prompt_for_round,
     _task_state_message,
     _terminal_tool_response,
-    _ThinkTagFilter,
     _tool_schemas_for_round,
     _TurnIntents,
     _unmet_verification_request,
     _sync_flow_state,
     _sync_run_result,
+    _process_tool_result,
     _validate_tool_result_target,
 )
 from app.services.ai_tools.executor import RpaToolExecutor
@@ -85,6 +86,23 @@ def _ready(**overrides: Any) -> GuardState:
     for key, value in overrides.items():
         setattr(state, key, value)
     return state
+
+
+async def test_context_preparation_error_ends_stream_without_model_request(monkeypatch):
+    import litellm
+
+    def invalid_context(messages):
+        raise ValueError("fixture context failure")
+
+    completion = AsyncMock()
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    monkeypatch.setattr("app.services.ai_orchestrator._serialize_messages", invalid_context)
+    events = [event async for event in AiOrchestrator(_FakeExecutor()).stream(
+        [{"role": "user", "content": "你好"}], "fixture-model",
+    )]
+    assert any(event.get("type") == "error" and "fixture context failure" in event["message"] for event in events)
+    assert events[-1] == {"type": "done"}
+    completion.assert_not_awaited()
 
 
 def test_split_partial_tag_suffix_holds_back_split_tag() -> None:
@@ -1459,7 +1477,7 @@ class _FakeStream:
 async def relay_clients(monkeypatch):
     import_module("litellm")  # LiteLLM 的运行时类型注解需要原始 OpenAI 类。
     import openai
-    import app.services.ai_orchestrator as orch
+    import app.services.ai_model_transport as transport
 
     clients = []
 
@@ -1469,51 +1487,51 @@ async def relay_clients(monkeypatch):
         return client
 
     monkeypatch.setattr(openai, "AsyncOpenAI", create_client)
-    monkeypatch.setattr(orch, "_relay_client_cache", {})
-    monkeypatch.setattr(orch, "_relay_models_cache", {})
-    monkeypatch.setattr(orch, "_resolve_relay_model", AsyncMock(return_value="openai/test-model"))
+    monkeypatch.setattr(transport, "_relay_client_cache", {})
+    monkeypatch.setattr(transport, "_relay_models_cache", {})
+    monkeypatch.setattr(transport, "_resolve_relay_model", AsyncMock(return_value="openai/test-model"))
     try:
         yield clients
     finally:
-        await orch.close_relay_clients()
+        await transport.close_relay_clients()
 
 
 async def test_relay_client_reuse_and_idle_invalidation(relay_clients):
-    import app.services.ai_orchestrator as orch
+    import app.services.ai_model_transport as transport
 
-    async with orch._relay_client_lease("https://relay.test/v1", "fixture-key") as first:
-        async with orch._relay_client_lease("https://relay.test/v1", "fixture-key") as second:
+    async with transport._relay_client_lease("https://relay.test/v1", "fixture-key") as first:
+        async with transport._relay_client_lease("https://relay.test/v1", "fixture-key") as second:
             assert first is second
     assert len(relay_clients) == 1
     first.close.assert_not_awaited()
-    orch._relay_models_cache["fixture"] = (["test-model"], 0)
-    await orch.close_relay_clients()
-    assert not orch._relay_client_cache
-    assert not orch._relay_models_cache
+    transport._relay_models_cache["fixture"] = (["test-model"], 0)
+    await transport.close_relay_clients()
+    assert not transport._relay_client_cache
+    assert not transport._relay_models_cache
     first.close.assert_awaited_once()
-    await orch.close_relay_clients()
+    await transport.close_relay_clients()
     first.close.assert_awaited_once()
 
 
 async def test_relay_invalidation_waits_for_all_active_users(relay_clients):
-    import app.services.ai_orchestrator as orch
+    import app.services.ai_model_transport as transport
 
     async with AsyncExitStack() as users:
-        first = await users.enter_async_context(orch._relay_client_lease("https://relay.test/v1", "fixture"))
-        async with orch._relay_client_lease("https://relay.test/v1", "fixture") as second:
+        first = await users.enter_async_context(transport._relay_client_lease("https://relay.test/v1", "fixture"))
+        async with transport._relay_client_lease("https://relay.test/v1", "fixture") as second:
             assert first is second
-            await orch.close_relay_clients()
-            async with orch._relay_client_lease("https://relay.test/v1", "fixture") as replacement:
+            await transport.close_relay_clients()
+            async with transport._relay_client_lease("https://relay.test/v1", "fixture") as replacement:
                 assert replacement is not first
         first.close.assert_not_awaited()
     first.close.assert_awaited_once()
     replacement.close.assert_not_awaited()
-    await orch.close_relay_clients()
+    await transport.close_relay_clients()
     replacement.close.assert_awaited_once()
 
 
 async def test_relay_lease_covers_model_resolution_cancellation(monkeypatch, relay_clients):
-    import app.services.ai_orchestrator as orch
+    import app.services.ai_model_transport as transport
 
     started = asyncio.Event()
 
@@ -1521,33 +1539,33 @@ async def test_relay_lease_covers_model_resolution_cancellation(monkeypatch, rel
         started.set()
         await asyncio.Event().wait()
 
-    monkeypatch.setattr(orch, "_resolve_relay_model", resolve)
+    monkeypatch.setattr(transport, "_resolve_relay_model", resolve)
     config = SimpleNamespace(
         get_base_url_for_model=lambda _: "https://relay.test",
         get_api_key_for_model=lambda _: "fixture",
     )
-    orchestrator = AiOrchestrator(_FakeExecutor(), config)
+    model_transport = ModelTransport(config)
 
     async def request():
-        async with orchestrator._completion_kwargs("test-model"):
+        async with model_transport._completion_kwargs("test-model"):
             pytest.fail("model resolution should still be waiting")
 
     task = asyncio.create_task(request())
     await asyncio.wait_for(started.wait(), 1)
-    await orch.close_relay_clients()
+    await transport.close_relay_clients()
     relay_clients[0].close.assert_not_awaited()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     relay_clients[0].close.assert_awaited_once()
-    assert not orch._relay_client_cache
+    assert not transport._relay_client_cache
 
 
 async def test_relay_close_failure_does_not_skip_other_clients(relay_clients, caplog):
-    import app.services.ai_orchestrator as orch
+    import app.services.ai_model_transport as transport
 
     for url in ("https://first.test/v1", "https://second.test/v1"):
-        async with orch._relay_client_lease(url, "fixture"):
+        async with transport._relay_client_lease(url, "fixture"):
             pass
     close_transport = relay_clients[0].close.side_effect
 
@@ -1556,7 +1574,7 @@ async def test_relay_close_failure_does_not_skip_other_clients(relay_clients, ca
         raise RuntimeError("private-fixture-key")
 
     relay_clients[0].close.side_effect = fail_close
-    await orch.close_relay_clients()
+    await transport.close_relay_clients()
     for client in relay_clients:
         client.close.assert_awaited_once()
     assert "Failed to close relay client" in caplog.text
@@ -1565,7 +1583,7 @@ async def test_relay_close_failure_does_not_skip_other_clients(relay_clients, ca
 
 async def test_inflight_model_lookup_cannot_refill_invalidated_cache(monkeypatch):
     import httpx
-    import app.services.ai_orchestrator as orch
+    import app.services.ai_model_transport as transport
 
     started, finish = asyncio.Event(), asyncio.Event()
 
@@ -1585,14 +1603,14 @@ async def test_inflight_model_lookup_cannot_refill_invalidated_cache(monkeypatch
             return SimpleNamespace(status_code=200, json=lambda: {"data": [{"id": "fixture-model"}]})
 
     monkeypatch.setattr(httpx, "AsyncClient", LookupClient)
-    monkeypatch.setattr(orch, "_relay_models_cache", {})
-    task = asyncio.create_task(orch._fetch_relay_models("https://relay.test/v1", "fixture"))
+    monkeypatch.setattr(transport, "_relay_models_cache", {})
+    task = asyncio.create_task(transport._fetch_relay_models("https://relay.test/v1", "fixture"))
     try:
         await asyncio.wait_for(started.wait(), 1)
-        await orch.close_relay_clients()
+        await transport.close_relay_clients()
         finish.set()
         assert await task == ["fixture-model"]
-        assert not orch._relay_models_cache
+        assert not transport._relay_models_cache
     finally:
         finish.set()
         await task
@@ -1601,7 +1619,7 @@ async def test_inflight_model_lookup_cannot_refill_invalidated_cache(monkeypatch
 @pytest.mark.parametrize("exit_kind", ["complete", "cancel", "disconnect", "stream_error", "request_error", "timeout"])
 async def test_relay_round_releases_response_and_client(monkeypatch, relay_clients, exit_kind):
     import litellm
-    import app.services.ai_orchestrator as orch
+    import app.services.ai_model_transport as transport
 
     started = asyncio.Event()
     response = _FakeStream([_chunk(content="你好", finish="stop")])
@@ -1621,7 +1639,7 @@ async def test_relay_round_releases_response_and_client(monkeypatch, relay_clien
     monkeypatch.setattr(_FakeStream, "__anext__", lambda self: next_chunk())
 
     async def completion(**kwargs):
-        await orch.close_relay_clients()
+        await transport.close_relay_clients()
         kwargs["client"].close.assert_not_awaited()
         if exit_kind == "request_error":
             raise RuntimeError("fixture request failure")
@@ -2379,7 +2397,7 @@ async def test_request_serializes_system_messages_before_tool_history(monkeypatc
 
 def test_system_serialization_keeps_content_cache_and_original_history() -> None:
     import copy
-    from app.services.ai_orchestrator import _serialize_messages
+    from app.services.ai_model_transport import _serialize_messages
 
     original = [
         {"role": "system", "content": [{"type": "text", "text": "base", "cache_control": {"type": "ephemeral"}}]},
@@ -2856,6 +2874,62 @@ def test_stale_background_completion_does_not_affect_current_flow(monkeypatch):
     }
     assert not _sync_run_result(None, result, state)
     assert state.accepted_revision is None and state.attempt_budget["spent"] == 0
+
+
+@pytest.mark.parametrize("first_path", ["tool", "poll"])
+@pytest.mark.parametrize("status,passed,spent", [
+    ("success", True, 0), ("success", False, 1), ("error", None, 1), ("stopped", None, 0),
+])
+def test_run_result_is_committed_once_across_tool_and_poll_paths(monkeypatch, first_path, status, passed, spent):
+    recorded, checkpoints = [], []
+    monkeypatch.setattr("app.services.ai_orchestrator.record_events", lambda *args: recorded.append(args))
+    monkeypatch.setattr("app.services.ai_orchestrator._session_checkpoint.save", lambda *args, **kwargs: checkpoints.append(kwargs))
+    monkeypatch.setattr("app.services.ai_orchestrator._repair_ledger.clear", lambda *args: None)
+    state = _ready(flow_id="f", current_flow_revision=3, current_definition_digest="d3")
+    pending = {"flow_id": "f", "task_id": "t", "status": "running", "flow_revision": 3, "definition_digest": "d3"}
+    result = {**pending, "status": status}
+    if status == "error":
+        result.update(error="selector timeout", failure_diagnostics={"inspect_hint": "inspect first"})
+    if passed is not None:
+        result["acceptance_audit"] = {
+            "passed": passed, "flow_revision": 3, "definition_digest": "d3",
+            "issues": [] if passed else [{"issue": "missing_records"}],
+        }
+
+    def apply(path):
+        if path == "tool":
+            return _process_tool_result("run_flow", copy.deepcopy(result), state, rounds=2)[1]
+        return _sync_run_result(pending, copy.deepcopy(result), state, rounds=2)
+
+    assert apply(first_path)
+    committed = asdict(state)
+    assert not apply("poll" if first_path == "tool" else "tool")
+    assert asdict(state) == committed
+    assert state.attempt_budget["spent"] == spent
+    assert len(recorded) == 1
+    assert checkpoints == [{"rounds": 2}]
+    assert state.pending_run["task_id"] == "t"
+    assert state.accepted_revision == (3 if passed is True else None)
+
+
+@pytest.mark.parametrize("path", ["tool", "poll"])
+@pytest.mark.parametrize("status", ["success", "error"])
+@pytest.mark.parametrize("mismatch", [{"flow_id": "other"}, {"flow_revision": 2}, {"definition_digest": "old"}])
+def test_result_commit_rejects_other_flow_or_definition(monkeypatch, path, status, mismatch):
+    monkeypatch.setattr("app.services.ai_orchestrator.record_events", lambda *args: pytest.fail("foreign evidence persisted"))
+    monkeypatch.setattr("app.services.ai_orchestrator._session_checkpoint.save", lambda *args, **kwargs: pytest.fail("foreign state saved"))
+    state = _ready(flow_id="f", current_flow_revision=3, current_definition_digest="d3")
+    before = asdict(state)
+    result = {
+        "flow_id": "f", "task_id": "t", "status": status, "flow_revision": 3, "definition_digest": "d3",
+        "acceptance_audit": {"passed": True, "flow_revision": 3, "definition_digest": "d3"}, **mismatch,
+    }
+    if status == "error":
+        result["error"] = "selector timeout"
+    applied = (_process_tool_result("run_flow", result, state)[1] if path == "tool"
+               else _sync_run_result(None, result, state))
+    assert not applied
+    assert asdict(state) == before
 
 
 @pytest.mark.parametrize("execution_changed", [False, None, True])
