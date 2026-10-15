@@ -8,14 +8,12 @@ const { createFileLogger, captureProcessOutput, redactLogText } = require('./log
 
 const DEFAULT_HOST = '127.0.0.1';
 const DEFAULT_PORT = 8765;
-// Adaptive health-check: fast burst first, then back off. Extended to 38 s to accommodate
-// first-install cold starts where Python + uvicorn + FastAPI can take 15-30 s.
-// Total budget: 5×150 + 5×300 + 10×600 + 30×1000 = 38.25 s
+// 先快速探测，再退避以覆盖冷启动；重试间隔不包含健康请求的耗时。
 const HEALTH_RETRY_DELAYS_MS = [
-  ...Array(5).fill(150),    // 0–0.75 s   — fast burst
-  ...Array(5).fill(300),    // 0.75–2.25 s
-  ...Array(10).fill(600),   // 2.25–8.25 s
-  ...Array(30).fill(1000),  // 8.25–38.25 s — first-install cold start
+  ...Array(5).fill(150),
+  ...Array(5).fill(300),
+  ...Array(10).fill(600),
+  ...Array(30).fill(1000),
 ];
 
 /** 应用本地数据目录，所有持久化数据统一存放在此 */
@@ -60,7 +58,10 @@ class BackendSupervisor {
     this.cacheDir = path.join(appDataDir, 'cache');
 
     this.child = null;
+    this.installChild = null;
     this.startPromise = null;
+    this.startController = null;
+    this.stopPromise = null;
     this.status = {
       error: null,
       installProgress: null,
@@ -90,18 +91,49 @@ class BackendSupervisor {
   }
 
   async ensureStarted() {
-    if (this.startPromise !== null) {
-      return this.startPromise;
+    if (this.stopPromise !== null) await this.stopPromise;
+    if (this.startPromise === null) {
+      const controller = new AbortController();
+      this.startController = controller;
+      this.startPromise = Promise.resolve().then(() => this.#ensureStartedInternal(controller.signal)).catch((error) => {
+        if (!controller.signal.aborted) {
+          this.#setStatus({
+            error: redactLogText(error.message),
+            managed: this.child !== null || this.installChild !== null,
+            pid: this.child?.pid ?? this.installChild?.pid ?? null,
+            status: 'error'
+          });
+        }
+        return this.getStatus();
+      }).finally(() => {
+        this.startPromise = null;
+        this.startController = null;
+      });
     }
-
-    this.startPromise = this.#ensureStartedInternal().finally(() => {
-      this.startPromise = null;
-    });
-    return this.startPromise;
+    const signal = this.startController.signal;
+    const result = await this.startPromise;
+    if (signal.aborted) return this.stopPromise ?? this.getStatus();
+    return result;
   }
 
   async stop() {
-    if (this.child === null) {
+    if (this.stopPromise !== null) return this.stopPromise;
+    const starting = this.startPromise;
+    this.stopPromise = Promise.resolve().then(async () => {
+      const results = await Promise.allSettled([
+        this.#stopManagedChild('installChild'), this.#stopManagedChild('child')
+      ]);
+      if (starting !== null) await starting;
+      const failure = results.find((result) => result.status === 'rejected');
+      if (failure) {
+        this.#setStatus({
+          error: redactLogText(failure.reason.message),
+          managed: true,
+          pid: this.child?.pid ?? this.installChild?.pid ?? null,
+          status: 'error'
+        });
+        throw failure.reason;
+      }
       this.#setStatus({
         error: null,
         installProgress: null,
@@ -113,54 +145,50 @@ class BackendSupervisor {
         status: 'stopped'
       });
       return this.getStatus();
-    }
-
-    const child = this.child;
-    this.child = null;
-
-    await new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        child.kill('SIGKILL');
-        resolve();
-      }, 3000);
-
-      child.once('exit', () => {
-        clearTimeout(timer);
-        resolve();
-      });
-
-      child.kill('SIGTERM');
+    }).finally(() => {
+      this.stopPromise = null;
     });
-
-    this.#setStatus({
-      error: null,
-      installProgress: null,
-      installStep: null,
-      installStepLabel: null,
-      installStepTotal: null,
-      managed: false,
-      pid: null,
-      status: 'stopped'
-    });
-    return this.getStatus();
+    this.startController?.abort();
+    return this.stopPromise;
   }
 
-  async #ensureStartedInternal() {
+  async #stopManagedChild(field) {
+    const child = this[field];
+    if (child === null) return;
+    this[field] = null;
+    try {
+      await terminateChild(child);
+    } catch (error) {
+      this[field] = child;
+      throw error;
+    }
+  }
+
+  async #ensureStartedInternal(signal) {
+    if (signal.aborted) return this.getStatus();
     this.#setStatus({
       error: null,
       status: 'checking'
     });
 
-    if (await this.#isBackendHealthy()) {
+    const ownedAtCheck = this.child;
+    const healthy = await this.#isBackendHealthy();
+    if (signal.aborted) return this.getStatus();
+    if (healthy && (ownedAtCheck === null || (
+      this.child === ownedAtCheck && ownedAtCheck.exitCode == null && ownedAtCheck.signalCode == null
+    ))) {
       this.#setStatus({
         error: null,
-        managed: false,
-        pid: null,
-        source: 'external',
+        managed: ownedAtCheck !== null,
+        pid: ownedAtCheck?.pid ?? null,
+        source: ownedAtCheck === null ? 'external' : 'managed',
         status: 'ready'
       });
       return this.getStatus();
     }
+
+    await this.#stopManagedChild('child');
+    if (signal.aborted) return this.getStatus();
 
     const pythonExecutable = this.#resolvePythonExecutable();
     if (pythonExecutable === null) {
@@ -180,7 +208,8 @@ class BackendSupervisor {
 
     const pythonPathEntries = this.#resolvePythonPathEntries();
 
-    const installError = await this.#ensurePlaywrightBrowsers(pythonExecutable, pythonPathEntries);
+    const installError = await this.#ensurePlaywrightBrowsers(pythonExecutable, pythonPathEntries, signal);
+    if (signal.aborted) return this.getStatus();
     if (installError !== null) {
       this.#setStatus({
         error: installError,
@@ -207,6 +236,7 @@ class BackendSupervisor {
       source: 'managed',
       status: 'starting'
     });
+    if (signal.aborted) return this.getStatus();
     this.logger.write('INFO', 'Starting backend');
 
     const child = spawn(
@@ -214,6 +244,8 @@ class BackendSupervisor {
       ['-m', 'uvicorn', 'app.main:app', '--host', this.host, '--port', String(this.port), '--log-level', 'info'],
       {
         cwd: this.backendDir,
+        detached: process.platform !== 'win32',
+        windowsHide: true,
         env: {
           ...process.env,
           RPA_APP_DATA_DIR: this.appDataDir,
@@ -243,23 +275,24 @@ class BackendSupervisor {
 
     child.on('error', (error) => {
       processExited = true;
-      if (this.child === child) this.child = null;
+      if (this.child !== child) return;
+      this.child = null;
       const message = redactLogText(error.message);
       outputBuffer = message;
       this.logger.write('ERROR', `Backend spawn failed: ${message}`);
-      this.#setStatus({ error: message, managed: false, pid: null, source: 'managed', status: 'error' });
+      if (!signal.aborted) this.#setStatus({ error: message, managed: false, pid: null, source: 'managed', status: 'error' });
     });
 
-    child.on('exit', (code, signal) => {
+    child.on('exit', (code, exitSignal) => {
       processExited = true;
-      this.logger.write(code === 0 || signal === 'SIGTERM' ? 'INFO' : 'ERROR', `Backend exited (code=${code}, signal=${signal})`);
+      this.logger.write(code === 0 || exitSignal === 'SIGTERM' ? 'INFO' : 'ERROR', `Backend exited (code=${code}, signal=${exitSignal})`);
       if (this.child !== child) return;
       this.child = null;
-      if (this.status.status === 'stopped') {
+      if (signal.aborted || this.status.status === 'stopped') {
         return;
       }
       this.#setStatus({
-        error: redactLogText(outputBuffer.trim()) || `Backend 进程已退出 (code=${code ?? 'null'}, signal=${signal ?? 'null'})`,
+        error: redactLogText(outputBuffer.trim()) || `Backend 进程已退出 (code=${code ?? 'null'}, signal=${exitSignal ?? 'null'})`,
         managed: false,
         pid: null,
         source: 'managed',
@@ -271,6 +304,7 @@ class BackendSupervisor {
 
     for (const retryDelayMs of HEALTH_RETRY_DELAYS_MS) {
       const healthy = await this.#isBackendHealthy();
+      if (signal.aborted) return this.getStatus();
       if (healthy && !processExited && this.child === child) {
         this.#setStatus({
           error: null,
@@ -286,24 +320,27 @@ class BackendSupervisor {
       if (processExited) {
         break;
       }
-      await delay(retryDelayMs);
+      await delay(retryDelayMs, signal);
+      if (signal.aborted) return this.getStatus();
     }
 
+    const startupError = processExited
+      ? redactLogText(outputBuffer.trim()) || '后端进程已退出'
+      : `后端启动超时，健康检查未通过${outputBuffer.trim() ? `\n${redactLogText(outputBuffer.trim())}` : ''}`;
+    await this.#stopManagedChild('child');
+    if (signal.aborted) return this.getStatus();
     this.#setStatus({
-      error: redactLogText(outputBuffer.trim()) || '后端启动超时，健康检查未通过',
-      managed: !processExited,
-      pid: processExited ? null : child.pid ?? null,
+      error: startupError,
+      managed: false,
+      pid: null,
       source: 'managed',
       status: 'error'
     });
     return this.getStatus();
   }
 
-  /**
-   * 浏览器内核不随安装包分发（体积会暴涨几百 MB），首启才下载。
-   * 已存在时 `playwright install` 只是一次本地检查，耗时可忽略。
-   */
-  async #ensurePlaywrightBrowsers(pythonExecutable, pythonPathEntries) {
+  // 按当前 Playwright 版本补齐浏览器；缓存命中时只做本地检查。
+  async #ensurePlaywrightBrowsers(pythonExecutable, pythonPathEntries, signal) {
     this.#setStatus({
       error: null,
       installProgress: null,
@@ -315,10 +352,13 @@ class BackendSupervisor {
       source: 'managed',
       status: 'installing-browser'
     });
+    if (signal.aborted) return null;
 
     return new Promise((resolve) => {
       const child = spawn(pythonExecutable, ['-m', 'playwright', 'install', 'chromium'], {
         cwd: this.backendDir,
+        detached: process.platform !== 'win32',
+        windowsHide: true,
         env: {
           ...process.env,
           PLAYWRIGHT_BROWSERS_PATH: this.playwrightBrowsersDir,
@@ -330,17 +370,17 @@ class BackendSupervisor {
         stdio: ['ignore', 'pipe', 'pipe']
       });
 
-      // 超时按"停滞"计而不是总时长：慢网络下 250MB 可能超过任何固定死线，
-      // 只要进程还在持续输出（进度在推进）就不该杀；90 秒无任何输出才判定卡死。
-      const STALL_TIMEOUT_MS = 90 * 1000;
-      let timer = null;
-      const resetTimer = () => {
-        if (timer !== null) clearTimeout(timer);
-        timer = setTimeout(() => {
-          child.kill('SIGKILL');
-          resolve(`浏览器组件下载已停滞超过 90 秒，请检查网络后点击重试\n${redactLogText(output.trim())}`);
-        }, STALL_TIMEOUT_MS);
+      this.installChild = child;
+      // CLI 进度输出稀疏；网络超时和重试交给 Playwright，不能按输出间隔误杀下载。
+      let settled = false;
+      const finish = (error) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', onAbort);
+        resolve(error);
       };
+      const onAbort = () => finish(null);
+      signal.addEventListener('abort', onAbort, { once: true });
 
       let output = '';
       // Playwright 的下载进度条用 \r 原地重绘（"|■■■ | 30% of 171 MiB"），
@@ -350,9 +390,6 @@ class BackendSupervisor {
       // 产物起始行 "Downloading <name> ..." 是普通换行输出，与 \r 重绘的进度条不同路，可单独识别。
       const seenArtifacts = new Set();
       let stepIndex = 0;
-      // 仅作为文案提示的经验值：以后 Playwright 版本调整下载产物数量，最坏情况只是
-      // "第 4/3 项"这种轻微文案瑕疵，不影响下载和进度本身。
-      const KNOWN_STEP_TOTAL = 3;
       const FRIENDLY_ARTIFACT_NAMES = {
         chromium: 'Chromium',
         'chromium-headless-shell': 'Headless Shell',
@@ -360,7 +397,7 @@ class BackendSupervisor {
       };
       const headerPattern = /Downloading\s+.+?\(playwright\s+([\w-]+)\s+v[\d.]+\)/g;
       const onChunk = (chunk) => {
-        resetTimer();
+        if (settled || signal.aborted) return;
         const text = String(chunk);
         output = `${output}${text}`.slice(-4000);
 
@@ -375,7 +412,7 @@ class BackendSupervisor {
               installProgress: 0,
               installStep: stepIndex,
               installStepLabel: FRIENDLY_ARTIFACT_NAMES[internalName] ?? internalName,
-              installStepTotal: KNOWN_STEP_TOTAL
+              installStepTotal: null
             });
           }
         }
@@ -393,22 +430,21 @@ class BackendSupervisor {
       };
       captureProcessOutput(child, this.logger, 'browser-install', onChunk);
 
-      resetTimer();
-
       child.on('error', (err) => {
-        clearTimeout(timer);
-        this.logger.write('ERROR', `Browser install failed: ${err.message}`);
-        resolve(`浏览器组件安装失败：${redactLogText(err.message)}`);
+        if (this.installChild === child) this.installChild = null;
+        this.logger.write('ERROR', `Browser install failed: ${redactLogText(err.message)}`);
+        finish(`浏览器组件安装失败：${redactLogText(err.message)}`);
       });
 
       child.on('exit', (code) => {
-        clearTimeout(timer);
+        if (this.installChild === child) this.installChild = null;
         if (code === 0) {
-          resolve(null);
+          finish(null);
           return;
         }
-        resolve(redactLogText(output.trim()) || `浏览器组件安装失败 (code=${code ?? 'null'})`);
+        finish(redactLogText(output.trim()) || `浏览器组件安装失败 (code=${code ?? 'null'})`);
       });
+      if (signal.aborted) onAbort();
     });
   }
 
@@ -502,9 +538,80 @@ class BackendSupervisor {
   }
 }
 
-function delay(timeoutMs) {
+function signalChild(child, signal) {
+  if (process.platform !== 'win32') {
+    try {
+      // 受管进程以独立进程组启动，同时终止 Python 拉起的 Node 安装器。
+      process.kill(-child.pid, signal);
+    } catch (error) {
+      if (error.code !== 'ESRCH') throw error;
+    }
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    const executable = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe');
+    const args = ['/PID', String(child.pid), '/T'];
+    if (signal === 'SIGKILL') args.push('/F');
+    const killer = spawn(executable, args, { windowsHide: true, stdio: 'ignore' });
+    killer.once('error', reject);
+    killer.once('exit', (code) => {
+      if (code === 0 || child.exitCode != null || child.signalCode != null) resolve();
+      else reject(new Error(`无法终止后端进程树 (code=${code ?? 'null'})`));
+    });
+  });
+}
+
+function terminateChild(child) {
+  if (child.exitCode != null || child.signalCode != null || !child.pid) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let forceTimer = null;
+    let killTimer = null;
+    let forced = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(forceTimer);
+      clearTimeout(killTimer);
+      child.removeListener('exit', onExit);
+      child.removeListener('error', onError);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onExit = () => finish();
+    const onError = (error) => finish(error);
+    const force = () => {
+      if (settled || forced) return;
+      forced = true;
+      clearTimeout(forceTimer);
+      try {
+        void signalChild(child, 'SIGKILL').catch(finish);
+      } catch (error) {
+        finish(error);
+      }
+      if (!settled) killTimer = setTimeout(() => finish(new Error('无法确认后端进程已退出')), 5000);
+    };
+    child.once('exit', onExit);
+    child.once('error', onError);
+    forceTimer = setTimeout(force, 3000);
+    try {
+      void signalChild(child, 'SIGTERM').catch(force);
+    } catch {
+      force();
+    }
+  });
+}
+
+function delay(timeoutMs, signal) {
+  if (signal?.aborted) return Promise.resolve();
   return new Promise((resolve) => {
-    setTimeout(resolve, timeoutMs);
+    const finish = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    signal?.addEventListener('abort', finish, { once: true });
   });
 }
 

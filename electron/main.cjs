@@ -269,7 +269,9 @@ app.whenReady().then(() => {
     }
     app.__rpaBackendStopping = true;
     event.preventDefault();
-    void backendSupervisor.stop().finally(() => {
+    void backendSupervisor.stop().catch((error) => {
+      appLogger.write('ERROR', `Backend shutdown failed: ${redactLogText(error.message)}`);
+    }).finally(() => {
       app.exit(0);
     });
   });

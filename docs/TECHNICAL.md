@@ -23,6 +23,7 @@ Electron 承载 React 前端，通过桥接调用本机 FastAPI 服务。SQLite 
 
 | 模块 | 主要入口 |
 | --- | --- |
+| 桌面进程管理 | `electron/backendSupervisor.cjs`：后端启动、停止与浏览器安装 |
 | 节点配置与校验 | `src/types/rpa.ts`、`src/lib/flowDefinition.ts`、`src/lib/nodeConfigDraft.ts`、`src/lib/runValidation.ts` |
 | 任务执行 | `backend/app/services/task_manager.py` 与各类 `*_action_runner.py` |
 | 浏览器两端 | `backend/app/services/browser_action_runner.py`、`backend/app/services/extension_executor.py`、`extension/entrypoints/` |
