@@ -3,4 +3,5 @@ allowBuilds:
   electron-winstaller: false
   esbuild: true
 minimumReleaseAgeExclude:
-  - electron@43.7.6
+  - react-dom@19.3.1
+  - react@19.3.1
