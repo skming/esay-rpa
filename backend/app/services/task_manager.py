@@ -566,7 +566,8 @@ class TaskManager:
             "status": status or record.snapshot.status,
             "progress": progress or record.snapshot.progress,
             "result": result if result is not None else record.snapshot.result,
-            "artifacts": artifacts if artifacts is not None else record.snapshot.artifacts,
+            # 隔离运行列表，防止后续 append 改写已持久化快照，使变化检测漏掉新增产物。
+            "artifacts": list(artifacts if artifacts is not None else record.snapshot.artifacts),
             "variables": variables if variables is not None else record.variables.snapshots(),
             "error": redact_log_text(error, record.variables.sensitive_values()) if error else error,
             "updated_at": datetime.now(UTC),

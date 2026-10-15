@@ -138,21 +138,32 @@ async def test_snapshot_tracking_keeps_changes_made_during_persistence(tmp_path,
     variables = RuntimeVariableStore.from_initial({"count": 1})
     snapshot = build_task_snapshot().model_copy(update={"variables": variables.snapshots()})
     record = TaskRecord(request=request, snapshot=snapshot, persisted_snapshot=snapshot, variables=variables)
+    first_artifact = ArtifactSnapshot(
+        artifactId="artifact-1", taskId=snapshot.task_id, artifactType="dataset", filename="first.json",
+        storageUrl="file:///tmp/first.json", contentType="application/json", sizeBytes=2, createdAt=datetime.now(UTC),
+    )
+    second_artifact = first_artifact.model_copy(update={"artifact_id": "artifact-2", "filename": "second.json"})
+    record.artifacts.append(first_artifact)
     manager = TaskManager(FakeRunner(), LogBroker(), task_store=store)
     save = store.save_task
     async def interleaved_save(task, request, **options):
         record.variables.set("count", 2)
+        record.artifacts.append(second_artifact)
         record.snapshot = record.snapshot.model_copy(update={"variables": record.variables.snapshots()})
         return await save(task, request, **options)
     try:
         await save(snapshot, request)
         monkeypatch.setattr(store, "save_task", interleaved_save)
-        await manager._update_snapshot(record)
+        await manager._update_snapshot(record, artifacts=record.artifacts)
         assert record.persisted_snapshot.variables[0].value == "1"
+        assert record.persisted_snapshot.artifacts == [first_artifact]
+        persisted = await store.get_task(snapshot.task_id)
+        assert persisted.artifacts == [first_artifact]
         monkeypatch.setattr(store, "save_task", save)
-        await manager._update_snapshot(record)
+        await manager._update_snapshot(record, artifacts=record.artifacts)
         restored = await store.get_task(snapshot.task_id)
         assert restored.variables[0].value == "2"
+        assert restored.artifacts == [first_artifact, second_artifact]
     finally:
         await engine.dispose()
 

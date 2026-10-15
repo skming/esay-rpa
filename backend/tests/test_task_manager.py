@@ -131,6 +131,77 @@ async def test_failed_terminal_persistence_keeps_task_record(tmp_path) -> None:
     assert record.persisted_snapshot.status == "running"
 
 
+@pytest.mark.parametrize("status", ["success", "error", "stopped"])
+@pytest.mark.parametrize("artifact_backend", ["local", "minio"])
+async def test_all_node_artifacts_survive_task_completion_and_reload(tmp_path, status, artifact_backend) -> None:
+    from tests.test_artifact_store import FakeMinioClient
+
+    class TerminalBrowser(FakeBrowserActionRunner):
+        def __init__(self):
+            super().__init__()
+            self.reached_finish = asyncio.Event()
+
+        async def run(self, node, variables, context, *, timeout_ms):
+            if node["id"] == "finish":
+                self.reached_finish.set()
+                if status == "error":
+                    raise RuntimeError("target unavailable")
+                if status == "stopped":
+                    await asyncio.Event().wait()
+            return await super().run(node, variables, context, timeout_ms=timeout_ms)
+
+    engine = create_schedule_engine(f"sqlite+aiosqlite:///{tmp_path / 'artifacts.db'}")
+    store = SqlAlchemyTaskStore(engine)
+    await store.create_schema()
+    artifacts = LocalArtifactStore(tmp_path / "runs") if artifact_backend == "local" else MinioArtifactStore(FakeMinioClient(), bucket="test")
+    manager = TaskManager(FakeRunner(), LogBroker(), task_store=store, artifact_store=artifacts)
+    browser = TerminalBrowser()
+    manager._browser_action_runner = browser
+    manager._file_action_runner = FileActionRunner(workspace_root=tmp_path)
+    try:
+        snapshot = await manager.start_task(RunTaskRequest(
+            flowName="artifact persistence", screenshot=True,
+            flowDefinition={
+                "nodes": [
+                    {"id": "open", "type": "browser.open", "targetUrl": "https://example.com"},
+                    {"id": "extract", "type": "browser.extract", "selector": "h1", "outputVariable": "rows"},
+                    {"id": "write", "type": "file.write", "path": "report.json", "content": "[]"},
+                    {"id": "finish", "type": "browser.click", "selector": "#finish"},
+                ],
+                "edges": [
+                    {"source": "open", "target": "extract"},
+                    {"source": "extract", "target": "write"},
+                    {"source": "write", "target": "finish"},
+                ],
+            },
+        ))
+        record = manager._tasks[snapshot.task_id]
+        await asyncio.wait_for(browser.reached_finish.wait(), timeout=5)
+        if status == "stopped":
+            await manager.stop_task(snapshot.task_id)
+        await asyncio.wait_for(record.done_waiter.wait(), timeout=5)
+        assert snapshot.task_id not in manager._tasks
+        assert artifacts.list_task_artifacts(snapshot.task_id) == []
+
+        reloaded = TaskManager(FakeRunner(), LogBroker(), task_store=store, artifact_store=artifacts)
+        restored = await reloaded.get_task(snapshot.task_id)
+        assert restored is not None and restored.status == status
+        expected = ["open.png", "extract.png", "report.json"]
+        if status == "success":
+            expected += ["finish.png", "scrape-result.json"]
+        elif status == "error":
+            expected += ["failure_finish.png"]
+        saved = await reloaded.get_artifacts(snapshot.task_id)
+        assert saved is not None
+        assert sorted(artifact.filename for artifact in saved) == sorted(expected)
+        assert any(variable.name == "rows" for variable in restored.variables)
+        for artifact in saved:
+            assert await reloaded.get_artifact_content(snapshot.task_id, artifact.artifact_id) is not None
+    finally:
+        await manager.stop_workers()
+        await engine.dispose()
+
+
 @pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
 @pytest.mark.parametrize("artifact_backend", ["local", "local-custom-root", "minio"])
 async def test_prune_run_outputs_synchronizes_artifact_records(tmp_path, monkeypatch, store_kind, artifact_backend) -> None:
