@@ -1,20 +1,10 @@
-# Easy RPA Chrome Extension
+# Chrome 扩展开发
 
-Chrome 扩展让 Easy RPA 可以操作用户真实浏览器标签页，复用当前 Chrome 登录态。它适合企业 SSO、需要先由用户完成验证的站点，以及必须在真实浏览器中完成的页面操作。
+客户端安装和使用见 [使用指南](../docs/OVERVIEW.md#创建与运行)。
 
-## 客户端安装与使用
+## 启动与连接
 
-打包客户端已包含扩展文件，设置页提供安装入口和连接状态。加载客户端提供的扩展后会自动连接，无需输入扩展 ID。此前加载的旧版扩展需在 Chrome 扩展管理页重新加载。流程可在顶部运行菜单选择“当前 Chrome”。客户端重启后扩展会自动恢复连接。
-
-## 开发启动
-
-先启动桌面端/后端：
-
-```bash
-pnpm run stack:dev
-```
-
-再启动扩展开发服务：
+先在仓库根目录启动 `pnpm stack:dev`，再运行：
 
 ```bash
 cd extension
@@ -22,35 +12,27 @@ pnpm install
 pnpm dev
 ```
 
-在 Chrome 扩展管理页加载 WXT 输出的开发扩展。扩展会连接：
-
-```text
-ws://127.0.0.1:8765/ws/extension/bridge
-```
-
-## 检查连接
+在 Chrome 扩展管理页加载 WXT 输出的开发扩展。默认桥接地址为 `ws://127.0.0.1:8765/ws/extension/bridge`。
 
 ```bash
 curl http://127.0.0.1:8765/api/extension/status
 ```
 
-返回结果中的 `canExecute` 为 `true` 表示扩展已启用、连接可用，可以执行流程。
+`canExecute=true` 表示扩展已启用且连接可执行。
 
-## 支持能力
+## 执行边界
 
-- 页面快照：`query`，返回 `ref/name/text/rect/visible`
-- 语义查找：`find`
-- 浏览器动作：`browser.open`、`click`、`fill`、`extract`、`hover`、`select`、`press`、`scroll`
-- 标签页：`browser.tab.open`、`browser.tab.switch`、`browser.tab.close`
-- 截图：`browser.screenshot`
-- 可视化：目标元素高亮、敏感操作确认 Banner
-- 可信输入：动作带 `trusted: true` 时通过 Chrome Debugger/CDP 执行点击或输入
+- 助手探索与流程运行分别管理受控标签页；探索传入 URL 时复用目标页或新建页，省略 URL 时绑定当前活动页。
+- content script 提供页面观察与 DOM 动作；可信点击和输入通过 Chrome Debugger/CDP 执行，会短暂显示调试提示。
+- content script 不能直接读取跨域 iframe。敏感动作通过确认 Banner 执行，并记录审计日志。
+- 分页协议与回执要求见 [分页执行](../docs/TECHNICAL.md#分页执行)。
 
-## 使用边界
+## 回归验证
 
-- 扩展操作的是用户真实 Chrome，不适合作为无人值守主路径。
-- 助手探索传入 URL 时复用目标标签页或新建标签页；省略 URL 时绑定当前活动页。后续观察与交互保持该绑定。
-- 流程运行的受控标签页与助手探索会话分别管理。
-- 跨域 iframe 不能由 content script 直接读取。
-- CDP 可信输入会短暂显示 Chrome 调试提示。
-- 破坏性动作应启用敏感操作确认并保留审计日志。
+修改协议后同时使用对应版本的后端与扩展，按 [开发验证](../docs/TECHNICAL.md#验证) 准备并构建，在仓库根目录运行两端一致性测试：
+
+```bash
+pnpm backend:test tests/test_real_executor_parity.py -ra
+```
+
+测试使用临时 Profile 和本地页面，覆盖异步分页、安全上限和 URL 回跳。

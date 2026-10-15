@@ -1,6 +1,6 @@
 # Electron 打包说明
 
-Easy RPA 桌面端使用 Electron + Vite 构建，打包工具为 `electron-builder`。当前桌面包会同时携带前端 UI、Electron Main Process 和 Python FastAPI 后端运行时，应用启动后由 Electron 主进程自动托管后端服务。
+Easy RPA 桌面端使用 Electron + Vite 构建，打包工具为 `electron-builder`。当前桌面包会同时携带前端 UI、Electron Main Process 和 Python FastAPI 后端运行时，应用启动后由 Electron 主进程自动托管后端服务。以下命令在仓库根目录执行。
 
 ## 本地验证目录包
 
@@ -31,29 +31,13 @@ macOS 的 arm64 与 x64 包必须分别在对应架构的 runner 上构建。打
 
 ## 生成安装包
 
-```bash
-pnpm electron:dist
-```
+| 平台 | 命令 | 产物 |
+| --- | --- | --- |
+| macOS | `pnpm electron:dist` | `.dmg`、`.zip` |
+| Windows | `pnpm electron:dist:win` | NSIS `.exe` |
+| Linux | `pnpm electron:dist:linux` | `.AppImage` |
 
-打包入口按平台区分：
-
-- macOS：`pnpm electron:dist`，生成 `.dmg`、`.zip`
-- Windows：`pnpm electron:dist:win`，生成 NSIS `.exe`
-- Linux：`pnpm electron:dist:linux`，生成 `.AppImage`
-
-Windows 安装包需要在 Windows 环境执行：
-
-```bash
-pnpm electron:dist:win
-```
-
-Linux 安装包需要在 Linux 环境执行：
-
-```bash
-pnpm electron:dist:linux
-```
-
-不要在 macOS 上强行交叉构建 Windows/Linux 包。桌面包内包含平台相关的 Python/Playwright 原生运行时，跨平台构建会产出前端可打开但后端不可运行的坏包。
+各平台必须在对应系统构建。包内包含平台相关的 Python/Playwright 原生运行时，不能在 macOS 上交叉生成可用的 Windows/Linux 包。
 
 默认 `electron:pack` / `electron:dist` 会跳过代码签名，用于本地和普通 CI 验证可重复打包。正式发布使用：
 
@@ -97,13 +81,7 @@ CSC_LINK=...
 CSC_KEY_PASSWORD=...
 ```
 
-仓库提供 `.github/workflows/release.yml`，在 tag `v*` 或手动触发时构建：
-
-- macOS：签名 + 公证 `.dmg` / `.zip`
-- Windows：NSIS `.exe`
-- Linux：`.AppImage`
-
-GitHub Secrets 名称与上面的环境变量一致。
+仓库提供 `.github/workflows/release.yml`，在 tag `v*` 或手动触发时构建上述平台产物；macOS 执行签名与公证。GitHub Secrets 名称与上面的环境变量一致。
 
 ## 后端运行模型
 
@@ -122,13 +100,7 @@ http://127.0.0.1:8765
 - `backend/pyproject.toml`
 - `backend/uv.lock`
 
-AI 模型目录（`backend/config/model_catalog.json`）在打包时自动随包携带，无需额外配置。若需新增或修改模型，直接编辑该 JSON 文件，重新打包即可生效。
-
-运行期数据默认写入以下目录，布局见 [README](README.md#数据目录)，不写入应用包：
-
-```text
-~/.easy-rpa/
-```
+运行期数据不写入应用包，位置与布局见 [数据目录](TECHNICAL.md#数据目录)。
 
 开发态如需改连外部后端，仍可在启动桌面端前设置：
 
@@ -150,12 +122,6 @@ node tools/measure_electron_startup.cjs \
 
 测量脚本会设置 `RPA_STARTUP_PROBE=1`，Electron 主进程在主窗口 `ready-to-show` 时输出结构化事件；脚本以 `spawn` 到该事件的耗时作为冷启动样本。默认连接不可达的本地后端端口，避免后端网络请求影响首屏窗口可用时间。
 
-产物：
-
-```text
-output/bench/electron-startup.json
-```
-
 测量边界：
 
 - 该测量只能证明当前操作系统和当前硬件上的目录包冷启动，不代表 Windows/Linux 或签名安装包。
@@ -171,20 +137,12 @@ output/bench/electron-startup.json
 ## 常见问题
 
 - Electron 生产模式使用 `loadFile` 加载 `dist/index.html`，Vite `base` 必须保持 `./`，否则静态资源会按文件系统根路径解析导致白屏。
-- 不要在打包态直接使用 `.venv/bin/python`。该文件在很多机器上是指向 Homebrew/Miniconda 的绝对软链接，正式包会依赖构建机本地路径。当前 Electron 主进程打包态优先使用 `resources/backend/python/bin/python3.12`。
 - `electron-builder` 的 Windows 安装器依赖可能触发 pnpm build-script 审批提示，跨平台制品应在对应平台 CI 中单独验证。
-- Windows `.exe` 不会在 macOS 打包命令中出现；必须在 Windows 本机或 Windows CI 构建。
-- macOS 未签名产物会被 Gatekeeper（macOS 应用安全校验）拦截，不应直接发给终端用户。
-- `electron:dist:signed` 缺少 Apple Developer 或证书变量时会失败，这是预期的发布门禁。
 
 ## 发布验证
 
 - 每次打包前执行 `pnpm build` 和 Electron 主进程语法检查。
-- 每次打包前执行 `pnpm backend:bundle:prepare` 和 `pnpm backend:bundle:verify`，确保随包 Python 与后端依赖可用。
+- 按 [本地验证目录包](#本地验证目录包) 完成后端运行时门禁；对外发布前按 [生成安装包](#生成安装包) 完成凭据校验与签名。
 - 生产发布时将桌面端与后端服务版本一起记录，避免 API 合约漂移。
-- 打包验证时检查 `release/**/resources/backend/.venv` 是否存在，否则桌面端虽然能启动窗口，但后端会进入 `missing` 状态。
-- 检查 `release/**/resources/backend/config/model_catalog.json` 是否存在，缺失时 AI 模型列表为空，无法选择模型。
 - 验证产物内无 `__pycache__/` 目录、`.pyc` 文件、测试目录或缓存文件（由 `electron-builder.config.cjs` 的 `filter` 规则自动排除）。
-- 对外发布使用 release workflow 开启签名和公证，本地 `electron:pack` 保持无签名验证链路。
-- 发布前执行 `node tools/verify_release_env.cjs darwin` 或 `win32`，避免缺失凭据时产出未签名制品。
 - `release/` 是构建产物目录，已加入 `.gitignore`，不要纳入源码管理。

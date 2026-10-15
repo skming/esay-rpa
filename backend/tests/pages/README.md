@@ -1,7 +1,11 @@
-# 真实浏览器取证用的本地页面
+# 本地测试页面
 
-给 `tests/test_real_page_probe.py` 用：探测与交互的判据只在真实 DOM 上才算数，
-假对象能让 `matches`、shadow 穿透、弹层是否真的打开这几件事全部「测试里通、页面上不通」。
+| 入口 | 用途 |
+| --- | --- |
+| `tests/test_real_page_probe.py` | DOM 探测与真实交互 |
+| `tests/test_real_page_flow_replay.py` | 既定流程重放与输出校验 |
+| `python -m evals.run_e2e` | 模型创建、执行与验收流程 |
 
-`holdout/` 是留出集：调配方、改 skills 时**不许打开它**。配方一旦按某个页面调过，
-它就只能证明「这个页面能过」，证不了「换个实现也能过」——留出集是唯一还能回答后者的东西。
+`test_real_executor_parity.py` 在测试内另行构造页面。环境与命令见 [开发验证](../../../docs/TECHNICAL.md#验证) 和 [AI 评测](../../evals/README.md)。
+
+`holdout/` 是留出集：调配方或组件技能时不得查看。已用于调优的页面不能再作为跨页面泛化证据。

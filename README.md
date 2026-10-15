@@ -1,127 +1,22 @@
 # Easy RPA
 
-Easy RPA 是一个本地桌面端 RPA（机器人流程自动化）工具，用于通过可视化流程画布创建、运行和调试 Web 自动化任务。项目面向开发者和技术用户，重点覆盖网页采集、表单填写、分页抓取、文件/Excel 处理、定时调度和 AI 辅助流程生成。
+本地桌面端 Web 自动化工具，支持可视化流程、网页采集、表单操作、文件与 Excel 处理、定时任务和 AI 辅助创建。
 
-## 核心能力
+## 使用说明
 
-- 可视化流程编排：基于节点和连线组织浏览器操作、控制流、变量、脚本和文件处理。
-- Web 自动化：打开页面、点击、填表、滚动、等待、截图、表格/列表提取。
-- 数据处理：JSON、正则、字符串、列表、数学、类型转换、加解密等轻量处理。
-- 文件与 Excel：读写文件、CSV/JSON/Excel 导出、Excel 行操作。
-- 定时调度：基于 Cron 表达式触发流程，查看运行历史。
-- AI 助手：通过工具调用创建流程、修改节点、运行流程、读取错误、检查 DOM、审计输出；凭据只在输入变量面板配置，不进入对话或工具参数。
+- [使用指南](docs/OVERVIEW.md)：创建与运行流程、分页配置、AI 助手和功能边界。
 
-## 技术栈
+## 技术文档
 
-| 层级   | 技术                                                     |
-| ------ | -------------------------------------------------------- |
-| 桌面端 | Electron                                                 |
-| 前端   | React、TypeScript、Tailwind CSS、Base UI、@xyflow/react  |
-| 后端   | Python 3.12+、FastAPI、SQLite                            |
-| 自动化 | Playwright、Scrapling                                    |
-| AI     | LiteLLM 多模型供应商路由                                 |
+- [开发指南](docs/TECHNICAL.md)：环境搭建、架构、执行约束、数据目录与验证命令。
+- [扩展开发](extension/README.md)：Chrome 扩展启动、连接与两端回归。
+- [AI 评测](backend/evals/README.md)：模型行为、真实页面 E2E 与评分规则。
+- [桌面端打包](docs/ELECTRON_PACKAGING.md)：构建、签名与发布。
+- [本地测试页面](backend/tests/pages/README.md)：页面用途与留出集约定。
 
-## 快速启动
+## 产品与设计
 
-需要 Node.js、pnpm、uv 和 Python 3.12。先安装前后端依赖及浏览器：
+- [产品原则](PRODUCT.md)
+- [视觉规范](DESIGN.md)
 
-```bash
-pnpm install
-cd backend
-uv sync --locked
-uv run playwright install chromium
-cd ..
-```
-
-启动完整开发栈：
-
-```bash
-pnpm stack:dev
-```
-
-仅启动前端：
-
-```bash
-pnpm dev
-```
-
-仅启动后端：
-
-```bash
-pnpm backend:dev
-```
-
-若启动失败，先检查后端日志及端口占用：
-
-```bash
-lsof -nP -iTCP:8765 -sTCP:LISTEN
-```
-
-确认进程归属后再停止对应开发进程，不要直接终止所有占用端口的进程。
-
-## 执行模式
-
-| 模式 | 适用场景 | 说明 |
-| --- | --- | --- |
-| Playwright | 默认后台自动化、定时任务、无人值守流程 | 使用 Easy RPA 管理的浏览器 Profile，稳定可复现 |
-| Chrome 扩展 | 复用用户真实 Chrome 登录态、企业 SSO、敏感操作确认 | 需要扩展在线，复用真实浏览器会话，不建议作为无人值守主路径 |
-
-流程可在顶部运行菜单切换为当前 Chrome；扩展说明见 [extension/README.md](extension/README.md)。
-
-## 常用命令
-
-| 命令                       | 说明                          |
-| -------------------------- | ----------------------------- |
-| `pnpm build`               | 类型检查 + ESLint + 构建前端  |
-| `pnpm lint`                | 前端 ESLint                   |
-| `pnpm backend:lint`        | 后端 ruff                     |
-| `pnpm test`                | 运行前端测试                  |
-| `pnpm backend:test`        | 运行后端测试                  |
-| `pnpm icons:generate`      | 重新生成应用图标              |
-| `pnpm electron:pack`       | 生成 macOS 目录包             |
-| `pnpm electron:dist`       | 构建 macOS 发布包             |
-| `pnpm electron:dist:win`   | 构建 Windows 发布包           |
-| `pnpm electron:dist:linux` | 构建 Linux 发布包             |
-
-## 数据目录
-
-默认本地数据目录：
-
-```text
-~/.easy-rpa/
-```
-
-主要包含：
-
-- `db/`：流程、调度、任务记录。
-- `ai/`：AI 配置和对话记录。
-- `runtime/browser/`：浏览器 Profile 与 Cookie。
-- `workspace/runs/`：流程运行产物。
-- `cache/`：内联脚本落盘等可重建的中间文件，删掉不丢数据。
-- `logs/`：后端、桌面端诊断和扩展操作审计日志，按天归档并清理过期文件。
-
-`backend.log` 记录应用异常与服务日志；`backend-process.log` 记录桌面端启动后端、安装浏览器时的进程输出；`electron.log` 记录桌面端启动与渲染进程异常；`extension_bridge_audit.jsonl` 记录扩展动作的归属、耗时和结果，不保存动作输入值或提取结果。流程执行日志仍在任务记录中查看。
-
-日志按 UTC 日期归档，默认保留 30 天，不限制单个文件大小。归档在启动或轮转时清理，后端可用 `RPA_LOG_BACKUP_COUNT`、`RPA_LOG_RETENTION_DAYS` 调整归档数量与天数；日志级别使用 `RPA_LOG_LEVEL` 与 `RPA_LOG_LEVELS`。
-
-## 项目文档
-
-- [OVERVIEW.md](OVERVIEW.md)：完整能力说明（节点清单、执行模型、AI 助手、数据存储）。
-- [PRODUCT.md](PRODUCT.md)：产品定位与设计原则简报。
-- [DESIGN.md](DESIGN.md)：视觉设计系统规范（色板、字体、组件、Do's and Don'ts）。
-- [ELECTRON_PACKAGING.md](ELECTRON_PACKAGING.md)：桌面端打包、签名与发布说明。
-- [extension/README.md](extension/README.md)：Chrome 扩展开发与调试。
-- [backend/evals/README.md](backend/evals/README.md)：RPA 助手行为回归评测集。
-
-## 当前功能边界
-
-- 主要面向 Web 自动化，不覆盖原生桌面 GUI 自动化。
-- 图形验证码、滑块验证、点选验证不做自动破解，也不在运行中暂停等待交互。请先在扩展连接的浏览器标签页完成登录或验证，再运行流程；运行时命中验证组件会失败并保留现场证据。
-- iframe（`>>>` 穿透语法）与 open Shadow DOM（CSS 自动穿透）已支持；closed Shadow DOM 不可及。
-- 复杂前端组件如日期范围、多选下拉、级联选择仍是后续重点增强方向。
-
-## 文档维护
-
-README 维护安装和导航；OVERVIEW 维护能力与行为边界；PRODUCT 和 DESIGN 分别维护产品原则与设计约束；打包、扩展和评测步骤放在各自文档。
-
-修改功能时同步其所属文档。命令和参数以源码为依据，避免重复抄录版本、阈值和性能数字；评测结果必须注明条件，未运行不能写成通过。
+使用指南维护操作和功能边界，技术文档维护实现与验证；字段、模型目录和阈值以源码为准，不重复维护完整清单。
