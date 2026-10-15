@@ -25,7 +25,7 @@ from app.services.ai_prompts import SYSTEM_PROMPT, render_guard_contract
 from app.services.ai_tool_events import attach_tool_events, reduce_evidence_state
 from app.services.ai_tools.executor import RpaToolExecutor
 from app.services.ai_tools.lint_diff import ChangeContext
-from app.services.ai_tools.schemas import TOOL_SCHEMAS, validate_tool_arguments
+from app.services.ai_tools.schemas import validate_tool_arguments
 from app.services.flow_service import FlowService
 from app.services.runtime_variables import RuntimeVariableStore
 from app.services.scheduler_service import ScheduleService

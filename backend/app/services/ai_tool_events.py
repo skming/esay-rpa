@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from app.services.ai_tool_registry import FLOW_WRITE_TOOLS
+
 if TYPE_CHECKING:
-    # 只在类型检查期引用：本模块运行期保持零 ai_* 依赖，属性读写不需要这个类。
+    # 只在类型检查期引用状态，避免事件层反向依赖会话实现。
     from app.services.ai_guard_state import GuardState
 
 
@@ -15,7 +17,7 @@ def attach_tool_events(tool_name: str, result: Any) -> Any:
     ):
         return result
     events: list[dict[str, Any]] = []
-    if tool_name in {"create_flow", "update_flow", "apply_node_fix", "set_acceptance_contract"}:
+    if tool_name in FLOW_WRITE_TOOLS:
         if result.get("execution_changed") is False:
             return result
         # 写入成功一定产生新 revision；缺少 revision 表示工具没有真正修改流程，

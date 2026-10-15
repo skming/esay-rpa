@@ -10,32 +10,11 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
+from app.services.ai_tool_registry import FLOW_WRITE_TOOLS, PARALLEL_SAFE_TOOLS, WRITE_TOOLS
+
 if TYPE_CHECKING:
-    # 只在类型检查期引用：ai_guards 运行期保持零 ai_* 依赖，getattr 取字段不需要这个类。
+    # 只读状态字段，不在运行期反向依赖会话状态。
     from app.services.ai_guard_state import GuardState
-
-# ── 工具分组 ──────────────────────────────────────────────────────────────────
-
-# 自愈诊断等只读场景禁用的写入类工具
-WRITE_TOOLS = frozenset({
-    "create_flow", "update_flow", "apply_node_fix", "set_acceptance_contract", "run_flow",
-    "stop_run", "create_schedule", "toggle_schedule",
-    # interact_page 是真的在用户已登录的浏览器上点、填、回车，不是读页面：
-    # 无人值守自愈时它可能替用户提交一张表单，所以按写入类工具收掉。
-    "interact_page",
-})
-
-FLOW_WRITE_TOOLS = frozenset({"create_flow", "update_flow", "apply_node_fix", "set_acceptance_contract"})
-
-# 可并发起跑的工具：纯读、无副作用、不参与收敛记账。
-# 不含 inspect_page / inspect_screenshot / get_run_error——它们会写证据指纹与
-# fresh_page_evidence，并发会让「同一次取证重复调用」判不出先后。
-PARALLEL_SAFE_TOOLS = frozenset({
-    "get_run_logs",
-    "get_run_output",
-    "list_node_types",
-    "list_schedules",
-})
 
 _CREDENTIAL_NAME_TOKENS = (
     "password", "passwd", "pwd", "token", "secret", "api_key", "apikey", "credential",

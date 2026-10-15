@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any, get_args
 
 from app.models.schemas import FlowAcceptanceContract, TaskLogLevel
+from app.services.ai_tool_registry import bind_tool_schemas
 
 from jsonschema import Draft202012Validator
 
@@ -49,7 +50,7 @@ def _acceptance_contract_schema() -> dict[str, Any]:
 
 _ACCEPTANCE_CONTRACT_SCHEMA = _acceptance_contract_schema()
 
-TOOL_SCHEMAS: list[dict[str, Any]] = [
+TOOL_SCHEMAS: list[dict[str, Any]] = bind_tool_schemas([
     {
         "type": "function",
         "function": {
@@ -606,7 +607,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
-]
+])
 
 
 # 完整契约只展示一次，两个写入口仍使用相同的严格校验。

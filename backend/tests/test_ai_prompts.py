@@ -14,6 +14,7 @@ from app.services.ai_prompts import (
 )
 from app.services.ai_tools import lint, lint_diff, lint_scenarios
 from app.services.ai_tools.schemas import TOOL_SCHEMAS
+from app.services.ai_tool_registry import TOOL_REGISTRY
 from app.services.ai_tools.executor import RpaToolExecutor
 
 # 只留给 ai_flow_state 每轮重建状态块用，不作为工具暴露给模型。
@@ -131,8 +132,8 @@ def test_tool_schema_names_match_the_executor_dispatch_table() -> None:
     多出任何一个都意味着有工具被误删或漏接。
     """
     schema_names = {item["function"]["name"] for item in TOOL_SCHEMAS}
-    dispatch_source = inspect.getsource(RpaToolExecutor._dispatch)
-    dispatch_names = set(re.findall(r'case "([a-z_]+)"', dispatch_source))
+    dispatch_names = set(TOOL_REGISTRY)
+    assert all(callable(getattr(RpaToolExecutor, spec.handler, None)) for spec in TOOL_REGISTRY.values())
 
     assert schema_names <= dispatch_names, schema_names - dispatch_names
     assert dispatch_names - schema_names == PLATFORM_ONLY_TOOLS

@@ -29,6 +29,7 @@ from app.services.extension_executor import ExtensionBusyError, extension_busy_m
 import app.services.ai_tools.extension_page_channel as _extension_page
 from app.services.ai_tools.catalog import REMOVED_FLOW_NODE_TYPES, select_node_types
 from app.services.ai_tools.schemas import validate_tool_arguments
+from app.services.ai_tool_registry import TOOL_REGISTRY
 from app.services.ai_tools.diagnostics import (
     SELECTOR_MATCH_HIDDEN_OR_NOT_VISIBLE,
     SELECTOR_MATCH_NOT_VISIBLE,
@@ -416,53 +417,17 @@ class RpaToolExecutor:
         self, name: str, args: dict[str, Any], progress_sink: dict[str, Any] | None,
         change_context: ChangeContext | None,
     ) -> dict[str, Any]:
-        match name:
-            case "lint_flow":
-                return await self._lint_flow_tool(**args)
-            case "list_node_types":
-                return await self._list_node_types(**args)
-            case "get_flow":
-                return await self._get_flow(**args)
-            case "validate_flow":
-                return await self._validate_flow(**args)
-            case "create_flow":
-                return await self._create_flow(**args, change_context=change_context)
-            case "update_flow":
-                return await self._update_flow(**args, change_context=change_context)
-            case "run_flow":
-                return await self._run_flow(**args, progress_sink=progress_sink)
-            case "check_extension_connection":
-                return await self._check_extension_connection()
-            case "stop_run":
-                return await self._stop_run(**args)
-            case "list_schedules":
-                return await self._list_schedules(change_context.flow_id if change_context else None)
-            case "create_schedule":
-                return await self._create_schedule(**args)
-            case "toggle_schedule":
-                return await self._toggle_schedule(**args, expected_flow_id=change_context.flow_id if change_context else None)
-            case "get_run_status":
-                return await self._get_run_status(**args)
-            case "get_run_error":
-                return await self._get_run_error(**args)
-            case "apply_node_fix":
-                return await self._apply_node_fix(**args, change_context=change_context)
-            case "set_acceptance_contract":
-                return await self._set_acceptance_contract(**args, change_context=change_context)
-            case "get_run_output":
-                return await self._get_run_output(**args)
-            case "audit_run":
-                return await self._audit_run(**args)
-            case "get_run_logs":
-                return await self._get_run_logs(**args)
-            case "inspect_page":
-                return await self._inspect_page(**args)
-            case "inspect_screenshot":
-                return await self._inspect_screenshot(**args)
-            case "interact_page":
-                return await self._interact_page(**args)
-            case _:
-                return {"error": f"未知工具: {name}"}
+        spec = TOOL_REGISTRY.get(name)
+        if spec is None:
+            return {"error": f"未知工具: {name}"}
+        arguments = dict(args)
+        if spec.context == "change_context":
+            arguments["change_context"] = change_context
+        elif spec.context == "progress_sink":
+            arguments["progress_sink"] = progress_sink
+        elif spec.context in {"flow_id", "expected_flow_id"}:
+            arguments[spec.context] = change_context.flow_id if change_context else None
+        return await getattr(self, spec.handler)(**arguments)
 
     async def _lint_flow_tool(self, flow_id: str) -> dict[str, Any]:
         flow = await self._flow_service.get_flow(flow_id)
