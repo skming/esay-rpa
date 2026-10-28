@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 
-from app.services.task_queue import RedisTaskQueue
+import pytest
+
+from app.services.task_queue import InMemoryTaskQueue, RedisTaskQueue
 
 
 class FakeRedis:
@@ -40,6 +42,173 @@ class FakeRedis:
             return key, queue.popleft()
         await asyncio.sleep(min(timeout, 1) * 0.01)
         return None
+
+
+@pytest.fixture(params=["memory", "redis"])
+def queue_factory(request):
+    def create(runner, concurrency=1):
+        if request.param == "memory":
+            return InMemoryTaskQueue(runner, concurrency=concurrency)
+        return RedisTaskQueue(runner, FakeRedis(), queue_name="test:jobs", concurrency=concurrency)
+    return create
+
+
+async def test_failed_job_does_not_strand_the_next_job(queue_factory):
+    finished = asyncio.Event()
+
+    async def runner(task_id):
+        if task_id == "broken":
+            raise RuntimeError("persistence unavailable")
+        finished.set()
+
+    queue = queue_factory(runner)
+    try:
+        await queue.enqueue("broken")
+        await queue.enqueue("next")
+        await asyncio.wait_for(finished.wait(), timeout=1)
+        assert (await queue.snapshot()).queued_count == 0
+    finally:
+        await queue.stop()
+
+
+async def test_runner_can_return_a_future_or_raise_before_returning(queue_factory):
+    called = asyncio.Event()
+
+    def runner(task_id):
+        if task_id == "broken":
+            raise RuntimeError("runner setup failed")
+        result = asyncio.get_running_loop().create_future()
+        result.set_result(None)
+        called.set()
+        return result
+
+    queue = queue_factory(runner)
+    try:
+        await queue.enqueue("broken")
+        await queue.enqueue("next")
+        await asyncio.wait_for(called.wait(), timeout=1)
+    finally:
+        await queue.stop()
+
+
+async def test_cancelling_one_job_keeps_workers_and_other_jobs_alive(queue_factory):
+    entered, finished, cleaned = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def runner(task_id):
+        if task_id == "cancelled":
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaned.set()
+        else:
+            finished.set()
+
+    queue = queue_factory(runner)
+    try:
+        await queue.enqueue("cancelled")
+        await queue.enqueue("next")
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        assert queue.cancel("cancelled")
+        await asyncio.wait_for(finished.wait(), timeout=1)
+        assert cleaned.is_set()
+    finally:
+        await queue.stop()
+
+
+async def test_worker_replacement_preserves_pending_and_active_jobs(queue_factory):
+    entered, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def runner(task_id):
+        calls.append(task_id)
+        if task_id == "active":
+            entered.set()
+            await release.wait()
+        if task_id == "last":
+            finished.set()
+
+    queue = queue_factory(runner, concurrency=2)
+    original_workers = []
+    try:
+        queue.start()
+        original_workers = list(queue._workers)
+        await queue.enqueue("active")
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        queue._workers[1].cancel()
+        await asyncio.gather(queue._workers[1], return_exceptions=True)
+        await queue.enqueue("pending")
+        queue.start()
+        await queue.enqueue("last")
+        await asyncio.wait_for(finished.wait(), timeout=1)
+        for _ in range(20):
+            if (await queue.snapshot()).active_task_ids == ["active"]:
+                break
+            await asyncio.sleep(0)
+        assert (await queue.snapshot()).active_task_ids == ["active"]
+        release.set()
+    finally:
+        release.set()
+        await queue.stop()
+        for worker in original_workers:
+            if not worker.done():
+                worker.cancel()
+        await asyncio.gather(*original_workers, return_exceptions=True)
+    assert sorted(calls) == ["active", "last", "pending"]
+
+
+async def test_duplicate_submission_does_not_run_an_active_job_twice(queue_factory):
+    entered, release, duplicate = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def runner(task_id):
+        calls.append(task_id)
+        entered.set()
+        if len(calls) > 1:
+            duplicate.set()
+        await release.wait()
+
+    queue = queue_factory(runner, concurrency=2)
+    try:
+        await queue.enqueue("same")
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        await queue.enqueue("same")
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(duplicate.wait(), timeout=0.05)
+        assert calls == ["same"]
+    finally:
+        release.set()
+        await queue.stop()
+
+
+async def test_concurrent_stop_waits_for_job_cleanup_without_recancelling_it(queue_factory):
+    entered, cleaning, release, closed = (asyncio.Event() for _ in range(4))
+
+    async def runner(task_id):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cleaning.set()
+            await release.wait()
+        closed.set()
+
+    queue = queue_factory(runner)
+    await queue.enqueue("job")
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    first = asyncio.create_task(queue.stop())
+    second = None
+    try:
+        await asyncio.wait_for(cleaning.wait(), timeout=1)
+        second = asyncio.create_task(queue.stop())
+        await asyncio.sleep(0)
+        assert not first.done() and not second.done()
+    finally:
+        release.set()
+        await asyncio.gather(*(task for task in (first, second) if task))
+    assert closed.is_set()
+    snapshot = await queue.snapshot()
+    assert not snapshot.started and snapshot.active_count == 0
 
 
 async def test_redis_task_queue_runs_task_and_updates_snapshot() -> None:

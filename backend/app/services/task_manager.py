@@ -83,6 +83,7 @@ class TaskRecord:
     artifacts: list[ArtifactSnapshot] = field(default_factory=list)
     logs: list[TaskLogEntry] = field(default_factory=list)
     canceled: bool = False
+    execution_started: bool = False
     active_node_id: str | None = None
     debug_waiter: asyncio.Event = field(default_factory=asyncio.Event)
     debug_step_once: bool = False
@@ -394,11 +395,13 @@ class TaskManager:
             return await self._task_store.get_task(task_id)
         if record.snapshot.status in {"success", "error", "stopped"} and record.done_waiter.is_set():
             return record.snapshot
+        already_canceled = record.canceled
         record.canceled = True
         record.confirmation_active = False
         record.confirmation_waiter.set()
         record.debug_waiter.set()
-        canceled_running_task = self._queue.cancel(task_id)
+        # 尚未进入 runner 的任务只标记取消，保留它执行收尾的机会；重复停止不再投递取消。
+        canceled_running_task = record.execution_started and not already_canceled and self._queue.cancel(task_id)
         await self._append_log(record, "warn", "用户请求停止任务", None, node_id="end")
         current_progress = record.snapshot.progress
         current_step = min(max(current_progress.current_step, 1), current_progress.total_steps)
@@ -410,7 +413,7 @@ class TaskManager:
         )
         if record.snapshot.status == "queued" or canceled_running_task:
             await self._update_snapshot(record, status="stopped", progress=progress)
-        if canceled_running_task:
+        if record.execution_started and not record.done_waiter.is_set():
             # cancel() 只投递 CancelledError，浏览器关闭与 profile 锁释放在运行协程随后的 finally 里。
             # 等收尾信号再返回，让紧接着的重跑不再撞上仍登记的占用；有上限，挂死的操作不该拖死停止接口。
             try:
@@ -449,6 +452,7 @@ class TaskManager:
 
     async def _run_record(self, task_id: str) -> None:
         record = self._tasks[task_id]
+        record.execution_started = True
         try:
             await self._execute_record(record, task_id)
         finally:

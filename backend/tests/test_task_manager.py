@@ -73,6 +73,56 @@ class FakeRunner:
         return ScrapeResult(url=str(request.target_url), selector=request.selector, count=1, values=["hello"])
 
 
+async def test_stopping_a_dequeued_but_unstarted_task_preserves_its_finalizer(tmp_path):
+    from unittest.mock import AsyncMock, Mock
+    manager = TaskManager(FakeRunner(), LogBroker(), artifact_store=LocalArtifactStore(tmp_path))
+    manager._queue.enqueue = AsyncMock()
+    manager._queue.cancel = Mock(return_value=True)
+    snapshot = await manager.start_task(RunTaskRequest(
+        flowName="queued-stop", flowDefinition={"nodes": [{"id": "fetch", "type": "browser.fetch", "targetUrl": "https://example.com", "selector": "h1"}], "edges": []},
+    ))
+    record = manager._tasks[snapshot.task_id]
+    assert (await manager.stop_task(snapshot.task_id)).status == "stopped"
+    assert (await manager.stop_task(snapshot.task_id)).status == "stopped"
+    manager._queue.cancel.assert_not_called()
+    await manager._run_record(snapshot.task_id)
+    assert record.done_waiter.is_set()
+    assert snapshot.task_id not in manager._tasks
+
+
+async def test_repeated_stop_waits_for_cleanup_without_cancelling_it_twice(tmp_path):
+    entered, cleaning, release, closed = (asyncio.Event() for _ in range(4))
+
+    class CleaningRunner(FakeRunner):
+        async def run(self, task_id, request, on_log):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cleaning.set()
+                await release.wait()
+                closed.set()
+                raise
+
+    manager = TaskManager(CleaningRunner(), LogBroker(), artifact_store=LocalArtifactStore(tmp_path))
+    snapshot = await manager.start_task(RunTaskRequest(
+        flowName="running-stop", flowDefinition={"nodes": [{"id": "fetch", "type": "browser.fetch", "targetUrl": "https://example.com", "selector": "h1"}], "edges": []},
+    ))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    first = asyncio.create_task(manager.stop_task(snapshot.task_id))
+    second = None
+    try:
+        await asyncio.wait_for(cleaning.wait(), timeout=1)
+        second = asyncio.create_task(manager.stop_task(snapshot.task_id))
+        await asyncio.sleep(0.02)
+        assert not first.done() and not second.done()
+    finally:
+        release.set()
+        await asyncio.gather(*(task for task in (first, second) if task))
+        await manager.stop_workers()
+    assert closed.is_set()
+
+
 @pytest.mark.parametrize("status", ["success", "error", "stopped"])
 @pytest.mark.parametrize("artifact_backend", ["local", "minio"])
 async def test_terminal_tasks_release_memory_after_persistence_and_cleanup(tmp_path, status, artifact_backend) -> None:

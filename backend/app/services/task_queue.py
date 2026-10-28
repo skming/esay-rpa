@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Protocol
+
+logger = logging.getLogger(__name__)
 
 TaskRunner = Callable[[str], Awaitable[None]]
 
@@ -53,59 +56,71 @@ class InMemoryTaskQueue:
         self._runner = runner
         self._queue: asyncio.Queue[str | None] = asyncio.Queue()
         self._workers: list[asyncio.Task[None]] = []
-        self._active: dict[str, asyncio.Task[None]] = {}
+        self._active: dict[str, asyncio.Future[None]] = {}
         self._pending: set[str] = set()
         self._concurrency = concurrency
         self._started = False
+        self._stopping = False
+        self._stop_lock = asyncio.Lock()
 
     def start(self) -> None:
+        if self._stopping:
+            raise RuntimeError("任务队列正在停止")
         if self._has_running_workers_in_current_loop():
             return
-        self._workers = []
-        self._active = {}
-        self._pending = set()
-        self._queue = asyncio.Queue()
-        self._started = True
-        self._workers = [asyncio.create_task(self._worker_loop(index)) for index in range(self._concurrency)]
-
-    async def stop(self) -> None:
-        if not self._started:
-            return
         current_loop = asyncio.get_running_loop()
-        # worker 绑定的事件循环若已不是当前循环（如测试间重建 event loop），旧 task 早已失效，
-        # 不能对它们做 cancel/await，直接重置状态即可
-        if any(worker.get_loop() is not current_loop for worker in self._workers):
+        if any(not worker.done() and worker.get_loop() is not current_loop and worker.get_loop().is_running() for worker in self._workers):
+            raise RuntimeError("任务队列仍在另一个事件循环运行")
+        if self._workers and all(worker.get_loop() is current_loop for worker in self._workers):
+            self._workers = [worker for worker in self._workers if not worker.done()]
+        else:
             self._workers = []
             self._active = {}
             self._pending = set()
-            self._started = False
-            return
-        for worker_task in tuple(self._active.values()):
-            worker_task.cancel()
-        while not self._queue.empty():
+            self._queue = asyncio.Queue()
+        self._started = True
+        self._workers.extend(asyncio.create_task(self._worker_loop(index)) for index in range(len(self._workers), self._concurrency))
+
+    async def stop(self) -> None:
+        async with self._stop_lock:
+            if not self._started:
+                return
+            current_loop = asyncio.get_running_loop()
+            if any(worker.get_loop() is not current_loop for worker in self._workers):
+                self._workers = []
+                self._active = {}
+                self._pending = set()
+                self._started = False
+                return
+            self._stopping = True
             try:
-                _ = self._queue.get_nowait()
-                self._queue.task_done()
-            except asyncio.QueueEmpty:
-                break
-        self._pending = set()
-        for _ in self._workers:
-            await self._queue.put(None)
-        await asyncio.gather(*self._workers, return_exceptions=True)
-        self._workers = []
-        self._started = False
+                for job in tuple(self._active.values()):
+                    job.cancel()
+                while not self._queue.empty():
+                    self._queue.get_nowait()
+                    self._queue.task_done()
+                self._pending.clear()
+                for worker in self._workers:
+                    if not worker.done():
+                        await self._queue.put(None)
+                await asyncio.gather(*self._workers, return_exceptions=True)
+            finally:
+                self._workers = []
+                self._active = {}
+                self._started = self._stopping = False
 
     async def enqueue(self, task_id: str) -> None:
-        if not self._has_running_workers_in_current_loop():
-            self.start()
+        self.start()
+        if task_id in self._pending or task_id in self._active:
+            return
         self._pending.add(task_id)
         await self._queue.put(task_id)
 
     def cancel(self, task_id: str) -> bool:
-        worker_task = self._active.get(task_id)
-        if worker_task is None or worker_task.done():
+        job = self._active.get(task_id)
+        if job is None or job.done():
             return False
-        worker_task.cancel()
+        job.cancel()
         return True
 
     async def snapshot(self) -> QueueSnapshot:
@@ -131,12 +146,17 @@ class InMemoryTaskQueue:
                 self._queue.task_done()
                 return
 
-            current_task = asyncio.current_task()
-            if current_task is not None:
-                self._active[task_id] = current_task
+            # 任务取消只作用于这次执行，worker 继续服务后续排队任务。
             self._pending.discard(task_id)
             try:
-                await self._runner(task_id)
+                job = asyncio.ensure_future(self._runner(task_id))
+                self._active[task_id] = job
+                await job
+            except asyncio.CancelledError:
+                if asyncio.current_task().cancelling():
+                    raise
+            except Exception as exc:
+                logger.error("Task execution failed (task_id=%s, error_type=%s)", task_id, type(exc).__name__)
             finally:
                 self._active.pop(task_id, None)
                 self._queue.task_done()
@@ -162,61 +182,67 @@ class RedisTaskQueue:
         self._pending_key = f"{queue_name}:pending"
         self._active_key = f"{queue_name}:active"
         self._workers: list[asyncio.Task[None]] = []
-        self._active: dict[str, asyncio.Task[None]] = {}
+        self._active: dict[str, asyncio.Future[None]] = {}
         self._pending: set[str] = set()
         self._concurrency = concurrency
         self._poll_timeout_seconds = poll_timeout_seconds
         self._started = False
+        self._stopping = False
+        self._stop_lock = asyncio.Lock()
 
     def start(self) -> None:
+        if self._stopping:
+            raise RuntimeError("任务队列正在停止")
         current_loop = asyncio.get_running_loop()
-        if (
-            self._started
-            and self._workers
-            and all(not worker.done() for worker in self._workers)
-            and all(worker.get_loop() is current_loop for worker in self._workers)
-        ):
-            return
-        self._workers = []
-        self._active = {}
-        self._pending = set()
-        self._started = True
-        self._workers = [asyncio.create_task(self._worker_loop(index)) for index in range(self._concurrency)]
-
-    async def stop(self) -> None:
-        if not self._started:
-            return
-        current_loop = asyncio.get_running_loop()
-        if any(worker.get_loop() is not current_loop for worker in self._workers):
+        if any(not worker.done() and worker.get_loop() is not current_loop and worker.get_loop().is_running() for worker in self._workers):
+            raise RuntimeError("任务队列仍在另一个事件循环运行")
+        if self._workers and all(worker.get_loop() is current_loop for worker in self._workers):
+            self._workers = [worker for worker in self._workers if not worker.done()]
+        else:
             self._workers = []
             self._active = {}
             self._pending = set()
-            self._started = False
-            return
-        for worker_task in tuple(self._active.values()):
-            worker_task.cancel()
-        for worker in self._workers:
-            worker.cancel()
-        await asyncio.gather(*self._workers, return_exceptions=True)
-        if self._active:
-            await self._redis.srem(self._active_key, *self._active)
-        self._workers = []
-        self._active = {}
-        self._pending = set()
-        self._started = False
+        self._started = True
+        self._workers.extend(asyncio.create_task(self._worker_loop(index)) for index in range(len(self._workers), self._concurrency))
+
+    async def stop(self) -> None:
+        async with self._stop_lock:
+            if not self._started:
+                return
+            current_loop = asyncio.get_running_loop()
+            if any(worker.get_loop() is not current_loop for worker in self._workers):
+                self._workers = []
+                self._active = {}
+                self._pending = set()
+                self._started = False
+                return
+            self._stopping = True
+            try:
+                # 取消 worker 会传递给其正在等待的 job，只投递一次取消，避免打断资源收尾。
+                for worker in self._workers:
+                    worker.cancel()
+                await asyncio.gather(*self._workers, return_exceptions=True)
+                if self._active:
+                    await self._redis.srem(self._active_key, *self._active)
+            finally:
+                self._workers = []
+                self._active = {}
+                self._pending = set()
+                self._started = self._stopping = False
 
     async def enqueue(self, task_id: str) -> None:
-        if not self._started:
-            self.start()
+        self.start()
+        if task_id in self._pending or task_id in self._active:
+            return
         self._pending.add(task_id)
         await self._redis.sadd(self._pending_key, task_id)
         await self._redis.rpush(self._queue_name, task_id)
 
     def cancel(self, task_id: str) -> bool:
-        worker_task = self._active.get(task_id)
-        if worker_task is None or worker_task.done():
+        job = self._active.get(task_id)
+        if job is None or job.done():
             return False
-        worker_task.cancel()
+        job.cancel()
         return True
 
     async def snapshot(self) -> QueueSnapshot:
@@ -232,21 +258,25 @@ class RedisTaskQueue:
         )
 
     async def _worker_loop(self, _index: int) -> None:
-        while True:
+        while not self._stopping:
             item = await self._redis.blpop(self._queue_name, timeout=self._poll_timeout_seconds)
             if item is None:
                 await asyncio.sleep(0)
                 continue
             _, raw_task_id = item
             task_id = self._decode_task_id(raw_task_id)
-            current_task = asyncio.current_task()
-            if current_task is not None:
-                self._active[task_id] = current_task
             self._pending.discard(task_id)
             await self._redis.srem(self._pending_key, task_id)
             await self._redis.sadd(self._active_key, task_id)
             try:
-                await self._runner(task_id)
+                job = asyncio.ensure_future(self._runner(task_id))
+                self._active[task_id] = job
+                await job
+            except asyncio.CancelledError:
+                if asyncio.current_task().cancelling():
+                    raise
+            except Exception as exc:
+                logger.error("Task execution failed (task_id=%s, error_type=%s)", task_id, type(exc).__name__)
             finally:
                 self._active.pop(task_id, None)
                 await self._redis.srem(self._active_key, task_id)
