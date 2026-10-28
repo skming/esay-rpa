@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+from datetime import UTC, datetime
+
 import pytest
 
 from app.models.schemas import FlowCreateRequest, FlowUpdateRequest
 from app.services.flow_service import FlowService
-from app.services.flow_store import SqlAlchemyFlowStore
+from app.services.flow_store import InMemoryFlowStore, SqlAlchemyFlowStore
 from app.services.schedule_store import create_schedule_engine
 
 
@@ -13,6 +16,84 @@ def build_definition() -> dict[str, object]:
         "nodes": [{"id": "start", "type": "start"}, {"id": "n1", "type": "browser.fetch", "outputVariable": "orders"}],
         "edges": [{"source": "start", "target": "n1"}],
     }
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+async def test_run_completion_cannot_overwrite_concurrent_flow_edits(tmp_path, monkeypatch, backend):
+    store = InMemoryFlowStore() if backend == "memory" else SqlAlchemyFlowStore(create_schedule_engine(f"sqlite+aiosqlite:///{tmp_path / 'concurrent.db'}"))
+    if backend == "sqlite":
+        await store.create_schema()
+    service = FlowService(store)
+    flow = await service.create_flow(FlowCreateRequest(name="original", definition=build_definition()))
+    entered, release = asyncio.Event(), asyncio.Event()
+    save = store.save
+
+    async def paused_save(snapshot):
+        if snapshot.last_run_status == "success" and not entered.is_set():
+            entered.set()
+            await release.wait()
+        return await save(snapshot)
+
+    monkeypatch.setattr(store, "save", paused_save)
+    completion = asyncio.create_task(service.update_last_run(flow.flow_id, "success", datetime.now(UTC)))
+    editing = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        editing = asyncio.create_task(service.update_flow(flow.flow_id, FlowUpdateRequest(name="edited", definition={"nodes": [], "edges": []})))
+        await asyncio.sleep(0.05)
+        release.set()
+        await asyncio.gather(completion, editing)
+        restored = await service.get_flow(flow.flow_id)
+        assert restored.name == "edited"
+        assert restored.definition == {"nodes": [], "edges": []}
+        assert restored.revision == 2
+        assert restored.last_run_status == "success"
+    finally:
+        release.set()
+        await asyncio.gather(*(task for task in (completion, editing) if task), return_exceptions=True)
+        if backend == "sqlite":
+            await store.close()
+
+
+async def test_delete_cannot_be_undone_by_an_in_flight_save(monkeypatch):
+    service = FlowService()
+    flow = await service.create_flow(FlowCreateRequest(name="original", definition=build_definition()))
+    save = service._store.save
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def paused_save(snapshot):
+        entered.set()
+        await release.wait()
+        return await save(snapshot)
+
+    monkeypatch.setattr(service._store, "save", paused_save)
+    editing = asyncio.create_task(service.update_flow(flow.flow_id, FlowUpdateRequest(name="edited")))
+    deleting = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        deleting = asyncio.create_task(service.delete_flow(flow.flow_id))
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(editing, deleting)
+        assert await service.get_flow(flow.flow_id) is None
+    finally:
+        release.set()
+        await asyncio.gather(*(task for task in (editing, deleting) if task), return_exceptions=True)
+
+
+async def test_outdated_run_notification_preserves_newer_status_and_edit_time():
+    from datetime import timedelta
+    service = FlowService()
+    flow = await service.create_flow(FlowCreateRequest(name="flow", definition=build_definition()))
+    earlier = flow.created_at - timedelta(seconds=1)
+    await service.update_last_run(flow.flow_id, "error", earlier)
+    restored = await service.get_flow(flow.flow_id)
+    assert restored.updated_at == flow.created_at
+    await service.update_last_run(flow.flow_id, "success", flow.created_at)
+    await service.update_last_run(flow.flow_id, "error", earlier)
+    restored = await service.get_flow(flow.flow_id)
+    assert restored.last_run_status == "success"
+    assert restored.last_run_at == flow.created_at
 
 
 async def test_flow_service_persists_crud_with_sqlalchemy(tmp_path) -> None:

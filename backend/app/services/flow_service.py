@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import re
+from weakref import WeakValueDictionary
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -29,6 +31,15 @@ class FlowService:
 
     def __init__(self, store: FlowStore | None = None) -> None:
         self._store = store or InMemoryFlowStore()
+        self._mutation_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+
+    def _mutation_lock(self, flow_id: str) -> asyncio.Lock:
+        # 状态回写、编辑与删除共用锁；弱引用不保留已结束流程的锁对象。
+        lock = self._mutation_locks.get(flow_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._mutation_locks[flow_id] = lock
+        return lock
 
     async def create_flow(self, request: FlowCreateRequest) -> FlowSnapshot:
         if request.acceptance_contract.deliverables or request.acceptance_contract.requirements:
@@ -71,70 +82,71 @@ class FlowService:
         return None if flow is None else flow.snapshots
 
     async def update_flow(self, flow_id: str, request: FlowUpdateRequest) -> FlowSnapshot | None:
-        current = await self._store.get(flow_id)
-        if current is None:
-            return None
+        async with self._mutation_lock(flow_id):
+            current = await self._store.get(flow_id)
+            if current is None:
+                return None
 
-        definition_changed = request.definition is not None and request.definition != current.definition
-        contract_changed = (
-            request.acceptance_contract is not None
-            and request.acceptance_contract != current.acceptance_contract
-        )
-        input_variables_changed = (
-            request.input_variables is not None
-            and request.input_variables != current.input_variables
-        )
-        revision_changed = definition_changed or contract_changed or input_variables_changed
-        if revision_changed:
-            next_definition = request.definition if request.definition is not None else current.definition
-            next_variables = request.input_variables if request.input_variables is not None else current.input_variables
-            # 空契约是真值（Pydantic 模型实例），用 `or` 取不到 current，显式传 {} 会把已有契约换成空的；
-            # 而空契约又刚好绕过下面的校验，于是契约被静默清掉，直到运行时才被拒绝。
-            next_contract = request.acceptance_contract if request.acceptance_contract is not None else current.acceptance_contract
-            cleared = (
-                not next_contract.requirements
-                and not next_contract.deliverables
-                and bool(current.acceptance_contract.requirements or current.acceptance_contract.deliverables)
+            definition_changed = request.definition is not None and request.definition != current.definition
+            contract_changed = (
+                request.acceptance_contract is not None
+                and request.acceptance_contract != current.acceptance_contract
             )
-            if cleared:
-                raise ValueError("不能用空验收契约覆盖已有契约：清空后流程只会在运行时被拒绝，保存这一步看不出任何异常")
-            if next_contract.deliverables or next_contract.requirements:
-                contract_errors = contract_validation_errors(
-                    next_contract,
-                    defined_variables=definition_variable_names(
-                        next_definition,
-                        [variable.name for variable in next_variables],
-                    ),
-                    pagination_caps=pagination_caps_from_nodes(next_definition.get("nodes")),
+            input_variables_changed = (
+                request.input_variables is not None
+                and request.input_variables != current.input_variables
+            )
+            revision_changed = definition_changed or contract_changed or input_variables_changed
+            if revision_changed:
+                next_definition = request.definition if request.definition is not None else current.definition
+                next_variables = request.input_variables if request.input_variables is not None else current.input_variables
+                # 空契约是真值（Pydantic 模型实例），用 `or` 取不到 current，显式传 {} 会把已有契约换成空的；
+                # 而空契约又刚好绕过下面的校验，于是契约被静默清掉，直到运行时才被拒绝。
+                next_contract = request.acceptance_contract if request.acceptance_contract is not None else current.acceptance_contract
+                cleared = (
+                    not next_contract.requirements
+                    and not next_contract.deliverables
+                    and bool(current.acceptance_contract.requirements or current.acceptance_contract.deliverables)
                 )
-                if contract_errors:
-                    raise ValueError("；".join(contract_errors))
-        if revision_changed:
-            entry = FlowVersionSnapshot(
-                version=current.version,
-                description=current.description,
-                definition=current.definition,
-                input_variables=current.input_variables,
-                acceptance_contract=current.acceptance_contract,
-                revision=current.revision,
-                saved_at=current.updated_at,
-            )
-            updated_snapshots = [entry, *current.snapshots[:49]]  # 版本历史最多保留 50 条（含本条），避免无限增长
-        else:
-            updated_snapshots = current.snapshots
+                if cleared:
+                    raise ValueError("不能用空验收契约覆盖已有契约：清空后流程只会在运行时被拒绝，保存这一步看不出任何异常")
+                if next_contract.deliverables or next_contract.requirements:
+                    contract_errors = contract_validation_errors(
+                        next_contract,
+                        defined_variables=definition_variable_names(
+                            next_definition,
+                            [variable.name for variable in next_variables],
+                        ),
+                        pagination_caps=pagination_caps_from_nodes(next_definition.get("nodes")),
+                    )
+                    if contract_errors:
+                        raise ValueError("；".join(contract_errors))
+            if revision_changed:
+                entry = FlowVersionSnapshot(
+                    version=current.version,
+                    description=current.description,
+                    definition=current.definition,
+                    input_variables=current.input_variables,
+                    acceptance_contract=current.acceptance_contract,
+                    revision=current.revision,
+                    saved_at=current.updated_at,
+                )
+                updated_snapshots = [entry, *current.snapshots[:49]]  # 版本历史最多保留 50 条（含本条），避免无限增长
+            else:
+                updated_snapshots = current.snapshots
 
-        payload = current.model_dump()
-        for key, value in request.model_dump(by_alias=False).items():
-            if value is not None:
-                payload[key] = value
-        # 调用方（尤其 AI 工具）几乎不显式传 version，不自动递增会导致版本历史挤在同一版本号上。
-        if revision_changed and request.version is None:
-            payload["version"] = _bump_patch_version(current.version)
-        if revision_changed:
-            payload["revision"] = current.revision + 1
-        payload["snapshots"] = updated_snapshots
-        payload["updated_at"] = datetime.now(UTC)
-        return await self._store.save(FlowSnapshot.model_validate(payload))
+            payload = current.model_dump()
+            for key, value in request.model_dump(by_alias=False).items():
+                if value is not None:
+                    payload[key] = value
+            # 调用方（尤其 AI 工具）几乎不显式传 version，不自动递增会导致版本历史挤在同一版本号上。
+            if revision_changed and request.version is None:
+                payload["version"] = _bump_patch_version(current.version)
+            if revision_changed:
+                payload["revision"] = current.revision + 1
+            payload["snapshots"] = updated_snapshots
+            payload["updated_at"] = datetime.now(UTC)
+            return await self._store.save(FlowSnapshot.model_validate(payload))
 
     async def duplicate_flow(self, flow_id: str) -> FlowSnapshot | None:
         source = await self._store.get(flow_id)
@@ -159,34 +171,40 @@ class FlowService:
         return await self._store.save(copy)
 
     async def move_flow(self, flow_id: str, folder_path: str) -> FlowSnapshot | None:
-        current = await self._store.get(flow_id)
-        if current is None:
-            return None
-        return await self._store.save(
-            current.model_copy(update={"folder_path": folder_path, "updated_at": datetime.now(UTC)})
-        )
+        async with self._mutation_lock(flow_id):
+            current = await self._store.get(flow_id)
+            if current is None:
+                return None
+            return await self._store.save(
+                current.model_copy(update={"folder_path": folder_path, "updated_at": datetime.now(UTC)})
+            )
 
     async def set_flow_status(self, flow_id: str, status: FlowStatus) -> FlowSnapshot | None:
-        current = await self._store.get(flow_id)
-        if current is None:
-            return None
-        return await self._store.save(
-            current.model_copy(update={"status": status, "updated_at": datetime.now(UTC)})
-        )
+        async with self._mutation_lock(flow_id):
+            current = await self._store.get(flow_id)
+            if current is None:
+                return None
+            return await self._store.save(
+                current.model_copy(update={"status": status, "updated_at": datetime.now(UTC)})
+            )
 
     async def archive_flow(self, flow_id: str) -> FlowSnapshot | None:
         return await self.set_flow_status(flow_id, "archived")
 
     async def delete_flow(self, flow_id: str) -> bool:
-        return await self._store.delete(flow_id)
+        async with self._mutation_lock(flow_id):
+            return await self._store.delete(flow_id)
 
     async def update_last_run(self, flow_id: str, task_status: str, run_at: datetime) -> None:
-        current = await self._store.get(flow_id)
-        if current is None:
-            return
-        await self._store.save(
-            current.model_copy(update={"last_run_status": task_status, "last_run_at": run_at, "updated_at": run_at})
-        )
+        async with self._mutation_lock(flow_id):
+            current = await self._store.get(flow_id)
+            if current is None:
+                return
+            if current.last_run_at is not None and run_at < current.last_run_at:
+                return
+            await self._store.save(
+                current.model_copy(update={"last_run_status": task_status, "last_run_at": run_at, "updated_at": max(current.updated_at, run_at)})
+            )
 
     @staticmethod
     def compute_success_rate_30d(tasks: list[TaskSnapshot]) -> int | None:
