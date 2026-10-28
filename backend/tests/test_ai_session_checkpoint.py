@@ -6,8 +6,13 @@
 """
 
 import ast
+import asyncio
 import inspect
 import json
+import sqlite3
+import threading
+
+from langgraph.checkpoint.base import empty_checkpoint
 import time
 from dataclasses import fields
 from pathlib import Path
@@ -54,7 +59,7 @@ def test_only_whitelisted_keys_persist() -> None:
     assert "model_no_vision" not in checkpoint.load("f1")
 
 
-def test_clean_state_leaves_no_file_behind() -> None:
+def test_clean_state_removes_its_checkpoint() -> None:
     """留一份全空的检查点，只会让之后每次会话都白读一次盘。
 
     未动过的预算不算未了结事项——但它的默认值 new_budget() 本身是一份真值 dict，
@@ -76,51 +81,152 @@ def test_a_recorded_but_uncharged_budget_is_still_persisted() -> None:
     assert checkpoint.load("f1").get("attempt_budget") == budget
 
 
-def test_stale_checkpoint_is_ignored(tmp_path: Path) -> None:
-    """隔了几小时再回来，页面和流程多半都变了，旧熔断不该继续挡人。"""
+def _write_payload(payload: dict[str, Any]) -> None:
+    checkpoint._checkpoint_dir().mkdir(parents=True, exist_ok=True)
+    with checkpoint._checkpointer() as saver:
+        stored = empty_checkpoint()
+        stored["channel_values"] = payload
+        saver.put(checkpoint._config("f1"), stored, {"source": "update", "step": 1, "parents": {}, "flow_id": "f1"}, {})
+
+
+def test_stale_checkpoint_is_ignored(monkeypatch) -> None:
+    now = time.time()
+    monkeypatch.setattr(checkpoint.time, "time", lambda: now - 3 * 3600)
     checkpoint.save("f1", GuardState(failure_budget_lock={"flow_id": "f1"}), rounds=1)
-    path = tmp_path / "checkpoints" / "flow_f1.json"
-    data = json.loads(path.read_text(encoding="utf-8"))
-    data["updated_at"] = time.time() - 3 * 3600
-    path.write_text(json.dumps(data), encoding="utf-8")
+    monkeypatch.setattr(checkpoint.time, "time", lambda: now)
     assert checkpoint.load("f1") == {}
 
 
 def test_corrupt_checkpoint_is_ignored_not_raised(tmp_path: Path) -> None:
-    """检查点是省钱的优化，不是正确性的前提——读坏了必须让会话照常开始。"""
-    d = tmp_path / "checkpoints"
-    d.mkdir(parents=True)
-    (d / "flow_f1.json").write_text("{不是 json", encoding="utf-8")
+    directory = tmp_path / "checkpoints"
+    directory.mkdir(parents=True)
+    (directory / "langgraph.sqlite3").write_bytes(b"not a sqlite database")
     assert checkpoint.load("f1") == {}
 
 
-def test_valid_json_with_invalid_timestamp_is_ignored_not_raised(tmp_path: Path) -> None:
-    """JSON 能解析不等于元数据可用；坏时间戳不能把整轮请求带崩。"""
-    d = tmp_path / "checkpoints"
-    d.mkdir(parents=True)
-    (d / "flow_f1.json").write_text(json.dumps({
-        "state": {"attempt_budget": _budget(2)},
-        "updated_at": "不是时间戳",
-    }), encoding="utf-8")
-
+def test_valid_checkpoint_with_invalid_timestamp_is_ignored_not_raised() -> None:
+    _write_payload({"state": {"attempt_budget": _budget(2)}, "updated_at": "invalid timestamp"})
     assert checkpoint.load("f1") == {}
 
 
-def test_invalid_persisted_state_shape_is_ignored_before_apply(tmp_path: Path) -> None:
-    """已知字段类型损坏时整份检查点作废，不能把字符串回灌成 attempt_budget。"""
-    d = tmp_path / "checkpoints"
-    d.mkdir(parents=True)
-    (d / "flow_f1.json").write_text(json.dumps({
-        "state": {"attempt_budget": "three"},
-        "updated_at": time.time(),
-    }), encoding="utf-8")
-
-    loaded = checkpoint.load("f1")
+def test_invalid_persisted_state_shape_is_ignored_before_apply() -> None:
+    _write_payload({"state": {"attempt_budget": "three"}, "updated_at": time.time()})
     state = GuardState()
     state.apply_checkpoint({"attempt_budget": "three"})
-
-    assert loaded == {}
+    assert checkpoint.load("f1") == {}
     assert state.attempt_budget == _budget(0)
+
+
+def test_latest_checkpoint_is_bounded_and_other_flows_are_isolated() -> None:
+    checkpoint.save("f2", GuardState(attempt_budget=_budget(2)), rounds=1)
+    for spent in range(1, 5):
+        checkpoint.save("f1", GuardState(attempt_budget=_budget(spent)), rounds=spent)
+    with checkpoint._checkpointer() as saver:
+        assert len(list(saver.list(checkpoint._config("f1")))) == 1
+    assert checkpoint.load("f1")["attempt_budget"] == _budget(4)
+    checkpoint.clear("f1")
+    assert checkpoint.load("f1") == {}
+    assert checkpoint.load("f2")["attempt_budget"] == _budget(2)
+
+
+def test_checkpoint_excludes_authorization_messages_and_browser_state() -> None:
+    checkpoint.save("f1", GuardState(
+        attempt_budget=_budget(1), run_authorized=True, latest_user_message="synthetic-secret",
+        active_task={"target_url": "https://private.example"},
+    ), rounds=1)
+    with checkpoint._checkpointer() as saver:
+        payload = saver.get_tuple(checkpoint._config("f1")).checkpoint["channel_values"]
+    assert set(payload["state"]) == {"attempt_budget"}
+    assert "synthetic-secret" not in json.dumps(payload)
+    assert "private.example" not in json.dumps(payload)
+
+
+def test_failed_save_preserves_the_previous_checkpoint(monkeypatch) -> None:
+    from langgraph.checkpoint.sqlite import SqliteSaver
+    checkpoint.save("f1", GuardState(attempt_budget=_budget(1)), rounds=1)
+    def fail(*args, **kwargs):
+        raise OSError("disk unavailable")
+    monkeypatch.setattr(SqliteSaver, "put", fail)
+    checkpoint.save("f1", GuardState(attempt_budget=_budget(2)), rounds=2)
+    assert checkpoint.load("f1")["attempt_budget"] == _budget(1)
+
+
+async def test_task_checkpoints_and_cleanup_are_isolated():
+    first = GuardState(task_key="a" * 64, attempt_budget=_budget(1))
+    second = GuardState(task_key="b" * 64, attempt_budget=_budget(2))
+    await checkpoint.asave("f1", first, rounds=1)
+    await checkpoint.asave("f1", second, rounds=2)
+    assert await checkpoint.aload("f1") == {}
+    assert (await checkpoint.aload("f1", task_key=first.task_key))["attempt_budget"] == _budget(1)
+    await checkpoint.afinish("f1", GuardState(task_key=first.task_key), rounds=3)
+    assert await checkpoint.aload("f1", task_key=first.task_key) == {}
+    assert (await checkpoint.aload("f1"))["task_key"] == second.task_key
+    await asyncio.to_thread(checkpoint.clear_flow, "f1")
+    assert await checkpoint.aload("f1") == {}
+
+
+async def test_read_only_finish_cannot_clear_or_replace_an_interactive_checkpoint():
+    original = GuardState(task_key="a" * 64, attempt_budget=_budget(2))
+    await checkpoint.asave("f1", original, rounds=1)
+    for task_key in (original.task_key, "b" * 64):
+        diagnosis = GuardState(task_key=task_key, read_only_tools=True, attempt_budget=_budget(3))
+        await checkpoint.asave("f1", diagnosis, rounds=2)
+        await checkpoint.afinish("f1", diagnosis, rounds=2)
+    assert (await checkpoint.aload("f1", task_key=original.task_key))["attempt_budget"] == _budget(2)
+
+
+async def test_locked_checkpoint_save_keeps_the_event_loop_responsive(caplog):
+    original = GuardState(attempt_budget=_budget(1))
+    await checkpoint.asave("f1", original, rounds=1)
+    finished = False
+    observed = []
+
+    async def tick():
+        await asyncio.sleep(0.01)
+        observed.append(not finished)
+
+    with sqlite3.connect(str(checkpoint._checkpoint_path())) as lock:
+        lock.execute("BEGIN IMMEDIATE")
+        timer = asyncio.create_task(tick())
+        try:
+            await checkpoint.asave("f1", GuardState(attempt_budget=_budget(2)), rounds=2)
+            finished = True
+            await timer
+        finally:
+            lock.rollback()
+    assert observed == [True]
+    assert "AI checkpoint save failed" in caplog.text
+    assert checkpoint.load("f1")["attempt_budget"] == _budget(1)
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_async_save_freezes_state_and_finishes_before_cancellation(monkeypatch, cancel):
+    entered, release = threading.Event(), threading.Event()
+    save = checkpoint.save
+
+    def delayed_save(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=3)
+        save(*args, **kwargs)
+
+    monkeypatch.setattr(checkpoint, "save", delayed_save)
+    state = GuardState(attempt_budget=_budget(1))
+    saving = asyncio.create_task(checkpoint.asave("f1", state, rounds=1))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        state.attempt_budget["spent"] = 3
+        if cancel:
+            saving.cancel()
+            await asyncio.sleep(0)
+            assert not saving.done()
+    finally:
+        release.set()
+    if cancel:
+        with pytest.raises(asyncio.CancelledError):
+            await saving
+    else:
+        await saving
+    assert checkpoint.load("f1")["attempt_budget"] == _budget(1)
 
 
 def test_missing_flow_id_is_a_no_op() -> None:
@@ -313,7 +419,10 @@ async def test_created_flow_moves_interrupted_checkpoint_off_the_local_draft(
     from test_ai_orchestrator import _chunk, _FakeExecutor, _FakeStream, _tool_call_chunk
 
     monkeypatch.setattr(checkpoint, "resolve_ai_dir", lambda: tmp_path)
-    checkpoint.save("local-draft", GuardState(attempt_budget=_budget(1)), rounds=1)
+    checkpoint.save("local-draft", GuardState(
+        task_key=ai_orchestrator._conversation_task_key([{ "role": "user", "content": "继续创建流程"}]),
+        attempt_budget=_budget(1),
+    ), rounds=1)
 
     async def fake_acompletion(**kwargs: Any) -> Any:
         return _FakeStream([
@@ -352,7 +461,10 @@ async def test_orchestrator_keeps_unresolved_budget_after_final_reply(
     from test_ai_orchestrator import _chunk, _FakeExecutor, _FakeStream  # noqa: F401
 
     monkeypatch.setattr(checkpoint, "resolve_ai_dir", lambda: tmp_path)
-    checkpoint.save("f-ck", GuardState(attempt_budget=_budget(VERIFY_ATTEMPT_BUDGET)), rounds=4)
+    checkpoint.save("f-ck", GuardState(
+        task_key=ai_orchestrator._conversation_task_key([{ "role": "user", "content": "还是不行"}]),
+        attempt_budget=_budget(VERIFY_ATTEMPT_BUDGET),
+    ), rounds=4)
 
     captured: list[list[dict[str, Any]]] = []
 

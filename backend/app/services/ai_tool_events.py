@@ -73,14 +73,24 @@ def reduce_evidence_state(state: GuardState, result: Any) -> None:
             state.current_definition_digest = event.get("definition_digest")
             state.run_verified_revision = None
             state.accepted_revision = None
-        elif event_type == "run_completed" and event.get("status") == "success":
-            revision = event.get("flow_revision")
-            if _matches_current_definition(state, event):
-                state.run_verified_revision = revision
-        elif event_type == "audit_completed" and event.get("passed") is True:
-            revision = event.get("flow_revision")
-            if _matches_current_definition(state, event):
-                state.accepted_revision = revision
+            state.verification_task_id = None
+        elif event_type == "run_completed" and _matches_current_definition(state, event):
+            task_id = event.get("task_id")
+            if not isinstance(task_id, str) or not task_id:
+                continue
+            succeeded = event.get("status") == "success"
+            if task_id != state.verification_task_id or not succeeded:
+                state.accepted_revision = None
+                state.audit_passed = False
+            state.verification_task_id = task_id
+            state.run_succeeded = succeeded
+            state.run_verified_revision = event.get("flow_revision") if succeeded else None
+        elif event_type == "audit_completed":
+            if (_matches_current_definition(state, event) and state.verification_task_id is not None
+                    and event.get("task_id") == state.verification_task_id
+                    and state.run_verified_revision == state.current_flow_revision):
+                state.audit_passed = event.get("passed") is True
+                state.accepted_revision = event.get("flow_revision") if state.audit_passed else None
     result["verification_status"] = current_verification_status(state)
 
 

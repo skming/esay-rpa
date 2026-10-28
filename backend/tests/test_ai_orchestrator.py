@@ -2814,7 +2814,7 @@ def test_unfinished_run_does_not_spend_failure_budget(status):
 
 
 @pytest.mark.parametrize("passed", [True, False])
-def test_background_completion_updates_evidence_and_is_booked_once(monkeypatch, passed):
+async def test_background_completion_updates_evidence_and_is_booked_once(monkeypatch, passed):
     from app.services.ai_tool_events import current_verification_status
 
     recorded = []
@@ -2832,15 +2832,15 @@ def test_background_completion_updates_evidence_and_is_booked_once(monkeypatch, 
             "issues": [] if passed else [{"issue": "missing_records"}],
         },
     }
-    assert _sync_run_result(pending, completed, state)
+    assert (await _sync_run_result(pending, completed, state))
     assert current_verification_status(state) == ("accepted" if passed else "run_verified")
     assert state.attempt_budget["spent"] == (0 if passed else 1)
-    assert not _sync_run_result(completed, dict(completed), state)
+    assert not (await _sync_run_result(completed, dict(completed), state))
     assert len(recorded) == 1
     assert state.attempt_budget["spent"] == (0 if passed else 1)
 
 
-def test_background_failure_is_booked_once_and_requires_dom(monkeypatch):
+async def test_background_failure_is_booked_once_and_requires_dom(monkeypatch):
     monkeypatch.setattr("app.services.ai_orchestrator.record_events", lambda *args: None)
     state = _ready(flow_id="f", current_flow_revision=3, current_definition_digest="d3")
     pending = {"task_id": "t", "status": "timeout", "flow_revision": 3, "definition_digest": "d3"}
@@ -2853,14 +2853,14 @@ def test_background_failure_is_booked_once_and_requires_dom(monkeypatch):
             "last_browser_url": "https://example.test",
         },
     }
-    assert _sync_run_result(pending, completed, state)
+    assert (await _sync_run_result(pending, completed, state))
     assert state.attempt_budget["spent"] == 1
     assert state.page_evidence_required["url"] == "https://example.test"
-    assert not _sync_run_result(completed, dict(completed), state)
+    assert not (await _sync_run_result(completed, dict(completed), state))
     assert state.attempt_budget["spent"] == 1
 
 
-def test_stale_background_completion_does_not_affect_current_flow(monkeypatch):
+async def test_stale_background_completion_does_not_affect_current_flow(monkeypatch):
     monkeypatch.setattr(
         "app.services.ai_orchestrator.record_events", lambda *args: pytest.fail("stale evidence recorded")
     )
@@ -2872,7 +2872,7 @@ def test_stale_background_completion_does_not_affect_current_flow(monkeypatch):
         "definition_digest": "d3",
         "acceptance_audit": {"passed": True},
     }
-    assert not _sync_run_result(None, result, state)
+    assert not (await _sync_run_result(None, result, state))
     assert state.accepted_revision is None and state.attempt_budget["spent"] == 0
 
 
@@ -2880,7 +2880,7 @@ def test_stale_background_completion_does_not_affect_current_flow(monkeypatch):
 @pytest.mark.parametrize("status,passed,spent", [
     ("success", True, 0), ("success", False, 1), ("error", None, 1), ("stopped", None, 0),
 ])
-def test_run_result_is_committed_once_across_tool_and_poll_paths(monkeypatch, first_path, status, passed, spent):
+async def test_run_result_is_committed_once_across_tool_and_poll_paths(monkeypatch, first_path, status, passed, spent):
     recorded, checkpoints = [], []
     monkeypatch.setattr("app.services.ai_orchestrator.record_events", lambda *args: recorded.append(args))
     monkeypatch.setattr("app.services.ai_orchestrator._session_checkpoint.save", lambda *args, **kwargs: checkpoints.append(kwargs))
@@ -2896,14 +2896,14 @@ def test_run_result_is_committed_once_across_tool_and_poll_paths(monkeypatch, fi
             "issues": [] if passed else [{"issue": "missing_records"}],
         }
 
-    def apply(path):
+    async def apply(path):
         if path == "tool":
-            return _process_tool_result("run_flow", copy.deepcopy(result), state, rounds=2)[1]
-        return _sync_run_result(pending, copy.deepcopy(result), state, rounds=2)
+            return (await _process_tool_result("run_flow", copy.deepcopy(result), state, rounds=2))[1]
+        return (await _sync_run_result(pending, copy.deepcopy(result), state, rounds=2))
 
-    assert apply(first_path)
+    assert (await apply(first_path))
     committed = asdict(state)
-    assert not apply("poll" if first_path == "tool" else "tool")
+    assert not (await apply("poll" if first_path == "tool" else "tool"))
     assert asdict(state) == committed
     assert state.attempt_budget["spent"] == spent
     assert len(recorded) == 1
@@ -2915,7 +2915,7 @@ def test_run_result_is_committed_once_across_tool_and_poll_paths(monkeypatch, fi
 @pytest.mark.parametrize("path", ["tool", "poll"])
 @pytest.mark.parametrize("status", ["success", "error"])
 @pytest.mark.parametrize("mismatch", [{"flow_id": "other"}, {"flow_revision": 2}, {"definition_digest": "old"}])
-def test_result_commit_rejects_other_flow_or_definition(monkeypatch, path, status, mismatch):
+async def test_result_commit_rejects_other_flow_or_definition(monkeypatch, path, status, mismatch):
     monkeypatch.setattr("app.services.ai_orchestrator.record_events", lambda *args: pytest.fail("foreign evidence persisted"))
     monkeypatch.setattr("app.services.ai_orchestrator._session_checkpoint.save", lambda *args, **kwargs: pytest.fail("foreign state saved"))
     state = _ready(flow_id="f", current_flow_revision=3, current_definition_digest="d3")
@@ -2926,8 +2926,8 @@ def test_result_commit_rejects_other_flow_or_definition(monkeypatch, path, statu
     }
     if status == "error":
         result["error"] = "selector timeout"
-    applied = (_process_tool_result("run_flow", result, state)[1] if path == "tool"
-               else _sync_run_result(None, result, state))
+    applied = ((await _process_tool_result("run_flow", result, state))[1] if path == "tool"
+               else (await _sync_run_result(None, result, state)))
     assert not applied
     assert asdict(state) == before
 

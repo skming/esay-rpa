@@ -872,7 +872,7 @@ def _reset_session_state(flow_id: str | None) -> None:
     if not flow_id:
         return
     _repair_ledger.clear(flow_id)
-    _session_checkpoint.clear(flow_id)
+    _session_checkpoint.clear_flow(flow_id)
     _evidence_ledger._ledger_path(flow_id).unlink(missing_ok=True)
 
 

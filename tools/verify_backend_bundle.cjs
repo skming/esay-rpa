@@ -99,7 +99,8 @@ function main() {
 
   const CHECKED_IMPORTS = [
     'fastapi', 'uvicorn', 'playwright', 'scrapling', 'openpyxl',
-    'litellm', 'sqlalchemy', 'redis', 'minio', 'jsonschema', 'asyncpg', 'app.main',
+    'litellm', 'langgraph.graph', 'langgraph.checkpoint.sqlite',
+    'sqlalchemy', 'redis', 'minio', 'jsonschema', 'asyncpg', 'app.main',
   ];
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-rpa-bundle-verify-'));
   const env = {

@@ -1,26 +1,36 @@
 """跨请求保留失败预算和未完成的修复要求，避免中断重置额度。
 
-验收完成且无未完成义务时清空；新任务通过 task_key 隔离旧状态。
+验收完成且无未完成义务时清空；按 flow_id + task_key 隔离，诊断请求不改交互状态。
 节点级修复轨迹由生命周期不同的 ai_repair_ledger 管理。
+LangGraph SqliteSaver 只保存语义检查点，不重放图节点或浏览器副作用。
 检查点写入失败不阻断任务，正确性不能依赖检查点可用。"""
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
+import logging
 import math
 import time
-import os
-import tempfile
+import sqlite3
+from contextlib import closing, contextmanager
+from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from langgraph.checkpoint.base import empty_checkpoint
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+from langgraph.checkpoint.sqlite import SqliteSaver
 
 from app.core.storage import resolve_ai_dir
 from app.services.ai_guard_state import is_valid_checkpoint_value
 from app.services.ai_phases import VERIFY_ATTEMPT_BUDGET
 from app.services.ai_tool_events import current_verification_status
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
-    # 只用于类型标注：save() 只 getattr 读字段，from __future__ 让标注变惰性字符串，
-    # 运行期不必真导入 GuardState。
+    # 类型标注不引入加载期的反向依赖。
     from app.services.ai_guard_state import GuardState
 
 # 只有「重来一次要再付一次代价」的状态值得存。
@@ -72,8 +82,8 @@ _PER_ROUND_KEYS = frozenset({
     # 同样另有归属：验收台账已按 flow_id + revision 落盘，每轮开场由
     # load_verification_state 重算。存一份反而更危险——流程在会话之外被改过，
     # 旧的 accepted_revision 会让「这版已验收」凭空成立
-    "current_flow_revision", "current_definition_digest", "run_verified_revision", "accepted_revision",
-    # 不是事实：flow_id 是检查点文件名本身，_last_tool_args 只在一次调用内传参
+    "current_flow_revision", "current_definition_digest", "run_verified_revision", "accepted_revision", "verification_task_id",
+    # flow_id 已用于线程标识；_last_tool_args 只在一次调用内传参。
     "flow_id", "_last_tool_args",
     # 本轮请求本身：下一轮换了一句话，这些就全过期了
     "latest_user_message", "user_requirement_text", "turn_intent_actionable", "active_task",
@@ -92,18 +102,23 @@ def _checkpoint_dir() -> Path:
     return resolve_ai_dir() / "checkpoints"
 
 
-def _checkpoint_path(flow_id: str) -> Path:
-    return _checkpoint_dir() / f"flow_{flow_id}.json"
+def _checkpoint_path() -> Path:
+    return _checkpoint_dir() / "langgraph.sqlite3"
 
 
-def load(flow_id: str | None, *, task_key: str | None = None) -> dict[str, Any]:
-    """读回可续跑的 guard_state 片段；缺失/损坏/过期一律当空。"""
-    if not flow_id:
-        return {}
-    try:
-        data = json.loads(_checkpoint_path(flow_id).read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+@contextmanager
+def _checkpointer() -> Iterator[SqliteSaver]:
+    serde = JsonPlusSerializer(allowed_json_modules=[], allowed_msgpack_modules=[])
+    with closing(sqlite3.connect(str(_checkpoint_path()), timeout=0.2)) as connection:
+        yield SqliteSaver(connection, serde=serde)
+
+
+def _config(flow_id: str, task_key: str = "") -> dict[str, Any]:
+    identity = json.dumps([flow_id, task_key], separators=(",", ":"))
+    return {"configurable": {"thread_id": identity, "checkpoint_ns": ""}}
+
+
+def _validated_state(data: Any, *, task_key: str | None) -> dict[str, Any]:
     if not isinstance(data, dict):
         return {}
     try:
@@ -114,9 +129,7 @@ def load(flow_id: str | None, *, task_key: str | None = None) -> dict[str, Any]:
     if not math.isfinite(updated_at) or age < 0 or age > _STALE_SECONDS:
         return {}
     state = data.get("state")
-    if not isinstance(state, dict):
-        return {}
-    if task_key is not None and state.get("task_key") != task_key:
+    if not isinstance(state, dict) or (task_key is not None and state.get("task_key", "") != task_key):
         return {}
     persisted = {k: v for k, v in state.items() if k in _PERSISTED_KEYS}
     if any(not is_valid_checkpoint_value(key, value) for key, value in persisted.items()):
@@ -124,44 +137,54 @@ def load(flow_id: str | None, *, task_key: str | None = None) -> dict[str, Any]:
     return persisted
 
 
+def load(flow_id: str | None, *, task_key: str | None = None) -> dict[str, Any]:
+    """精确读取任务；缺少任务身份时，仅恢复唯一且未过期的检查点。"""
+    if not flow_id or not _checkpoint_path().is_file():
+        return {}
+    try:
+        with _checkpointer() as saver:
+            if task_key is not None:
+                stored = saver.get_tuple(_config(flow_id, task_key))
+                return _validated_state(stored.checkpoint["channel_values"], task_key=task_key) if stored else {}
+            candidates = [
+                state for item in saver.list(None, filter={"flow_id": flow_id})
+                if (state := _validated_state(item.checkpoint["channel_values"], task_key=None))
+            ]
+        return candidates[0] if len(candidates) == 1 else {}
+    except Exception:
+        logger.warning("AI checkpoint load failed (flow_id=%s)", flow_id, exc_info=True)
+        return {}
+
+
 def save(flow_id: str | None, state: GuardState, *, rounds: int) -> None:
-    """每轮结束调一次。全空就删文件——留一份全 0 的检查点只会让 load 白读一次。"""
-    if not flow_id:
+    if not flow_id or state.read_only_tools:
         return
     snapshot = {k: v for k in _PERSISTED_KEYS if (v := getattr(state, k, None))}
-    task_key = snapshot.pop("task_key", None)
-    # attempt_budget 默认就是一份真值 dict（new_budget()），不滤掉它 snapshot 永不为空，
-    # 下面的「全空即删」就成了死码、每轮都白写一份检查点。只有真花过额度、记过签名（首次
-    # 拦截不计价但要留签名）、或攒下尝试记录的预算才算「重来要再付的代价」，值得存。
+    task_key = snapshot.pop("task_key", "")
     budget = snapshot.get("attempt_budget")
-    if isinstance(budget, dict) and not (
-        budget.get("spent") or budget.get("signatures") or budget.get("attempts")
-    ):
+    if isinstance(budget, dict) and not any(budget.get(key) for key in ("spent", "signatures", "attempts")):
         snapshot.pop("attempt_budget", None)
     if not snapshot:
-        clear(flow_id)
+        clear(flow_id, task_key=task_key)
         return
     if task_key:
         snapshot["task_key"] = task_key
-    temporary: str | None = None
     try:
         _checkpoint_dir().mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=_checkpoint_dir(), delete=False) as output:
-            temporary = output.name
-            json.dump({"state": snapshot, "rounds": rounds, "updated_at": time.time()}, output, ensure_ascii=False)
-        os.replace(temporary, _checkpoint_path(flow_id))
+        with _checkpointer() as saver:
+            checkpoint = empty_checkpoint()
+            checkpoint["id"] = "latest"
+            checkpoint["channel_values"] = {"state": snapshot, "rounds": rounds, "updated_at": time.time()}
+            saver.put(_config(flow_id, task_key), checkpoint, {
+                "source": "update", "step": rounds, "parents": {}, "flow_id": flow_id,
+            }, {})
     except Exception:
-        pass
-    finally:
-        if temporary:
-            try:
-                Path(temporary).unlink(missing_ok=True)
-            except OSError:
-                pass
+        logger.warning("AI checkpoint save failed (flow_id=%s)", flow_id, exc_info=True)
 
 
 def finish(flow_id: str | None, state: GuardState, *, rounds: int) -> None:
-    """正文结束不等于后台运行或修复义务结束；保留同一任务仍需处理的状态。"""
+    if state.read_only_tools:
+        return
     run = state.pending_run or {}
     unfinished = run.get("status") in {"queued", "pending", "running", "timeout", "awaiting_confirmation"}
     budget = state.attempt_budget
@@ -171,17 +194,55 @@ def finish(flow_id: str | None, state: GuardState, *, rounds: int) -> None:
             or (state.page_evidence_required and not state.page_evidence_done)):
         save(flow_id, state, rounds=rounds)
     else:
-        clear(flow_id)
+        clear(flow_id, task_key=state.task_key or "")
 
 
-def clear(flow_id: str | None) -> None:
-    """本轮对话正常收尾时调用：预算是为「这一次任务」设的，不该跨任务累积。"""
-    if not flow_id:
+def clear(flow_id: str | None, *, task_key: str = "") -> None:
+    if not flow_id or not _checkpoint_path().is_file():
         return
     try:
-        _checkpoint_path(flow_id).unlink(missing_ok=True)
+        with _checkpointer() as saver:
+            saver.delete_thread(_config(flow_id, task_key)["configurable"]["thread_id"])
     except Exception:
-        pass
+        logger.warning("AI checkpoint clear failed (flow_id=%s)", flow_id, exc_info=True)
+
+
+def clear_flow(flow_id: str) -> None:
+    """显式清理流程下的全部任务检查点，仅用于隔离评测的重置。"""
+    if not _checkpoint_path().is_file():
+        return
+    try:
+        with _checkpointer() as saver:
+            for item in list(saver.list(None, filter={"flow_id": flow_id})):
+                saver.delete_thread(item.config["configurable"]["thread_id"])
+    except Exception:
+        logger.warning("AI checkpoint flow reset failed (flow_id=%s)", flow_id, exc_info=True)
+
+
+async def _offload(operation: Any, *args: Any, **kwargs: Any) -> Any:
+    # 提交回执等记账必须收尾后才能传播取消，避免已入队却丢掉可恢复的 task_id。
+    worker = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        await worker
+        raise
+
+
+async def aload(flow_id: str | None, *, task_key: str | None = None) -> dict[str, Any]:
+    return await _offload(load, flow_id, task_key=task_key)
+
+
+async def asave(flow_id: str | None, state: GuardState, *, rounds: int) -> None:
+    await _offload(save, flow_id, copy.deepcopy(state), rounds=rounds)
+
+
+async def afinish(flow_id: str | None, state: GuardState, *, rounds: int) -> None:
+    await _offload(finish, flow_id, copy.deepcopy(state), rounds=rounds)
+
+
+async def aclear(flow_id: str | None, *, task_key: str = "") -> None:
+    await _offload(clear, flow_id, task_key=task_key)
 
 
 def summarize(checkpoint: dict[str, Any]) -> str | None:

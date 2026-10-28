@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from app.services.ai_guard_state import GuardState
 from app.services.ai_tool_events import attach_tool_events, reduce_evidence_state
 
@@ -69,3 +71,19 @@ def test_same_revision_with_different_digest_cannot_be_verified():
     )
     reduce_evidence_state(state, result)
     assert state.accepted_revision is None and state.run_verified_revision is None
+
+
+@pytest.mark.parametrize("status", ["success", "error", "stopped"])
+def test_latest_run_and_audit_must_belong_to_the_same_task(status):
+    state = GuardState(
+        current_flow_revision=1, current_definition_digest="d", run_verified_revision=1,
+        accepted_revision=1, verification_task_id="old", audit_passed=True,
+    )
+    result = {"events": [
+        {"type": "run_completed", "flow_revision": 1, "definition_digest": "d", "task_id": "new", "status": status},
+        {"type": "audit_completed", "flow_revision": 1, "definition_digest": "d", "task_id": "old", "passed": True},
+    ]}
+    reduce_evidence_state(state, result)
+    assert state.verification_task_id == "new"
+    assert state.accepted_revision is None and not state.audit_passed
+    assert state.run_verified_revision == (1 if status == "success" else None)

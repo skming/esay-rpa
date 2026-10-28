@@ -18,18 +18,20 @@ from app.services.ai_tools.diagnostics import (
 )
 from app.services.execution_evidence import definition_digest
 
-# 审计要读产物文件，而状态块每轮都会重算一次。按 (任务, 定义摘要, 流程版本) 缓存：
-# 这三者不变，结论必然不变；任一变化都必须重算（改完流程后旧产物应当被判为过期证据）。
+# 按任务、流程版本与两端定义摘要缓存，防止 revision 未增长的旁路修改复用旧结论。
 _CACHE_LIMIT = 32
-_audit_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
+_audit_cache: dict[tuple[str, str, str, str], dict[str, Any]] = {}
 
 
 def audit_run(task: Any, flow: Any) -> dict[str, Any]:
     """审计一次运行的产物。调用方保证 `task.status == "success"`。"""
+    if flow is None or (task.flow_revision is not None and task.flow_revision != flow.revision):
+        return _audit(task, flow)
     key = (
         str(task.task_id),
         str(task.definition_digest or ""),
-        str(getattr(flow, "revision", "") if flow is not None else ""),
+        str(getattr(flow, "revision", "")),
+        definition_digest(flow.definition),
     )
     cached = _audit_cache.get(key)
     if cached is not None:

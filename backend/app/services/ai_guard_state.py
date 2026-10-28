@@ -2,7 +2,7 @@
 
 项目没有静态类型检查，这些字段又分散在编排层写、ai_phases 与 ai_guards 读：键名写错时
 读侧只会永远拿到默认值，表现是阶段机卡在 BUILD 或漏判授权，与「没做过这个功能」无从区分。
-本模块不依赖其他 ai 模块，避免循环依赖。检查点使用 JSON，恢复时仅接收已知字段。"""
+本模块不依赖其他 ai 模块，避免循环依赖。检查点仅恢复已知字段和基础数据类型。"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
@@ -88,6 +88,7 @@ class GuardState:
     current_definition_digest: str | None = None
     run_verified_revision: int | None = None
     accepted_revision: int | None = None
+    verification_task_id: str | None = None
 
     # 修复台账（ai_repair_ledger）跨会话累计的节点级轨迹，会写回检查点
     repair_sessions: int = 0

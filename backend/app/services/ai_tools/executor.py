@@ -326,6 +326,16 @@ def _validated_contract(raw: dict[str, Any] | None) -> tuple[Any, dict[str, Any]
         }
 
 
+async def _publish_run_progress(sink: dict[str, Any] | None, values: dict[str, Any]) -> None:
+    if sink is None:
+        return
+    publish = getattr(sink, "publish", None)
+    if publish is not None:
+        await publish(values)
+    else:
+        sink.update(values)
+
+
 class RpaToolExecutor:
     def __init__(
         self,
@@ -347,7 +357,7 @@ class RpaToolExecutor:
         progress_sink: dict[str, Any] | None = None,
         change_context: ChangeContext | None = None,
     ) -> dict[str, Any]:
-        """progress_sink：调用方传入的可变字典，长耗时工具在执行途中往里写进度。
+        """progress_sink：调用方传入的可变字典，可用异步 publish 钩子在发布进度前持久化任务回执。
         change_context：本轮的写入约束（受保护节点、是否已有新页面证据）。
 
         执行器是全进程单例，这两样都不能挂在 self 上——两个会话同时跑会互相覆盖。
@@ -1654,8 +1664,7 @@ class RpaToolExecutor:
                       "flow_revision": active.flow_revision, "definition_digest": active.definition_digest,
                       "reused_existing_run": True,
                       "message": "当前流程已有未完成任务，已恢复观察，请勿重复运行。"}
-            if progress_sink is not None:
-                progress_sink.update(result)
+            await _publish_run_progress(progress_sink, result)
             return result
 
         # 探索会话占着同一个 browser profile 的进程内互斥锁，不先让开，这次运行会被自己刚才的
@@ -1789,11 +1798,9 @@ class RpaToolExecutor:
             variables=merged_variables,
             browser_executor=browser_executor,
         )
-        def _publish_progress(task: Any) -> None:
+        async def _publish_progress(task: Any) -> None:
             # 运行要几分钟，AI 面板在这期间只能靠这份进度证明自己没死
-            if progress_sink is None:
-                return
-            progress_sink.update({
+            await _publish_run_progress(progress_sink, {
                 "task_id": task.task_id,
                 "status": task.status,
                 "flow_id": flow_id,
@@ -1810,9 +1817,9 @@ class RpaToolExecutor:
             task = await asyncio.shield(submission)
         except asyncio.CancelledError:
             task = await submission
-            _publish_progress(task)
+            await _publish_progress(task)
             raise
-        _publish_progress(task)
+        await _publish_progress(task)
 
         _TERMINAL = {"success", "error", "stopped"}
         _MAX_WAIT_S = 90
@@ -1825,7 +1832,7 @@ class RpaToolExecutor:
             if refreshed is None:
                 break
             task = refreshed
-            _publish_progress(task)
+            await _publish_progress(task)
 
         if task.status == "success":
             try:
@@ -2499,6 +2506,10 @@ class RpaToolExecutor:
             if issue.get("issue")
         ]
         records = self._quality_failures_by_flow.setdefault(flow_id, [])
+        for record in records:
+            if record["task_id"] == task_id:
+                record["issues"] = issue_names
+                return
         records.insert(0, {
             "task_id": task_id,
             "issues": issue_names,

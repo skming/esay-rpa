@@ -228,7 +228,7 @@ def test_history_restores_the_latest_failed_run_instead_of_an_older_success():
 
 
 @pytest.mark.parametrize("status", ["error", "success"])
-def test_restoring_a_failed_run_does_not_charge_the_retry_budget_twice(monkeypatch, tmp_path, status):
+async def test_restoring_a_failed_run_does_not_charge_the_retry_budget_twice(monkeypatch, tmp_path, status):
     monkeypatch.setattr(checkpoint, "resolve_ai_dir", lambda: tmp_path)
     state = GuardState(flow_id="f", current_flow_revision=3, current_definition_digest="digest")
     result = {"task_id": "t", "flow_id": "f", "status": status, "flow_revision": 3, "definition_digest": "digest",
@@ -236,12 +236,12 @@ def test_restoring_a_failed_run_does_not_charge_the_retry_budget_twice(monkeypat
         "task_id": "t", "flow_id": "f", "status": "success", "flow_revision": 3, "definition_digest": "digest",
         "acceptance_audit": {"passed": False, "issues": [{"issue": "missing_rows"}]},
     }
-    assert _sync_run_result(None, result, state)
+    assert (await _sync_run_result(None, result, state))
     spent = state.attempt_budget["spent"]
     checkpoint.finish("f", state, rounds=1)
     restored = GuardState(flow_id="f", current_flow_revision=3, current_definition_digest="digest")
     restored.apply_checkpoint(checkpoint.load("f"))
-    assert not _sync_run_result(None, result, restored)
+    assert not (await _sync_run_result(None, result, restored))
     assert restored.attempt_budget["spent"] == spent
 
 
@@ -328,3 +328,71 @@ async def test_images_follow_all_results_in_a_multi_tool_batch(monkeypatch):
     )]
     assert not [event for event in events if event["type"] == "error"]
     assert len(requests) == 2
+
+
+async def test_read_only_diagnosis_preserves_the_interactive_checkpoint(monkeypatch, tmp_path):
+    import litellm
+    from test_ai_orchestrator import _RunnableFlowExecutor, _FakeStream, _chunk
+    monkeypatch.setattr(checkpoint, "resolve_ai_dir", lambda: tmp_path)
+    state = GuardState(task_key="a" * 64, attempt_budget={"spent": 2, "signatures": {}, "attempts": []})
+    await checkpoint.asave("flow-run", state, rounds=2)
+    complete = AsyncMock(return_value=_FakeStream([_chunk(content="这里只解释当前流程配置。", finish="stop")]))
+    monkeypatch.setattr(litellm, "acompletion", complete)
+    events = [event async for event in AiOrchestrator(_RunnableFlowExecutor()).stream(
+        [{"role": "user", "content": "只解释当前流程配置"}], "test-model", "flow-run", read_only=True,
+    )]
+    assert not [event for event in events if event["type"] == "error"]
+    assert (await checkpoint.aload("flow-run", task_key=state.task_key))["attempt_budget"]["spent"] == 2
+
+
+async def test_repeated_quality_audits_do_not_evict_other_failed_runs(monkeypatch):
+    from datetime import UTC, datetime
+    from app.services import ai_checks
+    from app.services.execution_evidence import definition_digest
+    monkeypatch.setattr(ai_checks, "_audit_cache", {})
+    definition = {"nodes": [], "edges": []}
+    flow = SimpleNamespace(flow_id="f", revision=1, definition=definition)
+    tasks = [SimpleNamespace(
+        task_id=f"audit-{index}", flow_id="f", status="success", flow_revision=1,
+        definition_digest=definition_digest(definition), variables=[], acceptance_contract=FlowAcceptanceContract(),
+        execution_evidence=[], updated_at=datetime.now(UTC),
+    ) for index in range(3)]
+    manager = SimpleNamespace(
+        get_task=AsyncMock(side_effect=lambda task_id: next(task for task in tasks if task.task_id == task_id)),
+        list_tasks=AsyncMock(return_value=tasks), get_logs=AsyncMock(return_value=[]),
+    )
+    executor = RpaToolExecutor(SimpleNamespace(get_flow=AsyncMock(return_value=flow)), manager)
+    for task in tasks:
+        await executor._audit_run(task.task_id)
+    before = await executor._recent_failure_gate("f")
+    for _ in range(8):
+        await executor._audit_run(tasks[-1].task_id)
+    after = await executor._recent_failure_gate("f")
+    assert before is not None and after == before
+    assert len(executor._quality_failures_by_flow["f"]) == 3
+    executor._record_quality_failure("f", tasks[-1].task_id, [{"issue": "changed_issue"}])
+    assert len(executor._quality_failures_by_flow["f"]) == 3
+    assert executor._recorded_quality_issues(tasks[-1].task_id) == ["changed_issue"]
+
+
+def test_audit_cache_rejects_a_definition_change_without_revision_change(monkeypatch):
+    from app.services import ai_checks
+    from app.services.execution_evidence import definition_digest
+    monkeypatch.setattr(ai_checks, "_audit_cache", {})
+    definition = {"nodes": [], "edges": []}
+    flow = SimpleNamespace(revision=1, definition=definition)
+    task = SimpleNamespace(
+        task_id="cache-check", flow_revision=1, definition_digest=definition_digest(definition),
+        variables=[RuntimeVariableSnapshot(name="count", type="Integer", value="1", scope="局部")],
+        acceptance_contract=FlowAcceptanceContract.model_validate({
+            "requirements": [{"id": "r", "description": "结果数量", "sourceQuote": "输出结果数量"}],
+            "deliverables": [{"id": "d", "variable": "count", "kind": "scalar", "required": True, "requirementIds": ["r"]}],
+        }), execution_evidence=[],
+    )
+    first = ai_checks.audit_run(task, flow)
+    assert first["passed"]
+    assert ai_checks.audit_run(task, flow) is first
+    flow.definition = {"nodes": [{"id": "changed", "type": "variable.set", "variableName": "count", "value": 99}], "edges": []}
+    changed = ai_checks.audit_run(task, flow)
+    assert not changed["passed"]
+    assert changed["issues"][0]["issue"] == "definition_digest_mismatch"

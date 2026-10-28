@@ -12,8 +12,11 @@ ai_guards / ai_tool_events 只在 TYPE_CHECKING 下引用它、运行期不反�
 from __future__ import annotations
 
 import ast
+import subprocess
+import sys
 from pathlib import Path
 
+import pytest
 _SERVICES = Path(__file__).resolve().parent.parent / "app" / "services"
 
 
@@ -132,3 +135,14 @@ def test_guard_state_is_a_zero_dependency_base() -> None:
     """底座只能被依赖，不能反向依赖任何 AI 模块——否则 TYPE_CHECKING 那条分层线形同虚设。"""
     graph = _build_graph()
     assert graph["app.services.ai_guard_state"] == set()
+
+
+@pytest.mark.parametrize("modules", [
+    ["app.services.ai_checks"],
+    ["app.services.ai_tools.diagnostics", "app.services.ai_checks"],
+    ["app.services.ai_tools.executor", "app.services.ai_orchestrator"],
+])
+def test_ai_modules_import_in_a_fresh_process(modules):
+    code = f"import importlib; [importlib.import_module(name) for name in {modules!r}]"
+    result = subprocess.run([sys.executable, "-c", code], cwd=_SERVICES.parent.parent, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr

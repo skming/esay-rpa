@@ -1,4 +1,4 @@
-"""LiteLLM-based AI orchestrator with tool-call loop and SSE streaming."""
+"""LangGraph AI orchestration with domain guards and SSE streaming."""
 from __future__ import annotations
 
 import asyncio
@@ -11,6 +11,10 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import aclosing
 from dataclasses import dataclass
 from typing import Any
+
+from langgraph.graph import END, START, StateGraph
+
+from app.services.ai_graph_runtime import GraphDelivery, OrchestrationState
 
 from app.services import ai_repair_ledger as _repair_ledger
 from app.services import ai_session_checkpoint as _session_checkpoint
@@ -1045,12 +1049,12 @@ class _RunProgressSink(dict[str, Any]):
         self.state = state
         self.rounds = rounds
 
-    def update(self, *args: Any, **kwargs: Any) -> None:
-        super().update(*args, **kwargs)
+    async def publish(self, values: dict[str, Any]) -> None:
+        super().update(values)
         handle = _run_handle(self, self.state.flow_id)
         if handle and handle != self.state.pending_run:
             self.state.pending_run = handle
-            _session_checkpoint.save(self.state.flow_id, self.state, rounds=self.rounds)
+            await _session_checkpoint.asave(self.state.flow_id, self.state, rounds=self.rounds)
 
 
 class AiOrchestrator:
@@ -1240,12 +1244,12 @@ class AiOrchestrator:
 
         # 上一轮被中断（用户点停止、断流、关窗）时留下的预算与未了结义务。
         # 放在初始化之后覆盖：默认值是"这轮从零开始"，检查点存在才说明不是。
-        checkpoint = _session_checkpoint.load(flow_id, task_key=guard_state.task_key)
+        checkpoint = await _session_checkpoint.aload(flow_id, task_key=guard_state.task_key) if not read_only else {}
         latest = _latest_user_message(messages).strip(" 。！!")
-        if (not checkpoint and len(messages) == 1 and not _NEW_TASK_RE.search(latest)
+        if (not read_only and not checkpoint and len(messages) == 1 and not _NEW_TASK_RE.search(latest)
                 and (_RESUME_TASK_RE.match(latest) or latest in {"还是不行", "仍然失败", "未采集完整", "数据统计为空"})):
             # 前端裁掉历史时，用户明确要求继续，才允许恢复该流程唯一的未完成检查点。
-            checkpoint = _session_checkpoint.load(flow_id)
+            checkpoint = await _session_checkpoint.aload(flow_id)
         if checkpoint:
             guard_state.apply_checkpoint(checkpoint)
             resume_note = _session_checkpoint.summarize(checkpoint)
@@ -1294,11 +1298,21 @@ class AiOrchestrator:
         else:
             last_run = guard_state.pending_run = None
 
-        for round_num in range(effective_max_rounds):
+        delivery = GraphDelivery()
+        collected = RoundOutput()
+
+        async def model_round(state: OrchestrationState) -> dict[str, Any]:
+            nonlocal flow_state, last_run, collected
+            nonlocal last_verification_status, last_verification_revision
+            nonlocal vision_fallback_done, consecutive_empty_rounds
+            round_num = state["round_num"]
+            if round_num >= effective_max_rounds:
+                return {"route": "limit"}
+            emit = delivery.emit
             if round_num == 0:
-                yield {"type": "status", "delta": "正在思考…"}
+                await emit({"type": "status", "delta": "正在思考…"})
             else:
-                yield {"type": "status", "delta": _next_round_status_text(last_tool_name)}
+                await emit({"type": "status", "delta": _next_round_status_text(last_tool_name)})
 
             # 无条件重建，不做「看起来没变就跳过」的优化：用户可能在画布上直接改了流程，
             # 运行状态也会自己往前走。任何「我觉得它没变」的判断都是过期状态的复发路径。
@@ -1308,10 +1322,10 @@ class AiOrchestrator:
                 flow_state.last_run = await _refresh_run(self._executor, last_run)
             _sync_flow_state(flow_state, guard_state)
             refreshed_run = flow_state.last_run
-            synced = _sync_run_result(last_run, refreshed_run, guard_state, rounds=meter.rounds)
+            synced = await _sync_run_result(last_run, refreshed_run, guard_state, rounds=meter.rounds)
             guard_state.pending_run = _run_handle(refreshed_run, flow_id) if refreshed_run else None
             if not synced and last_run != refreshed_run:
-                _session_checkpoint.save(flow_id, guard_state, rounds=meter.rounds)
+                await _session_checkpoint.asave(flow_id, guard_state, rounds=meter.rounds)
             last_run = refreshed_run
             sync_state_message(full_messages, render_flow_state(flow_state))
             # 阶段由事实推导，所以事实必须每轮跟着状态块一起重算：用户可能在画布上
@@ -1327,7 +1341,7 @@ class AiOrchestrator:
             ):
                 last_verification_status = verification_status
                 last_verification_revision = verification_revision
-                yield {"type": "verification", "status": verification_status, "revision": verification_revision}
+                await emit({"type": "verification", "status": verification_status, "revision": verification_revision})
             collected = RoundOutput()
             try:
                 full_messages[0] = _build_system_message(
@@ -1339,124 +1353,132 @@ class AiOrchestrator:
                 _mark_history_cache_anchor(full_messages, model, relayed)
                 serialized = _serialize_messages(full_messages)
                 if _total_content_chars(serialized) + tool_chars > context_budget:
-                    _session_checkpoint.save(flow_id, guard_state, rounds=meter.rounds)
-                    yield {"type": "error", "code": "context_budget_exceeded",
-                           "message": "当前需求和必要工具上下文仍超过模型预算，已停止发送以避免无效请求。请缩小本次处理范围或选择更大上下文的模型；已提交的后台任务仍保留。"}
-                    yield {"type": "done"}
-                    return
+                    await _session_checkpoint.asave(flow_id, guard_state, rounds=meter.rounds)
+                    await emit({"type": "error", "code": "context_budget_exceeded",
+                           "message": "当前需求和必要工具上下文仍超过模型预算，已停止发送以避免无效请求。请缩小本次处理范围或选择更大上下文的模型；已提交的后台任务仍保留。"})
+                    await emit({"type": "done"})
+                    return {"round_num": round_num + 1, "route": END}
                 # 前端断开时显式关闭适配器生成器，立即释放响应与中转连接租约。
                 async with aclosing(self._transport.stream_round(
                     model, serialized, round_tools, collected, round_num=round_num,
                 )) as events:
                     async for event in events:
-                        yield event
+                        await emit(event)
                 if collected.stall_error is not None:
-                    yield {"type": "error", "message": collected.stall_error}
-                    yield {"type": "done"}
-                    return
+                    await emit({"type": "error", "message": collected.stall_error})
+                    await emit({"type": "done"})
+                    return {"round_num": round_num + 1, "route": END}
                 meter.add_round(collected.usage, collected.elapsed_s)
-                yield {"type": "usage", "usage": meter.snapshot(effective_max_rounds)}
+                await emit({"type": "usage", "usage": meter.snapshot(effective_max_rounds)})
             except ModelTransportError as exc:
                 if not vision_fallback_done and exc.vision_unsupported and _strip_image_messages(full_messages):
                     vision_fallback_done = True
-                    yield {"type": "status", "delta": "当前模型不支持图片，已移除截图重试…"}
-                    continue
-                yield {"type": "error", "message": str(exc)}
-                yield {"type": "done"}
-                return
+                    await emit({"type": "status", "delta": "当前模型不支持图片，已移除截图重试…"})
+                    return {"round_num": round_num + 1, "route": "model"}
+                await emit({"type": "error", "message": str(exc)})
+                await emit({"type": "done"})
+                return {"round_num": round_num + 1, "route": END}
 
             except Exception as exc:
-                yield {"type": "error", "message": clean_litellm_error(str(exc))}
-                yield {"type": "done"}
-                return
+                await emit({"type": "error", "message": clean_litellm_error(str(exc))})
+                await emit({"type": "done"})
+                return {"round_num": round_num + 1, "route": END}
 
             tool_calls = list(collected.tool_calls.values())
 
             if tool_calls or collected.text or collected.thinking:
                 consecutive_empty_rounds = 0
 
-            if not tool_calls:
-                if not collected.text and not collected.thinking:
-                    # 允许连续空响应重试一次：长编排跑到第 N 轮时一次瞬时抖动不该
-                    # 废掉整个会话；连续两次空响应才判定为真故障。
-                    consecutive_empty_rounds += 1
-                    if consecutive_empty_rounds == 1:
-                        full_messages.append({
-                            "role": "system",
-                            "content": "你上一次返回了空响应，请重新处理用户的请求并给出回复或调用工具。",
-                        })
-                        continue
-                    yield {"type": "error", "message": "模型连续返回空响应，请检查 API Key 或更换模型。"}
-                    yield {"type": "done"}
-                    return
-                if not collected.text and collected.thinking:
-                    thinking_text = "".join(collected.thinking)
-                    yield {"type": "text", "delta": thinking_text}
-                    # 这段是用户看到的回复，同样要过证据门
-                    collected.text.append(thinking_text)
-                final_text = "".join(collected.text)
-                # 伪调用判在所有检查之前：正文写着调用、执行层一次也没收到，这时任何
-                # 「结论/验证」维度的更正都是对着一段没发生的事实说话。
-                # 两次机会——一次要求经真实接口重试，再不行就照实报调用失败，
-                # 绝不把正文里的 JSON 当结果读，也绝不置 page_evidence_* 冒充本轮已检查。
-                fake_call_correction = _fake_tool_call_text(final_text, guard_state)
-                if fake_call_correction is not None:
-                    full_messages.append({"role": "assistant", "content": final_text})
-                    full_messages.append({"role": "system", "content": fake_call_correction})
-                    yield {"type": "retract", "reason": "工具调用没有真正发起，正在重试"}
-                    yield {"type": "status", "delta": "正在重新发起工具调用…"}
-                    continue
-                if guard_state.fake_tool_call_corrected and _fake_call_text_for_turn(
-                    final_text, guard_state
-                ):
-                    yield {"type": "retract", "reason": "工具调用没有真正发起"}
-                    yield {
-                        "type": "error",
-                        "message": (
-                            "模型两次把工具调用写在了正文里，没有一次真实调用到达执行层，"
-                            "因此没有任何工具返回结果。本轮没有做出任何改动，也没有取得页面证据。"
-                            "请重试，或更换模型。"
-                        ),
-                    }
-                    yield {"type": "done"}
-                    return
-                # 顺序即优先级：先判「该干的活被推掉了」——模型一旦拿拒答模板收尾，
-                # 后两条会把它误诊成「结论越界」或「没做验证」，给出方向完全错的更正。
-                # 其余两条之间，说法不实比交付不全严重。
-                claim_correction: str | None = None
-                retract_reason = "结论超出已有证据，正在重写"
-                claim_correction = _misapplied_refusal(final_text, guard_state)
-                if claim_correction:
-                    retract_reason = "该请求在职责范围内，正在重写"
-                else:
-                    claim_correction = result_claim_correction(final_text, guard_state, _overstated_result_claim, _RESULT_CLAIM_PHRASES)
-                    if claim_correction:
-                        if guard_state.result_claim_corrected:
-                            yield {"type": "retract", "reason": "重写后结论仍缺少证据"}
-                            yield {"type": "text", "delta": conservative_result_reply(guard_state)}
-                            _session_checkpoint.finish(flow_id, guard_state, rounds=meter.rounds)
-                            yield {"type": "usage", "usage": meter.snapshot(effective_max_rounds)}
-                            yield {"type": "done"}
-                            return
-                        guard_state.result_claim_corrected = True
-                if claim_correction is None:
-                    claim_correction = _unmet_verification_request(guard_state)
-                if claim_correction is not None:
-                    full_messages.append({"role": "assistant", "content": final_text})
-                    full_messages.append({"role": "system", "content": claim_correction})
-                    # 越界结论已经流式吐给前端了，只追加更正会留下一段自相矛盾的回复，
-                    # 让前端丢弃本条已渲染正文，由下一轮重写。
-                    yield {"type": "retract", "reason": retract_reason}
-                    yield {"type": "status", "delta": "正在核对结论依据…"}
-                    continue
-                # 拿到了最终回复，这一轮对话就算了结：预算是为「这次任务」设的，
-                # 留到下一条消息会让新需求一上来就背着上次的熔断。
-                _session_checkpoint.finish(flow_id, guard_state, rounds=meter.rounds)
-                # 收尾再补一次：本轮的工具/阻断计数发生在上一次 usage 之后
-                yield {"type": "usage", "usage": meter.snapshot(effective_max_rounds)}
-                yield {"type": "done"}
-                return
+            return {"round_num": round_num + 1, "route": "tools" if tool_calls else "respond"}
 
+        async def respond(state: OrchestrationState) -> dict[str, Any]:
+            nonlocal consecutive_empty_rounds
+            emit = delivery.emit
+            if not collected.text and not collected.thinking:
+                # 允许连续空响应重试一次：长编排跑到第 N 轮时一次瞬时抖动不该
+                # 废掉整个会话；连续两次空响应才判定为真故障。
+                consecutive_empty_rounds += 1
+                if consecutive_empty_rounds == 1:
+                    full_messages.append({
+                        "role": "system",
+                        "content": "你上一次返回了空响应，请重新处理用户的请求并给出回复或调用工具。",
+                    })
+                    return {"route": "model"}
+                await emit({"type": "error", "message": "模型连续返回空响应，请检查 API Key 或更换模型。"})
+                await emit({"type": "done"})
+                return {"route": END}
+            if not collected.text and collected.thinking:
+                thinking_text = "".join(collected.thinking)
+                await emit({"type": "text", "delta": thinking_text})
+                # 这段是用户看到的回复，同样要过证据门
+                collected.text.append(thinking_text)
+            final_text = "".join(collected.text)
+            # 伪调用判在所有检查之前：正文写着调用、执行层一次也没收到，这时任何
+            # 「结论/验证」维度的更正都是对着一段没发生的事实说话。
+            # 两次机会——一次要求经真实接口重试，再不行就照实报调用失败，
+            # 绝不把正文里的 JSON 当结果读，也绝不置 page_evidence_* 冒充本轮已检查。
+            fake_call_correction = _fake_tool_call_text(final_text, guard_state)
+            if fake_call_correction is not None:
+                full_messages.append({"role": "assistant", "content": final_text})
+                full_messages.append({"role": "system", "content": fake_call_correction})
+                await emit({"type": "retract", "reason": "工具调用没有真正发起，正在重试"})
+                await emit({"type": "status", "delta": "正在重新发起工具调用…"})
+                return {"route": "model"}
+            if guard_state.fake_tool_call_corrected and _fake_call_text_for_turn(
+                final_text, guard_state
+            ):
+                await emit({"type": "retract", "reason": "工具调用没有真正发起"})
+                await emit({
+                    "type": "error",
+                    "message": (
+                        "模型两次把工具调用写在了正文里，没有一次真实调用到达执行层，"
+                        "因此没有任何工具返回结果。本轮没有做出任何改动，也没有取得页面证据。"
+                        "请重试，或更换模型。"
+                    ),
+                })
+                await emit({"type": "done"})
+                return {"route": END}
+            # 顺序即优先级：先判「该干的活被推掉了」——模型一旦拿拒答模板收尾，
+            # 后两条会把它误诊成「结论越界」或「没做验证」，给出方向完全错的更正。
+            # 其余两条之间，说法不实比交付不全严重。
+            claim_correction: str | None = None
+            retract_reason = "结论超出已有证据，正在重写"
+            claim_correction = _misapplied_refusal(final_text, guard_state)
+            if claim_correction:
+                retract_reason = "该请求在职责范围内，正在重写"
+            else:
+                claim_correction = result_claim_correction(final_text, guard_state, _overstated_result_claim, _RESULT_CLAIM_PHRASES)
+                if claim_correction:
+                    if guard_state.result_claim_corrected:
+                        await emit({"type": "retract", "reason": "重写后结论仍缺少证据"})
+                        await emit({"type": "text", "delta": conservative_result_reply(guard_state)})
+                        await _session_checkpoint.afinish(flow_id, guard_state, rounds=meter.rounds)
+                        await emit({"type": "usage", "usage": meter.snapshot(effective_max_rounds)})
+                        await emit({"type": "done"})
+                        return {"route": END}
+                    guard_state.result_claim_corrected = True
+            if claim_correction is None:
+                claim_correction = _unmet_verification_request(guard_state)
+            if claim_correction is not None:
+                full_messages.append({"role": "assistant", "content": final_text})
+                full_messages.append({"role": "system", "content": claim_correction})
+                # 越界结论已经流式吐给前端了，只追加更正会留下一段自相矛盾的回复，
+                # 让前端丢弃本条已渲染正文，由下一轮重写。
+                await emit({"type": "retract", "reason": retract_reason})
+                await emit({"type": "status", "delta": "正在核对结论依据…"})
+                return {"route": "model"}
+            # 拿到了最终回复，这一轮对话就算了结：预算是为「这次任务」设的，
+            # 留到下一条消息会让新需求一上来就背着上次的熔断。
+            await _session_checkpoint.afinish(flow_id, guard_state, rounds=meter.rounds)
+            # 收尾再补一次：本轮的工具/阻断计数发生在上一次 usage 之后
+            await emit({"type": "usage", "usage": meter.snapshot(effective_max_rounds)})
+            await emit({"type": "done"})
+            return {"route": END}
+
+        async def tools(state: OrchestrationState) -> dict[str, Any]:
+            nonlocal flow_id, last_tool_name, last_run, last_verification_status, last_verification_revision
+            emit = delivery.emit
+            tool_calls = list(collected.tool_calls.values())
             assistant_msg: dict[str, Any] = {
                 "role": "assistant",
                 "content": "".join(collected.text) or None,
@@ -1483,9 +1505,9 @@ class AiOrchestrator:
                 raw_args = tc["arguments"]
 
                 if stream_idx in collected.emitted_tool_starts:
-                    yield {"type": "tool_args", "tool": tool_name, "args": raw_args, "call_id": tc["call_id"]}
+                    await emit({"type": "tool_args", "tool": tool_name, "args": raw_args, "call_id": tc["call_id"]})
                 else:
-                    yield {"type": "tool_start", "tool": tool_name, "args": raw_args, "call_id": tc["call_id"]}
+                    await emit({"type": "tool_start", "tool": tool_name, "args": raw_args, "call_id": tc["call_id"]})
 
                 try:
                     args, _dup_arg_keys = _parse_tool_arguments(raw_args) if raw_args.strip() else ({}, [])
@@ -1520,7 +1542,7 @@ class AiOrchestrator:
                             result = guard_result
                         else:
                             # 轮次状态是进入本轮时定的（"正在思考…"），工具真正开跑后就过期了
-                            yield {"type": "status", "delta": _executing_status_text(tool_name)}
+                            await emit({"type": "status", "delta": _executing_status_text(tool_name)})
                             # 用 task 执行工具并每 5s 发心跳，避免长时任务（run_flow 等）期间 SSE 看似冻结
                             progress_sink: dict[str, Any] = _RunProgressSink(guard_state, meter.rounds) if tool_name == "run_flow" else {}
                             # 只读工具可能已在本轮开头并发起跑了，直接接管那个任务
@@ -1538,12 +1560,12 @@ class AiOrchestrator:
                                 try:
                                     await asyncio.wait_for(asyncio.shield(tool_task), timeout=5.0)
                                 except asyncio.TimeoutError:
-                                    yield {
+                                    await emit({
                                         "type": "heartbeat",
                                         "tool": tool_name,
                                         "elapsed_s": int(time.monotonic() - tool_started_at),
                                         "progress": dict(progress_sink) or None,
-                                    }
+                                    })
                             result = tool_task.result()
                             tool_tasks.discard(tool_task)
                     except Exception as exc:
@@ -1560,7 +1582,7 @@ class AiOrchestrator:
                 # 记账与落盘都排在 yield 之前：一旦让出去，用户点停止就会让这个生成器
                 # 停在这里再也不往下走，而这次工具的代价（run_flow 常以分钟计）已经付掉了。
                 last_tool_name = tool_name
-                result, _ = _process_tool_result(tool_name, result, guard_state, rounds=meter.rounds)
+                result, _ = await _process_tool_result(tool_name, result, guard_state, rounds=meter.rounds)
                 flow_id = guard_state.flow_id
                 if tool_name in _RUN_STATE_TOOLS and isinstance(result, dict) and _run_handle(result, flow_id):
                     # 下一轮的状态块要讲「最近一次运行怎么样了」，来源就是这里
@@ -1569,9 +1591,9 @@ class AiOrchestrator:
                 if isinstance(result, dict) and str(result.get("status", "")).startswith("blocked_"):
                     meter.blocked_calls += 1
 
-                yield {"type": "tool_result", "tool": tool_name, "result": result, "call_id": tc["call_id"]}
+                await emit({"type": "tool_result", "tool": tool_name, "result": result, "call_id": tc["call_id"]})
                 # 工具计数发生后立即推送；若用户此时关闭窗口，落盘的 usage 仍与工具卡片一致。
-                yield {"type": "usage", "usage": meter.snapshot(effective_max_rounds)}
+                await emit({"type": "usage", "usage": meter.snapshot(effective_max_rounds)})
                 verification_status = current_verification_status(guard_state)
                 verification_revision = guard_state.current_flow_revision
                 if (
@@ -1583,11 +1605,11 @@ class AiOrchestrator:
                 ):
                     last_verification_status = verification_status
                     last_verification_revision = verification_revision
-                    yield {
+                    await emit({
                         "type": "verification",
                         "status": verification_status,
                         "revision": verification_revision,
-                    }
+                    })
 
                 full_messages.append({
                     "role": "tool",
@@ -1635,8 +1657,8 @@ class AiOrchestrator:
                         "message": "该调用未执行：前序工具要求重新判断下一步，请先读取其结果和系统引导，再按需调用。",
                     }
                     if _skip_stream_idx not in collected.emitted_tool_starts:
-                        yield {"type": "tool_start", "tool": _skip_tc["name"], "args": _skip_tc["arguments"], "call_id": _skip_tc["call_id"]}
-                    yield {"type": "tool_result", "tool": _skip_tc["name"], "result": _skip_result, "call_id": _skip_tc["call_id"]}
+                        await emit({"type": "tool_start", "tool": _skip_tc["name"], "args": _skip_tc["arguments"], "call_id": _skip_tc["call_id"]})
+                    await emit({"type": "tool_result", "tool": _skip_tc["name"], "result": _skip_result, "call_id": _skip_tc["call_id"]})
                     full_messages.append({
                         "role": "tool",
                         "tool_call_id": _skip_tc["id"],
@@ -1645,23 +1667,42 @@ class AiOrchestrator:
 
             full_messages.extend(pending_images)
             if terminal_response is not None:
-                _session_checkpoint.finish(flow_id, guard_state, rounds=meter.rounds)
-                yield {"type": "text", "delta": terminal_response}
-                yield {"type": "usage", "usage": meter.snapshot(effective_max_rounds)}
-                yield {"type": "done"}
-                return
+                await _session_checkpoint.afinish(flow_id, guard_state, rounds=meter.rounds)
+                await emit({"type": "text", "delta": terminal_response})
+                await emit({"type": "usage", "usage": meter.snapshot(effective_max_rounds)})
+                await emit({"type": "done"})
+                return {"route": END}
 
-        # 唯一一条不经模型的收尾路径，措辞要能独立成话：这轮的正文可能一个字都没有
-        yield {
-            "type": "text",
-            "delta": (
-                f"\n\n已连续调用 {effective_max_rounds} 轮工具仍未收敛，我在这里停下来，避免继续空转。\n"
-                "上面的处理时间线是这轮实际做过的操作。请告诉我优先解决哪一个问题，"
-                "或把任务拆成更小的一步再发给我，我接着这里继续。"
-            ),
-        }
-        yield {"type": "usage", "usage": meter.snapshot(effective_max_rounds)}
-        yield {"type": "done"}
+            return {"route": "model"}
+
+        async def limit(state: OrchestrationState) -> dict[str, Any]:
+            emit = delivery.emit
+            # 唯一一条不经模型的收尾路径，措辞要能独立成话：这轮的正文可能一个字都没有
+            await emit({
+                "type": "text",
+                "delta": (
+                    f"\n\n已连续调用 {effective_max_rounds} 轮工具仍未收敛，我在这里停下来，避免继续空转。\n"
+                    "上面的处理时间线是这轮实际做过的操作。请告诉我优先解决哪一个问题，"
+                    "或把任务拆成更小的一步再发给我，我接着这里继续。"
+                ),
+            })
+            await emit({"type": "usage", "usage": meter.snapshot(effective_max_rounds)})
+            await emit({"type": "done"})
+
+            return {"route": END}
+
+        graph = StateGraph(OrchestrationState)
+        graph.add_node("model", model_round)
+        graph.add_node("respond", respond)
+        graph.add_node("tools", tools)
+        graph.add_node("limit", limit)
+        graph.add_edge(START, "model")
+        for name in ("model", "respond", "tools", "limit"):
+            graph.add_conditional_edges(name, lambda state: state["route"], ["model", "respond", "tools", "limit", END])
+        compiled = graph.compile()
+        async with aclosing(delivery.stream(compiled, effective_max_rounds)) as events:
+            async for event in events:
+                yield event
 
 
 _NON_EXECUTED_STATUSES = {"blocked_by_orchestrator_guard", "skipped", "error"}
@@ -2117,6 +2158,7 @@ def _sync_flow_state(flow_state: FlowState, state: GuardState) -> None:
     state.current_definition_digest = flow_state.definition_digest
     state.run_verified_revision = evidence["run_verified_revision"]
     state.accepted_revision = evidence["accepted_revision"]
+    state.verification_task_id = evidence.get("verification_task_id")
     state.run_succeeded = False
     state.audit_passed = False
     state.run_attempted = False
@@ -2131,7 +2173,7 @@ def _run_accounting_key(result: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
 
 
-def _process_tool_result(
+async def _process_tool_result(
     tool_name: str, result: Any, state: GuardState, *, rounds: int = 0,
 ) -> tuple[Any, bool]:
     """工具返回与后台刷新共用的状态提交；必须在向客户端让出控制权前完成。"""
@@ -2167,13 +2209,13 @@ def _process_tool_result(
     _orchestrator_guard_after_tool(tool_name, result, state)
     if is_run_result:
         state.run_accounted_key = _run_accounting_key(result)
-    _session_checkpoint.save(state.flow_id, state, rounds=rounds)
+    await _session_checkpoint.asave(state.flow_id, state, rounds=rounds)
     if previous_flow_id != state.flow_id:
-        _session_checkpoint.clear(previous_flow_id)
+        await _session_checkpoint.aclear(previous_flow_id, task_key=state.task_key or "")
     return result, True
 
 
-def _sync_run_result(previous: Any, current: Any, state: GuardState, *, rounds: int = 0) -> bool:
+async def _sync_run_result(previous: Any, current: Any, state: GuardState, *, rounds: int = 0) -> bool:
     if not isinstance(current, dict):
         return False
     if isinstance(previous, dict) and all(
@@ -2181,7 +2223,7 @@ def _sync_run_result(previous: Any, current: Any, state: GuardState, *, rounds: 
         for key in ("task_id", "status", "acceptance_audit")
     ):
         return False
-    _, applied = _process_tool_result("run_flow", current, state, rounds=rounds)
+    _, applied = await _process_tool_result("run_flow", current, state, rounds=rounds)
     return applied
 
 
